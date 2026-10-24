@@ -13,7 +13,7 @@ static const RadConstraint cSampleVoc[] = { C_GE("n_vocab", 1) };
   "f32 logits in place, i32 history, i32 {n, window} per-row pair",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cSampleVoc), NOTUNE,
-  /* No `opd_shape`: nullptr.cpp declares the sampler's shapes, and the oracle (libref) describes
+  /* No `opd_shape`: r4d_shapes.cpp declares the sampler's shapes, and the oracle (libref) describes
    * this op for the tools that ask. */
   nullptr, nullptr, r4d_rad_sample_ngram_ban },
 #endif

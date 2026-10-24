@@ -121,6 +121,6 @@ static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4
   "u32 (id, logit-bits) pairs in, i32 candidate ids and f32 candidate logits out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cSampleCand), NOTUNE,
-  /* No `opd_shape`: see nullptr.cpp (word-typed pairs, no `world_size`); ref declines it too. */
+  /* No `opd_shape`: see r4d_shapes.cpp (word-typed pairs, no `world_size`); ref declines it too. */
   nullptr, nullptr, r4d_rad_sample_merge_topk },
 #endif

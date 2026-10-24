@@ -38,6 +38,8 @@ static const RadConstraint cXeGemvI8[] = {
 };
 extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_logits_gemm_bf16(const RadArgs* a, RadStream s);
+static const RadConstraint cXeLogitsBf16[] = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") };
 static const RadConstraint cXeGemvBf16[] = { C_DIV("K", 8), C_IN("dtype", "bf16") };
 static const RadConstraint cXeRouterGemm[] = {
     C_GE("M", 1), C_DIV("K", 8), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
@@ -68,6 +70,13 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeRouterGemm), NOTUNE,
   nullptr, nullptr, xe_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_logits_gemm_bf16", "logits_gemm", "gemm",
+  "the bf16 lm_head's product as the sub-group GEMV",
+  "any M; n_embd a multiple of 8; the stored layout",
+  "bf16 x and lm_head, bf16 or f32 logits",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeLogitsBf16), NOTUNE,
+  nullptr, nullptr, xe_rad_logits_gemm_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 

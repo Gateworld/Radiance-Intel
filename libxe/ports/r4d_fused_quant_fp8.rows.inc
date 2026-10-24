@@ -20,7 +20,7 @@ static const RadConstraint cGatedQuantFp8[] = {
   ROW(cRmsNormQuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_rmsnorm_quant_fp8, nullptr, nullptr, nullptr,
   nullptr, nullptr,
-  /* `add` + `rmsnorm` + `quant_act_fp8`, not `rmsnorm_add` (nullptr.cpp). */
+  /* `add` + `rmsnorm` + `quant_act_fp8`, not `rmsnorm_add` (r4d_fuse.cpp). */
   nullptr },
 { "gated_quant_fp8", "gated_quant_fp8", "quant",
   "an elementwise gated product and the fp8 activation quantiser in one pass; `act` silu is "
@@ -33,6 +33,6 @@ static const RadConstraint cGatedQuantFp8[] = {
   ROW(cGatedQuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_quant_fp8, nullptr, nullptr, nullptr,
   nullptr, nullptr,
-  /* `silu_mul` + `quant_act_fp8`, silu arm only (nullptr.cpp). */
+  /* `silu_mul` + `quant_act_fp8`, silu arm only (r4d_fuse.cpp). */
   nullptr },
 #endif

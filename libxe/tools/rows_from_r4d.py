@@ -27,7 +27,7 @@ defined = set(re.findall(DEF, ptxt))
 adapters = {a for a in defined if a.startswith('r4d_rad_')} - skip
 # libr4d's host-side weight-layout hooks, which libxe compiles unchanged (libxe/CMakeLists.txt):
 # a row keeps its layout / relayout / unrelayout hooks when they are defined there.
-for extra in ('r4d_fp8_layout.cpp',):
+for extra in ('r4d_fp8_layout.cpp', 'r4d_layout.cpp'):
     defined |= set(re.findall(DEF, open(rows_src.replace('r4d_rows.cpp', extra)).read()))
 
 # kernel-table entries: a '{' at line start followed by a string literal, up to the matching '},'
@@ -58,7 +58,10 @@ for e in entries:
     def fix(mm):
         name = mm.group(1)
         return name if name in defined else 'nullptr'
-    body = re.sub(r'\b(r4d_\w+)\b', fix, e)
+    # identifiers in code only: a comment or string naming a libr4d file or symbol stays as written
+    parts = re.split(r'(/\*.*?\*/|"(?:[^"\\]|\\.)*")', e, flags=re.S)
+    body = ''.join(p if (p.startswith('/*') or p.startswith('"')) else re.sub(r'\b(r4d_\w+)\b', fix, p)
+                   for p in parts)
     picked.append(body)
     consts += re.findall(r'ROW\((c\w+)\)', e)
 seen, cdefs = set(), []

@@ -158,3 +158,13 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
     sub.n_t = 6;
     return r4d_rad_router_topk_scatter(&sub, s);
 }
+
+/* logits_gemm at dtype bf16: x, lm_head, logits. (Production's int8 lm_head is a joined code + scale
+ * plane, r4d_fp8_layout.cpp's i8 logits layout: not served here yet.) */
+extern "C" int xe_rad_logits_gemm_bf16(const RadArgs* args, RadStream s) {
+    const RadTensor* B = r4d_opt(args, 1);
+    if (!B) return R4D_NO(RAD_E_INVAL);
+    const long long V = r4d_geti_or(args, "n_vocab", r4d_dim(B, (int)B->rank - 2));
+    const long long E = r4d_geti_or(args, "n_embd", r4d_dim(B, (int)B->rank - 1));
+    return gemv(r4d_opt(args, 0), B, r4d_opt(args, 2), V, E, s);
+}

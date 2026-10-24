@@ -2605,6 +2605,70 @@ static int g_moe_down_tile_pin = 0;
  *
  * `ncls` is the class count: 2 for `moe_gemm_q` (odd class = operands 6 and 7 at N_odd/K_odd), 4
  * for `moe_gemm_q_mod4` (classes 1..3 = operands 6/7, 8/9, 10/11 at N_1/K_1 .. N_3/K_3, `y` at 12). */
+/* ================================================================== libxe: the codebook experts as a GEMV
+ *
+ * libr4d's decode, down and prefill forms are all fp8 WMMA over the expanded codes; libxe replaces the
+ * launch (moe_gemm_launch below) with this sub-group GEMV over the same stored layout and MoeCls tables,
+ * at libref's arithmetic (ref_moe.cpp): per 64-K weight group the sub-sum of level * activation, then
+ * acc += (sub * a_scale(row, k / 128)) * (e4m3(scale) * 2^-13). A sub-group computes one (row, column)
+ * output, lanes over the weight groups; rows outside the routing and columns past a narrower class's
+ * width are written as zeros, as libref writes them. w4nl64a8h only (W4 2). */
+__global__ void xe_moe_w4nl64_gemv(const uint8_t* __restrict__ A, const float* __restrict__ As, MoeCls c0,
+                                   MoeCls c1, MoeCls c2, MoeCls c3, const int32_t* __restrict__ sorted,
+                                   const int32_t* __restrict__ off, uint16_t* __restrict__ Y, uint32_t T,
+                                   uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld,
+                                   uint32_t as_ld, uint32_t y_ld, uint32_t mode, MoeTab tab, uint32_t a_rows) {
+    const int lane = (int)threadIdx.x & 31;
+    const uint32_t n = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const uint32_t i = blockIdx.y;
+    if (n >= N || i >= T) return;   /* whole sub-groups: no barrier below */
+    const bool a_sorted = (mode & 1u) != 0;
+    const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8;
+    /* the row's expert and activation row (ref_moe.cpp: ex / tk) */
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    uint32_t tok = 0;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        tok = a_sorted ? i : (uint32_t)flat / top_k;
+        if (tok < a_rows) e = (int32_t)lo;
+    }
+    const uint32_t fy = N / parts, pp = n / fy, j = n - pp * fy;
+    const uint32_t q = e >= 0 ? ((uint32_t)e & ((1u << cshift) - 1u)) : 0u;
+    const MoeCls& c = q == 0 ? c0 : q == 1 ? c1 : q == 2 ? c2 : c3;
+    const uint32_t fc = e >= 0 ? c.n / parts : 0u;
+    float acc = 0.0f;
+    if (e >= 0 && j < fc) {
+        const uint32_t entry = (uint32_t)e >> cshift, r = pp * fc + j;
+        const uint8_t* wrow = wtab_at(c.w, c.w_s0, entry) + (size_t)r * c.w_ld;
+        const uint8_t* srow = wtab_at(c.s, c.s_s0, entry) + (size_t)r * (c.k / 64u);
+        const uint8_t* arow = A + (size_t)tok * a_ld;
+        float lv[16];
+#pragma unroll
+        for (int t = 0; t < 16; ++t) lv[t] = r4d_fp8::e4m3((tab.v[t >> 2] >> (8 * (t & 3))) & 0xFFu);
+        for (uint32_t g = (uint32_t)lane; g < c.k / 64u; g += 32u) {
+            const uint32_t* wd = (const uint32_t*)(wrow + (size_t)g * 32);   /* 8 dwords, 64 codes */
+            const uint8_t* ab = arow + (size_t)g * 64;
+            float sub = 0.0f;
+            for (int d = 0; d < 8; ++d) {
+                const uint32_t w = wd[d];
+                /* byte b: element 8d + b in its low nibble, 8d + 4 + b in its high one */
+                for (int b = 0; b < 4; ++b) sub += lv[(w >> (8 * b)) & 15u] * r4d_fp8::e4m3(ab[8 * d + b]);
+                for (int b = 0; b < 4; ++b) sub += lv[(w >> (8 * b + 4)) & 15u] * r4d_fp8::e4m3(ab[8 * d + 4 + b]);
+            }
+            const float sa = As[(size_t)tok * as_ld + (g * 64u) / 128u];
+            const float sb = r4d_fp8::e4m3(srow[g]) * kW4G64Scale;
+            acc += (sub * sa) * sb;
+        }
+        for (int x = 16; x >= 1; x >>= 1) acc += __shfl_xor(acc, x);
+    }
+    if (lane == 0) Y[(size_t)i * y_ld + n] = f32_to_bf16(acc);
+}
+
 template <int W4>
 static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     int emit_rc = RAD_OK;
@@ -2743,6 +2807,20 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8);
     MoeTab tabv{};
     for (int i = 0; i < 4; ++i) tabv.v[i] = tab[i];
+
+    /* libxe: every band of the codebook experts through the GEMV above (libr4d's forms are WMMA). */
+    if constexpr (W4 == 2) {
+        for (int q = 0; q < ncls; ++q)
+            if (cl[q].k % 64u) return R4D_NO(RAD_E_SHAPE);
+        emit_rc = R4D_EMIT(stream, xe_moe_w4nl64_gemv, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
+                           (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                           (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                           (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld,
+                           (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv, (uint32_t)M);
+        return emit_rc;
+    } else if constexpr (W4 >= 1) {
+        return R4D_NO(RAD_E_UNSUPPORTED);   /* the other codebook / int4 forms: not served by libxe yet */
+    }
 
     /* The band: a decode step takes the (tile, run) form (the kernel's ES note) and runs of several
      * rows take the aligned 32-row form; r4d_moe_decode_band has the crossover. */
