@@ -453,6 +453,15 @@ RadTape z_tape_end(int keep) {
         delete t;
         return nullptr;
     }
+    /* Step 5's per-launch figure: what one replay submits (graph nodes are the pass's dispatches,
+     * copies and barriers), for the first few tapes kept. */
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 8) {
+        size_t nodes = 0, evs = 0;
+        for (const Seg& s : t->segs) { nodes += s.nodes; evs += s.evs.size(); }
+        RAD_INFO("l0 tape: %zu segment(s), %zu graph node(s), %zu event record(s), %zu stream(s) recorded",
+                 t->segs.size(), nodes, evs, t->qs.size());
+    }
     return (RadTape)t;
 }
 int z_tape_len(RadTape p) { return p ? (int)static_cast<Tape*>(p)->segs.size() : RAD_E_INVAL; }
