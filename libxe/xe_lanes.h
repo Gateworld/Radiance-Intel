@@ -340,6 +340,8 @@ struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };
 struct alignas(16) int4   { int x, y, z, w; };
 struct alignas(16) float4 { float x, y, z, w; };
+struct alignas(4)  uchar4 { unsigned char x, y, z, w; };
+inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) { return uchar4{a, b, c, d}; }
 inline uint4  make_uint4(unsigned a, unsigned b, unsigned c, unsigned d) { return uint4{a, b, c, d}; }
 inline uint2  make_uint2(unsigned a, unsigned b) { return uint2{a, b}; }
 inline float4 make_float4(float a, float b, float c, float d) { return float4{a, b, c, d}; }
@@ -350,7 +352,33 @@ typedef sycl::queue* hipStream_t;
  * reached uniformly at kernel scope. Dynamic LDS: the launch's `lds` bytes. */
 #define XE_SHARED(type, name, n) \
     auto& name = *sycl::ext::oneapi::group_local_memory_for_overwrite<type[n]>(xe::wg())
+#define XE_SHARED2(type, name, n, m) \
+    auto& name = *sycl::ext::oneapi::group_local_memory_for_overwrite<type[n][m]>(xe::wg())
 #define XE_DYN_LDS(type, name) type* const name = (type*)xe::dyn_lds()
+
+/* ------------------------------------------------------------------ the rest of HIP's surface a
+ * ported unit names: errors, constants, and builtins that must compile but are never reached --
+ * the WMMA, transpose-load and kernarg ones belong to kernels libxe rewrites or AQL chaining, whose
+ * rows libxe does not register. Each poisons its result (NaN, or the sign bit), so a row that
+ * reached one by mistake fails its libref check loudly instead of passing by luck. */
+typedef int hipError_t;
+enum { hipSuccess = 0 };
+inline hipError_t hipGetLastError() { return hipSuccess; }
+inline hipError_t hipPeekAtLastError() { return hipSuccess; }
+/* Declared, never defined: libr4d's r4d_emit() template names it, and R4D_EMIT above replaces every
+ * use, so it is never instantiated (a link error says otherwise). */
+hipError_t hipLaunchKernel(const void* f, xe::dim3 g, xe::dim3 b, void** args, size_t lds, hipStream_t s);
+#define __constant__ const
+namespace xe {
+alignas(16) inline constexpr unsigned char kZeroKarg[1024] = {};
+typedef short xe_v8s __attribute__((ext_vector_type(8)));
+}
+#define __builtin_amdgcn_kernarg_segment_ptr() ((const void*)xe::kZeroKarg)
+#define __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
+#define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
+#define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
+#define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) ((c) | (int)0x80000000)
+#define __builtin_amdgcn_global_load_tr_b128_v8i16(p) ((xe::xe_v8s)(short)0x7fc0)
 #define R4D_DYN_LDS(type, name) XE_DYN_LDS(type, name)
 
 /* R4D_EMIT / R4D_KLAUNCH / hipLaunchKernelGGL on a queue (the RadStream) */
@@ -362,3 +390,15 @@ typedef sycl::queue* hipStream_t;
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__), 0)
 #define hipLaunchKernelGGL(kernel, grid, block, lds, stream, ...) \
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__))
+
+/* libr4d spells global loads with __attribute__((address_space(1))) casts (r4d_common.h ldg_u16,
+ * load_tr_b128). Under SYCL a pointer is generic and such a cast is refused; the attribute is
+ * dropped. Last in this header, after every SYCL header it includes. */
+#define address_space(n)
+
+/* glibc's sincosf has no device definition; SYCL's accurate sin and cos (not the native forms:
+ * rope angles reach 262144, past a fast argument reduction). */
+namespace xe {
+inline void sincos_acc(float x, float* s, float* c) { *s = sycl::sin(x); *c = sycl::cos(x); }
+}
+#define sincosf(x, s, c) xe::sincos_acc((x), (s), (c))

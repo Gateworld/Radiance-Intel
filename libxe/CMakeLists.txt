@@ -6,11 +6,16 @@
 # counterpart of libr4d. Links radiance::abi and nothing else of the engine, like every kernel
 # library; built only with RAD_WITH_L0=ON (cmake/RadL0.cmake), AOT for the B70 plus SPIR-V for the CPU
 # SYCL device.
-file(GLOB XE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+file(GLOB XE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ports/*.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
-target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# ports/ are libr4d units behind the shim: <hip/hip_runtime.h> resolves to compat/ (the shim), a
+# header edited for Xe2 to its copy in ports/ (beside the unit), and the rest to libr4d's own.
+target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                           ${CMAKE_SOURCE_DIR}/libr4d)
+# As libr4d: the ops are held bit for bit to unfused chains and to libref's rounding.
+target_compile_options(libxe PRIVATE -ffp-contract=off -Wno-unused-function)
 
 if(RAD_BUILD_TESTS)
   # This directory is added before the top level's enable_testing(), so enable it here.
