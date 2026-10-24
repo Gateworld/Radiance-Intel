@@ -198,7 +198,7 @@ int ref_hc_read(const RadArgs* a, RadStream) {
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
                 const float sc = q8_group([&](int64_t i) { return ldt(x, xb + (k0 + i) * xs); },
-                                           k1 - k0, 448.0f, q, qb + k0 * qs, qs);
+                                           k1 - k0, q->dtype == RAD_I8 ? 127.0f : 448.0f, q, qb + k0 * qs, qs);
                 stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
             }
         }
@@ -211,7 +211,7 @@ int ref_hc_read(const RadArgs* a, RadStream) {
                 const int64_t k0 = gi * rg;
                 for (int64_t i = 0; i < rg; ++i) buf[i] = ldt(x, xb + (k0 + i) * xs);
                 fwht(buf, rg);
-                const float sc = q8_group([&](int64_t i) { return buf[i]; }, rg, 448.0f, rq,
+                const float sc = q8_group([&](int64_t i) { return buf[i]; }, rg, rq->dtype == RAD_I8 ? 127.0f : 448.0f, rq,
                                            qb + k0 * qs, qs);
                 stt(rs, rowoff(rs, r, rgrp) + gi * laststride(rs), sc);
             }

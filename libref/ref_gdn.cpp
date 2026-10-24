@@ -886,7 +886,7 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             if (oq && osc) {
                 const int64_t qb = rowoff(oq, tok, Hv * V), qs = laststride(oq);
                 const float qsc = q8_group([&](int64_t e) { return ldt(o, at3(ov, tok, h, e)); },
-                                            V, 448.0f, oq, qb + h * V * qs, qs);
+                                            V, oq->dtype == RAD_I8 ? 127.0f : 448.0f, oq, qb + h * V * qs, qs);
                 stt(osc, rowoff(osc, tok, Hv) + h * laststride(osc), qsc);
             }
 
