@@ -15,7 +15,7 @@ int wtab_patch(const WtabPatch& p, RadStream s) {
         for (uint32_t i = 0; i < p.n; ++i) *p.dst[i] = p.val[i];
         return RAD_OK;
     }
-#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+#if (defined(RAD_HAVE_HIP) && RAD_HAVE_HIP) || (defined(RAD_HAVE_L0) && RAD_HAVE_L0)
     return rad_wtab_patch_launch(&p, (void*)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 #else
     (void)s;

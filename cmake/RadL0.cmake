@@ -51,6 +51,17 @@ message(STATUS "radiance: Level Zero backend ON, SYCL targets ${RAD_L0_TARGETS} 
 
 # The core half: RAD_HAVE_L0, l0.cpp as SYCL host code, and the runtimes every executable then needs.
 function(rad_l0_core target)
+  # The core's device code (core/device/l0_kernels.sycl): its own shared library, device-linked once,
+  # so executables that link the core statically need no -fsycl link of their own.
+  set(_k ${CMAKE_CURRENT_SOURCE_DIR}/device/l0_kernels.sycl)
+  set_source_files_properties(${_k} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
+  add_library(rad_l0k SHARED ${_k})
+  target_include_directories(rad_l0k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/abi)
+  target_compile_options(rad_l0k PRIVATE ${RAD_SYCL_FLAGS})
+  target_link_options(rad_l0k PRIVATE ${RAD_SYCL_FLAGS})
+  set_target_properties(rad_l0k PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+  install(TARGETS rad_l0k LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  target_link_libraries(${target} PUBLIC rad_l0k)
   target_compile_definitions(${target} PUBLIC RAD_HAVE_L0=1)
   target_include_directories(${target} SYSTEM PRIVATE ${RAD_ZE_INCLUDE})
   set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/device/l0.cpp

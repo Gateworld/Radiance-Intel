@@ -15,7 +15,7 @@ int step_advance(const AdvanceArgs& a, RadStream s) {
         for (int i = 0; i < a.n_seq; ++i) adv_row(a, i);
         return RAD_OK;
     }
-#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+#if (defined(RAD_HAVE_HIP) && RAD_HAVE_HIP) || (defined(RAD_HAVE_L0) && RAD_HAVE_L0)
     return rad_step_advance_launch(&a, (void*)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 #else
     (void)s;

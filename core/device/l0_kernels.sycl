@@ -1,0 +1,51 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Deadcode and the radiance contributors
+ * Part of the Intel port of radiance (Level Zero backend + SYCL kernel library, milestone 1).
+ *
+ * l0_kernels.sycl -- the core's own device code on the Level Zero backend: the step advance
+ * (sched/advance.hip) and the weight-table patch (runtime/wtab.hip), under the launcher names the
+ * HIP build uses, so advance.cpp and wtab.cpp call them unchanged.
+ *
+ * Built as the shared library rad_l0k (cmake/RadL0.cmake), not into rad_core: every tool links the
+ * core statically, and a SYCL device image only survives a link made with -fsycl, so the device code
+ * lives in one library that is device-linked once. The extension keeps it out of the core's *.cpp
+ * glob. The stream is the backend's sycl::queue (core/device/l0.cpp). No chained forms: chaining is
+ * AQL-only (rad_dev_chain_enabled is 0 here).
+ */
+#include <sycl/sycl.hpp>
+
+#include "sched/advance_impl.h"
+#include "runtime/wtab.h"
+
+extern "C" __attribute__((visibility("default")))
+int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
+    if (!args || args->n_seq <= 0) return 0;
+    const rad::AdvanceArgs a = *args;
+    const size_t threads = 64, blocks = (size_t)((a.n_seq + 63) / 64);
+    try {
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<1>(blocks * threads, threads), [=](sycl::nd_item<1> it) {
+                const int i = (int)it.get_global_id(0);
+                if (i < a.n_seq) rad::adv_row(a, i);
+            });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default")))
+int rad_wtab_patch_launch(const rad::WtabPatch* p, void* stream) {
+    if (!p || p->n == 0) return 0;
+    const rad::WtabPatch w = *p;
+    try {
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<1>(64, 64), [=](sycl::nd_item<1> it) {
+                const uint32_t i = (uint32_t)it.get_local_id(0);
+                if (i < w.n) *w.dst[i] = w.val[i];
+            });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
