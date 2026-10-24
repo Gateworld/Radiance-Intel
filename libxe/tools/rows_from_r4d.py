@@ -41,7 +41,7 @@ picked, consts = [], []
 for e in entries:
     ids = re.findall(r'\b(r4d_\w+)\b', e)
     launch = [x for x in ids if x in adapters]
-    if not launch:
+    if not launch or any(x in skip for x in ids):
         continue
     op = re.search(r'"[^"]+",\s*"([^"]+)"', e).group(1)
     if op not in ref_ops:

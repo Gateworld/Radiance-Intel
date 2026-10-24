@@ -455,6 +455,8 @@ typedef short xe_v8s __attribute__((ext_vector_type(8)));
 #define hipLaunchKernelGGL(kernel, grid, block, lds, stream, ...) \
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__))
 /* r4d_launch.h's form (it leaves an R4D_KLAUNCH already defined alone) */
+/* A launch a port keeps only so its unit compiles (a matrix kernel libxe rewrites): refused. */
+#define XE_NOT_PORTED(...) R4D_NO(RAD_E_UNSUPPORTED)
 #define R4D_KLAUNCH(kernel, grid, block, stream, ...) \
     ((void)XE_LAUNCH((hipStream_t)(stream), (kernel), grid, block, 0, __VA_ARGS__))
 
@@ -475,3 +477,10 @@ inline void sincos_acc(float x, float* s, float* c) { *s = sycl::sin(x); *c = sy
  * effect. IGC parses inline asm as vISA and refuses it, so the form is dropped. `asm volatile(...)`
  * is not matched by this macro; libxe's ports replace their few by hand. */
 #define asm(...) ((void)0)
+
+/* libr4d spells its WMMA fragments as `__bf16` vectors (r4d_gdn_wmma.h, r4d_moe.hip, r4d_hc_bf16.hip);
+ * the B70's SPIR-V target has no SPV_KHR_bfloat16, so any such type fails libxe's device link. In the
+ * ports these vectors are only 16-bit containers handed to the poisoned WMMA stubs above (their rows
+ * are not registered), so here `__bf16` is a 16-bit integer. A port that does bf16 arithmetic must use
+ * __hip_bfloat16 / bf16_to_f32 (it would fail its libref check, never pass by luck). */
+#define __bf16 short

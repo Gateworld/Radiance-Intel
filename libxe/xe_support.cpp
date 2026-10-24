@@ -16,6 +16,9 @@ extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
     out->nch = (int)r4d_geti_or(a, "nch", 0);
     out->pt1 = (int)r4d_geti_or(a, "pt1", 8);
 }
+/* The skinny-GEMM tuning read (r4d_rows.cpp). Named only by the WMMA expert GEMM's adapter in the moe
+ * port, which libxe registers no row for (step 4 rewrites it); zeros = libr4d's own rules. */
+extern "C" void r4d_cfg_gemm(const RadArgs*, R4dGemmCfg* out) { *out = R4dGemmCfg{}; }
 /* r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip's geometry (KD, VD, BT): head 128 x 128, chunk 64 */
 extern "C" void r4d_gdn_dims(int* head_k, int* head_v, int* chunk) {
     if (head_k) *head_k = 128;

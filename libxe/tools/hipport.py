@@ -22,7 +22,7 @@ import sys
 SRC_COMMIT = '9eaf10d'
 
 TYPE = r'((?:(?:unsigned|signed|long|short|const|volatile)\s+)*[\w:]+(?:\s*<[^;>]*>)?)'
-ALIGN = r'(?:__align__\(\d+\)\s+|alignas\(\d+\)\s+)*'
+ALIGN = r'(?:__align__\(\d+\)\s+|alignas\(\d+\)\s+|__attribute__\(\(aligned\(\d+\)\)\)\s+)*'
 dyn = re.compile(r'extern\s+__shared__\s+' + ALIGN + TYPE + r'\s+' + ALIGN + r'(\w+)\s*\[\s*\]\s*;')
 shared = re.compile(r'__shared__\s+' + ALIGN + TYPE + r'\s+' + ALIGN + r'([^;{}]+);')
 decl = re.compile(r'^\s*(\w+)\s*((?:\[[^\]]+\]\s*)*)$', re.S)
