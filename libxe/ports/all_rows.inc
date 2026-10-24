@@ -12,6 +12,7 @@
 #include "ports/r4d_ple_gate_bf16.rows.inc"
 #include "ports/r4d_qk_norm_rope_gate.rows.inc"
 #include "ports/r4d_qsa_block_key_bf16.rows.inc"
+#include "ports/r4d_qsa_score_bf16.rows.inc"
 #include "ports/r4d_qsa_select_bf16.rows.inc"
 #include "ports/r4d_qsa_tail_store_bf16.rows.inc"
 #include "ports/r4d_qsa_work_bf16.rows.inc"

@@ -50,6 +50,7 @@ extern "C" int r4d_rad_pair_argmax_f32(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_ple_gate(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_qsa_block_key(const RadArgs* a, RadStream stream);
+extern "C" int r4d_rad_qsa_score(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream);
 extern "C" int64_t r4d_rad_qsa_select_scratch(const RadArgs* a);
 extern "C" int r4d_rad_qsa_tail_store(const RadArgs* a, RadStream stream);
