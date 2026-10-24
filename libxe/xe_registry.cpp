@@ -45,6 +45,13 @@ static const RadConstraint cXeRouterGemm[] = {
     C_GE("M", 1), C_DIV("K", 8), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
     C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
+extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
+extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
+/* block_size is derived on attn_paged: no EQ here, so the page size is the model's declared one */
+static const RadConstraint cXeAttnPaged[] = {
+    C_DIV("head_dim", 128), C_LE("head_dim", 256), C_GE("gqa", 1), C_LE("gqa", 32),
+    C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3 bf16"),
+};
 
 static const RadKernelInfo kKernels[] = {
 #include "ports/all_rows.inc"
@@ -77,6 +84,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeLogitsBf16), NOTUNE,
   nullptr, nullptr, xe_rad_logits_gemm_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_attn_paged_split", "attn_paged", "attn",
+  "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "
+  "head, f32 online softmax, a merge launch over the splits",
+  "head_dim 128 or 256, gqa <= 32, any block size, q_len, causal and window; made for decode and "
+  "speculative verify (a long prefill re-reads the cache per query row)",
+  "bf16 query, fp8-e4m3 kv cache with optional per-(seq, head) descales, or bf16; bf16 or f32 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cXeAttnPaged), NOTUNE,
+  nullptr, nullptr, xe_rad_attn_paged, xe_rad_attn_paged_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 
