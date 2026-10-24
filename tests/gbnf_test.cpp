@@ -208,7 +208,15 @@ std::unique_ptr<BpeVocab> bpe_like(uint64_t seed, size_t n_target) {
     while (b->v.n_tokens() < (int32_t)n_target) {
         std::string w;
         const size_t syl = 1 + rng.below(3);
-        for (size_t k = 0; k < syl; ++k) w += rng.pick(onset) + rng.pick(vowel) + rng.pick(coda);
+        for (size_t k = 0; k < syl; ++k) {
+            /* One draw a statement: the operands of an overloaded + are unsequenced, so in one
+             * expression g++ drew coda, vowel, onset and clang onset, vowel, coda, and the two
+             * builds tested different vocabularies. g++'s order is kept. */
+            const std::string c = rng.pick(coda);
+            const std::string v = rng.pick(vowel);
+            const std::string o = rng.pick(onset);
+            w += o + v + c;
+        }
         if (rng.chance(15)) w[0] = (char)std::toupper((unsigned char)w[0]);
         if (rng.chance(12)) w += rng.pick(tail);
         if (rng.chance(50)) w = " " + w;
