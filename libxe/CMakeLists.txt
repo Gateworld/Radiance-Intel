@@ -31,6 +31,17 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_lane_test PRIVATE rad_abi)
   target_link_options(xe_lane_test PRIVATE ${RAD_SYCL_FLAGS})
   set_target_properties(xe_lane_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # The trunk W8A8 GEMV against libref's quant_dot order (host re-computation), canaries on y.
+  add_executable(xe_gemv_i8_test test/gemv_i8_test.cpp xe_gemv_i8.cpp)
+  rad_l0_sycl(xe_gemv_i8_test)
+  target_include_directories(xe_gemv_i8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/libr4d)
+  target_compile_options(xe_gemv_i8_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_gemv_i8_test PRIVATE rad_abi)
+  set_target_properties(xe_gemv_i8_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_gemv_i8_cpu COMMAND xe_gemv_i8_test)
+  set_tests_properties(xe_gemv_i8_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)

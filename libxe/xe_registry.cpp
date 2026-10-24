@@ -31,8 +31,22 @@
 #include "ports/all_rows.inc"
 #undef XE_ROWS_CONSTRAINTS
 
+/* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
+extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
+static const RadConstraint cXeGemvI8[] = {
+    C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "i8a8 i8a8h"),
+};
+
 static const RadKernelInfo kKernels[] = {
 #include "ports/all_rows.inc"
+{ "xe_gemm_i8a8_gemv", "gemm_nt_q", "gemm",
+  "the trunk's W8A8 product as a sub-group GEMV: exact int32 group sums, scaled per (row, 128 K)",
+  "any M (4 activation rows a weight pass), any N; K a multiple of 128; the stored layout",
+  "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 (or f32) scale per (row, 128 K), bf16 C; "
+  "i8a8h: the weight Hadamard-rotated at convert against had_quant_act_i8g's activation",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvI8), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_i8a8_gemv, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 
