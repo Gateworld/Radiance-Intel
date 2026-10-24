@@ -50,6 +50,18 @@ if(RAD_BUILD_TESTS)
   target_include_directories(xe_tiny_qwen4exp PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/vendor)
   target_link_libraries(xe_tiny_qwen4exp PRIVATE rad_abi)
   set_target_properties(xe_tiny_qwen4exp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # The w4nl64a8h expert GEMM through libxe's own adapter (dlopen of libxe.so) against libref's
+  # arithmetic; rad-kbench cannot allocate the row's packed weight plane.
+  add_executable(xe_moe_w4_test test/moe_w4_test.cpp)
+  rad_l0_sycl(xe_moe_w4_test)
+  target_include_directories(xe_moe_w4_test PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_compile_options(xe_moe_w4_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_moe_w4_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_moe_w4_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_moe_w4_test libxe)
+  add_test(NAME xe_moe_w4_cpu COMMAND xe_moe_w4_test $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_moe_w4_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
