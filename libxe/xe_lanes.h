@@ -199,8 +199,11 @@ using aref = sycl::atomic_ref<T, sycl::memory_order::relaxed, S, sycl::access::a
     case 4:         { constexpr auto S_ = sycl::memory_scope::device;     __VA_ARGS__; }       \
     default:        { constexpr auto S_ = sycl::memory_scope::system;     __VA_ARGS__; }       \
     }
-template <class T> inline T atomic_load(T* p, int order, int scope) {
-    XE_SCOPE_SWITCH(scope, return aref<T, S_>(*p).load(mo(order)))
+/* A load may name a const object (libr4d's flag reads); atomic_ref wants a mutable one. */
+template <class T> inline std::remove_const_t<T> atomic_load(T* p, int order, int scope) {
+    using U = std::remove_const_t<T>;
+    U* q = const_cast<U*>(p);
+    XE_SCOPE_SWITCH(scope, return aref<U, S_>(*q).load(mo(order)))
 }
 template <class T> inline void atomic_store(T* p, T v, int order, int scope) {
     XE_SCOPE_SWITCH(scope, aref<T, S_>(*p).store(v, mo(order)); return)
@@ -301,6 +304,16 @@ inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) { return xe::byt
 #define __builtin_amdgcn_rcpf(x) (1.0f / (float)(x))
 /* a macro: glibc declares __expf itself (math.h), with a different exception specification */
 #define __expf(x) sycl::exp((float)(x))
+/* HIP's other fast-math forms, the same way (glibc declares __logf and friends too); the accurate
+ * SYCL functions, so a port is never less accurate than the original */
+#define __logf(x)     sycl::log((float)(x))
+#define __log2f(x)    sycl::log2((float)(x))
+#define __log10f(x)   sycl::log10((float)(x))
+#define __sinf(x)     sycl::sin((float)(x))
+#define __cosf(x)     sycl::cos((float)(x))
+#define __tanf(x)     sycl::tan((float)(x))
+#define __powf(x, y)  sycl::pow((float)(x), (float)(y))
+#define __exp10f(x)   sycl::exp10((float)(x))
 inline float rsqrtf(float x) { return sycl::rsqrt(x); }
 
 /* fences: (order, scope[, address space]); the address-space hint is dropped */
@@ -330,6 +343,42 @@ inline void __threadfence_system() { sycl::atomic_fence(sycl::memory_order::seq_
 #define atomicMin(p, v) xe::atomic_min((p), (v))
 #define atomicMax(p, v) xe::atomic_max((p), (v))
 #define atomicCAS(p, e, v) xe::atomic_cas((p), (e), (v))
+namespace xe {
+template <class T> inline T atomic_or(T* p, T v) { return aref<T, sycl::memory_scope::device>(*p).fetch_or(v); }
+template <class T> inline T atomic_and(T* p, T v) { return aref<T, sycl::memory_scope::device>(*p).fetch_and(v); }
+template <class T> inline T atomic_exch(T* p, T v) { return aref<T, sycl::memory_scope::device>(*p).exchange(v); }
+}
+#define atomicOr(p, v) xe::atomic_or((p), (v))
+#define atomicAnd(p, v) xe::atomic_and((p), (v))
+#define atomicExch(p, v) xe::atomic_exch((p), (v))
+
+/* HIP's numeric min/max overloads (device and host) */
+#define XE_MINMAX(T) \
+    inline T min(T a, T b) { return a < b ? a : b; } \
+    inline T max(T a, T b) { return a > b ? a : b; }
+XE_MINMAX(int) XE_MINMAX(unsigned) XE_MINMAX(long) XE_MINMAX(unsigned long) XE_MINMAX(long long)
+XE_MINMAX(unsigned long long)
+inline float  min(float a, float b)   { return sycl::fmin(a, b); }
+inline float  max(float a, float b)   { return sycl::fmax(a, b); }
+inline double min(double a, double b) { return sycl::fmin(a, b); }
+inline double max(double a, double b) { return sycl::fmax(a, b); }
+#undef XE_MINMAX
+inline float __frsqrt_rn(float x) { return sycl::rsqrt(x); }
+/* HIP's float -> int conversions: _rn rounds to nearest even (v_cvt_rpi is not used: HIP's _rn is
+ * rint), _rz truncates; out-of-range inputs are the kernels' to clamp first. */
+inline int      __float2int_rn(float x)  { return (int)sycl::rint(x); }
+inline int      __float2int_rz(float x)  { return (int)x; }
+inline unsigned __float2uint_rn(float x) { return (unsigned)sycl::rint(x); }
+inline float __fdividef(float a, float b) { return a / b; }
+inline float __frcp_rn(float x) { return 1.0f / x; }
+
+/* The device queries a launcher sizes LDS by: one device, the B70's 64 KiB a work-group as libr4d
+ * plans for the R9700 (both 64 KiB under libr4d's own cap). */
+struct hipDeviceProp_t { size_t sharedMemPerBlock; int warpSize; int multiProcessorCount; };
+inline int hipGetDevice(int* d) { *d = 0; return 0; }
+inline int hipGetDeviceProperties(hipDeviceProp_t* p, int) { *p = hipDeviceProp_t{64 * 1024, 32, 32}; return 0; }
+inline int hipDeviceGetAttribute(int* v, int, int) { *v = 0; return 0; }
+inline int hipDeviceSynchronize() { return 0; }
 
 inline float    __uint_as_float(unsigned u) { return sycl::bit_cast<float>(u); }
 inline unsigned __float_as_uint(float f)    { return sycl::bit_cast<unsigned>(f); }
@@ -341,6 +390,19 @@ struct alignas(16) uint4  { unsigned x, y, z, w; };
 struct alignas(16) int4   { int x, y, z, w; };
 struct alignas(16) float4 { float x, y, z, w; };
 struct alignas(4)  uchar4 { unsigned char x, y, z, w; };
+struct alignas(2)  uchar2 { unsigned char x, y; };
+struct alignas(4)  ushort2 { unsigned short x, y; };
+struct alignas(8)  ushort4 { unsigned short x, y, z, w; };
+struct alignas(4)  short2 { short x, y; };
+struct alignas(8)  short4 { short x, y, z, w; };
+struct alignas(8)  int2 { int x, y; };
+struct alignas(8)  float2 { float x, y; };
+inline ushort2 make_ushort2(unsigned short a, unsigned short b) { return ushort2{a, b}; }
+inline ushort4 make_ushort4(unsigned short a, unsigned short b, unsigned short c, unsigned short d) { return ushort4{a, b, c, d}; }
+inline short4  make_short4(short a, short b, short c, short d) { return short4{a, b, c, d}; }
+inline int2    make_int2(int a, int b) { return int2{a, b}; }
+inline int4    make_int4(int a, int b, int c, int d) { return int4{a, b, c, d}; }
+inline float2  make_float2(float a, float b) { return float2{a, b}; }
 inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) { return uchar4{a, b, c, d}; }
 inline uint4  make_uint4(unsigned a, unsigned b, unsigned c, unsigned d) { return uint4{a, b, c, d}; }
 inline uint2  make_uint2(unsigned a, unsigned b) { return uint2{a, b}; }
@@ -354,6 +416,8 @@ typedef sycl::queue* hipStream_t;
     auto& name = *sycl::ext::oneapi::group_local_memory_for_overwrite<type[n]>(xe::wg())
 #define XE_SHARED2(type, name, n, m) \
     auto& name = *sycl::ext::oneapi::group_local_memory_for_overwrite<type[n][m]>(xe::wg())
+#define XE_SHARED_VAR(type, name) \
+    auto& name = *sycl::ext::oneapi::group_local_memory_for_overwrite<type>(xe::wg())
 #define XE_DYN_LDS(type, name) type* const name = (type*)xe::dyn_lds()
 
 /* ------------------------------------------------------------------ the rest of HIP's surface a
@@ -390,6 +454,9 @@ typedef short xe_v8s __attribute__((ext_vector_type(8)));
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__), 0)
 #define hipLaunchKernelGGL(kernel, grid, block, lds, stream, ...) \
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__))
+/* r4d_launch.h's form (it leaves an R4D_KLAUNCH already defined alone) */
+#define R4D_KLAUNCH(kernel, grid, block, stream, ...) \
+    ((void)XE_LAUNCH((hipStream_t)(stream), (kernel), grid, block, 0, __VA_ARGS__))
 
 /* libr4d spells global loads with __attribute__((address_space(1))) casts (r4d_common.h ldg_u16,
  * load_tr_b128). Under SYCL a pointer is generic and such a cast is refused; the attribute is
@@ -402,3 +469,9 @@ namespace xe {
 inline void sincos_acc(float x, float* s, float* c) { *s = sycl::sin(x); *c = sycl::cos(x); }
 }
 #define sincosf(x, s, c) xe::sincos_acc((x), (s), (c))
+
+/* libr4d's only plain `asm(...)` is r4d_gdn_wmma.h's LDSOPAQUE, `asm("" : "+v"(x))`: an empty
+ * statement that hides a value from the optimiser (AMDGPU's "v" register class), the identity in
+ * effect. IGC parses inline asm as vISA and refuses it, so the form is dropped. `asm volatile(...)`
+ * is not matched by this macro; libxe's ports replace their few by hand. */
+#define asm(...) ((void)0)

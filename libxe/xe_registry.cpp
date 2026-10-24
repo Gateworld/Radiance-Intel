@@ -16,27 +16,23 @@
 
 /* libr4d/r4d_rows.cpp's row helpers, verbatim */
 #define ROW(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
+#define C_EQ(k, v)  { (k), RAD_C_EQ,  (long long)(v), nullptr }
+#define C_LE(k, v)  { (k), RAD_C_LE,  (long long)(v), nullptr }
 #define C_GE(k, v)  { (k), RAD_C_GE,  (long long)(v), nullptr }
 #define C_DIV(k, v) { (k), RAD_C_DIV, (long long)(v), nullptr }
 #define C_IN(k, s)  { (k), RAD_C_IN,  0, (s) }
 #define NOTUNE nullptr, 0, nullptr
 
-/* the ports' adapters */
+/* the ports' adapters and rows (libxe/tools/gen_registry.py) */
 #define XE_ADAPTER(n) extern "C" int n(const RadArgs* a, RadStream s);
-XE_ADAPTER(r4d_rad_embed_lookup) XE_ADAPTER(r4d_rad_embed_lookup_q) XE_ADAPTER(r4d_rad_gather_rows)
-XE_ADAPTER(r4d_rad_gather_rows_u8) XE_ADAPTER(r4d_rad_scatter_rows_u8) XE_ADAPTER(r4d_rad_scatter_rows_bf16)
-XE_ADAPTER(r4d_rad_cast) XE_ADAPTER(r4d_rad_rmsnorm) XE_ADAPTER(r4d_rad_add_rmsnorm) XE_ADAPTER(r4d_rad_rmsnorm_p)
-XE_ADAPTER(r4d_rad_add) XE_ADAPTER(r4d_rad_mul) XE_ADAPTER(r4d_rad_mul_weight) XE_ADAPTER(r4d_rad_sigmoid)
-XE_ADAPTER(r4d_rad_fill) XE_ADAPTER(r4d_rad_logit_softcap) XE_ADAPTER(r4d_rad_scale) XE_ADAPTER(r4d_rad_silu_mul)
-XE_ADAPTER(r4d_rad_gelu_mul) XE_ADAPTER(r4d_rad_rope) XE_ADAPTER(r4d_rad_kv_store) XE_ADAPTER(r4d_rad_kv_store_fp8)
-XE_ADAPTER(r4d_rad_kv_store_fp8v4) XE_ADAPTER(r4d_rad_kv_store_k6v4)
+#include "ports/adapters.inc"
 
 #define XE_ROWS_CONSTRAINTS
-#include "ports/r4d_model_bf16.rows.inc"
+#include "ports/all_rows.inc"
 #undef XE_ROWS_CONSTRAINTS
 
 static const RadKernelInfo kKernels[] = {
-#include "ports/r4d_model_bf16.rows.inc"
+#include "ports/all_rows.inc"
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 

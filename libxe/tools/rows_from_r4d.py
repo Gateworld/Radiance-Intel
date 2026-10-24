@@ -18,6 +18,9 @@ import sys
 rows_src, port, out = sys.argv[1], sys.argv[2], sys.argv[3]
 skip = set(sys.argv[4:])
 rows = open(rows_src).read()
+# Ops libref declares a schema for: a libxe row for any other op cannot load (libxe declares none).
+ref_ops = set(re.findall(r'^\{ "([^"]+)", ARR\(',
+                         open(rows_src.replace('libr4d/r4d_rows.cpp', 'libref/ref_registry.cpp')).read(), re.M))
 ptxt = open(port).read()
 defined = set(re.findall(r'extern "C" (?:int|long long|int64_t|void\*?|const \w+\*?)\s+(r4d_\w+)\s*\(', ptxt))
 adapters = {a for a in defined if a.startswith('r4d_rad_')} - skip
@@ -40,6 +43,12 @@ for e in entries:
     launch = [x for x in ids if x in adapters]
     if not launch:
         continue
+    op = re.search(r'"[^"]+",\s*"([^"]+)"', e).group(1)
+    if op not in ref_ops:
+        print('  skipped (no libref schema for op %s): %s' % (op, re.search(r'"([^"]+)"', e).group(1)))
+        continue
+    # no tuning in milestone 1: a tunable table becomes NOTUNE, so the adapters read the defaults
+    e = re.sub(r'\bROW\(\s*t[A-Z]\w*\s*\)\s*,\s*\w+', 'NOTUNE', e)
     # null every r4d_ hook the port does not define
     def fix(mm):
         name = mm.group(1)
