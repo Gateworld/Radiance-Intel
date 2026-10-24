@@ -42,6 +42,11 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_i8_cpu COMMAND xe_gemv_i8_test)
   set_tests_properties(xe_gemv_i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Step 6's model: a tiny random qwen4exp checkpoint (host code, tests/tiny_model.h's helpers).
+  add_executable(xe_tiny_qwen4exp test/tiny_qwen4exp.cpp)
+  target_include_directories(xe_tiny_qwen4exp PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/vendor)
+  target_link_libraries(xe_tiny_qwen4exp PRIVATE rad_abi)
+  set_target_properties(xe_tiny_qwen4exp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
