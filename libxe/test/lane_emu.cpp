@@ -86,5 +86,6 @@ extern "C" void lane_emu_run(int c, const int* in, int* out, int* counter) {
     case 8:  hipLaunchKernelGGL(lane_case_math, g, b, 0, nullptr, in, out); break;
     case 9:  hipLaunchKernelGGL(lane_case_barrier, g, b, 0, nullptr, in, out); break;
     case 10: hipLaunchKernelGGL(lane_case_atomic, g, b, 0, nullptr, in, out, counter); break;
+    case 11: hipLaunchKernelGGL(lane_case_wmma, g, b, 0, nullptr, in, out); break;
     }
 }

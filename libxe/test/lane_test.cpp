@@ -43,6 +43,7 @@ const Case kCases[LANE_NCASES] = {
     {"math", "exp2f, rcpf, __expf, rsqrtf", "emulator / ISA, <= 4 ulp", true},
     {"barrier", "__syncthreads, __syncthreads_or, s_barrier, s_barrier_signal/wait, wave_barrier, LDS atomicAdd", "emulator", false},
     {"atomic", "__hip_atomic_fetch_add/load/store, fence x4, sched_barrier, sched_group_barrier, s_sleep, __threadfence(_system)", "emulator", false},
+    {"wmma", "wmma_f32_16x16x16 bf16 / f16 / fp8 (gfx12 w32)", "emulator", false},
 };
 
 template <auto K, class... A>
@@ -63,6 +64,7 @@ void run_case(sycl::queue& q, int c, const int* in, int* out, int* counter) {
     case 8:  run_xe<lane_case_math>(q, in, out); break;
     case 9:  run_xe<lane_case_barrier>(q, in, out); break;
     case 10: run_xe<lane_case_atomic>(q, in, out, counter); break;
+    case 11: run_xe<lane_case_wmma>(q, in, out); break;
     }
 }
 

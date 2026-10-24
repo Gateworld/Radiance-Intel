@@ -222,4 +222,47 @@ LANE_KERNEL lane_case_atomic(const int* in, int* out, int* counter) {
     LANE_O(1) = __hip_atomic_load(&LANE_O(0), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-#define LANE_NCASES 11
+/* 11: the gfx12 wave32 WMMAs (bf16, f16, E4M3) on small multiples of 1/8 and 1/4, exact in every
+ * operand format and in f32 sums, so the two sides agree bit for bit whatever order they add in */
+typedef short    lane_v8s __attribute__((ext_vector_type(8)));
+typedef _Float16 lane_v8h __attribute__((ext_vector_type(8)));
+typedef int      lane_v2i __attribute__((ext_vector_type(2)));
+typedef float    lane_v8f __attribute__((ext_vector_type(8)));
+static inline short lane_f16_bits(float x) {   /* normal or zero values only */
+    const unsigned u = __float_as_uint(x);
+    if (!(u & 0x7fffffffu)) return (short)((u >> 16) & 0x8000u);
+    return (short)(((u >> 16) & 0x8000u) | ((((u >> 23) & 255u) - 112u) << 10) | ((u >> 13) & 0x3ffu));
+}
+LANE_KERNEL lane_case_wmma(const int* in, int* out) {
+    const int v = in[LANE_T()], l = (int)threadIdx.x & 31;
+    float fa[8], fb[8];
+    lane_v8s a, b, ha, hb;
+    lane_v8f c;
+    for (int e = 0; e < 8; ++e) {
+        fa[e] = (float)((((unsigned)v >> e) ^ (unsigned)(l * 7 + e)) % 17u) * 0.125f - 1.0f;
+        fb[e] = (float)((((unsigned)v >> (e + 3)) ^ (unsigned)(l * 3 + 5 * e)) % 13u) * 0.25f - 1.5f;
+        a[e] = (short)(__float_as_uint(fa[e]) >> 16);
+        b[e] = (short)(__float_as_uint(fb[e]) >> 16);
+        ha[e] = lane_f16_bits(fa[e]);
+        hb[e] = lane_f16_bits(fb[e]);
+        c[e] = (float)(((unsigned)v + (unsigned)e) % 7u) * 0.5f;
+    }
+    const lane_v8f d = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+    const lane_v8f g = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(lane_v8h, ha),
+                                                                         __builtin_bit_cast(lane_v8h, hb), c);
+    lane_v2i qa, qb;
+    for (int w = 0; w < 2; ++w) {
+        int x = __builtin_amdgcn_cvt_pk_fp8_f32(fa[4 * w], fa[4 * w + 1], 0, false);
+        qa[w] = __builtin_amdgcn_cvt_pk_fp8_f32(fa[4 * w + 2], fa[4 * w + 3], x, true);
+        x = __builtin_amdgcn_cvt_pk_fp8_f32(fb[4 * w], fb[4 * w + 1], 0, false);
+        qb[w] = __builtin_amdgcn_cvt_pk_fp8_f32(fb[4 * w + 2], fb[4 * w + 3], x, true);
+    }
+    const lane_v8f f = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(qa, qb, c);
+    for (int e = 0; e < 8; ++e) {
+        LANE_O(e) = __float_as_int(d[e]);
+        LANE_O(8 + e) = __float_as_int(g[e]);
+        LANE_O(16 + e) = __float_as_int(f[e]);
+    }
+}
+
+#define LANE_NCASES 12

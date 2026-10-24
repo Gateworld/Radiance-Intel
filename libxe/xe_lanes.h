@@ -438,9 +438,60 @@ alignas(16) inline constexpr unsigned char kZeroKarg[1024] = {};
 typedef short xe_v8s __attribute__((ext_vector_type(8)));
 }
 #define __builtin_amdgcn_kernarg_segment_ptr() ((const void*)xe::kZeroKarg)
-#define __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
-#define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
-#define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) ((c) + __builtin_nanf(""))
+/* The gfx12 wave32 16x16x16 WMMAs, from sub-group shuffles in tests/r4d_emu's layout (emu_wmma):
+ * lane l holds 8 elements of A and of B; A(M, k) is element k & 7 of lane M + 16 * (k >> 3), and
+ * B(k, N) element k & 7 of lane N + 16 * (k >> 3); the result lane l is column N = l & 15, rows
+ * 8 * (l >> 4) + e. Each product is added to c in ascending k, as the emulator does. The operands
+ * move a 32-bit word at a time (two bf16/f16 or four E4M3 elements). Correct, not fast: 16 + 64
+ * shuffles a bf16 tile (8 + 32 for E4M3). */
+namespace xe {
+inline float wmma_e4m3(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    float v;
+    if (e == 0) v = (float)m * 0.001953125f;
+    else if (e == 15 && m == 7) v = __builtin_bit_cast(float, 0x7fc00000u);
+    else v = __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20));
+    return (b & 0x80u) ? -v : v;
+}
+/* KIND 0 bf16, 1 f16 (four words), 2 E4M3 (two words) */
+template <int KIND> inline float wmma_elem(const uint32_t* w, int j) {
+    if constexpr (KIND == 2) return wmma_e4m3((w[j >> 2] >> (8 * (j & 3))) & 0xffu);
+    const uint32_t h = (w[j >> 1] >> (16 * (j & 1))) & 0xffffu;
+    if constexpr (KIND == 0) return __builtin_bit_cast(float, h << 16);
+    else return (float)sycl::bit_cast<sycl::half>((uint16_t)h);
+}
+template <int KIND, class V, class C> inline C wmma(const V& a, const V& b, const C& c) {
+    constexpr int NW = KIND == 2 ? 2 : 4;
+    static_assert(sizeof(V) == 4 * NW && sizeof(C) == 32, "a gfx12 wave32 WMMA operand");
+    uint32_t wa[NW], wb[NW];
+    __builtin_memcpy(wa, &a, sizeof wa);
+    __builtin_memcpy(wb, &b, sizeof wb);
+    float d[8];
+    __builtin_memcpy(d, &c, sizeof d);
+    const int l = lane(), N = l & 15, h = l >> 4;
+    float bcol[16];
+    for (int kh = 0; kh < 2; ++kh) {
+        uint32_t w[NW];
+        for (int i = 0; i < NW; ++i) w[i] = shfl_from(wb[i], N + 16 * kh);
+        for (int j = 0; j < 8; ++j) bcol[8 * kh + j] = wmma_elem<KIND>(w, j);
+    }
+    for (int e = 0; e < 8; ++e) {
+        float acc = d[e];
+        for (int kh = 0; kh < 2; ++kh) {
+            uint32_t w[NW];
+            for (int i = 0; i < NW; ++i) w[i] = shfl_from(wa[i], 8 * h + e + 16 * kh);
+            for (int j = 0; j < 8; ++j) acc += wmma_elem<KIND>(w, j) * bcol[8 * kh + j];
+        }
+        d[e] = acc;
+    }
+    C r;
+    __builtin_memcpy(&r, d, sizeof d);
+    return r;
+}
+}  // namespace xe
+#define __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c) (xe::wmma<2>((a), (b), (c)))
+#define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) (xe::wmma<0>((a), (b), (c)))
+#define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) (xe::wmma<1>((a), (b), (c)))
 #define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) ((c) | (int)0x80000000)
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) ((xe::xe_v8s)(short)0x7fc0)
 #define R4D_DYN_LDS(type, name) XE_DYN_LDS(type, name)
