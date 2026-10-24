@@ -34,6 +34,37 @@ int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     return 0;
 }
 
+/* A byte fill as a kernel, for host-memory destinations: queue::memset into pinned host memory left
+ * the tail of the range unwritten on card1 (device_test memset_async and the pinned-range test, runs
+ * b1/b2), with the queue waited for. 16 bytes a work-item, the head and tail bytewise. */
+extern "C" __attribute__((visibility("default")))
+int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes) {
+    if (!dst || bytes <= 0) return 0;
+    unsigned char* p = (unsigned char*)dst;
+    const unsigned char v = (unsigned char)value;
+    const int64_t head = (int64_t)((16 - ((uintptr_t)p & 15)) & 15) < bytes ? (int64_t)((16 - ((uintptr_t)p & 15)) & 15) : bytes;
+    const int64_t body = (bytes - head) / 16, tail = bytes - head - body * 16;
+    const size_t items = (size_t)(body + 16);   /* + 16 lanes for head and tail bytes */
+    const size_t wg = 256, global = (items + wg - 1) / wg * wg;
+    try {
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<1>(global, wg), [=](sycl::nd_item<1> it) {
+                const int64_t i = (int64_t)it.get_global_id(0);
+                if (i < body) {
+                    sycl::vec<unsigned char, 16> x(v);
+                    *(sycl::vec<unsigned char, 16>*)(p + head + 16 * i) = x;
+                } else if (i < body + 16) {
+                    const int64_t k = i - body;   /* lane k writes head byte k and tail byte k */
+                    if (k < head) p[k] = v;
+                    if (k < tail) p[head + 16 * body + k] = v;
+                }
+            });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
+
 extern "C" __attribute__((visibility("default")))
 int rad_wtab_patch_launch(const rad::WtabPatch* p, void* stream) {
     if (!p || p->n == 0) return 0;

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,9 @@
 #include <string>
 #include <map>
 #include <vector>
+
+/* core/device/l0_kernels.sycl (librad_l0k) */
+extern "C" int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes);
 
 namespace rad {
 namespace {
@@ -294,18 +298,19 @@ void z_stream_destroy(RadStream s) {
     delete &S(s);
 }
 
-/* Waits for the work issued before the call only (a barrier's event), as hipStreamSynchronize: the
- * scheduler syncs while another thread keeps issuing. */
+/* Waits for the stream's work. */
 int z_stream_sync(RadStream s) {
     RAD_TRY(check_stream(s, "rad_stream_sync"));
     if (S(s).gates.load() > 0) {
         device_set_error("rad_stream_sync: the stream waits at a closed gate, which only rad_gate_open releases");
         return RAD_E_STATE;
     }
-    return guarded("rad_stream_sync", [&] {
-        Q(s).ext_oneapi_submit_barrier().wait();
-        Q(s).throw_asynchronous();
-    });
+    /* queue::wait: it may also wait for work other threads issue meanwhile (HIP waits only for the
+     * work before the call), the simplest form that is never short. Run 3 tried barriers that name
+     * the queue's last event: ext_oneapi_get_last_event misbehaved behind a gate's host task on the
+     * CPU device (an early return, then a runtime abort). device_test's concurrent-sync case still
+     * passes on card1 (run b2). */
+    return guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
 }
 
 /* ------------------------------------------------------------------ gates */
@@ -478,7 +483,12 @@ int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
                          "memory (RAD_MEM_DEVICE, RAD_MEM_HOST_PINNED or RAD_MEM_HOST_MAPPED)", dst);
         return RAD_E_UNSUPPORTED;
     }
-    return guarded("rad_memset_async", [&] { Q(s).memset(dst, value, (size_t)bytes); });
+    /* Only the low byte, as hipMemsetAsync and memset. Host memory is filled by a kernel
+     * (l0_kernels.sycl rad_l0k_fill): queue::memset left the tail of a pinned range unwritten on
+     * card1. Device memory keeps the runtime's fill. */
+    if (sycl::get_pointer_type(dst, Q(s).get_context()) != sycl::usm::alloc::device)
+        return rad_l0k_fill(s, dst, value & 0xff, bytes) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return guarded("rad_memset_async", [&] { Q(s).memset(dst, value & 0xff, (size_t)bytes); });
 }
 
 /* The ranges are read here, at the call: the contract keeps the list unchanged until the stream

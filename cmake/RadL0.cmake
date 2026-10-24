@@ -42,7 +42,10 @@ endif()
 # The offload targets: AOT for the B70 so nothing JIT-compiles on the card's host, and SPIR-V for the
 # CPU SYCL device the plain kernels are checked on first.
 set(RAD_L0_TARGETS "intel_gpu_bmg_g31,spir64" CACHE STRING "-fsycl-targets of the Level Zero build")
-set(RAD_SYCL_FLAGS -fsycl -fsycl-targets=${RAD_L0_TARGETS})
+# Correctly rounded fp32 division and sqrt on the device: IGC's default division is OpenCL's 2.5 ulp,
+# and libref holds ops such as quant_act_i8 (scale = amax / 127, inv = 1 / scale) bit for bit (card1
+# run b2: 6 quant_act_i8 cases off by one code with the default).
+set(RAD_SYCL_FLAGS -fsycl -fsycl-targets=${RAD_L0_TARGETS} -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
 set(RAD_L0_FOUND ON)
 # Ubuntu's gcc links with --build-id by default and clang does not; rad-kbench names code by its
 # build id (tests/kbench_test.cpp, the_code_identity_follows_build_ids).
