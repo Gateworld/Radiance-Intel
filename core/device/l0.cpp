@@ -76,15 +76,23 @@ std::map<uintptr_t, AllocRec>& alloc_table() {
 struct L0Stream {
     sycl::queue      q;
     std::atomic<int> gates{0};   /* closed gates on it */
-    /* The thread whose backend calls last named it: a tape records only the calling thread's. */
-    std::atomic<std::thread::id> user{};
+    /* Whether any thread's backend call has named it yet; see t_touched. */
+    std::atomic<bool> used{false};
+    uint64_t          id = 0;      /* serial, never reused */
     explicit L0Stream(sycl::queue&& x) : q(std::move(x)) {}
 };
 std::mutex& stream_mutex() { static std::mutex m; return m; }
 std::vector<L0Stream*>& streams() { static std::vector<L0Stream*> v; return v; }
+std::atomic<uint64_t> g_stream_ids{0};
+/* The streams this thread's backend calls have ever named, by serial: a tape records those (and
+ * streams nobody has used yet), not a stream another thread drives (the mover's). Run 8 on card1:
+ * keeping only the streams this thread named LAST lost the engine's own stream, which the load had
+ * named from another thread, and the tape came out empty. */
+thread_local std::set<uint64_t> t_touched;
 thread_local L0Stream* t_last = nullptr;
 void touch(L0Stream& s) {
-    s.user.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    s.used.store(true, std::memory_order_relaxed);
+    t_touched.insert(s.id);
     t_last = &s;
 }
 
@@ -402,11 +410,8 @@ int z_tape_begin(void) {
     t->id = ++g_tape_ids;
     {
         std::lock_guard<std::mutex> lk(stream_mutex());
-        const std::thread::id me = std::this_thread::get_id(), none{};
-        for (L0Stream* s : streams()) {
-            const std::thread::id u = s->user.load(std::memory_order_relaxed);
-            if (u == me || u == none) t->qs.push_back(s);
-        }
+        for (L0Stream* s : streams())
+            if (t_touched.count(s->id) || !s->used.load(std::memory_order_relaxed)) t->qs.push_back(s);
         for (size_t k = 0; k < t->qs.size(); ++k)
             if (t->qs[k] == t_last) std::swap(t->qs[0], t->qs[k]);
     }
@@ -439,6 +444,10 @@ RadTape z_tape_end(int keep) {
     if (!t) return nullptr;
     if (t_rec.g && guarded("tape_end", [] { seg_close(); }) != RAD_OK) refuse("the last segment could not be closed");
     t_rec = Rec{};
+    /* A pass always puts work on the card; an empty recording means it went to a stream outside
+     * the recording, and replaying nothing would be silently wrong. */
+    if (t->segs.empty() && t->refused.empty())
+        t->refused = "nothing was recorded (the pass's work went to a stream outside the recording)";
     if (!keep || !t->refused.empty()) {
         if (keep) device_set_error("the pass cannot be replayed from a SYCL graph: %s", t->refused.c_str());
         delete t;
@@ -517,6 +526,7 @@ int z_stream_create(RadStream* out, int high_priority) {
                   : (high_priority ? sycl::property_list{in_order(), priority_high(), enable_profiling()}
                                    : sycl::property_list{in_order(), enable_profiling()});
         auto* st = new L0Stream(sycl::queue(D.ctx, D.d, async_errors, pl));
+        st->id = ++g_stream_ids;
         if ((void*)&st->q != (void*)st) { delete st; device_set_error("rad_stream_create: layout"); return RAD_E_STATE; }
         {
             std::lock_guard<std::mutex> lk(stream_mutex());
