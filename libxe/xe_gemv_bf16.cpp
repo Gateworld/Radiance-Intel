@@ -125,7 +125,84 @@ int gemv(const RadTensor* A, const RadTensor* B, const RadTensor* Y, long long N
     return RAD_OK;
 }
 
+/* The int8 lm_head (libr4d's logits_gemm_i8 stored row, r4d_fp8_layout.cpp): each row is K i8 codes,
+ * then its K/128 bf16 scales, padded to w_ld bytes. y[m, n] = sum_g scale[n, g] * sum_{k in g}
+ * x[m, k] * code[n, k], f32 out. Lane l reads 16-code chunks l, l + 32, ...; a chunk's partial sum
+ * takes its group's scale before it joins the lane's sum. */
+template <int MB>
+void logits_i8_kernel(const uint16_t* __restrict__ x, long x_ld, const uint8_t* __restrict__ w, long w_ld,
+                      float* __restrict__ y, long y_ld, int N, int K, int M) {
+    const int lane = (int)threadIdx.x & 31;
+    const int n = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);
+    const bool live = n < N;
+    const uint8_t* row = w + (size_t)(live ? n : 0) * w_ld;
+    const uint16_t* srow = (const uint16_t*)(row + K);
+    float acc[MB];
+#pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+    const int nchunk = K / 16;
+    for (int c = lane; c < nchunk && live; c += 32) {
+        const uint4 q = *(const uint4*)(row + (size_t)c * 16);
+        const unsigned qv[4] = {q.x, q.y, q.z, q.w};
+        float wf[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) wf[u] = (float)(int8_t)((qv[u >> 2] >> (8 * (u & 3))) & 0xffu);
+        const float sc = ld_bf16(srow, c >> 3);
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            const uint16_t* xr = x + (size_t)m * x_ld + (size_t)c * 16;
+            float s = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) s += ld_bf16(xr, e) * wf[e];
+            acc[m] += s * sc;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float v = acc[m];
+        for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
+        if (live && lane == 0 && m < M) y[(size_t)m * y_ld + n] = v;
+    }
+}
+
 }  // namespace
+
+/* logits_gemm over the int8 head: x (bf16), lm_head (the stored row above, declared [n_vocab,
+ * n_embd] i8), logits (f32) -- libr4d's r4d_rad_logits_gemm_i8 operands and checks. */
+extern "C" int xe_rad_logits_gemm_i8(const RadArgs* args, RadStream s) {
+    const RadTensor* X = r4d_opt(args, 0);
+    const RadTensor* W = r4d_opt(args, 1);
+    const RadTensor* Y = r4d_opt(args, 2);
+    if (!X || !W || !Y || !X->data || !W->data || !Y->data) return R4D_NO(RAD_E_INVAL);
+    if (X->dtype != RAD_BF16 || W->dtype != RAD_I8 || Y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(W)) return R4D_NO(RAD_E_STRIDE);
+    const long long V = r4d_geti_or(args, "n_vocab", r4d_dim(W, 0));
+    const long long E = r4d_geti_or(args, "n_embd", 0);
+    if (V <= 0 || E <= 0 || E % 128) return R4D_NO(RAD_E_SHAPE);
+    if (W->rank != 2 || W->shape[0] != V || W->shape[1] != E) return R4D_NO(RAD_E_SHAPE);
+    const long long w_ld = (E + 2 * (E / 128) + 15) & ~15LL;   /* r4d_fp8::lm_row_bytes */
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(X, E, &M);
+    const long long y_ld = r4d_rows_pitch(Y, V, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    if (((uintptr_t)X->data | (uintptr_t)W->data) % 16 || x_ld % 8) return R4D_NO(RAD_E_ALIGN);
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        const dim3 grid((unsigned)((V + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+        for (long long m0 = 0; m0 < M; m0 += kMaxM) {
+            const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
+            const uint16_t* xm = (const uint16_t*)X->data + (size_t)m0 * x_ld;
+            float* ym = (float*)Y->data + (size_t)m0 * y_ld;
+            if (mb == 1) XE_LAUNCH(q, (logits_i8_kernel<1>), grid, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+            else XE_LAUNCH(q, (logits_i8_kernel<kMaxM>), grid, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+        }
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
 
 /* gemm_nt: a, b, y */
 extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* args, RadStream s) {

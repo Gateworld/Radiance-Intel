@@ -45,6 +45,8 @@ static const RadConstraint cXeRouterGemm[] = {
     C_GE("M", 1), C_DIV("K", 8), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
     C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
+extern "C" int xe_rad_logits_gemm_i8(const RadArgs* a, RadStream s);
+static const RadConstraint cXeLogitsI8[] = { C_DIV("n_embd", 128), C_IN("dtype", "bf16") };
 extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
 /* block_size is derived on attn_paged: no EQ here, so the page size is the model's declared one */
@@ -84,6 +86,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeLogitsBf16), NOTUNE,
   nullptr, nullptr, xe_rad_logits_gemm_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_logits_gemm_i8", "logits_gemm", "vocab",
+  "the int8 lm_head's product as a sub-group GEMV over libr4d's stored row (codes, the row's bf16 "
+  "scales in its tail), f32 accumulate",
+  "any M (4 rows a weight pass), any vocabulary; n_embd a multiple of 128",
+  "bf16 x, i8 head with a bf16 scale per row per 128 columns, F32 LOGITS OUT",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cXeLogitsI8), NOTUNE,
+  nullptr, nullptr, xe_rad_logits_gemm_i8, nullptr,
+  r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits, nullptr, r4d_rad_unrelayout_i8_logits, nullptr },
 { "xe_attn_paged_split", "attn_paged", "attn",
   "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "
   "head, f32 online softmax, a merge launch over the splits",
