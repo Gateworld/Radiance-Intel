@@ -21,7 +21,8 @@ namespace {
 
 struct Q4 {
     int64_t layers = 4, interval = 4;                 /* layers 0-2 GDN, 3 full (QSA) */
-    int64_t hidden = 256, hc = 4, lowrank = 160;      /* lowrank % 80 (hc_up group 80) */
+    /* hidden % 512: libr4d's e4m3 hc_read row (ported to libxe) needs n % 512; production's 2560 is */
+    int64_t hidden = 512, hc = 4, lowrank = 320;      /* lowrank % 80 (hc_up group 80) and % 64 (hc_read_e4m3) */
     int64_t heads = 24, kv_heads = 2, head_dim = 256;
     double  rotary = 0.25;
     int64_t lin_k_heads = 2, lin_v_heads = 6, lin_k_dim = 128, lin_v_dim = 128, conv = 4;

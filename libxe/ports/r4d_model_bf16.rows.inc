@@ -34,7 +34,7 @@ static const RadConstraint cKvStoreK6v4[] = { C_GE("block_size", 1), C_DIV("head
   "i32 tokens, an E4M3 table with a bf16 or f32 scale or a plain bf16 one, bf16 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
-  nullptr, nullptr, r4d_rad_embed_lookup_q, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_embed_lookup_q, nullptr, r4d_rad_layout_embed_q, nullptr,
   nullptr },
 { "gather_rows_bf16", "gather_rows", "elem",
   "y[i, :] = x[idx[i], :], one workgroup a row",

@@ -66,8 +66,8 @@ static const RadConstraint cHcReadE4m3[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMtpEnterE4m3), NOTUNE,
   nullptr, nullptr, r4d_rad_mtp_enter, r4d_rad_mtp_enter_scratch,
-  nullptr, nullptr,
-  nullptr, nullptr },
+  r4d_rad_layout_mtp_e4m3, r4d_rad_relayout_mtp_e4m3,
+  nullptr, r4d_rad_unrelayout_mtp_e4m3 },
 { "hc_read_bf16", "hc_read", "norm",
   "grouped rmsnorm, the low-rank read gate, the stream mean, the per-branch write gains and the "
   "fp8 twin of the block input -- in two launches",
@@ -87,6 +87,6 @@ static const RadConstraint cHcReadE4m3[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHcReadE4m3), NOTUNE,
   nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch,
-  nullptr, nullptr,
-  nullptr, nullptr },
+  r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
+  nullptr, r4d_rad_unrelayout_hc_e4m3 },
 #endif

@@ -28,10 +28,10 @@ static const RadConstraint cRowTopKMerge[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLogitRerank), NOTUNE,
   nullptr, nullptr, r4d_rad_logit_rerank, nullptr,
-  nullptr, nullptr,
+  r4d_rad_layout_fp8_logits, r4d_rad_relayout_fp8_logits,
   /* No opd_shape, as for logits_gemm_fp8: the declared shape and the stored plane (scales in
    * each row's tail) differ, so a buffer of the declared shape would be read past its end. */
-  nullptr, nullptr },
+  nullptr, r4d_rad_unrelayout_fp8_logits },
 { "logit_rerank_i8", "logit_rerank", "select",
   "logit_rerank over an INT8 head: the same candidates rescored against logits_gemm_i8's rows",
   "logit_rerank's: any M, R <= 32, bf16 x and the i8 lm_head plane logits_gemm_i8 stores",
@@ -39,9 +39,9 @@ static const RadConstraint cRowTopKMerge[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLogitRerank), NOTUNE,
   nullptr, nullptr, r4d_rad_logit_rerank_i8, nullptr,
-  nullptr, nullptr,
+  r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   /* No opd_shape, for logit_rerank's reason: the declared shape and the stored row differ. */
-  nullptr, nullptr },
+  nullptr, r4d_rad_unrelayout_i8_logits },
 { "rowtopk_merge", "row_topk_merge", "select",
   "the global top-R of world_size all-gathered per-rank candidate sets",
   "any M, R <= 32; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "

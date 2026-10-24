@@ -36,6 +36,13 @@ extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "i8a8 i8a8h"),
 };
+extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
+static const RadConstraint cXeGemvBf16[] = { C_DIV("K", 8), C_IN("dtype", "bf16") };
+static const RadConstraint cXeRouterGemm[] = {
+    C_GE("M", 1), C_DIV("K", 8), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
+    C_LE("top_k", 32), C_IN("dtype", "bf16"),
+};
 
 static const RadKernelInfo kKernels[] = {
 #include "ports/all_rows.inc"
@@ -47,6 +54,20 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGemvI8), NOTUNE,
   nullptr, nullptr, xe_rad_gemm_i8a8_gemv, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_gemm_nt_bf16_gemv", "gemm_nt", "gemm",
+  "a bf16 weight's product as a sub-group GEMV, f32 accumulate, one rounding to y",
+  "any M (4 rows a weight pass), any N; K a multiple of 8; the stored layout",
+  "bf16 or f32 a, bf16 b, bf16 or f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvBf16), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_nt_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
+  "the router GEMV (and the shared expert's gate column), then libr4d's router_topk_scatter",
+  "any M; n_expert <= 512, top_k <= 32; K a multiple of 8",
+  "bf16 a and router weight, the logits as the operand declares them, i32 ids, f32 weights",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeRouterGemm), NOTUNE,
+  nullptr, nullptr, xe_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 

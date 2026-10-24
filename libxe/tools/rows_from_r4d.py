@@ -22,8 +22,13 @@ rows = open(rows_src).read()
 ref_ops = set(re.findall(r'^\{ "([^"]+)", ARR\(',
                          open(rows_src.replace('libr4d/r4d_rows.cpp', 'libref/ref_registry.cpp')).read(), re.M))
 ptxt = open(port).read()
-defined = set(re.findall(r'extern "C" (?:int|long long|int64_t|void\*?|const \w+\*?)\s+(r4d_\w+)\s*\(', ptxt))
+DEF = r'extern "C" (?:int|long long|int64_t|void\*?|const \w+\*?)\s+(r4d_\w+)\s*\('
+defined = set(re.findall(DEF, ptxt))
 adapters = {a for a in defined if a.startswith('r4d_rad_')} - skip
+# libr4d's host-side weight-layout hooks, which libxe compiles unchanged (libxe/CMakeLists.txt):
+# a row keeps its layout / relayout / unrelayout hooks when they are defined there.
+for extra in ('r4d_fp8_layout.cpp',):
+    defined |= set(re.findall(DEF, open(rows_src.replace('r4d_rows.cpp', extra)).read()))
 
 # kernel-table entries: a '{' at line start followed by a string literal, up to the matching '},'
 entries = []

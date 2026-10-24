@@ -47,7 +47,7 @@ with open(X + '/ports/all_rows.inc', 'w') as f:
         if re.search(r'^\{ "', txt, re.M):
             f.write('#include "ports/%s.rows.inc"\n' % u)
         used = set(re.findall(r'\b(r4d_\w+)\b', txt.split('#else', 1)[-1]))
-        src = open('%s/ports/%s.cpp' % (X, u)).read()
+        src = open('%s/ports/%s.cpp' % (X, u)).read() + open(S + '/libr4d/r4d_fp8_layout.cpp').read()
         for sym in used:
             m = re.search(r'extern "C"\s+([^;{()]*?\b' + sym + r'\s*\([^{;]*\))\s*\{', src)
             if m:

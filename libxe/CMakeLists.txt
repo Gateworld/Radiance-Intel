@@ -7,6 +7,9 @@
 # library; built only with RAD_WITH_L0=ON (cmake/RadL0.cmake), AOT for the B70 plus SPIR-V for the CPU
 # SYCL device.
 file(GLOB XE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ports/*.cpp)
+# libr4d's host-side weight layouts (E4M3 / int8 planes joined at load), compiled unchanged: the rows
+# libxe copies from libr4d name them (rows_from_r4d.py keeps a hook defined here).
+list(APPEND XE_SRC ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)

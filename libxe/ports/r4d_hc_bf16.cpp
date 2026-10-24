@@ -3616,7 +3616,11 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * (prefill), else 32 or 64 with a K-split down product. Below kDecMinRows the per-row kernels
      * win. */
     bool fused = false;
-    const bool tiled  = can_tile && rows >= kDecMinRows;
+    /* libxe: the tiled forms (hc_down_wide, PF2, the K-split down product) are bf16 WMMA, which the
+     * port does not shim (their stubs return NaN: kbench caught it on the tiny model, hc_read_e4m3
+     * at M 8-32). The per-row kernels are plain and correct at any row count, only slower at
+     * prefill sizes; a matrix-unit form is milestone 2. */
+    const bool tiled  = false && can_tile && rows >= kDecMinRows;
     if (tiled) {
         const int  rt   = hc_down_rt(rows);
         /* The inject gains, if any, are hc more columns of the same GEMM. */
