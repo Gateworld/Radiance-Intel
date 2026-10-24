@@ -20,11 +20,25 @@ constexpr int64_t kBounceBytes = 1 << 20;
 
 int64_t align_down(int64_t v, int64_t a) { return v / a * a; }
 
+/* EFAULT on a direct transfer: the kernel cannot pin the buffer's pages, as with memory a GPU driver
+ * mapped itself (Level Zero host allocations, the Intel port: card1 probe d2). The same transfer then
+ * goes through this aligned heap buffer, a piece at a time; nothing else takes this path. */
+uint8_t* efault_bounce() {
+    thread_local uint8_t* b = nullptr;
+    if (!b && posix_memalign((void**)&b, 4096, (size_t)kBounceBytes) != 0) b = nullptr;
+    return b;
+}
+
 /* Reads up to `bytes`, stopping at end of file. Returns the byte count, or a negative error. */
 int64_t pread_some(int fd, void* dst, int64_t bytes, int64_t off) {
     int64_t done = 0;
     while (done < bytes) {
         ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
+        if (r < 0 && errno == EFAULT && efault_bounce()) {
+            const int64_t n = std::min<int64_t>(kBounceBytes, bytes - done);
+            r = ::pread(fd, efault_bounce(), (size_t)n, (off_t)(off + done));
+            if (r > 0) std::memcpy((uint8_t*)dst + done, efault_bounce(), (size_t)r);
+        }
         if (r < 0) {
             if (errno == EINTR) continue;
             return RAD_E_IO;
@@ -48,6 +62,11 @@ int pwrite_exact(int fd, const void* src, int64_t bytes, int64_t off) {
     while (done < bytes) {
         ssize_t w = ::pwrite(fd, (const uint8_t*)src + done, (size_t)(bytes - done),
                              (off_t)(off + done));
+        if (w < 0 && errno == EFAULT && efault_bounce()) {   /* see efault_bounce */
+            const int64_t n = std::min<int64_t>(kBounceBytes, bytes - done);
+            std::memcpy(efault_bounce(), (const uint8_t*)src + done, (size_t)n);
+            w = ::pwrite(fd, efault_bounce(), (size_t)n, (off_t)(off + done));
+        }
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
             return RAD_E_IO;
