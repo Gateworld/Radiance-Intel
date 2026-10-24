@@ -482,6 +482,12 @@ int64_t aql_pageable_bytes(void);
 size_t  aql_code_registered(void);
 #endif
 
+#if defined(RAD_HAVE_L0) && RAD_HAVE_L0
+/* The Level Zero backend (core/device/l0.cpp, Intel port): null when no Level Zero GPU is visible
+ * (or RADIANCE_L0=0), so the build falls back to the host backend. */
+const DeviceBackend* l0_backend_if_present(void);
+#endif
+
 /* ------------------------------------------------------------------ the error slot */
 /* Both backends write here; rad_dev_last_error() drains it. Thread-local because spec §1 gives each
  * tensor-parallel rank and the mover their own thread, and an error must be reported on the thread

@@ -77,6 +77,10 @@ if(RAD_HIP_FOUND)
   endforeach()
 endif()
 
+if(RAD_L0_FOUND)
+  rad_l0_core(rad_core)
+endif()
+
 # The engine binary. core/main.cpp is owned by the engine component.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
   add_executable(radiance main.cpp)

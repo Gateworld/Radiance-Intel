@@ -264,6 +264,16 @@ if(RAD_HIP_FOUND)
   find_library(RAD_HSA_RUNTIME hsa-runtime64 HINTS /opt/rocm/lib ENV ROCM_PATH)
 endif()
 
+# ---------------------------------------------------------------- Level Zero (Intel port)
+# OFF by default; cmake/RadL0.cmake says how to configure it. Not part of AUTO detection, so the CPU
+# and HIP builds are unchanged.
+set(RAD_WITH_L0 "OFF" CACHE STRING "ON | OFF -- build the Level Zero backend and the libxe SYCL kernels")
+set_property(CACHE RAD_WITH_L0 PROPERTY STRINGS ON OFF)
+set(RAD_L0_FOUND OFF)
+if(RAD_WITH_L0 STREQUAL "ON")
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/RadL0.cmake)
+endif()
+
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------- media decoding
@@ -297,12 +307,18 @@ add_subdirectory(libquant)
 if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr4d/CMakeLists.txt)
   add_subdirectory(libr4d)
 endif()
+if(RAD_L0_FOUND)
+  add_subdirectory(libxe)
+endif()
 # libavx: the production host kernels (x86 SIMD, dispatched by CPU feature), built on every x86-64.
 # Not optional: host-placed ops need a kernel other than the oracle (rad_gate_reference_kernels
 # refuses libref), and a table too large for the card, such as the n-gram embedding's gather, runs
 # on the host every step. Also builds standalone without ROCm (`cmake -S libavx -B build-avx`).
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_subdirectory(libavx)
+endif()
+if(RAD_L0_FOUND)
+  rad_l0_clang_fixes()
 endif()
 add_subdirectory(arch)
 add_subdirectory(tools)

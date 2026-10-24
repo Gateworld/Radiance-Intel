@@ -85,6 +85,13 @@ static DeviceBackend g_host_beside_hip;
 #endif
 
 static const DeviceBackend* select_backend() {
+#if defined(RAD_HAVE_L0) && RAD_HAVE_L0
+    if (const DeviceBackend* b = l0_backend_if_present()) {
+        RAD_INFO("device: Level Zero backend, %d device(s) [%s]", b->count(),
+                 device_inventory(b).c_str());
+        return b;
+    }
+#endif
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     if (const DeviceBackend* b = aql_backend_if_present()) {
         RAD_INFO("device: AQL backend, %d device(s) [%s]", b->count(),
