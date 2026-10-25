@@ -48,9 +48,10 @@ RAD_ADV_FN float adv_margin(const AdvanceArgs& a, int32_t i) {
  *     reads the -1 padding the builder fills and faults the card on a negative block;
  *   - a position at or past ring_pos lives in the ring, at block
  *     ring_pos/block + ((p - ring_pos)/block) % ring_blocks, not at (p - first)/block, which runs
- *     off the table once the ring wraps. */
-/* `len`, when given, is the context's count from `base` in place of `n` (ADV_HIST under AdvanceArgs::hist_ctx: rows
- * that repeat a position must not lengthen the context; upstream 64c652f). */
+ *     off the table once the ring wraps.
+ *
+ * `len`, when given, is the context's count from `base` in place of `n` (ADV_HIST under AdvanceArgs::hist_ctx: rows
+ * that repeat a position must not lengthen the context; upstream 64c652f, where it is unconditional). */
 RAD_ADV_FN void adv_groups(const AdvanceArgs& a, int i, int32_t k, int32_t base, int32_t n, int32_t len = -1) {
     const AdvGroup* G = reinterpret_cast<const AdvGroup*>(a.slab + a.grp_off);
     const int32_t* pos = adv_i32(a, a.pos_off);
@@ -172,11 +173,15 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
             out[k + j] = row0 + jj;
         }
         ctx[i] = base;
-        /* hist_ctx: the context ends at the last committed position (see AdvanceArgs::hist_ctx). Attention places row
-         * j of a q_len-row run at seqused - q_len + j and reads keys up to there, so with the run's whole length the
-         * last row -- the only one whose output is used -- also read the n_spec - acc positions after it. Earlier
-         * rows then count lower than their positions, but nothing reads their output, and every row's K and V still
-         * store at its own position's slot. */
+        /* hist_ctx (upstream 64c652f, unconditional there): the context ends at the last committed position, not at
+         * the run's end. Attention places row j of a q_len-row run at seqused - q_len + j and reads keys up to there
+         * (attn_paged's contract, libref/ref_attn.cpp). The rows past `last` sit at the last committed position but
+         * are counted as if at base + j, so with the run's whole length the last row -- round 1, the one row whose
+         * output goes on -- would also read the n_spec - acc positions after it, which the head has not written for
+         * this sequence: last step's speculative rounds, or whatever the block held before it was handed out
+         * (another request's K and V, or bytes the expert slab left on a recalled loan). Ending it there puts the
+         * last row where it is; earlier rows count lower than their positions, but nothing reads their output, and
+         * every row's K and V still store at the slot of its own position. */
         adv_groups(a, i, k, base, n, a.hist_ctx ? last + 1 : -1);
         return;
     }

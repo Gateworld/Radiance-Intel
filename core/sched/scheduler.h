@@ -174,7 +174,7 @@ public:
         a.rot_shift = serial_rot_shift_;
         static const int32_t hist_ctx = [] {
             const char* v = std::getenv("RADIANCE_MTP_HIST_CTX");
-            return v && v[0] == '1' ? 1 : 0;
+            return v && v[0] == '0' ? 0 : 1;   /* default on since v1.0.4-intel (upstream 64c652f; owner note 281) */
         }();
         a.hist_ctx = hist_ctx;   /* see AdvanceArgs::hist_ctx */
         return a;
