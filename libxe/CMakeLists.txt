@@ -101,6 +101,15 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_event_stress_cpu COMMAND xe_event_stress 1000000 64)
   set_tests_properties(xe_event_stress_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # GPU faults 3-4 (owner note 10): tapes destroyed while a play runs, per-request buffers reallocated.
+  add_executable(xe_tape_lifetime_test test/tape_lifetime_test.cpp)
+  rad_l0_sycl(xe_tape_lifetime_test)
+  target_include_directories(xe_tape_lifetime_test PRIVATE ${CMAKE_SOURCE_DIR}/core)
+  target_link_libraries(xe_tape_lifetime_test PRIVATE stdc++ rad_core)
+  set_target_properties(xe_tape_lifetime_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_tape_lifetime_cpu COMMAND xe_tape_lifetime_test 200 16)
+  set_tests_properties(xe_tape_lifetime_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
   # The OpenCL CPU compiler crash (note 5's oracle on amd-host): the ported MoE unit alone, SPIR-V only,
   # one device image a kernel, and a harness that builds them one at a time (test/cpu_probe.cpp).
   add_library(xe_moe_cpuprobe SHARED ports/r4d_moe.cpp)

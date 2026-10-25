@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <cstdio>
@@ -332,6 +333,10 @@ struct Tape {
      * with no event records: its lanes are not ordered against each other in a plain pass either,
      * so the fences only cost (two barriers a stretch; b12b: replay 1.66 ms a step against 1.30). */
     bool fence = true;
+    /* The event of its latest graph submission (all of them go through run_on_home, in order on
+     * the home stream): when it is complete, no command buffer of this tape is still running. */
+    sycl::event last;
+    bool submitted = false;
 };
 std::atomic<uint64_t> g_tape_ids{0};
 struct Rec {
@@ -415,8 +420,59 @@ void run_on_home(Tape& t, Exec& ex) {
         H.ext_oneapi_submit_barrier(pre);
     }
     sycl::event ge = H.ext_oneapi_graph(ex);
+    t.last = ge;
+    t.submitted = true;
     if (fence)
         for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({ge});
+}
+
+/* Freeing a tape (GPU faults 3 and 4, owner note 10). Deleting a Tape releases its executable
+ * graphs and with them their command buffers; the runtime does not keep a graph alive for a
+ * submission it enqueued straight to the device, so a tape freed while a play of it still runs left
+ * the copy engine fetching commands from unmapped memory (fault 4's coredump: RING_BBADDR / DMA_FADD
+ * inside a second-level batch, "Engine memory CAT error, class=bcs"). A tape whose last submission
+ * has not completed goes to a graveyard instead, freed once it has; past kDeadMax pending, the
+ * oldest is waited for. Never grows without limit. */
+constexpr size_t kDeadMax = 64;
+std::mutex& dead_mutex() { static std::mutex m; return m; }
+std::deque<Tape*>& dead_tapes() { static std::deque<Tape*> d; return d; }
+std::atomic<int64_t> g_tapes_deferred{0}, g_tapes_waited{0}, g_tapes_freed{0};
+bool tape_idle(Tape* t) {
+    if (!t->submitted) return true;
+    try {
+        return t->last.get_info<sycl::info::event::command_execution_status>() ==
+               sycl::info::event_command_status::complete;
+    } catch (const sycl::exception&) {
+        return true;   /* a failed submission's event: nothing of it runs */
+    }
+}
+/* Frees the graveyard's completed tapes, oldest first; `all` waits for every one. */
+void reap_tapes(bool all = false) {
+    std::lock_guard<std::mutex> lk(dead_mutex());
+    auto& d = dead_tapes();
+    while (!d.empty()) {
+        Tape* t = d.front();
+        if (!tape_idle(t)) {
+            if (!all && d.size() <= kDeadMax) break;
+            try { t->last.wait(); } catch (const sycl::exception&) {}
+            g_tapes_waited.fetch_add(1, std::memory_order_relaxed);
+        }
+        d.pop_front();
+        delete t;
+        g_tapes_freed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+void release_tape(Tape* t) {
+    if (!t) return;
+    if (tape_idle(t)) {
+        delete t;
+        g_tapes_freed.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::lock_guard<std::mutex> lk(dead_mutex());
+        dead_tapes().push_back(t);
+        g_tapes_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
+    reap_tapes();
 }
 void rerecord(Tape& t, const std::vector<L0Event*>& evs) {
     std::lock_guard<std::mutex> lk(event_mutex());
@@ -458,6 +514,7 @@ template <class F> int seg_cut(const char* who, F&& f) {
 
 int z_tape_begin(void) {
     RAD_TRY(flush_held());
+    reap_tapes();
     if (t_rec.t) { device_set_error("rad tape_begin: a tape is already being recorded on this thread"); return RAD_E_STATE; }
     if (!dev_ok(t_device, "tape_begin")) return RAD_E_INVAL;
     const Dev& D = devs()[t_device];
@@ -517,7 +574,7 @@ RadTape z_tape_end(int keep) {
         t->refused = "nothing was recorded (the pass's work went to a stream outside the recording)";
     if (!keep || !t->refused.empty()) {
         if (keep) device_set_error("the pass cannot be replayed from a SYCL graph: %s", t->refused.c_str());
-        delete t;
+        release_tape(t);   /* its segments ran while recorded and may still be running */
         return nullptr;
     }
     /* Step 5's per-launch figure: what one replay submits (graph nodes are the pass's dispatches,
@@ -626,7 +683,7 @@ int z_tape_diff(RadTape pa, RadTape pb, char* why, int cap) {
 }
 void z_tape_destroy(RadTape p) {
     if (g_held.t == static_cast<Tape*>(p)) flush_held();
-    delete static_cast<Tape*>(p);   /* graphs in flight hold their own references */
+    release_tape(static_cast<Tape*>(p));   /* freed once its last play has completed */
 }
 /* A segment is ordered behind everything before it: an event-kind record, so no overlap is asked. */
 int z_tape_record(RadTape p, int i, int* kind, uint32_t* queue) {
@@ -698,6 +755,7 @@ int z_stream_sync(RadStream s) {
     if (recording()) return seg_cut("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
     const int rc = guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
     if (rc == RAD_OK) S(s).tags.store(0);   /* the queue is drained: its timestamp events are released */
+    reap_tapes();
     return rc;
 }
 
@@ -1130,6 +1188,17 @@ extern "C" void rad_l0_event_stats(int64_t out[6]) {
         for (L0Stream* s : streams()) mx = std::max(mx, s->tags.load());
     }
     out[5] = mx;
+}
+
+/* For tests (owner note 10): out[0] tapes deferred at release because a play was still running,
+ * out[1] graveyard tapes waited for (the bound), out[2] tapes freed, out[3] in the graveyard now. */
+extern "C" void rad_l0_tape_stats(int64_t out[4]) {
+    using namespace rad;
+    out[0] = g_tapes_deferred.load();
+    out[1] = g_tapes_waited.load();
+    out[2] = g_tapes_freed.load();
+    std::lock_guard<std::mutex> lk(dead_mutex());
+    out[3] = (int64_t)dead_tapes().size();
 }
 
 #endif /* RAD_HAVE_L0 */
