@@ -43,6 +43,7 @@
 
 /* core/device/l0_kernels.sycl (librad_l0k) */
 extern "C" int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes);
+extern "C" void rad_l0k_set_flush(void (*f)(void));
 
 namespace rad {
 namespace {
@@ -95,6 +96,7 @@ void touch(L0Stream& s) {
     t_touched.insert(s.id);
     t_last = &s;
 }
+int flush_held();   /* "recorded passes": submits a held tape play */
 
 /* A gate: a host task on the queue that returns once the host opens it. */
 struct Gate {
@@ -251,6 +253,7 @@ void* z_alloc(int64_t bytes, int kind) {
 }
 
 void z_free(void* p, int kind) {
+    (void)flush_held();
     if (!p) return;
     AllocRec r;
     {
@@ -320,6 +323,10 @@ struct Tape {
     std::vector<L0Stream*> qs;         /* the recorded streams, the home stream first */
     std::string refused;
     uint64_t id = 0;                   /* serial, never reused (L0Event::gtape) */
+    /* Fence the other recorded streams around each submission. Cleared at tape_end for a tape
+     * with no event records: its lanes are not ordered against each other in a plain pass either,
+     * so the fences only cost (two barriers a stretch; b12b: replay 1.66 ms a step against 1.30). */
+    bool fence = true;
 };
 std::atomic<uint64_t> g_tape_ids{0};
 struct Rec {
@@ -349,13 +356,15 @@ void real_record(L0Event* e, sycl::queue& q) {
 /* Submits `ex` on the home stream, fenced against the other recorded streams. */
 void run_on_home(Tape& t, Exec& ex) {
     sycl::queue& H = t.qs[0]->q;
-    if (t.qs.size() > 1) {
+    const bool fence = t.fence && t.qs.size() > 1;
+    if (fence) {
         std::vector<sycl::event> pre;
         for (size_t k = 1; k < t.qs.size(); ++k) pre.push_back(t.qs[k]->q.ext_oneapi_submit_barrier());
         H.ext_oneapi_submit_barrier(pre);
     }
     sycl::event ge = H.ext_oneapi_graph(ex);
-    for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({ge});
+    if (fence)
+        for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({ge});
 }
 void rerecord(Tape& t, const std::vector<L0Event*>& evs) {
     std::lock_guard<std::mutex> lk(event_mutex());
@@ -396,6 +405,7 @@ template <class F> int seg_cut(const char* who, F&& f) {
 }
 
 int z_tape_begin(void) {
+    RAD_TRY(flush_held());
     if (t_rec.t) { device_set_error("rad tape_begin: a tape is already being recorded on this thread"); return RAD_E_STATE; }
     if (!dev_ok(t_device, "tape_begin")) return RAD_E_INVAL;
     const Dev& D = devs()[t_device];
@@ -414,6 +424,11 @@ int z_tape_begin(void) {
             if (t_touched.count(s->id) || !s->used.load(std::memory_order_relaxed)) t->qs.push_back(s);
         for (size_t k = 0; k < t->qs.size(); ++k)
             if (t->qs[k] == t_last) std::swap(t->qs[0], t->qs[k]);
+        /* RADIANCE_L0_TAPE_HOME_ONLY=1 (step 5 experiment): record the home stream alone. Valid only
+         * where nothing else is used in the pass -- the tape-vs-plain token check says so. */
+        static const bool home = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_HOME_ONLY");
+                                      return v && std::strcmp(v, "1") == 0; }();
+        if (home && t->qs.size() > 1) t->qs.resize(1);
     }
     if (t->qs.empty()) { device_set_error("tape_begin: no stream to record"); return RAD_E_STATE; }
     t_rec = Rec{};
@@ -455,33 +470,81 @@ RadTape z_tape_end(int keep) {
     }
     /* Step 5's per-launch figure: what one replay submits (graph nodes are the pass's dispatches,
      * copies and barriers), for the first few tapes kept. */
+    size_t nodes = 0, evs = 0;
+    for (const Seg& s : t->segs) { nodes += s.nodes; evs += s.evs.size(); }
+    t->fence = evs > 0;
     static std::atomic<int> told{0};
-    if (told.fetch_add(1) < 8) {
-        size_t nodes = 0, evs = 0;
-        for (const Seg& s : t->segs) { nodes += s.nodes; evs += s.evs.size(); }
-        RAD_INFO("l0 tape: %zu segment(s), %zu graph node(s), %zu event record(s), %zu stream(s) recorded",
-                 t->segs.size(), nodes, evs, t->qs.size());
-    }
+    if (told.fetch_add(1) < 8)
+        RAD_INFO("l0 tape: %zu segment(s), %zu graph node(s), %zu event record(s), %zu stream(s) recorded%s",
+                 t->segs.size(), nodes, evs, t->qs.size(), t->fence ? "" : ", played unfenced");
     return (RadTape)t;
+}
+
+/* ---- held-back plays. The engine plays a pass as stretches cut at its host work (table
+ * refreshes, routing reports); in a steady decode step that work submits nothing, so a play is
+ * held back and the next play of the same tape that starts where it ends extends it: one graph
+ * submission a step instead of one a stretch. Anything else that reaches a queue -- every backend
+ * call that submits, waits or frees, and the core's own kernels (l0_kernels.sycl, through
+ * rad_l0k_set_flush) -- submits the held play first. A held play's error surfaces at that flush. */
+int play_now(Tape& t, int from, int to);
+std::mutex& held_mutex() { static std::mutex m; return m; }
+struct Held { Tape* t = nullptr; int a = 0, b = 0; };
+Held g_held;
+std::atomic<bool> g_have_held{false};
+int flush_held() {
+    if (!g_have_held.load(std::memory_order_acquire)) return RAD_OK;
+    std::lock_guard<std::mutex> lk(held_mutex());
+    const Held h = g_held;
+    g_held = Held{};
+    g_have_held.store(false, std::memory_order_release);
+    return h.t ? play_now(*h.t, h.a, h.b) : RAD_OK;
+}
+/* librad_l0k's hook (it cannot return an error to its caller's caller, so it warns) */
+void flush_held_hook(void) {
+    if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
 }
 int z_tape_len(RadTape p) { return p ? (int)static_cast<Tape*>(p)->segs.size() : RAD_E_INVAL; }
 int z_tape_play(RadTape p, int from, int to) {
     auto* t = static_cast<Tape*>(p);
     if (!t || from < 0 || to > (int)t->segs.size() || from > to) { device_set_error("tape_play: bad range"); return RAD_E_INVAL; }
     if (from == to) return RAD_OK;
+    std::lock_guard<std::mutex> lk(held_mutex());
+    if (g_held.t == t && g_held.b == from) { g_held.b = to; return RAD_OK; }   /* the next stretch */
+    const Held prev = g_held;
+    g_held = Held{t, from, to};
+    g_have_held.store(true, std::memory_order_release);
+    return prev.t ? play_now(*prev.t, prev.a, prev.b) : RAD_OK;
+}
+int play_now(Tape& tr, int from, int to) {
+    Tape* t = &tr;
     return guarded("tape_play", [&] {
         std::shared_ptr<Exec>& ex = t->stretch[{from, to}];
         if (!ex) {
             const Dev& D = devs()[t_device];
             Graph g(D.ctx, D.d);
-            std::optional<sx::node> prev;
-            for (int i = from; i < to; ++i) {
-                if (!t->segs[(size_t)i].ex) continue;
-                Exec& sub = *t->segs[(size_t)i].ex;
-                auto add = [&](sycl::handler& h) { h.ext_oneapi_graph(sub); };
-                prev = prev ? g.add(add, sycl::property_list{sx::property::node::depends_on(*prev)}) : g.add(add);
+            /* RADIANCE_L0_TAPE_COMPOSE=record (step 5 experiment): the stretch recorded from a private
+             * in-order queue, each segment a sub-graph submission, so the runtime may build an
+             * in-order command list; default: explicit nodes chained by depends_on. */
+            static const bool rec = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_COMPOSE");
+                                         return v && std::strcmp(v, "record") == 0; }();
+            bool any = false;
+            if (rec) {
+                sycl::queue rq(D.ctx, D.d, sycl::property_list{sycl::property::queue::in_order()});
+                g.begin_recording(rq);
+                for (int i = from; i < to; ++i)
+                    if (t->segs[(size_t)i].ex) { rq.ext_oneapi_graph(*t->segs[(size_t)i].ex); any = true; }
+                g.end_recording(rq);
+            } else {
+                std::optional<sx::node> prev;
+                for (int i = from; i < to; ++i) {
+                    if (!t->segs[(size_t)i].ex) continue;
+                    Exec& sub = *t->segs[(size_t)i].ex;
+                    auto add = [&](sycl::handler& h) { h.ext_oneapi_graph(sub); };
+                    prev = prev ? g.add(add, sycl::property_list{sx::property::node::depends_on(*prev)}) : g.add(add);
+                }
+                any = (bool)prev;
             }
-            if (prev) ex = std::make_shared<Exec>(g.finalize());
+            if (any) ex = std::make_shared<Exec>(g.finalize());
         }
         if (ex) run_on_home(*t, *ex);
         std::vector<L0Event*> evs;
@@ -509,7 +572,10 @@ int z_tape_diff(RadTape pa, RadTape pb, char* why, int cap) {
     }
     return -1;
 }
-void z_tape_destroy(RadTape p) { delete static_cast<Tape*>(p); }   /* graphs in flight hold their own references */
+void z_tape_destroy(RadTape p) {
+    if (g_held.t == static_cast<Tape*>(p)) flush_held();
+    delete static_cast<Tape*>(p);   /* graphs in flight hold their own references */
+}
 /* A segment is ordered behind everything before it: an event-kind record, so no overlap is asked. */
 int z_tape_record(RadTape p, int i, int* kind, uint32_t* queue) {
     auto* t = static_cast<Tape*>(p);
@@ -551,6 +617,7 @@ int z_stream_create(RadStream* out, int high_priority) {
 
 void z_stream_destroy(RadStream s) {
     if (!s) return;
+    (void)flush_held();
     try { Q(s).wait_and_throw(); }   /* drains rather than discards, as on the host backend */
     catch (const sycl::exception& e) { RAD_WARN("rad_stream_destroy: %s", e.what()); }
     {
@@ -575,6 +642,7 @@ int z_stream_sync(RadStream s) {
      * CPU device (an early return, then a runtime abort). device_test's concurrent-sync case still
      * passes on card1 (run b2). */
     touch(S(s));
+    RAD_TRY(flush_held());
     if (recording()) return seg_cut("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
     return guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
 }
@@ -587,6 +655,7 @@ int z_stream_gate(RadStream s, void** out) {
     auto* h = new (std::nothrow) GateHandle{g, &S(s)};
     if (!h) return RAD_E_NOMEM;
     touch(S(s));
+    RAD_TRY(flush_held());
     auto submit = [&] {
         Q(s).submit([&](sycl::handler& cgh) {
             cgh.host_task([g] {
@@ -654,6 +723,7 @@ int z_event_record(RadEvent ev, RadStream s) {
     }
     auto* e = static_cast<L0Event*>(ev);
     touch(S(s));
+    RAD_TRY(flush_held());
     if (recording()) {
         if (!recorded_stream(S(s))) { refuse("an event record on a stream outside the recording"); }
         else return guarded("rad_event_record", [&] {
@@ -676,6 +746,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
     }
     auto* e = static_cast<L0Event*>(ev);
     touch(S(s));
+    RAD_TRY(flush_held());
     sycl::event b;
     if (recording()) {
         bool here = false, earlier = false, never = false;
@@ -706,6 +777,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
 
 int z_event_query(RadEvent ev) {
     if (!ev) return RAD_E_INVAL;
+    RAD_TRY(flush_held());
     auto* e = static_cast<L0Event*>(ev);
     if (pending_here(e)) RAD_TRY(seg_cut("rad_event_query", [] {}));
     std::lock_guard<std::mutex> lk(e->m);
@@ -721,6 +793,7 @@ int z_event_query(RadEvent ev) {
 
 int z_event_sync(RadEvent ev) {
     if (!ev) return RAD_E_INVAL;
+    RAD_TRY(flush_held());
     auto* e = static_cast<L0Event*>(ev);
     if (!(e->flags & RAD_EVENT_HOST_WAIT)) {
         device_set_error("rad_event_sync: the event was made without RAD_EVENT_HOST_WAIT");
@@ -761,12 +834,13 @@ int z_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
 }
 
 /* Host writes to USM host memory are visible to work submitted after them. */
-void z_host_wrote(void) {}
+void z_host_wrote(void) { (void)flush_held(); }   /* a held play was issued before the write */
 
 /* ------------------------------------------------------------------ copies and fills */
 int z_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_async"));
     touch(S(s));
+    RAD_TRY(flush_held());
     if (bytes < 0 || (bytes > 0 && (!dst || !src))) {
         device_set_error("rad_memcpy_async: bad arguments (%p, %p, %lld)", dst, src, (long long)bytes);
         return RAD_E_INVAL;
@@ -779,6 +853,7 @@ int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
                       int64_t height, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_2d_async"));
     touch(S(s));
+    RAD_TRY(flush_held());
     if (width < 0 || height < 0 || dpitch < width || spitch < width || (width && height && (!dst || !src))) {
         device_set_error("rad_memcpy_2d_async: bad arguments");
         return RAD_E_INVAL;
@@ -792,6 +867,7 @@ int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
 int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memset_async"));
     touch(S(s));
+    RAD_TRY(flush_held());
     if (bytes < 0 || (bytes > 0 && !dst)) { device_set_error("rad_memset_async: bad arguments"); return RAD_E_INVAL; }
     if (bytes == 0) return RAD_OK;
     /* As on a HIP card (device.h, contract note 1): the destination must be device-accessible. */
@@ -814,6 +890,7 @@ int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
                           RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_ranges_async"));
     touch(S(s));
+    RAD_TRY(flush_held());
     if (!dst || !src || prefix < 0 || prefix % 16 || n < 0 || (n > 0 && !ranges)) {
         device_set_error("rad_memcpy_ranges_async: bad arguments (the prefix is a multiple of 16)");
         return RAD_E_INVAL;
@@ -836,6 +913,7 @@ int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
 int z_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_list_async"));
     touch(S(s));
+    RAD_TRY(flush_held());
     if (n < 0 || (n > 0 && !segs)) { device_set_error("rad_memcpy_list_async: bad arguments"); return RAD_E_INVAL; }
     return guarded("rad_memcpy_list_async", [&] {
         for (int i = 0; i < n; ++i)
@@ -906,6 +984,7 @@ DeviceBackend make_backend() {
     b.tape_destroy = z_tape_destroy;
     b.tape_record = z_tape_record;
     b.tape_set_overlap = z_tape_set_overlap;
+    rad_l0k_set_flush(flush_held_hook);
     return b;
 }
 

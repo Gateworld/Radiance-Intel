@@ -17,9 +17,16 @@
 #include "sched/advance_impl.h"
 #include "runtime/wtab.h"
 
+/* The backend's hook that submits a held-back tape play (l0.cpp, "recorded passes"): these
+ * launches reach the queue without passing through the backend, so they flush it first. */
+static void (*g_flush)(void) = nullptr;
+extern "C" __attribute__((visibility("default"))) void rad_l0k_set_flush(void (*f)(void)) { g_flush = f; }
+static inline void flush_pending() { if (g_flush) g_flush(); }
+
 extern "C" __attribute__((visibility("default")))
 int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     if (!args || args->n_seq <= 0) return 0;
+    flush_pending();
     const rad::AdvanceArgs a = *args;
     const size_t threads = 64, blocks = (size_t)((a.n_seq + 63) / 64);
     try {
@@ -68,6 +75,7 @@ int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes) {
 extern "C" __attribute__((visibility("default")))
 int rad_wtab_patch_launch(const rad::WtabPatch* p, void* stream) {
     if (!p || p->n == 0) return 0;
+    flush_pending();
     const rad::WtabPatch w = *p;
     try {
         static_cast<sycl::queue*>(stream)->parallel_for(
