@@ -675,6 +675,11 @@ void moe_gemm_q_kernel(
     uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+/* libxe: the WMMA expert GEMM is never launched (moe_gemm_launch -> XE_NOT_PORTED; the experts go
+ * through xe_moe_w4nl64_gemv or the planes row), but the launcher still instantiates it, and its
+ * body breaks Intel's OpenCL CPU compiler (sycl-kernel-reduce-cross-barrier-values; libxe/test/
+ * cpu_probe.cpp named it). Compiled empty unless XE_MOE_GEMM_Q_WMMA is defined. */
+#ifdef XE_MOE_GEMM_Q_WMMA
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits 8+
      * `parts`. */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
@@ -1417,6 +1422,7 @@ void moe_gemm_q_kernel(
          * that weight before issuing the pass's other loads. */
         if (ES || AL) break;
     }
+#endif  /* XE_MOE_GEMM_Q_WMMA */
 }
 
 /* ================================================================== moe_gemm_q, the down decode form

@@ -71,6 +71,21 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_tape_bench_cpu COMMAND xe_tape_bench 200 3 dev)
   set_tests_properties(xe_tape_bench_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # The OpenCL CPU compiler crash (note 5's oracle on amd-host): the ported MoE unit alone, SPIR-V only,
+  # one device image a kernel, and a harness that builds them one at a time (test/cpu_probe.cpp).
+  add_library(xe_moe_cpuprobe SHARED ports/r4d_moe.cpp)
+  target_include_directories(xe_moe_cpuprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/libr4d)
+  target_compile_options(xe_moe_cpuprobe PRIVATE -fsycl -fsycl-targets=spir64 -foffload-fp32-prec-div
+                         -foffload-fp32-prec-sqrt -ffp-contract=off -Wno-unused-function)
+  target_link_options(xe_moe_cpuprobe PRIVATE -fsycl -fsycl-targets=spir64 -fsycl-device-code-split=per_kernel)
+  target_link_libraries(xe_moe_cpuprobe PRIVATE rad_abi)
+  set_target_properties(xe_moe_cpuprobe PROPERTIES EXCLUDE_FROM_ALL ON)
+  add_executable(xe_cpu_probe test/cpu_probe.cpp)
+  target_compile_options(xe_cpu_probe PRIVATE -fsycl)
+  target_link_options(xe_cpu_probe PRIVATE -fsycl)
+  target_link_libraries(xe_cpu_probe PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(xe_cpu_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests EXCLUDE_FROM_ALL ON)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
