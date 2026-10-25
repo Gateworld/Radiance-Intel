@@ -62,6 +62,15 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_w4_cpu COMMAND xe_moe_w4_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_w4_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Owner note 1's per-launch figure: N tiny kernels launched plainly and replayed from a tape.
+  add_executable(xe_tape_bench test/tape_bench.cpp)
+  rad_l0_sycl(xe_tape_bench)
+  target_include_directories(xe_tape_bench PRIVATE ${CMAKE_SOURCE_DIR}/core)
+  target_link_libraries(xe_tape_bench PRIVATE stdc++ rad_core)
+  set_target_properties(xe_tape_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_tape_bench_cpu COMMAND xe_tape_bench 200 3)
+  set_tests_properties(xe_tape_bench_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
