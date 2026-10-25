@@ -30,6 +30,9 @@ struct Q4 {
     int64_t idx_heads = 4, idx_dim = 128, idx_budget = 2048, idx_ratio = 4;
     int64_t vocab = 512, ctx = 4096, mtp = 0;
     uint64_t seed = 1;
+    /* lm_head's scale on top of its usual gain (owner note 5: x10 makes greedy decoding decisive);
+     * the same draws either way, so every other tensor is unchanged */
+    float head = 1.0f;
 };
 
 using tiny::Tensor;
@@ -136,7 +139,7 @@ bool write_qwen4exp(const std::string& dir, const Q4& s) {
         }
         moe(ts, p, s, r);
     }
-    ts.push_back(tiny::linear("lm_head.weight", s.vocab, H, r, 2.0f));
+    ts.push_back(tiny::linear("lm_head.weight", s.vocab, H, r, 2.0f * s.head));
     if (s.mtp > 0) {
         ts.push_back(tiny::linear("mtp.fc_hidden.weight", H, H, r));
         ts.push_back(tiny::linear("mtp.fc_embedding.weight", H, H, r));
@@ -154,12 +157,21 @@ bool write_qwen4exp(const std::string& dir, const Q4& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: xe_tiny_qwen4exp DIR [mtp=0] [seed=1]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: xe_tiny_qwen4exp DIR [mtp=0] [seed=1] [head=1]\n"); return 2; }
     Q4 s;
     if (argc > 2) s.mtp = std::atoll(argv[2]);
     if (argc > 3) s.seed = (uint64_t)std::atoll(argv[3]);
+    if (argc > 4) s.head = (float)std::atof(argv[4]);
+    /* Owner note 4's relayout probe: production's per-weight shapes with few experts
+     * (RI_TINY_HIDDEN=2560 RI_TINY_FFN=640 RI_TINY_EXPERTS=16 ...); unset keeps the tiny model. */
+    auto env = [](const char* k, int64_t& v) { if (const char* e = std::getenv(k)) v = std::atoll(e); };
+    env("RI_TINY_HIDDEN", s.hidden);
+    env("RI_TINY_FFN", s.ffn);
+    env("RI_TINY_SHARED", s.shared);
+    env("RI_TINY_EXPERTS", s.experts);
+    env("RI_TINY_VOCAB", s.vocab);
     if (!write_qwen4exp(argv[1], s)) { std::fprintf(stderr, "xe_tiny_qwen4exp: write failed\n"); return 1; }
-    std::printf("xe_tiny_qwen4exp: wrote %s (mtp %lld, seed %llu)\n", argv[1], (long long)s.mtp,
-                (unsigned long long)s.seed);
+    std::printf("xe_tiny_qwen4exp: wrote %s (mtp %lld, seed %llu, lm_head x%g)\n", argv[1], (long long)s.mtp,
+                (unsigned long long)s.seed, (double)s.head);
     return 0;
 }
