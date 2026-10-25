@@ -2198,7 +2198,8 @@ unsigned int* hc_mix_ctr(RadStream s) {
     try {
         p = sycl::malloc_device((size_t)kMaxMixCtr * sizeof(unsigned int), q);
         if (!p) return nullptr;
-        q.memset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)).wait();
+        /* zeroed on a private queue: the stream's own may be recording a SYCL graph (a tape) */
+        sycl::queue(q.get_context(), q.get_device()).memset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)).wait();
     } catch (const sycl::exception&) {
         if (p) sycl::free(p, q);
         return nullptr;

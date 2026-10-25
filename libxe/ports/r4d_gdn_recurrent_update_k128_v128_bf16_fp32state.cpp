@@ -861,7 +861,9 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   try {
     p = sycl::malloc_device((size_t)kMaxConvCtr * sizeof(unsigned int), q);
     if (!p) return nullptr;
-    q.memset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)).wait();
+    /* zeroed on a private queue: the stream's own may be recording a SYCL graph (a tape), where
+     * a wait is refused (card1 run 10: the first recorded decode pass failed here) */
+    sycl::queue(q.get_context(), q.get_device()).memset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)).wait();
   } catch (const sycl::exception&) {
     if (p) sycl::free(p, q);
     return nullptr;
