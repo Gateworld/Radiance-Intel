@@ -346,13 +346,16 @@ struct Rec {
     int pause = 0;
     bool stopped = false;              /* recording given up: the rest of the pass runs plainly */
 };
-/* A pass longer than this many segments is not kept (H4, milestone 1b: each new prompt length
- * recorded a ~1,083-segment prefill pass, and their command buffers filled device memory --
- * "tape_mark: UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"). Decode passes are 45-61 segments. Past the
- * bound the recording stops, the rest of the pass is issued plainly, and the tape is refused (the
- * engine runs that pass plain from then on: owner note 1's per-pass fallback, counted in /stats
- * passes.issued_refused). */
-constexpr size_t kTapeMaxSegs = 256;
+/* A pass longer than this many segments is not kept. Past the bound the recording stops, the rest
+ * of the pass is issued plainly, and the tape is refused (the engine runs that pass plain from then
+ * on: owner note 1's per-pass fallback, counted in /stats passes.issued_refused). History: H4
+ * (milestone 1b) set this to 256 because each new prompt length recorded a ~1,083-segment prefill
+ * pass and their command buffers filled device memory ("tape_mark:
+ * UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"); but a decode pass with the mover's table refreshes has
+ * ~1,083 segments as well (one per refresh point), so that bound refused every decode pass while the
+ * heat engine was on (milestone 2 K1: played 0, refused 1 a step). The engine now records only
+ * decode-sized passes (ctx.cpp record_pass, n_tok <= 64), and this is a safety bound. */
+constexpr size_t kTapeMaxSegs = 2048;
 thread_local Rec t_rec;
 
 bool recording() { return t_rec.t && t_rec.g && t_rec.pause == 0; }

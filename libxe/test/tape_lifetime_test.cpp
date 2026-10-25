@@ -105,27 +105,43 @@ int main(int argc, char** argv) {
         }
     }
     rad_stream_sync(s);
-    /* a prefill-sized pass (300 segments, past the backend's 256): the recording stops, the rest
-     * runs plainly, the tape is refused -- and every kernel of the pass still ran exactly once */
+    /* Two long passes against the backend's segment bound (kTapeMaxSegs, 2048 since milestone 2: a
+     * decode pass with the mover's table refreshes has ~1,083 segments and must be kept; the engine
+     * keeps prefill-sized passes out by token count). 1,100 segments: kept and played. 2,100 segments:
+     * the recording stops, the rest runs plainly, the tape is refused -- and every kernel of the
+     * pass still ran exactly once. */
     uint32_t* cnt = (uint32_t*)rad_dev_alloc(4096, RAD_MEM_DEVICE);
-    rad_memset_async(cnt, 0, 4096, s);
-    rad_stream_sync(s);
-    bool long_ok = rad::tape_begin() >= 0;
-    for (int i = 0; i < 300 && long_ok; ++i) {
-        q.single_task([=] { cnt[0] += 1; });
-        rad::tape_mark();
+    bool long_ok = true;
+    const struct { int segs; bool keep; } longs[] = { { 1100, true }, { 2100, false } };
+    for (const auto& L : longs) {
+        rad_memset_async(cnt, 0, 4096, s);
+        rad_stream_sync(s);
+        bool ok1 = rad::tape_begin() >= 0;
+        for (int i = 0; i < L.segs && ok1; ++i) {
+            q.single_task([=] { cnt[0] += 1; });
+            rad::tape_mark();
+        }
+        rad::RadTape lt = ok1 ? rad::tape_end(true) : nullptr;
+        rad_stream_sync(s);
+        uint32_t hc = 0;
+        q.memcpy(&hc, cnt, 4).wait();
+        uint32_t want = (uint32_t)L.segs;
+        if (lt && L.keep) {   /* a kept tape plays once more: every kernel again, exactly once */
+            rad::tape_play(lt, 0, rad::tape_len(lt));
+            rad_stream_sync(s);
+            q.memcpy(&hc, cnt, 4).wait();
+            want *= 2;
+        }
+        ok1 = ok1 && (lt != nullptr) == L.keep && hc == want;
+        std::printf("  %d-segment pass: tape %s (want %s), counter %u (want %u): %s\n", L.segs,
+                    lt ? "KEPT" : "refused", L.keep ? "kept" : "refused", hc, want, ok1 ? "ok" : "WRONG");
+        if (lt) rad::tape_destroy(lt);
+        rad_stream_sync(s);
+        played += ok1 ? 1 : 0;   /* a refused tape, or a destroyed kept one, is released through the same path */
+        long_ok = long_ok && ok1;
     }
-    rad::RadTape lt = long_ok ? rad::tape_end(true) : nullptr;
-    rad_stream_sync(s);
-    uint32_t hc = 0;
-    q.memcpy(&hc, cnt, 4).wait();
-    long_ok = long_ok && lt == nullptr && hc == 300;
-    std::printf("  300-segment pass: tape %s, counter %u (want 300): %s\n", lt ? "KEPT" : "refused", hc,
-                long_ok ? "ok" : "WRONG");
-    if (lt) rad::tape_destroy(lt);
     rad_dev_free(cnt, RAD_MEM_DEVICE);
     rad_stream_sync(s);
-    played += long_ok ? 1 : 0;   /* the refused tape is released through the same path */
     rad_l0_tape_stats(st);
     const bool ok = long_ok && bad == 0 && canary_bad == 0 && st[2] == played && st[3] == 0 && max_dead <= 64 + 1;
     std::printf("tape_lifetime: %s -- %lld tapes, %lld deferred at destroy (a play still running), %lld freed, "

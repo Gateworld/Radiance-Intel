@@ -985,6 +985,24 @@ void Ctx::tape_drop(PassTape& t) {
 int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     *out = PassTape{};
     out->key = key;
+    /* Only decode-sized passes are recorded. A prefill-sized pass (a prompt chunk) has a new key
+     * for every prompt length, and each kept recording holds its command buffers on the device: on
+     * the Level Zero backend one ~1,083-segment prefill pass per prompt length filled device memory
+     * (milestone 1b, H4). A decode pass has the same segment count when the mover refreshes its
+     * tables (one segment per refresh point), so the backend cannot tell them apart by length; the
+     * token count can. Decode and speculative verify are a few tokens; 64 leaves room for wider
+     * drafts. The pass runs plainly, once per key is said so, and it is never retried. */
+    constexpr int64_t kTapeMaxTok = 64;
+    if (b->n_tok > kTapeMaxTok) {
+        if (std::find(tape_refused_.begin(), tape_refused_.end(), key) == tape_refused_.end()) {
+            tape_refused_.push_back(key);
+            RAD_INFO("rank %d: draft pass %d at %lld tokens is issued in full (not recorded): a pass "
+                     "wider than %lld tokens is prefill-sized, and recordings are kept per shape",
+                     rank_, b->draft_pass, (long long)b->n_tok, (long long)kTapeMaxTok);
+        }
+        arch_step_(this, b);
+        return 0;
+    }
     if (tape_begin() < 0) { arch_step_(this, b); return 0; }
     const int64_t i0 = n_issues_, c0 = ar_calls_.load(), y0 = ar_bytes_.load();
     rec_ = out;
