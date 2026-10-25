@@ -77,6 +77,10 @@ std::map<uintptr_t, AllocRec>& alloc_table() {
 struct L0Stream {
     sycl::queue      q;
     std::atomic<int> gates{0};   /* closed gates on it */
+    /* Profiling tags recorded on it since its last host sync (see real_record's bound). */
+    std::atomic<int64_t> tags{0};
+    /* Ever gated: its last command may be a gate's host task, so records on it are barriers. */
+    std::atomic<bool> gated{false};
     /* Whether any thread's backend call has named it yet; see t_touched. */
     std::atomic<bool> used{false};
     uint64_t          id = 0;      /* serial, never reused */
@@ -113,6 +117,7 @@ struct L0Event {
     std::mutex  m;
     sycl::event ev;
     bool        recorded = false;
+    bool        stamped = false;   /* `ev` carries a timestamp (rad_event_elapsed_ms can read it) */
     unsigned    flags = 0;
     /* Recorded inside a tape: the graph-internal barrier, its tape and segment (see tapes). */
     sycl::event gev;
@@ -346,12 +351,59 @@ void refuse(const std::string& why) {
     if (t_rec.t && t_rec.t->refused.empty()) t_rec.t->refused = why;
 }
 
-/* A real record of `e` on `q`: a profiling tag where the device has them, else a barrier. */
-void real_record(L0Event* e, sycl::queue& q) {
-    sycl::event b = devs()[0].tag ? sx::submit_profiling_tag(q) : q.ext_oneapi_submit_barrier();
+/* Event records without growth (run 24: card1 ran out of device memory after ~74,000 expert moves,
+ * each recorded with a new profiling tag on a stream nobody host-syncs; the runtime keeps a
+ * timestamp event until its queue syncs).
+ *
+ * A record submits nothing: on an in-order queue the last command's event is complete exactly when
+ * everything before the record is, so the RadEvent takes that event (the runtime recycles it like
+ * any kernel's). The events the backend holds are therefore one per RadEvent, a set the engine
+ * creates up front. On the CPU device a reused event's time is the end of the command before the
+ * record, not the moment the queue reached it (a per-op profile there shows no gaps). Three cases
+ * submit a command:
+ *  - a queue with no command yet: one barrier (at most once a stream);
+ *  - a stream that has had a gate: a barrier (the last event could be the gate's host task, which
+ *    misbehaved on the CPU device, run 3);
+ *  - timestamps: profiling tags, only once rad_event_elapsed_ms has asked for one (g_timing; the
+ *    per-op profile) and at most kTagsPerSync on a stream between its host syncs. Past that bound a
+ *    record is untimed, never a new tag; rad_event_elapsed_ms says so once.
+ * The CPU device's queues profile every command, so there every record is stamped. */
+constexpr int64_t kTagsPerSync = 32768;   /* the per-op profile's 8192 pairs a step, twice over */
+std::atomic<bool> g_timing{false};
+std::atomic<int64_t> g_rec_reused{0}, g_rec_barriers{0}, g_rec_tags{0}, g_rec_untimed{0};
+
+void real_record(L0Event* e, L0Stream& st) {
+    sycl::queue& q = st.q;
+    const bool tags = devs()[0].tag;
+    sycl::event b;
+    bool stamped;
+    if (tags && g_timing.load(std::memory_order_relaxed) && st.tags.load() < kTagsPerSync) {
+        b = sx::submit_profiling_tag(q);
+        st.tags.fetch_add(1);
+        g_rec_tags.fetch_add(1, std::memory_order_relaxed);
+        stamped = true;
+    } else {
+        if (tags && g_timing.load(std::memory_order_relaxed)) g_rec_untimed.fetch_add(1, std::memory_order_relaxed);
+        if (st.gated.load()) {
+            b = q.ext_oneapi_submit_barrier();
+            g_rec_barriers.fetch_add(1, std::memory_order_relaxed);
+            stamped = !tags;
+        } else {
+            std::optional<sycl::event> last = q.ext_oneapi_get_last_event();
+            if (last) {
+                b = *last;
+                g_rec_reused.fetch_add(1, std::memory_order_relaxed);
+            } else {   /* nothing on the queue yet: one barrier, so the record still has a time */
+                b = q.ext_oneapi_submit_barrier();
+                g_rec_barriers.fetch_add(1, std::memory_order_relaxed);
+            }
+            stamped = !tags;
+        }
+    }
     std::lock_guard<std::mutex> lk(e->m);
     e->ev = b;
     e->recorded = true;
+    e->stamped = stamped;
 }
 /* Submits `ex` on the home stream, fenced against the other recorded streams. */
 void run_on_home(Tape& t, Exec& ex) {
@@ -369,7 +421,7 @@ void run_on_home(Tape& t, Exec& ex) {
 void rerecord(Tape& t, const std::vector<L0Event*>& evs) {
     std::lock_guard<std::mutex> lk(event_mutex());
     for (L0Event* e : evs)
-        if (events_alive().count(e)) real_record(e, t.qs[0]->q);
+        if (events_alive().count(e)) real_record(e, *t.qs[0]);
 }
 
 void seg_open() {
@@ -644,7 +696,9 @@ int z_stream_sync(RadStream s) {
     touch(S(s));
     RAD_TRY(flush_held());
     if (recording()) return seg_cut("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
-    return guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
+    const int rc = guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
+    if (rc == RAD_OK) S(s).tags.store(0);   /* the queue is drained: its timestamp events are released */
+    return rc;
 }
 
 /* ------------------------------------------------------------------ gates */
@@ -656,6 +710,7 @@ int z_stream_gate(RadStream s, void** out) {
     if (!h) return RAD_E_NOMEM;
     touch(S(s));
     RAD_TRY(flush_held());
+    S(s).gated.store(true);   /* before the host task goes on the queue: real_record reads it */
     auto submit = [&] {
         Q(s).submit([&](sycl::handler& cgh) {
             cgh.host_task([g] {
@@ -736,7 +791,7 @@ int z_event_record(RadEvent ev, RadStream s) {
         });
     }
     /* everything before it on the queue; a profiling tag carries a timestamp as well */
-    return guarded("rad_event_record", [&] { real_record(e, Q(s)); });
+    return guarded("rad_event_record", [&] { real_record(e, S(s)); });
 }
 
 int z_event_wait(RadStream s, RadEvent ev) {
@@ -816,6 +871,17 @@ int z_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
         auto* e = static_cast<L0Event*>(ev);
         std::lock_guard<std::mutex> lk(e->m);
         if (!e->recorded) return RAD_E_STATE;
+        if (!e->stamped) {
+            /* Records carry timestamps from the first time one is asked for (real_record). */
+            if (devs()[0].tag && !g_timing.exchange(true))
+                RAD_INFO("l0 events: timing asked for -- records take profiling tags from now on, at most "
+                         "%lld a stream between its host syncs", (long long)kTagsPerSync);
+            static std::atomic<bool> said{false};
+            if (g_rec_untimed.load() > 0 && !said.exchange(true))
+                RAD_WARN("l0 events: a stream passed %lld timed records without a host sync; later records "
+                         "on it are untimed (bounded, owner note 7)", (long long)kTagsPerSync);
+            return RAD_E_STATE;
+        }
         if (e->ev.get_info<sycl::info::event::command_execution_status>() !=
             sycl::info::event_command_status::complete) return RAD_E_STATE;
         *t = e->ev.get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -1044,5 +1110,26 @@ const DeviceBackend* l0_backend_if_present(void) {
 }
 
 }  /* namespace rad */
+
+/* For tests and the report (owner note 7): out[0] RadEvents alive, out[1] records that reused the
+ * queue's last event, out[2] barrier records, out[3] profiling-tag records, out[4] untimed records
+ * past the bound, out[5] the most tags any stream holds since its last host sync. */
+extern "C" void rad_l0_event_stats(int64_t out[6]) {
+    using namespace rad;
+    {
+        std::lock_guard<std::mutex> lk(event_mutex());
+        out[0] = (int64_t)events_alive().size();
+    }
+    out[1] = g_rec_reused.load();
+    out[2] = g_rec_barriers.load();
+    out[3] = g_rec_tags.load();
+    out[4] = g_rec_untimed.load();
+    int64_t mx = 0;
+    {
+        std::lock_guard<std::mutex> lk(stream_mutex());
+        for (L0Stream* s : streams()) mx = std::max(mx, s->tags.load());
+    }
+    out[5] = mx;
+}
 
 #endif /* RAD_HAVE_L0 */
