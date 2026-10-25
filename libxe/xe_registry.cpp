@@ -36,6 +36,14 @@ extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "i8a8 i8a8h"),
 };
+extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* a, RadStream s);
+extern "C" int xe_w2a8_layout(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int,
+                              RadLayout*);
+extern "C" int xe_w2a8_relayout(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int,
+                                void*, int64_t);
+extern "C" int xe_w2a8_unrelayout(const RadParam*, int, int, const RadEncoding*, const int*, const void*, int64_t,
+                                  const RadTensor*, int);
+static const RadConstraint cXeGemvW2A8[] = { C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "w2a8") };
 extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_logits_gemm_bf16(const RadArgs* a, RadStream s);
@@ -76,6 +84,17 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGemvI8), NOTUNE,
   nullptr, nullptr, xe_rad_gemm_i8a8_gemv, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_gemm_w2a8_gemv", "gemm_nt_q", "gemm",
+  "the MTP draft head's w2a8 product as a sub-group GEMV over the canonical planes: exact int32 group "
+  "sums, the zero removed through quant_act_i8's group sums, scaled per (row, 128 K)",
+  "any M (4 activation rows a weight pass), any N; K a multiple of 128, group 128; codes stored, "
+  "scale and zero joined (abi/rad_planes.h)",
+  "int8 A in the step order with an f32 scale a row and f32 group sums, u2 W with an f16 scale and a "
+  "u8 or u4 zero per (row, 128 K), bf16 C",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvW2A8), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_w2a8_gemv, nullptr,
+  xe_w2a8_layout, xe_w2a8_relayout, nullptr, xe_w2a8_unrelayout, nullptr },
 { "xe_gemm_nt_bf16_gemv", "gemm_nt", "gemm",
   "a bf16 weight's product as a sub-group GEMV, f32 accumulate, one rounding to y",
   "any M (4 rows a weight pass), any N; K a multiple of 8; the stored layout",

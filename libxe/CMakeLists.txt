@@ -45,6 +45,17 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_i8_cpu COMMAND xe_gemv_i8_test)
   set_tests_properties(xe_gemv_i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # The MTP draft head's w2a8 GEMV, through its layout hooks, against libref's gemm_zp order.
+  add_executable(xe_gemv_w2a8_test test/gemv_w2a8_test.cpp xe_gemv_w2a8.cpp)
+  rad_l0_sycl(xe_gemv_w2a8_test)
+  target_include_directories(xe_gemv_w2a8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/libr4d)
+  target_compile_options(xe_gemv_w2a8_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_gemv_w2a8_test PRIVATE rad_abi)
+  set_target_properties(xe_gemv_w2a8_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_gemv_w2a8_cpu COMMAND xe_gemv_w2a8_test)
+  set_tests_properties(xe_gemv_w2a8_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Step 6's model: a tiny random qwen4exp checkpoint (host code, tests/tiny_model.h's helpers).
   add_executable(xe_tiny_qwen4exp test/tiny_qwen4exp.cpp)
   target_include_directories(xe_tiny_qwen4exp PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/vendor)
