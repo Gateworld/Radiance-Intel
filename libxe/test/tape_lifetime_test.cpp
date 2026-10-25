@@ -105,8 +105,29 @@ int main(int argc, char** argv) {
         }
     }
     rad_stream_sync(s);
+    /* a prefill-sized pass (300 segments, past the backend's 256): the recording stops, the rest
+     * runs plainly, the tape is refused -- and every kernel of the pass still ran exactly once */
+    uint32_t* cnt = (uint32_t*)rad_dev_alloc(4096, RAD_MEM_DEVICE);
+    rad_memset_async(cnt, 0, 4096, s);
+    rad_stream_sync(s);
+    bool long_ok = rad::tape_begin() >= 0;
+    for (int i = 0; i < 300 && long_ok; ++i) {
+        q.single_task([=] { cnt[0] += 1; });
+        rad::tape_mark();
+    }
+    rad::RadTape lt = long_ok ? rad::tape_end(true) : nullptr;
+    rad_stream_sync(s);
+    uint32_t hc = 0;
+    q.memcpy(&hc, cnt, 4).wait();
+    long_ok = long_ok && lt == nullptr && hc == 300;
+    std::printf("  300-segment pass: tape %s, counter %u (want 300): %s\n", lt ? "KEPT" : "refused", hc,
+                long_ok ? "ok" : "WRONG");
+    if (lt) rad::tape_destroy(lt);
+    rad_dev_free(cnt, RAD_MEM_DEVICE);
+    rad_stream_sync(s);
+    played += long_ok ? 1 : 0;   /* the refused tape is released through the same path */
     rad_l0_tape_stats(st);
-    const bool ok = bad == 0 && canary_bad == 0 && st[2] == played && st[3] == 0 && max_dead <= 64 + 1;
+    const bool ok = long_ok && bad == 0 && canary_bad == 0 && st[2] == played && st[3] == 0 && max_dead <= 64 + 1;
     std::printf("tape_lifetime: %s -- %lld tapes, %lld deferred at destroy (a play still running), %lld freed, "
                 "graveyard max %lld, wrong bytes %lld\n", ok ? "PASS" : "FAIL", played, (long long)st[0],
                 (long long)st[2], (long long)max_dead, bad);

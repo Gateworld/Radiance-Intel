@@ -344,7 +344,15 @@ struct Rec {
     std::optional<Graph> g;            /* the open segment */
     std::vector<L0Event*> pend;        /* its event records */
     int pause = 0;
+    bool stopped = false;              /* recording given up: the rest of the pass runs plainly */
 };
+/* A pass longer than this many segments is not kept (H4, milestone 1b: each new prompt length
+ * recorded a ~1,083-segment prefill pass, and their command buffers filled device memory --
+ * "tape_mark: UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"). Decode passes are 45-61 segments. Past the
+ * bound the recording stops, the rest of the pass is issued plainly, and the tape is refused (the
+ * engine runs that pass plain from then on: owner note 1's per-pass fallback, counted in /stats
+ * passes.issued_refused). */
+constexpr size_t kTapeMaxSegs = 256;
 thread_local Rec t_rec;
 
 bool recording() { return t_rec.t && t_rec.g && t_rec.pause == 0; }
@@ -546,21 +554,37 @@ int z_tape_begin(void) {
     if (rc != RAD_OK) { delete t_rec.t; t_rec = Rec{}; }
     return rc;
 }
+/* Gives up the recording: the queues leave record mode and the rest of the pass is issued plainly. */
+void stop_recording(const std::string& why) {
+    refuse(why);
+    if (t_rec.g) {
+        std::vector<sycl::queue> qs;
+        for (L0Stream* s : t_rec.t->qs) qs.push_back(s->q);
+        try { t_rec.g->end_recording(qs); } catch (const sycl::exception&) {}
+        t_rec.g.reset();
+    }
+    t_rec.stopped = true;
+}
 int z_tape_mark(void) {
     if (!t_rec.t) return 0;
     if (recording()) {
-        const int rc = guarded("tape_mark", [] { seg_close(); seg_open(); });
-        if (rc != RAD_OK) refuse(std::string("a segment could not be closed: ") + rad_dev_last_error());
+        const bool cap = t_rec.t->segs.size() + 1 >= kTapeMaxSegs;
+        const int rc = guarded("tape_mark", [cap] { seg_close(); if (!cap) seg_open(); });
+        if (rc != RAD_OK)
+            stop_recording(std::string("a segment could not be closed: ") + rad_dev_last_error());
+        else if (cap)
+            stop_recording("the pass has more than " + std::to_string(kTapeMaxSegs) +
+                           " segments (a prefill-sized pass): it runs plainly, so recorded graphs stay bounded");
     }
     return (int)t_rec.t->segs.size();
 }
 void z_tape_pause(int on) {
-    if (!t_rec.t) return;
+    if (!t_rec.t || t_rec.stopped) return;
     if (on) {
         if (t_rec.pause++ == 0 && t_rec.g && guarded("tape_pause", [] { seg_close(); }) != RAD_OK)
-            refuse("a segment could not be closed at a pause");
+            stop_recording("a segment could not be closed at a pause");
     } else if (t_rec.pause > 0 && --t_rec.pause == 0) {
-        if (guarded("tape_pause", [] { seg_open(); }) != RAD_OK) refuse("no segment after a pause");
+        if (guarded("tape_pause", [] { seg_open(); }) != RAD_OK) stop_recording("no segment after a pause");
     }
 }
 RadTape z_tape_end(int keep) {
