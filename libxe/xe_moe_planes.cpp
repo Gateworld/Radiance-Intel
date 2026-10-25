@@ -129,6 +129,135 @@ void moe_planes_kernel(const uint8_t* __restrict__ A, const float* __restrict__ 
     if (lane == 0) Y[(size_t)i * y_ld + n] = to_bf16(acc);
 }
 
+/* The decode kernel (milestone 2, stage 1, kernel 1): round 2 M6's best configuration brought to the
+ * planes form -- sub-group 16, 16 lanes a row along K with a 16-byte load each (32 codes), two rows
+ * a team sharing the activation, 512 work-items a work-group (32 teams, 64 rows), one routed row a
+ * work-group. Per work-group the activation row is staged once in work-group memory as f16 pairs
+ * (exact for E4M3), with its per-128 scales, a 256-entry table byte -> the two levels (f32, from the
+ * entry's 16-level table) and the 256 E4M3 values. Per code byte: one table read, one activation
+ * read, two f32 FMAs (level * activation is exact in f32). Per 16-byte chunk the partial sum takes
+ * the chunk's 64-group E4M3 scale and the activation's per-128 scale, as libref's quant_dot does per
+ * 64-group ((sub * sa) * sb); the entry's scale.1 multiplies the row's total at the store. Rounding
+ * differs from libref in the order of the sums (a half-group at a time, lanes meeting in a
+ * butterfly): a tolerance check, as the old kernel was. Rows outside the routing and columns past a
+ * narrower class's width write zeros, as before. K up to kV2MaxK; larger K and the LOGICAL form
+ * take the kernel above. RADIANCE_XE_MOE_V1=1 forces the old kernel (the A/B on card1). */
+constexpr int kV2WG = 512, kV2LPR = 16, kV2R = 2;
+constexpr int kV2Teams = kV2WG / kV2LPR;        /* 32 */
+constexpr int kV2RPW = kV2Teams * kV2R;         /* 64 rows a work-group */
+constexpr uint32_t kV2MaxK = 4096;
+
+inline float h2f(uint32_t bits16) { return (float)sycl::bit_cast<sycl::half>((uint16_t)bits16); }
+inline uint32_t f2h(float f) { return (uint32_t)sycl::bit_cast<uint16_t>((sycl::half)f); }
+
+void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict__ As, PCls c0, PCls c1,
+                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+                          uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+                          uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, uint32_t parts,
+                          uint32_t a_rows) {
+    XE_SHARED(uint32_t, s_a, kV2MaxK / 2);      /* the activation row as f16 pairs */
+    XE_SHARED(float, s_as, kV2MaxK / 128);      /* its per-128 scales */
+    XE_SHARED(float, s_lo, 256);                /* byte -> level of its low nibble */
+    XE_SHARED(float, s_hi, 256);                /* byte -> level of its high nibble */
+    XE_SHARED(float, s_e4, 256);                /* byte -> E4M3 value */
+    const int tid = (int)threadIdx.x;
+    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    if (i >= T) return;
+    /* the routed row's expert and token: uniform over the work-group */
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    uint32_t tok = 0;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        tok = a_sorted ? i : (uint32_t)flat / top_k;
+        if (tok < a_rows) e = (int32_t)lo;
+    }
+    const PCls& c = (e >= 0 && (e & 1)) ? c1 : c0;
+    const uint32_t fy = N / parts;
+    const uint32_t fc = e >= 0 ? c.n / parts : 0u;
+    const uint32_t K = e >= 0 ? c.k : 0u;
+    const uint8_t* we = nullptr;
+    const uint8_t* se = nullptr;
+    float s1 = 0.0f;
+    if (e >= 0) {
+        const uint32_t entry = (uint32_t)e >> 1;
+        we = entry_of(c.base, c.tab, c.stride, entry);
+        se = entry_of(c.sbase, c.stab, c.sstride, entry);
+        s1 = *(const float*)(se + c.s1_off);
+        const float* lvp = (const float*)(we + c.t_off);
+        const uint8_t* arow = A + (size_t)tok * a_ld;
+        for (uint32_t b = (uint32_t)tid; b < K / 2u; b += kV2WG)
+            s_a[b] = f2h(e4m3(arow[2 * b])) | (f2h(e4m3(arow[2 * b + 1])) << 16);
+        for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kV2WG) s_as[g] = As[(size_t)tok * as_ld + g];
+        for (uint32_t t = (uint32_t)tid; t < 256u; t += kV2WG) {
+            s_e4[t] = e4m3(t);
+            s_lo[t] = lvp[t & 15u];
+            s_hi[t] = lvp[t >> 4];
+        }
+    }
+    __syncthreads();
+    const int team = tid / kV2LPR, l = tid % kV2LPR;
+    float acc[kV2R];
+    uint32_t rowr[kV2R];
+    bool rowok[kV2R];
+#pragma unroll
+    for (int r = 0; r < kV2R; ++r) {
+        const uint32_t n = nb * kV2RPW + (uint32_t)(team * kV2R + r);
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        rowok[r] = e >= 0 && n < N && j < fc;
+        rowr[r] = pp * fc + j;
+        acc[r] = 0.0f;
+    }
+    if (e >= 0) {
+        const uint32_t CPR = K / 32u;                   /* 16-byte chunks a row */
+        const uint32_t rb = K / 2u, sb = K / 64u;       /* bytes a codes row, a scale row */
+        const uint8_t* wrow0 = we + c.c_off;
+        const uint8_t* srow0 = se + c.s_off;
+        for (uint32_t jc = (uint32_t)l; jc < CPR; jc += kV2LPR) {
+            const uint32_t bo = jc * 16u;               /* byte offset in the codes row */
+            const uint32_t k0 = bo * 2u;                /* its first K index (32 codes) */
+            const float asc = s_as[k0 / 128u];
+            const uint32_t g = k0 / 64u;
+            uint32_t a[16];
+#pragma unroll
+            for (int t = 0; t < 16; ++t) a[t] = s_a[k0 / 2u + (uint32_t)t];
+            uint4 w[kV2R];
+#pragma unroll
+            for (int r = 0; r < kV2R; ++r)
+                w[r] = rowok[r] ? *(const uint4*)(wrow0 + (size_t)rowr[r] * rb + bo) : uint4{0, 0, 0, 0};
+#pragma unroll
+            for (int r = 0; r < kV2R; ++r) {
+                const uint32_t d[4] = { w[r].x, w[r].y, w[r].z, w[r].w };
+                float s = 0.0f;
+#pragma unroll
+                for (int x = 0; x < 4; ++x)
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const uint32_t byte = (d[x] >> (8 * b)) & 0xffu;
+                        const uint32_t ab = a[x * 4 + b];
+                        s = sycl::fma(s_lo[byte], h2f(ab & 0xffffu), s);
+                        s = sycl::fma(s_hi[byte], h2f(ab >> 16), s);
+                    }
+                if (rowok[r]) acc[r] += (s * asc) * s_e4[srow0[(size_t)rowr[r] * sb + g]];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kV2R; ++r) {
+        float v = acc[r];
+        v += __shfl_xor(v, 8);
+        v += __shfl_xor(v, 4);
+        v += __shfl_xor(v, 2);
+        v += __shfl_xor(v, 1);
+        const uint32_t n = nb * kV2RPW + (uint32_t)(team * kV2R + r);
+        if (l == 0 && n < N) Y[(size_t)i * y_ld + n] = to_bf16(rowok[r] ? v * s1 : 0.0f);
+    }
+}
+
 /* Where the planes of an entry start: rad_planes_plan's arithmetic for two planes. */
 uint32_t first_plane() {
     return (uint32_t)rad_planes_round((int64_t)sizeof(RadPlanesHeader) + 2 * (int64_t)sizeof(RadPlanesEntry));
@@ -170,6 +299,11 @@ bool view_ok(const RadEncoding* enc, const int* sel, const RadTensor* pl, int n)
     if (!std::strcmp(a.role, "scale") && !std::strcmp(b.role, "scale.1"))
         return pl[0].dtype == RAD_F8E4M3 && a.block[0] == 1 && a.block[1] == 64 && pl[1].dtype == RAD_F32;
     return false;
+}
+
+bool v1_forced() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_V1"); return s && *s == '1'; }();
+    return v;
 }
 
 }  // namespace
@@ -262,6 +396,12 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
                   (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
                   (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u,
                   (uint32_t)parts, (uint32_t)M);
+        else if (K <= (long long)kV2MaxK && !v1_forced())
+            XE_LAUNCH_SG(16, qq, moe_planes_v2_kernel, dim3((unsigned)((N + kV2RPW - 1) / kV2RPW), (unsigned)T),
+                         dim3(kV2WG), 0, (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1],
+                         (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T,
+                         (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);
         else
             XE_LAUNCH(qq, moe_planes_kernel<false>, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
                   (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data,
