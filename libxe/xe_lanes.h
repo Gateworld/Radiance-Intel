@@ -125,7 +125,9 @@ inline unsigned byte_perm(unsigned x, unsigned y, unsigned s) {
 
 /* ------------------------------------------------------------------ conversions */
 typedef float    v2f  __attribute__((ext_vector_type(2)));
-typedef _Float16 v2hf __attribute__((ext_vector_type(2)));
+/* __fp16, as HIP's half2 is and libr4d's r4d_dt16.h declares it (the vit attention port mixes the
+ * two); the conversions above and fdot2 go through float either way */
+typedef __fp16   v2hf __attribute__((ext_vector_type(2)));
 typedef short    v2s  __attribute__((ext_vector_type(2)));
 
 /* v_cvt_pk_fp8_f32 (OCP E4M3, round to nearest even, saturating as rad_f32_to_fp8e4m3): a and b
@@ -493,7 +495,28 @@ template <int KIND, class V, class C> inline C wmma(const V& a, const V& b, cons
 #define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) (xe::wmma<0>((a), (b), (c)))
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) (xe::wmma<1>((a), (b), (c)))
 #define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) ((c) | (int)0x80000000)
-#define __builtin_amdgcn_global_load_tr_b128_v8i16(p) ((xe::xe_v8s)(short)0x7fc0)
+/* global_load_tr_b128 (gfx12): an 8x8 transpose of 16-bit elements across each group of 8 lanes --
+ * every lane loads 16 bytes from its own address, and lane j of a group receives element j of each
+ * of the group's 8 lanes, in lane order (libr4d/r4d_common.h load_tr_b128). By shuffles: the
+ * receiving lane's element index varies, so each source element is broadcast and the matching one
+ * kept (64 shuffles; correct, not fast). */
+namespace xe {
+inline xe_v8s load_tr_b128(const void* p) {
+    const xe_v8s v = *(const xe_v8s*)p;
+    const int l = lane(), j = l & 7, g = l & ~7;
+    xe_v8s r;
+    for (int i = 0; i < 8; ++i) {
+        short pick = 0;
+        for (int e = 0; e < 8; ++e) {
+            const short x = shfl_from((short)v[e], g + i);
+            if (e == j) pick = x;
+        }
+        r[i] = pick;
+    }
+    return r;
+}
+}  // namespace xe
+#define __builtin_amdgcn_global_load_tr_b128_v8i16(p) (xe::load_tr_b128((const void*)(p)))
 #define R4D_DYN_LDS(type, name) XE_DYN_LDS(type, name)
 
 /* R4D_EMIT / R4D_KLAUNCH / hipLaunchKernelGGL on a queue (the RadStream) */
