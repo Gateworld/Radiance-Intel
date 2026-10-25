@@ -860,6 +860,17 @@ int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
     }
     if (!width || !height) return RAD_OK;
     return guarded("rad_memcpy_2d_async", [&] {
+        /* sycl_ext_oneapi_graph does not record ext_oneapi_memcpy2d (it throws): on a tape the rows
+         * are plain copies, one a row (one copy when both sides are dense). */
+        if (Q(s).ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+            if (dpitch == width && spitch == width) {
+                Q(s).memcpy(dst, src, (size_t)(width * height));
+                return;
+            }
+            for (int64_t r = 0; r < height; ++r)
+                Q(s).memcpy((uint8_t*)dst + r * dpitch, (const uint8_t*)src + r * spitch, (size_t)width);
+            return;
+        }
         Q(s).ext_oneapi_memcpy2d(dst, (size_t)dpitch, src, (size_t)spitch, (size_t)width, (size_t)height);
     });
 }
