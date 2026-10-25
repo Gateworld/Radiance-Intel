@@ -151,7 +151,17 @@ int table_of(const RadTensor* t, long long cnt, const uint8_t** base, const void
 bool view_ok(const RadEncoding* enc, const int* sel, const RadTensor* pl, int n) {
     /* RADIANCE_XE_NO_PLANES=1: decline, so libr4d's packed row serves (the load A/B of owner note 4) */
     static const bool off = [] { const char* v = std::getenv("RADIANCE_XE_NO_PLANES"); return v && *v == '1'; }();
-    if (off || !enc || !sel || !pl || n != 2) return false;
+    if (off || !enc || !sel || !pl) return false;
+    if (std::getenv("RAD_R4D_TRACE")) {
+        std::fprintf(stderr, "[xe] moe planes layout: %d plane(s)", n);
+        for (int i = 0; i < n; ++i)
+            std::fprintf(stderr, " [%s dtype %u kind %u block %lld,%lld extent %lld,%lld]", enc->plane[sel[i]].role,
+                         (unsigned)pl[i].dtype, (unsigned)enc->plane[sel[i]].kind,
+                         (long long)enc->plane[sel[i]].block[0], (long long)enc->plane[sel[i]].block[1],
+                         (long long)enc->plane[sel[i]].extent[0], (long long)enc->plane[sel[i]].extent[1]);
+        std::fprintf(stderr, "\n");
+    }
+    if (n != 2) return false;
     const RadEncPlane& a = enc->plane[sel[0]];
     const RadEncPlane& b = enc->plane[sel[1]];
     if (!std::strcmp(a.role, "codes") && !std::strcmp(b.role, "table"))
