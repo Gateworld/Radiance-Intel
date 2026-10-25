@@ -47,6 +47,17 @@ static const RadConstraint cXeRouterGemm[] = {
 };
 extern "C" int xe_rad_logits_gemm_i8(const RadArgs* a, RadStream s);
 static const RadConstraint cXeLogitsI8[] = { C_DIV("n_embd", 128), C_IN("dtype", "bf16") };
+extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s);
+extern "C" int xe_moe_planes_layout(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*,
+                                    int, RadLayout*);
+extern "C" int xe_moe_planes_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                                      const RadTensor*, int, void*, int64_t);
+extern "C" int xe_moe_planes_unrelayout(const RadParam*, int, int, const RadEncoding*, const int*, const void*,
+                                        int64_t, const RadTensor*, int);
+static const RadConstraint cXeMoePlanes[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
+    C_EQ("group", 128), C_IN("dtype", "w4nl64a8h"),
+};
 extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
 /* block_size is derived on attn_paged: no EQ here, so the page size is the model's declared one */
@@ -95,6 +106,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cXeLogitsI8), NOTUNE,
   nullptr, nullptr, xe_rad_logits_gemm_i8, nullptr,
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits, nullptr, r4d_rad_unrelayout_i8_logits, nullptr },
+{ "xe_moe_gemm_w4nl64_planes", "moe_gemm_q", "moe",
+  "the w4nl64a8h experts read from their canonical planes, joined (abi/rad_planes.h), as a sub-group "
+  "GEMV: the load copies the experts instead of rearranging them (owner note 4)",
+  "any M; K a multiple of 128, group 128; two classes by parity",
+  "E4M3 activation with an f32 scale per 128 of K; u4 codes into 16 f32 levels, an E4M3 scale per "
+  "row per 64 of K times one f32; bf16 out",
+  RAD_DOMAIN_DEVICE, 60,
+  ROW(cXeMoePlanes), NOTUNE,
+  nullptr, nullptr, xe_rad_moe_gemm_w4p, nullptr,
+  xe_moe_planes_layout, xe_moe_planes_relayout, nullptr, xe_moe_planes_unrelayout, nullptr },
 { "xe_attn_paged_split", "attn_paged", "attn",
   "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "
   "head, f32 online softmax, a merge launch over the splits",
