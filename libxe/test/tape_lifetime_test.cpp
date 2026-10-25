@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     rad_stream_sync(s);
     /* Two long passes against the backend's segment bound (kTapeMaxSegs, 2048 since milestone 2: a
      * decode pass with the mover's table refreshes has ~1,083 segments and must be kept; the engine
-     * keeps prefill-sized passes out by token count). 1,100 segments: kept and played. 2,100 segments:
+     * keeps prefill-sized passes out by token count, n_tok <= 16). 1,100 segments: kept and played. 2,100 segments:
      * the recording stops, the rest runs plainly, the tape is refused -- and every kernel of the
      * pass still ran exactly once. */
     uint32_t* cnt = (uint32_t*)rad_dev_alloc(4096, RAD_MEM_DEVICE);

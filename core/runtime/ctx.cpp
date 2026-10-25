@@ -990,9 +990,11 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
      * the Level Zero backend one ~1,083-segment prefill pass per prompt length filled device memory
      * (milestone 1b, H4). A decode pass has the same segment count when the mover refreshes its
      * tables (one segment per refresh point), so the backend cannot tell them apart by length; the
-     * token count can. Decode and speculative verify are a few tokens; 64 leaves room for wider
-     * drafts. The pass runs plainly, once per key is said so, and it is never retried. */
-    constexpr int64_t kTapeMaxTok = 64;
+     * token count can. Decode and speculative verify are a few tokens (two sequences x four
+     * candidates = 8); 16 leaves room for wider drafts, and keeps a short prompt of every length
+     * from being kept as its own ~1,083-segment tape (K1c kept a 15-token prefill at the earlier
+     * bound of 64). The pass runs plainly, once per key is said so, and it is never retried. */
+    constexpr int64_t kTapeMaxTok = 16;
     if (b->n_tok > kTapeMaxTok) {
         if (std::find(tape_refused_.begin(), tape_refused_.end(), key) == tape_refused_.end()) {
             tape_refused_.push_back(key);
