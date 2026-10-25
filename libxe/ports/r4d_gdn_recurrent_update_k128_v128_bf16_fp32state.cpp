@@ -762,7 +762,7 @@ static int ru_update_launch(
   dim3 grid(N, H, vs), blk(RU_V / vs * 2);
   // Every switch is a template parameter; the nested pick macros enumerate the instantiations.
 #define RU_LAUNCH(AB, NM, VSC, NTC, ANCC, STGC, SDTC)                                         \
-  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<AB, NM, VSC, NTC, ANCC, STGC, SDTC>),   \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<AB, NM, VSC, NTC, ANCC, STGC, SDTC>),   \
                      grid, blk, 0, (hipStream_t)stream,                                       \
                      (const unsigned short*)q, (const unsigned short*)k,                      \
                      (const unsigned short*)v, a, b, ab_stride,                               \
@@ -894,7 +894,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
   while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC)                                                     \
-  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \

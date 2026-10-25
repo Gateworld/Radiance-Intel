@@ -24,6 +24,7 @@
  */
 #pragma once
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>   /* grf_size<256>: launch_as_grf256 */
 
 #include <cmath>     /* before the __expf macro below: glibc's math.h declares __expf */
 #include <math.h>
@@ -261,6 +262,32 @@ sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds
 #pragma clang diagnostic pop
 }
 inline void* dyn_lds() { return sxe::get_work_group_scratch_memory(); }
+
+/* The same launch with the large register file (Intel's grf_size kernel property, 256 GRF a thread
+ * instead of 128: half the threads a core, twice the registers a lane). For a ported kernel whose
+ * per-lane state fits AMD's 256 VGPRs but not Xe's default file -- libr4d's GDN recurrent update
+ * holds 64 state and 64 key floats a lane (207 VGPRs on gfx12, "no spill") and ran 20x slower than
+ * its bandwidth on the B70 (milestone 2 P1b: 303 us a layer). No dynamic work-group memory here:
+ * the property set is the kernel's, and such kernels declare their LDS statically (XE_SHARED). */
+template <auto K, int SG = 32, class... P, class... A>
+sycl::event launch_as_grf256(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, const A&... a) {
+    static_assert(sizeof...(P) == sizeof...(A),
+                  "a kernel argument list must match the kernel's parameter list");
+    /* The property is Intel-GPU-only: the OpenCL CPU device throws at submit (the oracle run of
+     * milestone 2 run 2 aborted on it), so elsewhere this is the plain launch. */
+    static const bool gpu = q.get_device().is_gpu();
+    if (!gpu) return launch_as<K, SG>((void (*)(P...))nullptr, q, g, b, 0, a...);
+    std::tuple<P...> v(static_cast<P>(a)...);
+    const sycl::range<3> local(b.z, b.y, b.x);
+    const sycl::range<3> global((size_t)g.z * b.z, (size_t)g.y * b.y, (size_t)g.x * b.x);
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<3>(global, local),
+                       sxe::properties{sycl::ext::intel::experimental::grf_size<256>},
+                       [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
+                           std::apply([](auto... x) { K(x...); }, v);
+                       });
+    });
+}
 
 }  /* namespace xe */
 
@@ -524,6 +551,9 @@ inline xe_v8s load_tr_b128(const void* p) {
     xe::launch_as<kernel>(kernel, *(q), (grid), (block), (size_t)(lds), __VA_ARGS__)
 #define XE_LAUNCH_SG(sgsize, q, kernel, grid, block, lds, ...) \
     xe::launch_as<kernel, sgsize>(kernel, *(q), (grid), (block), (size_t)(lds), __VA_ARGS__)
+/* hipLaunchKernelGGL's form with the large register file (xe::launch_as_grf256; lds must be 0) */
+#define XE_LAUNCH_GGL_GRF256(kernel, grid, block, lds, stream, ...) \
+    ((void)xe::launch_as_grf256<kernel>(kernel, *((hipStream_t)(stream)), (grid), (block), __VA_ARGS__))
 #define R4D_EMIT(stream, kernel, grid, block, lds, ...) \
     ((void)XE_LAUNCH((hipStream_t)(stream), kernel, grid, block, lds, __VA_ARGS__), 0)
 #define hipLaunchKernelGGL(kernel, grid, block, lds, stream, ...) \
