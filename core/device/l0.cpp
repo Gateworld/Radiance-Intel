@@ -45,6 +45,7 @@
 /* core/device/l0_kernels.sycl (librad_l0k) */
 extern "C" int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes);
 extern "C" void rad_l0k_set_flush(void (*f)(void));
+extern "C" void rad_l0k_set_devices(int n, const sycl::device* (*dev_of)(int), const sycl::context* (*ctx_of)(int));
 
 namespace rad {
 namespace {
@@ -201,13 +202,36 @@ int z_props(int device, RadDeviceProps* out) {
     return RAD_OK;
 }
 
+/* Peer access (milestone 2, two cards): SYCL's peer-access extension over Level Zero. M2b measured
+ * the B70 pair at 24 us an exchange with peer stores against 79 us through a host mailbox. The
+ * devices must share a context (discover) for a peer pointer to be valid. */
 int z_enable_peer(int self, int peer) {
     if (!dev_ok(self, "rad_dev_enable_peer") || !dev_ok(peer, "rad_dev_enable_peer")) return RAD_E_INVAL;
     if (self == peer) return RAD_OK;
-    device_set_error("rad_dev_enable_peer(%d, %d): no peer access in milestone 1 (one card)", self, peer);
-    return RAD_E_UNSUPPORTED;
+    Dev& a = devs()[self];
+    Dev& b = devs()[peer];
+    if (a.cpu || b.cpu) { device_set_error("rad_dev_enable_peer(%d, %d): the CPU device has no peers", self, peer); return RAD_E_UNSUPPORTED; }
+    if (a.ctx != b.ctx) { device_set_error("rad_dev_enable_peer(%d, %d): the cards do not share a context", self, peer); return RAD_E_UNSUPPORTED; }
+    try {
+        if (!a.d.ext_oneapi_can_access_peer(b.d)) {
+            device_set_error("rad_dev_enable_peer(%d, %d): the driver reports no peer access", self, peer);
+            return RAD_E_UNSUPPORTED;
+        }
+        a.d.ext_oneapi_enable_peer_access(b.d);
+    } catch (const sycl::exception& e) {
+        device_set_error("rad_dev_enable_peer(%d, %d): %s", self, peer, e.what());
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
 }
-int z_peer_access(int self, int peer) { return self == peer ? 1 : 0; }
+int z_peer_access(int self, int peer) {
+    if (self == peer) return 1;
+    if (!dev_ok(self, "rad_dev_peer_access") || !dev_ok(peer, "rad_dev_peer_access")) return -1;
+    Dev& a = devs()[self];
+    Dev& b = devs()[peer];
+    if (a.cpu || b.cpu || a.ctx != b.ctx) return 0;
+    try { return a.d.ext_oneapi_can_access_peer(b.d) ? 1 : 0; } catch (const sycl::exception&) { return -1; }
+}
 
 /* ------------------------------------------------------------------ memory */
 void* z_alloc(int64_t bytes, int kind) {
@@ -1171,6 +1195,22 @@ bool discover() {
         }
         if (cpu && !devs().empty()) break;   /* one CPU device */
     }
+    /* Milestone 2 (two cards): every GPU of the platform shares ONE context. Level Zero binds a
+     * USM allocation to its context, so a peer store into another card's memory, the pinned host
+     * pool read zero-copy by both cards and the collectives' mailboxes all need the ranks' devices
+     * in one context; per-device contexts (milestone 1) would make every cross-card pointer
+     * invalid. Peer access itself is granted per ordered pair (z_enable_peer). */
+    if (!cpu && devs().size() > 1) {
+        try {
+            std::vector<sycl::device> all;
+            for (const Dev& D : devs()) all.push_back(D.d);
+            sycl::context shared(all);
+            for (Dev& D : devs()) D.ctx = shared;
+        } catch (const sycl::exception& e) {
+            RAD_WARN("l0: no shared context over the %zu cards (%s): per-card contexts, no peer memory",
+                     devs().size(), e.what());
+        }
+    }
     return !devs().empty();
 }
 
@@ -1189,7 +1229,14 @@ const DeviceBackend* l0_backend_if_present(void) {
             RAD_INFO("device: Level Zero discovery failed: %s", e.what());
             ok = false;
         }
-        if (ok) g = make_backend();
+        if (ok) {
+            g = make_backend();
+            /* kernel libraries that allocate at init (libxe's all-reduce rows) find rank r's
+             * device and the shared context through rad_l0k (l0_kernels.sycl) */
+            rad_l0k_set_devices((int)devs().size(),
+                                [](int i) -> const sycl::device* { return &devs()[i].d; },
+                                [](int i) -> const sycl::context* { return &devs()[i].ctx; });
+        }
     });
     return ok ? &g : nullptr;
 }

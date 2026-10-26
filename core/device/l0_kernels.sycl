@@ -23,6 +23,25 @@ static void (*g_flush)(void) = nullptr;
 extern "C" __attribute__((visibility("default"))) void rad_l0k_set_flush(void (*f)(void)) { g_flush = f; }
 static inline void flush_pending() { if (g_flush) g_flush(); }
 
+/* The backend's devices for kernel libraries that allocate at init (milestone 2: libxe's all-reduce
+ * rows allocate their scratch and flags per rank before load, when they have no stream yet). The
+ * backend registers a provider at startup; a library asks for rank r's device and the context that
+ * every card shares (l0.cpp discover). Null before the backend is up, or past the device count. */
+static const sycl::device*  (*g_dev_of)(int) = nullptr;
+static const sycl::context* (*g_ctx_of)(int) = nullptr;
+static int g_n_dev = 0;
+extern "C" __attribute__((visibility("default")))
+void rad_l0k_set_devices(int n, const sycl::device* (*dev_of)(int), const sycl::context* (*ctx_of)(int)) {
+    g_n_dev = n; g_dev_of = dev_of; g_ctx_of = ctx_of;
+}
+extern "C" __attribute__((visibility("default")))
+int rad_l0k_device(int index, const sycl::device** dev, const sycl::context** ctx) {
+    if (!g_dev_of || !g_ctx_of || index < 0 || index >= g_n_dev) return -1;
+    if (dev) *dev = g_dev_of(index);
+    if (ctx) *ctx = g_ctx_of(index);
+    return 0;
+}
+
 extern "C" __attribute__((visibility("default")))
 int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     if (!args || args->n_seq <= 0) return 0;

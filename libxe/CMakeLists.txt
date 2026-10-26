@@ -19,6 +19,8 @@ target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CM
                            ${CMAKE_SOURCE_DIR}/libr4d)
 # As libr4d: the ops are held bit for bit to unfused chains and to libref's rounding.
 target_compile_options(libxe PRIVATE -ffp-contract=off -Wno-unused-function)
+# milestone 2: the all-reduce rows allocate at init through rad_l0k (rad_l0k_device)
+target_link_libraries(libxe PRIVATE rad_l0k)
 
 if(RAD_BUILD_TESTS)
   # This directory is added before the top level's enable_testing(), so enable it here.
@@ -83,6 +85,18 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_w4_cpu COMMAND xe_moe_w4_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_w4_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Milestone 2, stage 2: the two-rank all_reduce rows (peer stores / host mailbox) through the plugin
+  # entry points, two rank threads, against the host sum; on the CPU device as a ctest, on two GPUs timed.
+  add_executable(xe_allreduce_test test/allreduce_test.cpp)
+  rad_l0_sycl(xe_allreduce_test)
+  target_include_directories(xe_allreduce_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_allreduce_test PRIVATE rad_abi rad_l0k ${CMAKE_DL_LIBS} Threads::Threads)
+  set_target_properties(xe_allreduce_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_allreduce_test libxe)
+  add_test(NAME xe_allreduce_cpu COMMAND xe_allreduce_test $<TARGET_FILE:libxe> 20)
+  # XE_AR_BLOCKS=4: the CPU device (16 cores) must hold both ranks' blocks at once (see xe_allreduce.cpp)
+  set_tests_properties(xe_allreduce_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;XE_AR_BLOCKS=4" TIMEOUT 1800)
   # Milestone 2: device timing of the planes expert GEMV at Flash-Next's decode shapes (dlopen of
   # libxe.so; RADIANCE_XE_MOE_V1=1 for the old kernel). Not a ctest: a bench for card1.
   add_executable(xe_moe_planes_bench test/moe_planes_bench.cpp)

@@ -74,7 +74,38 @@ static const RadConstraint cXeAttnPaged[] = {
     C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3 bf16"),
 };
 
+/* milestone 2, stage 2: all_reduce for two ranks (xe_allreduce.cpp): peer stores, and the host-mailbox
+ * twin for a pair without peer access (the engine selects by the device.p2p fact) */
+extern "C" int xe_ar2_init(const RadParam*, int, int, int, void**);
+extern "C" int xe_ar2_host_init(const RadParam*, int, int, int, void**);
+extern "C" void xe_ar2_fini(void*);
+extern "C" int xe_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_oneshot_2rank_exact_host(const RadArgs* a, RadStream s);
+#define C_P2P { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr }
+static const RadConstraint cXeAr2[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
+};
+static const RadConstraint cXeAr2Host[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+};
+
 static const RadKernelInfo kKernels[] = {
+{ "xe_ar_oneshot_2rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot: each rank stores its payload into the peer's device scratch, a flag a "
+  "block, f32 accumulate in ascending rank order (bit-identical across ranks)",
+  "exactly 2 ranks, peer-accessible (one Level Zero context over both cards); in place or into y; "
+  "32-bit words (an even bf16 count); graph-safe (a device sequence counter)",
+  "bf16 / fp16 / fp32 payload, exact wire",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cXeAr2), NOTUNE,
+  xe_ar2_init, xe_ar2_fini, xe_rad_ar_oneshot_2rank_exact, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_oneshot_2rank_exact_host", "all_reduce", "ar",
+  "the same exchange through a pinned host-memory mailbox (no peer access needed)",
+  "exactly 2 ranks; in place or into y; 32-bit words; graph-safe",
+  "bf16 / fp16 / fp32 payload, exact wire",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
+  ROW(cXeAr2Host), NOTUNE,
+  xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_oneshot_2rank_exact_host, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 #include "ports/all_rows.inc"
 { "xe_gemm_i8a8_gemv", "gemm_nt_q", "gemm",
   "the trunk's W8A8 product as a sub-group GEMV: exact int32 group sums, scaled per (row, 128 K)",
