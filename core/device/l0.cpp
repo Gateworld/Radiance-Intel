@@ -437,6 +437,8 @@ struct Tape {
     size_t ncmds = 0;                  /* commands over every segment */
     int nslot = -1;                    /* the ring slot of the latest play and its serial (tape_idle) */
     uint64_t nserial = 0;
+    std::map<ze_command_list_handle_t, std::pair<int, uint64_t>> nlast;   /* each replayed list's latest play (slot, serial): a
+                                        * list must not be in flight twice; the tape's other lists may (run 20) */
     /* composed stretches: one list per played range (owner note 28's shape), the hybrid's bounded cache;
      * an evicted list is destroyed once the tape's play that followed its eviction has completed */
     std::map<std::pair<int, int>, ze_command_list_handle_t> nstretch;
@@ -750,8 +752,15 @@ bool ze_ready(int d) {
         if (zeEventCreate(Z.pool, &ed, &Z.ring[i].ev) != ZE_RESULT_SUCCESS) { Z.why = "zeEventCreate failed"; return false; }
     }
     /* the backend's own immediate list on the compute queue group */
-    ze_command_queue_desc_t qd{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 0, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
-    if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) { Z.why = "zeCommandListCreateImmediate failed"; return false; }
+    /* in order (run 20, M12): the appended batches execute one after another, so two plays never overlap
+     * on a device whatever the event chain says (a cross-stream wait slot fires with an older play) */
+    ze_command_queue_desc_t qd{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+    if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) {
+        qd.flags = 0;
+        Z.imm = nullptr;
+        if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) { Z.why = "zeCommandListCreateImmediate failed"; return false; }
+        RAD_WARN("l0 tape: the driver refused an in-order immediate list on device %d; plays are ordered by their events alone", d);
+    }
     ze_command_list_handle_t probe = n_list_create(Z, true);
     if (!probe) {
         Z.inorder = false;
@@ -873,10 +882,13 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     const bool host = ntape_sync() == 3;
     /* this tape's lists must not be in flight twice (an in-order list's counter state is one
      * submission's): its previous play first */
-    if (replay && t.submitted && !n_slot_done(t.dev, t.nslot, t.nserial)) {
-        g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
-        n_slot_wait(t.dev, t.nslot, t.nserial, "the same tape's previous play");
-    }
+    if (replay)
+        for (uint32_t i = 0; i < n; ++i) {   /* this list's own previous play (one step ago, as a rule: no wait) */
+            auto it = t.nlast.find(lists[i]);
+            if (it == t.nlast.end() || n_slot_done(t.dev, it->second.first, it->second.second)) continue;
+            g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
+            n_slot_wait(t.dev, it->second.first, it->second.second, "this list's previous play");
+        }
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
     /* the runtime's queue(s) first: a device-side wait on the queue's last event, the sycl::event
@@ -932,6 +944,7 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     t.nslot = slot;
     t.nserial = Z.prev_serial;
     t.submitted = true;
+    if (replay) for (uint32_t i = 0; i < n; ++i) t.nlast[lists[i]] = {slot, Z.prev_serial};
     if (zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) g_sig_early.fetch_add(1, std::memory_order_relaxed);
     if (host) zeEventHostSynchronize(r.ev, UINT64_MAX);
     for (size_t k = 0; k < t.qs.size(); ++k) {

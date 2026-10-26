@@ -52,7 +52,8 @@ namespace intelex = sycl::ext::intel::experimental;
 
 constexpr int      kWG = 256;            /* work-items a block */
 constexpr int      kMaxBlocks = 512;       /* flag words a slot */
-constexpr int      kResidentBlocks = 64;   /* the launch's block cap (see launch) */
+constexpr int      kResidentBlocks = 32;   /* the launch's block cap (see launch); 32 since run 20: two launches
+                                            * overlapping on a card (M12: both engines spinning) must both fit */
 constexpr uint32_t kSpin = 400000000u;   /* bounded wait: minutes at ~0.3 us an uncached poll (XE_AR_SPIN lowers it), never a hung card */
 constexpr int      kMaxRanks = 2;
 
