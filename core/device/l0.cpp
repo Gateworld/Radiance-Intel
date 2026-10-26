@@ -86,6 +86,7 @@ struct L0Stream {
     /* Whether any thread's backend call has named it yet; see t_touched. */
     std::atomic<bool> used{false};
     uint64_t          id = 0;      /* serial, never reused */
+    int               dev = 0;     /* the device it was created on (a tape records one device's streams) */
     explicit L0Stream(sycl::queue&& x) : q(std::move(x)) {}
 };
 std::mutex& stream_mutex() { static std::mutex m; return m; }
@@ -353,6 +354,7 @@ struct Tape {
     std::vector<L0Stream*> qs;         /* the recorded streams, the home stream first */
     std::string refused;
     uint64_t id = 0;                   /* serial, never reused (L0Event::gtape) */
+    int dev = 0;                       /* the device recorded (its graphs and held plays belong to it) */
     /* Fence the other recorded streams around each submission. Cleared at tape_end for a tape
      * with no event records: its lanes are not ordered against each other in a plain pass either,
      * so the fences only cost (two barriers a stretch; b12b: replay 1.66 ms a step against 1.30). */
@@ -562,10 +564,14 @@ int z_tape_begin(void) {
     }
     auto t = std::make_unique<Tape>();
     t->id = ++g_tape_ids;
+    t->dev = t_device;
     {
         std::lock_guard<std::mutex> lk(stream_mutex());
+        /* This device's streams only (TP2, run 9: with two rank threads, each recording its own card,
+         * the other rank's not-yet-used streams were swept into this tape's graph). */
         for (L0Stream* s : streams())
-            if (t_touched.count(s->id) || !s->used.load(std::memory_order_relaxed)) t->qs.push_back(s);
+            if (s->dev == t_device && (t_touched.count(s->id) || !s->used.load(std::memory_order_relaxed)))
+                t->qs.push_back(s);
         for (size_t k = 0; k < t->qs.size(); ++k)
             if (t->qs[k] == t_last) std::swap(t->qs[0], t->qs[k]);
         /* RADIANCE_L0_TAPE_HOME_ONLY=1 (step 5 experiment): record the home stream alone. Valid only
@@ -645,18 +651,23 @@ RadTape z_tape_end(int keep) {
  * held back and the next play of the same tape that starts where it ends extends it: one graph
  * submission a step instead of one a stretch. Anything else that reaches a queue -- every backend
  * call that submits, waits or frees, and the core's own kernels (l0_kernels.sycl, through
- * rad_l0k_set_flush) -- submits the held play first. A held play's error surfaces at that flush. */
+ * rad_l0k_set_flush) -- submits the held play first. A held play's error surfaces at that flush.
+ * One held play per device: a flush submits the current device's. With two rank threads (TP2, run 9)
+ * a single slot had rank 1's first backend call play rank 0's held tape -- composing rank 0's
+ * executable graphs into a graph of rank 1's device, on rank 1's thread -- and the server died of a
+ * SIGSEGV after the first recorded pass (T1 attempt 3). */
 int play_now(Tape& t, int from, int to);
 std::mutex& held_mutex() { static std::mutex m; return m; }
 struct Held { Tape* t = nullptr; int a = 0, b = 0; };
-Held g_held;
-std::atomic<bool> g_have_held{false};
+Held g_held[kMaxDevices];
+std::atomic<bool> g_have_held[kMaxDevices];
 int flush_held() {
-    if (!g_have_held.load(std::memory_order_acquire)) return RAD_OK;
+    const int d = t_device;
+    if (!g_have_held[d].load(std::memory_order_acquire)) return RAD_OK;
     std::lock_guard<std::mutex> lk(held_mutex());
-    const Held h = g_held;
-    g_held = Held{};
-    g_have_held.store(false, std::memory_order_release);
+    const Held h = g_held[d];
+    g_held[d] = Held{};
+    g_have_held[d].store(false, std::memory_order_release);
     return h.t ? play_now(*h.t, h.a, h.b) : RAD_OK;
 }
 /* librad_l0k's hook (it cannot return an error to its caller's caller, so it warns) */
@@ -669,10 +680,11 @@ int z_tape_play(RadTape p, int from, int to) {
     if (!t || from < 0 || to > (int)t->segs.size() || from > to) { device_set_error("tape_play: bad range"); return RAD_E_INVAL; }
     if (from == to) return RAD_OK;
     std::lock_guard<std::mutex> lk(held_mutex());
-    if (g_held.t == t && g_held.b == from) { g_held.b = to; return RAD_OK; }   /* the next stretch */
-    const Held prev = g_held;
-    g_held = Held{t, from, to};
-    g_have_held.store(true, std::memory_order_release);
+    Held& held = g_held[t->dev];
+    if (held.t == t && held.b == from) { held.b = to; return RAD_OK; }   /* the next stretch */
+    const Held prev = held;
+    held = Held{t, from, to};
+    g_have_held[t->dev].store(true, std::memory_order_release);
     return prev.t ? play_now(*prev.t, prev.a, prev.b) : RAD_OK;
 }
 int play_now(Tape& tr, int from, int to) {
@@ -680,7 +692,7 @@ int play_now(Tape& tr, int from, int to) {
     return guarded("tape_play", [&] {
         std::shared_ptr<Exec>& ex = t->stretch[{from, to}];
         if (!ex) {
-            const Dev& D = devs()[t_device];
+            const Dev& D = devs()[t->dev];
             Graph g(D.ctx, D.d);
             /* RADIANCE_L0_TAPE_COMPOSE=record (step 5 experiment): the stretch recorded from a private
              * in-order queue, each segment a sub-graph submission, so the runtime may build an
@@ -733,8 +745,20 @@ int z_tape_diff(RadTape pa, RadTape pb, char* why, int cap) {
     return -1;
 }
 void z_tape_destroy(RadTape p) {
-    if (g_held.t == static_cast<Tape*>(p)) flush_held();
-    release_tape(static_cast<Tape*>(p));   /* freed once its last play has completed */
+    auto* t = static_cast<Tape*>(p);
+    if (!t) return;
+    bool held;
+    {
+        std::lock_guard<std::mutex> lk(held_mutex());
+        held = g_held[t->dev].t == t;
+    }
+    if (held) {   /* its device's held play, whichever thread frees it */
+        const int saved = t_device;
+        t_device = t->dev;
+        (void)flush_held();
+        t_device = saved;
+    }
+    release_tape(t);   /* freed once its last play has completed */
 }
 /* A segment is ordered behind everything before it: an event-kind record, so no overlap is asked. */
 int z_tape_record(RadTape p, int i, int* kind, uint32_t* queue) {
@@ -762,6 +786,7 @@ int z_stream_create(RadStream* out, int high_priority) {
                                    : sycl::property_list{in_order(), enable_profiling()});
         auto* st = new L0Stream(sycl::queue(D.ctx, D.d, async_errors, pl));
         st->id = ++g_stream_ids;
+        st->dev = dev;
         if ((void*)&st->q != (void*)st) { delete st; device_set_error("rad_stream_create: layout"); return RAD_E_STATE; }
         {
             std::lock_guard<std::mutex> lk(stream_mutex());
