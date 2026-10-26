@@ -1303,14 +1303,17 @@ RadTape z_tape_end(int keep) {
  * executable graphs into a graph of rank 1's device, on rank 1's thread -- and the server died of a
  * SIGSEGV after the first recorded pass (T1 attempt 3). */
 int play_now(Tape& t, int from, int to);
-std::mutex& held_mutex() { static std::mutex m; return m; }
+/* One mutex a device (run 19, M11): a process-wide one, held across play_now's host waits, let rank 0's
+ * wait for its own device block rank 1's next play -- the play whose collective rank 0's device was
+ * waiting for (M4/M9/M11: the first decode step of a request's second run stalled for good). */
+std::mutex& held_mutex(int d) { static std::mutex m[kMaxDevices]; return m[d]; }
 struct Held { Tape* t = nullptr; int a = 0, b = 0; };
 Held g_held[kMaxDevices];
 std::atomic<bool> g_have_held[kMaxDevices];
 int flush_held() {
     const int d = t_device;
     if (!g_have_held[d].load(std::memory_order_acquire)) return RAD_OK;
-    std::lock_guard<std::mutex> lk(held_mutex());
+    std::lock_guard<std::mutex> lk(held_mutex(d));
     const Held h = g_held[d];
     g_held[d] = Held{};
     g_have_held[d].store(false, std::memory_order_release);
@@ -1325,7 +1328,7 @@ int z_tape_play(RadTape p, int from, int to) {
     auto* t = static_cast<Tape*>(p);
     if (!t || from < 0 || to > (int)t->segs.size() || from > to) { device_set_error("tape_play: bad range"); return RAD_E_INVAL; }
     if (from == to) return RAD_OK;
-    std::lock_guard<std::mutex> lk(held_mutex());
+    std::lock_guard<std::mutex> lk(held_mutex(t->dev));
     Held& held = g_held[t->dev];
     if (held.t == t && held.b == from) { held.b = to; return RAD_OK; }   /* the next stretch */
     const Held prev = held;
@@ -1704,7 +1707,7 @@ void z_tape_destroy(RadTape p) {
     if (!t) return;
     bool held;
     {
-        std::lock_guard<std::mutex> lk(held_mutex());
+        std::lock_guard<std::mutex> lk(held_mutex(t->dev));
         held = g_held[t->dev].t == t;
     }
     if (held) {   /* its device's held play, whichever thread frees it */
