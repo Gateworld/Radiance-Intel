@@ -85,6 +85,11 @@ extern "C" int xe_rad_ar_gather_2rank(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_ar_gather_2rank_host(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_ar_hc_write_2rank(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_ar_hc_write_2rank_host(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_gather_hc_write_2rank(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_gather_hc_write_2rank_host(const RadArgs* a, RadStream s);
+extern "C" int64_t xe_ar_gather_hc_write_scratch(const RadArgs* a);
+static const RadConstraint cXeArGHcW2[] = { C_EQ("world_size", 2), C_EQ("wire", 0), C_IN("dtype", "bf16"), C_LE("top_k", 32), { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr } };
+static const RadConstraint cXeArGHcW2Host[] = { C_EQ("world_size", 2), C_EQ("wire", 0), C_IN("dtype", "bf16"), C_LE("top_k", 32) };
 static const RadConstraint cXeGather2[] = { C_EQ("world_size", 2), C_IN("dtype", "f32 fp32 i32 bf16 fp16"), { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr } };
 static const RadConstraint cXeGather2Host[] = { C_EQ("world_size", 2), C_IN("dtype", "f32 fp32 i32 bf16 fp16") };
 static const RadConstraint cXeArHcW2[] = { C_EQ("world_size", 2), C_EQ("wire", 0), C_IN("dtype", "bf16"), { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr } };
@@ -144,6 +149,21 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
   ROW(cXeArHcW2Host), NOTUNE,
   xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_hc_write_2rank_host, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_gather_hc_write_2rank", "ar_gather_hc_write", "norm",
+  "libxe's moe_gather into y, then the all-reduce of y (peer stores, exact) and hc_write: three launches, "
+  "the unfused chain's bytes",
+  "exactly 2 ranks, peer-accessible, the exact wire (wire 0); a dense y; scratch as moe_gather's",
+  "bf16 expert rows, f32 expert weights, i32 sorted tokens, bf16 y, inj and h",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cXeArGHcW2), NOTUNE,
+  xe_ar2_init, xe_ar2_fini, xe_rad_ar_gather_hc_write_2rank, xe_ar_gather_hc_write_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_gather_hc_write_2rank_host", "ar_gather_hc_write", "norm",
+  "the same through the pinned host mailbox",
+  "exactly 2 ranks, the exact wire; a dense y; scratch as moe_gather's",
+  "bf16 expert rows, f32 expert weights, i32 sorted tokens, bf16 y, inj and h",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
+  ROW(cXeArGHcW2Host), NOTUNE,
+  xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_gather_hc_write_2rank_host, xe_ar_gather_hc_write_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
 #include "ports/all_rows.inc"
 { "xe_gemm_i8a8_gemv", "gemm_nt_q", "gemm",
   "the trunk's W8A8 product as a sub-group GEMV: exact int32 group sums, scaled per (row, 128 K)",

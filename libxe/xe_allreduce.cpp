@@ -416,7 +416,62 @@ int ar_hc_write_launch(const RadArgs* a, RadStream s, int host_form) {
 }
 
 }  // namespace
+/* libxe's moe_gather (ports/r4d_moe.cpp): y_expert, expert_w, sorted_tok, shared?, shared_gate?, y with
+ * M, n, top_k, dtype, act; scratch M * top_k * 4 bytes */
+extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s);
+extern "C" int64_t r4d_rad_moe_gather_scratch(const RadArgs* a);
+namespace {
 
+/* ar_gather_hc_write (libr4d's fusion, OPS.md): the routed experts' rows summed back to token order
+ * (moe_gather, with the shared arm folded when present) ARE the all-reduce's message, and the gated
+ * residual write follows. Here: libxe's moe_gather into y, then ar_hc_write on y -- three launches. */
+int ar_gather_hc_write_launch(const RadArgs* a, RadStream s, int host_form) {
+    Inst* in = (Inst*)a->instance;
+    if (!in || in->host != host_form) return R4D_NO(RAD_E_STATE);
+    if (a->n_t < 8) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* y = r4d_opt(a, 5);
+    const RadTensor* inj = r4d_opt(a, 6);
+    const RadTensor* h = r4d_opt(a, 7);
+    if (!y || !y->data || !inj || !h) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "wire", 0) != 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0), top_k = r4d_geti_or(a, "top_k", 0);
+    long long M = 0;
+    const long long y_ld = r4d_rows_pitch(y, n, &M);
+    if (n <= 0 || hc <= 0 || top_k <= 0 || M <= 0 || y_ld != n) return R4D_NO(RAD_E_STRIDE);
+    const char* dt = r4d_gets(a, "dtype");
+    const char* act = r4d_gets(a, "act");
+    /* 1. the gather: operands 0..4 and y, with the fused op's scratch */
+    RadTensor tg[6] = { a->t[0], a->t[1], a->t[2], a->t[3], a->t[4], *y };
+    RadParam pg[5]{};
+    int ng = 0;
+    pg[ng].key = "M"; pg[ng].kind = RAD_P_INT; pg[ng].ival = M; ++ng;
+    pg[ng].key = "n"; pg[ng].kind = RAD_P_INT; pg[ng].ival = n; ++ng;
+    pg[ng].key = "top_k"; pg[ng].kind = RAD_P_INT; pg[ng].ival = top_k; ++ng;
+    pg[ng].key = "dtype"; pg[ng].kind = RAD_P_STR; pg[ng].sval = dt; ++ng;
+    if (act) { pg[ng].key = "act"; pg[ng].kind = RAD_P_STR; pg[ng].sval = act; ++ng; }
+    RadArgs ga{};
+    ga.t = tg; ga.n_t = 6; ga.p = pg; ga.n_p = ng; ga.scratch = a->scratch; ga.scratch_bytes = a->scratch_bytes;
+    ga.rank = a->rank; ga.world_size = a->world_size;
+    int rc = r4d_rad_moe_gather(&ga, s);
+    if (rc != RAD_OK) return rc;
+    /* 2. the all-reduce of y in place, 3. hc_write */
+    RadTensor th[3] = { *y, *inj, *h };
+    RadParam ph[5]{};
+    ph[0].key = "n"; ph[0].kind = RAD_P_INT; ph[0].ival = n;
+    ph[1].key = "hc"; ph[1].kind = RAD_P_INT; ph[1].ival = hc;
+    ph[2].key = "world_size"; ph[2].kind = RAD_P_INT; ph[2].ival = 2;
+    ph[3].key = "dtype"; ph[3].kind = RAD_P_STR; ph[3].sval = dt;
+    ph[4].key = "wire"; ph[4].kind = RAD_P_INT; ph[4].ival = 0;
+    RadArgs ha{};
+    ha.t = th; ha.n_t = 3; ha.p = ph; ha.n_p = 5; ha.instance = in; ha.rank = a->rank; ha.world_size = a->world_size;
+    return ar_hc_write_launch(&ha, s, host_form);
+}
+
+}  // namespace
+
+extern "C" int xe_rad_ar_gather_hc_write_2rank(const RadArgs* a, RadStream s) { return ar_gather_hc_write_launch(a, s, 0); }
+extern "C" int xe_rad_ar_gather_hc_write_2rank_host(const RadArgs* a, RadStream s) { return ar_gather_hc_write_launch(a, s, 1); }
+extern "C" int64_t xe_ar_gather_hc_write_scratch(const RadArgs* a) { return r4d_rad_moe_gather_scratch(a); }
 extern "C" int xe_rad_ar_gather_2rank(const RadArgs* a, RadStream s) { return gather_launch(a, s, 0); }
 extern "C" int xe_rad_ar_gather_2rank_host(const RadArgs* a, RadStream s) { return gather_launch(a, s, 1); }
 extern "C" int xe_rad_ar_hc_write_2rank(const RadArgs* a, RadStream s) { return ar_hc_write_launch(a, s, 0); }
