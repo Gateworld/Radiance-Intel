@@ -443,6 +443,7 @@ struct Tape {
     uint64_t nclock = 0;
     struct NDead { ze_command_list_handle_t list; int slot; uint64_t serial; };
     std::deque<NDead> ndead;
+    bool segs_dropped = false;         /* the segment lists went at the first play (the pool's phase 2) */
     ~Tape();
 };
 std::atomic<uint64_t> g_tape_ids{0};
@@ -665,13 +666,15 @@ struct ZeDev {
      * under a barrier that had not consumed it yet (the runtime elides a plain barrier at times), which
      * lost the order (246 wrong rounds of 2000) and hung the lifetime test. `serial` tells a holder of
      * the slot (a tape, a RadEvent) that the slot has moved on, i.e. its play completed long ago. */
+    struct Consumer { int dev; int slot; uint64_t serial; };
     struct Ring {
         ze_event_handle_t ev = nullptr;
-        uint64_t serial = 0;
+        std::atomic<uint64_t> serial{0};   /* read without the lock (n_slot_done): a device never holds its lock while blocking on another's */
         bool used = false;
         std::vector<sycl::event> keep;   /* the runtime's events the play waited on: alive until the slot's reuse, so the runtime cannot recycle them under the device-side wait */
+        std::vector<Consumer> consumers;  /* slots of other devices whose lists wait on this one's event (rad_event_wait across streams): reuse waits for them too */
     };
-    std::vector<Ring> ring;
+    std::unique_ptr<Ring[]> ring;
     size_t next = 0;
     uint64_t serials = 0;
     /* the backend's own immediate command list: every native play runs there, chained by events */
@@ -739,7 +742,7 @@ bool ze_ready(int d) {
     if (all.empty()) all.push_back(Z.dev);
     ze_event_pool_desc_t pd{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, ZE_EVENT_POOL_FLAG_HOST_VISIBLE, kRingEvents};
     if (zeEventPoolCreate(Z.ctx, &pd, (uint32_t)all.size(), all.data(), &Z.pool) != ZE_RESULT_SUCCESS) { Z.why = "zeEventPoolCreate failed"; return false; }
-    Z.ring.resize(kRingEvents);
+    Z.ring = std::make_unique<ZeDev::Ring[]>(kRingEvents);
     for (uint32_t i = 0; i < kRingEvents; ++i) {
         ze_event_desc_t ed{ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, i, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_HOST};
         if (zeEventCreate(Z.pool, &ed, &Z.ring[i].ev) != ZE_RESULT_SUCCESS) { Z.why = "zeEventCreate failed"; return false; }
@@ -774,27 +777,39 @@ void done_wait(ze_event_handle_t done) {
         if (!told && us > 30000000) { told = true; RAD_WARN("l0 tape: a play's completion event has not signalled for 30 s"); }
     }
 }
-/* Takes the next ring slot: once its last play has completed, the event is reset. */
+bool n_slot_done(int dev, int slot, uint64_t serial);
+void n_slot_wait(int dev, int slot, uint64_t serial);
+/* Takes the next ring slot: once its last play has completed -- and every list of another device that
+ * waited on its event has passed that wait -- the event is reset. */
 ZeDev::Ring& ring_take(ZeDev& Z) {
     ZeDev::Ring& r = Z.ring[Z.next];
-    Z.next = (Z.next + 1) % Z.ring.size();
+    Z.next = (Z.next + 1) % kRingEvents;
     if (r.used) {
         done_wait(r.ev);
+        for (const ZeDev::Consumer& c : r.consumers) n_slot_wait(c.dev, c.slot, c.serial);
+        r.consumers.clear();
         zeEventHostReset(r.ev);
         r.used = false;
         r.keep.clear();
     }
-    r.serial = ++Z.serials;
+    r.serial.store(++Z.serials, std::memory_order_release);
     return r;
 }
 /* A play's slot has completed: the slot moved on to a later play (its reuse needed the event), or
- * the event is signalled. */
+ * the event is signalled. Lock-free (a reset racing the query reads "not yet", never "done"). */
 bool n_slot_done(int dev, int slot, uint64_t serial) {
     ZeDev& Z = zedev(dev);
-    std::lock_guard<std::mutex> lk(Z.m);
-    if (slot < 0 || slot >= (int)Z.ring.size()) return true;
+    if (slot < 0 || slot >= (int)kRingEvents || !Z.ring) return true;
     const ZeDev::Ring& r = Z.ring[(size_t)slot];
-    return r.serial != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS;
+    return r.serial.load(std::memory_order_acquire) != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS;
+}
+/* The slot's event for a device-side wait elsewhere, or null when the play has completed. */
+ze_event_handle_t n_slot_event(int dev, int slot, uint64_t serial) {
+    ZeDev& Z = zedev(dev);
+    if (slot < 0 || slot >= (int)kRingEvents || !Z.ring) return nullptr;
+    const ZeDev::Ring& r = Z.ring[(size_t)slot];
+    if (r.serial.load(std::memory_order_acquire) != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) return nullptr;
+    return r.ev;
 }
 void n_slot_wait(int dev, int slot, uint64_t serial) {
     using clock = std::chrono::steady_clock;
@@ -808,8 +823,8 @@ void n_slot_wait(int dev, int slot, uint64_t serial) {
         sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
         if (!told && us > 10000000) {
             told = true;
-            RAD_WARN("l0 tape: waiting 10 s for a play on device %d, slot %d, serial %llu (plays so far %lld)", dev, slot,
-                     (unsigned long long)serial, (long long)g_nplays.load());
+            RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (plays so far %lld)",
+                     t_device, dev, slot, (unsigned long long)serial, (long long)g_nplays.load());
         }
     }
 }
@@ -868,9 +883,9 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
     add_wait(H);
     if (fence) for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
     std::lock_guard<std::mutex> lk(Z.m);
-    if (Z.prev_slot >= 0) {   /* the previous play, unless its slot has moved on (then it completed) */
+    if (Z.prev_slot >= 0) {   /* the previous play (or cross-stream wait), unless its slot has moved on (then it completed) */
         const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
-        if (pr.serial == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS) waits.push_back(pr.ev);
+        if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS) waits.push_back(pr.ev);
     }
     ZeDev::Ring& r = ring_take(Z);
     const ze_result_t rc = append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
@@ -883,18 +898,18 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
     r.keep = std::move(keep);
     g_nplays.fetch_add(1, std::memory_order_relaxed);
     g_nlists_played.fetch_add(n, std::memory_order_relaxed);
-    const int slot = (int)(&r - Z.ring.data());
+    const int slot = (int)(&r - Z.ring.get());
     Z.prev_slot = slot;
-    Z.prev_serial = r.serial;
+    Z.prev_serial = r.serial.load(std::memory_order_relaxed);
     t.nslot = slot;
-    t.nserial = r.serial;
+    t.nserial = Z.prev_serial;
     t.submitted = true;
     if (zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) g_sig_early.fetch_add(1, std::memory_order_relaxed);
     if (host) zeEventHostSynchronize(r.ev, UINT64_MAX);
     for (size_t k = 0; k < (fence ? t.qs.size() : 1); ++k) {
         t.qs[k]->npend_dev = t.dev;
         t.qs[k]->npend_slot = slot;
-        t.qs[k]->npend_serial = r.serial;
+        t.qs[k]->npend_serial = Z.prev_serial;
     }
 }
 /* Events recorded in a native tape's segments: recorded for real after a play as the play's slot. */
@@ -1415,7 +1430,21 @@ int play_now(Tape& tr, int from, int to) {
     if (t->native) {
         return guarded("tape_play", [&] {
             std::vector<ze_command_list_handle_t> lists;
-            const bool compose = compose_mode() != 0 && to - from >= kComposeMin;
+            /* phase 2 of the pool: from the first play on, every range is a composed list; the segment
+             * lists (one a segment, 1,036 a decode pass) go once the recording's own plays have completed */
+            if (compose_mode() != 0 && !t->segs_dropped) {
+                if (t->submitted && !n_slot_done(t->dev, t->nslot, t->nserial)) n_slot_wait(t->dev, t->nslot, t->nserial);
+                int64_t n = 0;
+                for (Seg& s : t->segs)
+                    if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; ++n; }
+                g_nlists_destroyed.fetch_add(n, std::memory_order_relaxed);
+                t->segs_dropped = true;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) < 4)
+                    RAD_INFO("l0 tape %llu: %lld segment list(s) released at the first play; every played range is a composed list from here",
+                             (unsigned long long)t->id, (long long)n);
+            }
+            const bool compose = compose_mode() != 0 && (t->segs_dropped || to - from >= kComposeMin);
             if (compose) {
                 ze_command_list_handle_t& l = t->nstretch[{from, to}];
                 if (!l && !t->nstretch_used.count({from, to})) l = n_compose(*t, from, to);
@@ -1848,8 +1877,40 @@ int z_event_wait(RadStream s, RadEvent ev) {
         b = e->ev;
         zdev = e->zdev; zslot = e->zslot; zserial = e->zserial;
     }
-    if (zdev >= 0) {   /* recorded after a native play: the host waits for the play (the oracle's semantics) */
-        n_slot_wait(zdev, zslot, zserial);
+    if (zdev >= 0) {
+        /* recorded after a native play: a device-side wait on this device's own list (T4: a host wait
+         * here deadlocked the two ranks at 1 CPU -- a stream wait is asynchronous by contract), then a
+         * fresh slot's signal that the stream's next submission settles on and the next play follows */
+        L0Stream& st = S(s);
+        ZeDev& Z = zedev(st.dev);
+        if (!Z.ok || !Z.imm) { n_slot_wait(zdev, zslot, zserial); return RAD_OK; }
+        int slot;
+        uint64_t serial;
+        {
+            std::lock_guard<std::mutex> lk(Z.m);
+            ZeDev::Ring& r = ring_take(Z);
+            slot = (int)(&r - Z.ring.get());
+            serial = r.serial.load(std::memory_order_relaxed);
+        }
+        ze_event_handle_t ev = nullptr;
+        {   /* the source slot, under its own lock alone: still pending -> this slot is its consumer */
+            ZeDev& Y = zedev(zdev);
+            std::lock_guard<std::mutex> lk(Y.m);
+            ev = n_slot_event(zdev, zslot, zserial);
+            if (ev) Y.ring[(size_t)zslot].consumers.push_back(ZeDev::Consumer{st.dev, slot, serial});
+        }
+        if (!ev) return RAD_OK;   /* the play completed meanwhile: no wait (the taken slot stays unused) */
+        std::lock_guard<std::mutex> lk(Z.m);
+        ZeDev::Ring& r = Z.ring[(size_t)slot];
+        ze_result_t rc = zeCommandListAppendWaitOnEvents(Z.imm, 1, &ev);
+        if (rc == ZE_RESULT_SUCCESS) rc = zeCommandListAppendSignalEvent(Z.imm, r.ev);
+        if (rc != ZE_RESULT_SUCCESS) { device_set_error("rad_event_wait: the native wait failed (0x%x)", (unsigned)rc); return RAD_E_DEVICE; }
+        r.used = true;
+        Z.prev_slot = slot;
+        Z.prev_serial = serial;
+        st.npend_dev = st.dev;
+        st.npend_slot = slot;
+        st.npend_serial = serial;
         return RAD_OK;
     }
     return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
