@@ -380,6 +380,11 @@ struct Tape {
     bool segs_released = false;        /* note 27: the segment executables are gone, the stretches stand */
     std::vector<char> covered;         /* note 27: which segments some composed stretch already holds */
     int plays_told = 0;
+    /* the bounded stretch cache (hybrid mode): last-played clock per range, and the evicted executables
+     * with the tape's `last` event at eviction, freed once it has completed */
+    std::map<std::pair<int, int>, uint64_t> stretch_used;
+    uint64_t stretch_clock = 0;
+    std::deque<std::pair<std::shared_ptr<Exec>, sycl::event>> dead_stretch;
 };
 std::atomic<uint64_t> g_tape_ids{0};
 struct Rec {
@@ -708,16 +713,32 @@ int z_tape_play(RadTape p, int from, int to) {
 /* Owner note 27, G2 (run 12): a step plays the pass as dozens of stretches whose ranges change with the
  * mover's refresh points, so composing a stretch graph per range grew the pool without bound (one
  * executable per distinct range; +8 GB of host memory over two requests), and releasing the segment
- * executables made every new range re-finalize its segments (minutes a request). Default now: play the
- * segment executables directly, in order, fenced once at the stretch's ends -- the pool is the segments
- * alone, nothing is composed or re-finalized. RADIANCE_L0_TAPE_COMPOSE=stretch|record = the old modes. */
-bool compose_mode() {
+ * executables made every new range re-finalize its segments (minutes a request). G3 then showed the
+ * other side: playing the ~1,036 segment executables directly bounds the pool (+0.9 GB a card) but costs
+ * ~13 us of device-side gap a submission (40.7 ms a step against 27.2 composed).
+ * Default now, "hybrid": a stretch of kComposeMin segments or more is composed and cached as before, but
+ * the cache is bounded (kMaxStretch entries a tape, least recently played out, freed once its last
+ * submission has completed); shorter stretches play their segment executables directly; the segment
+ * executables stay (they are what a composition reads). RADIANCE_L0_TAPE_COMPOSE=direct|stretch|record
+ * = the other modes (stretch = the old unbounded cache, with the segment release above);
+ * RADIANCE_L0_TAPE_STRETCHES=N sets the bound. */
+constexpr int kComposeMin = 8;
+int compose_mode() {   /* 0 direct, 1 stretch (unbounded), 2 record, 3 hybrid */
     static const int m = [] {
         const char* v = std::getenv("RADIANCE_L0_TAPE_COMPOSE");
-        return !v ? 0 : std::strcmp(v, "record") == 0 ? 2 : std::strcmp(v, "stretch") == 0 ? 1 : 0;
+        if (!v) return 3;
+        if (!std::strcmp(v, "record")) return 2;
+        if (!std::strcmp(v, "stretch")) return 1;
+        if (!std::strcmp(v, "direct")) return 0;
+        return 3;
     }();
-    return m != 0;
+    return m;
 }
+size_t max_stretches() {
+    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_STRETCHES"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)512; }();
+    return n;
+}
+std::atomic<int64_t> g_stretch_composed{0}, g_stretch_evicted{0}, g_plays_direct{0};
 void run_on_home_direct(Tape& t, int from, int to) {
     sycl::queue& H = t.qs[0]->q;
     const bool fence = t.fence && t.qs.size() > 1;
@@ -737,11 +758,30 @@ void run_on_home_direct(Tape& t, int from, int to) {
     if (fence && any)
         for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({t.last});
 }
+/* Frees the evicted stretch executables whose last submission has completed (the tape's `last` at the
+ * time of eviction: everything of the stretch ran before it on the in-order home stream). Past kDeadMax
+ * pending, the oldest is waited for. */
+void reap_stretches(Tape& t, bool all = false) {
+    auto& d = t.dead_stretch;
+    while (!d.empty()) {
+        bool done = true;
+        try { done = d.front().second.get_info<sycl::info::event::command_execution_status>() ==
+                     sycl::info::event_command_status::complete; }
+        catch (const sycl::exception&) { done = true; }
+        if (!done) {
+            if (!all && d.size() <= kDeadMax) break;
+            try { d.front().second.wait(); } catch (const sycl::exception&) {}
+        }
+        d.pop_front();
+    }
+}
 int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
-    if (!compose_mode()) {
+    const int mode = compose_mode();
+    if (mode == 0 || (mode == 3 && to - from < kComposeMin)) {
         return guarded("tape_play", [&] {
             run_on_home_direct(*t, from, to);
+            g_plays_direct.fetch_add(1, std::memory_order_relaxed);
             if (t->plays_told < 6) {
                 ++t->plays_told;
                 RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s), direct", (unsigned long long)t->id, from, to, t->segs.size());
@@ -792,7 +832,7 @@ int play_now(Tape& tr, int from, int to) {
                 }
                 any = (bool)prev;
             }
-            if (any) ex = std::make_shared<Exec>(g.finalize());
+            if (any) { ex = std::make_shared<Exec>(g.finalize()); g_stretch_composed.fetch_add(1, std::memory_order_relaxed); }
         }
         if (ex) run_on_home(*t, *ex);
         if (t->plays_told < 6) {
@@ -800,9 +840,28 @@ int play_now(Tape& tr, int from, int to) {
             RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s)%s", (unsigned long long)t->id, from, to,
                      t->segs.size(), ex ? "" : " (nothing to run)");
         }
-        /* note 27: once composed stretches hold every segment (G1, run 12: a step plays the pass as more
-         * than one stretch, so the full range alone never came) and nothing of the recording still runs
-         * -> release the segment executables (command lists and scratch surfaces) */
+        if (mode == 3) {
+            /* the bounded cache: this stretch is the most recently played; evict the least recent past the
+             * bound, into the graveyard until its last submission (<= t->last, in order) completes */
+            t->stretch_used[{from, to}] = ++t->stretch_clock;
+            while (t->stretch.size() > max_stretches()) {
+                auto lru = t->stretch_used.begin();
+                for (auto it = t->stretch_used.begin(); it != t->stretch_used.end(); ++it)
+                    if (it->second < lru->second) lru = it;
+                auto victim = t->stretch.find(lru->first);
+                if (victim != t->stretch.end()) {
+                    if (victim->second) t->dead_stretch.emplace_back(std::move(victim->second), t->last);
+                    t->stretch.erase(victim);
+                }
+                t->stretch_used.erase(lru);
+                g_stretch_evicted.fetch_add(1, std::memory_order_relaxed);
+            }
+            reap_stretches(*t);
+        }
+        /* note 27, "stretch" mode only: once composed stretches hold every segment (G1, run 12: a step
+         * plays the pass as more than one stretch, so the full range alone never came) and nothing of the
+         * recording still runs -> release the segment executables (command lists and scratch surfaces) */
+        if (mode != 1) return;
         if (t->covered.size() != t->segs.size()) t->covered.assign(t->segs.size(), 0);
         for (int i = from; i < to; ++i) t->covered[(size_t)i] = 1;
         bool all = true;
