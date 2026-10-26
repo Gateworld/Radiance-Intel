@@ -97,6 +97,16 @@ if(RAD_BUILD_TESTS)
   # XE_AR_BLOCKS=4: the CPU device (16 cores) must hold both ranks' blocks at once (see xe_allreduce.cpp)
   set_tests_properties(xe_allreduce_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;XE_AR_BLOCKS=4" TIMEOUT 1800)
+  # Milestone 2, owner note 24: every registered kernel's Level Zero properties (spill = scratch, private
+  # memory, SIMD width); libxe through dlopen, librad_l0k's core kernels through the link.
+  add_executable(xe_kernel_props test/kernel_props.cpp)
+  rad_l0_sycl(xe_kernel_props)
+  target_link_libraries(xe_kernel_props PRIVATE rad_l0k ${CMAKE_DL_LIBS})
+  set_target_properties(xe_kernel_props PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_kernel_props libxe)
+  add_test(NAME xe_kernel_props_cpu COMMAND xe_kernel_props $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_kernel_props_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
   # Milestone 2: device timing of the planes expert GEMV at Flash-Next's decode shapes (dlopen of
   # libxe.so; RADIANCE_XE_MOE_V1=1 for the old kernel). Not a ctest: a bench for card1.
   add_executable(xe_moe_planes_bench test/moe_planes_bench.cpp)
