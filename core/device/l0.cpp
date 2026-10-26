@@ -377,7 +377,9 @@ struct Tape {
      * the home stream): when it is complete, no command buffer of this tape is still running. */
     sycl::event last;
     bool submitted = false;
-    bool segs_released = false;        /* note 27: the segment executables are gone, the stretch stands */
+    bool segs_released = false;        /* note 27: the segment executables are gone, the stretches stand */
+    std::vector<char> covered;         /* note 27: which segments some composed stretch already holds */
+    int plays_told = 0;
 };
 std::atomic<uint64_t> g_tape_ids{0};
 struct Rec {
@@ -749,9 +751,19 @@ int play_now(Tape& tr, int from, int to) {
             if (any) ex = std::make_shared<Exec>(g.finalize());
         }
         if (ex) run_on_home(*t, *ex);
-        /* note 27: the full-pass stretch stands and nothing of the recording still runs -> release the
-         * segment executables (command lists and scratch surfaces) */
-        if (!t->segs_released && !keep_segs() && from == 0 && to == (int)t->segs.size() && ex) {
+        if (t->plays_told < 6) {
+            ++t->plays_told;
+            RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s)%s", (unsigned long long)t->id, from, to,
+                     t->segs.size(), ex ? "" : " (nothing to run)");
+        }
+        /* note 27: once composed stretches hold every segment (G1, run 12: a step plays the pass as more
+         * than one stretch, so the full range alone never came) and nothing of the recording still runs
+         * -> release the segment executables (command lists and scratch surfaces) */
+        if (t->covered.size() != t->segs.size()) t->covered.assign(t->segs.size(), 0);
+        for (int i = from; i < to; ++i) t->covered[(size_t)i] = 1;
+        bool all = true;
+        for (char c : t->covered) if (!c) { all = false; break; }
+        if (!t->segs_released && !keep_segs() && all) {
             bool done = !had;
             if (!done) {
                 try { done = before.get_info<sycl::info::event::command_execution_status>() ==
