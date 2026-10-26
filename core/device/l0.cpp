@@ -345,10 +345,23 @@ using Graph = sx::command_graph<sx::graph_state::modifiable>;
 using Exec  = sx::command_graph<sx::graph_state::executable>;
 
 struct Seg {
-    std::shared_ptr<Exec> ex;          /* null when the segment holds only event records */
+    std::shared_ptr<Exec> ex;          /* null when the segment holds only event records, or released (below) */
+    std::optional<Graph>  g;           /* the recorded (modifiable) graph: re-finalized if a stretch needs it */
     std::vector<L0Event*> evs;         /* recorded for real after it */
     size_t nodes = 0;
 };
+/* Owner note 27 (run 12): a recorded decode pass is ~1,036 segment graphs, each an executable with its
+ * own command list and -- for the 375 kernels that spill -- its own scratch surface (the largest spill a
+ * thread x the hardware threads): ~10 GB a card for one pass (T2). A play composes the segments into
+ * one stretch graph, and in a steady decode step that is the whole pass. Once the full-pass stretch
+ * exists and the recording's own submissions have completed, the segment executables are released
+ * (their modifiable graphs stay, host-side, so another stretch can still be composed by re-finalizing).
+ * RADIANCE_L0_TAPE_KEEP_SEGS=1 keeps them (the A/B). */
+bool keep_segs() {
+    static const bool k = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_KEEP_SEGS"); return v && std::strcmp(v, "1") == 0; }();
+    return k;
+}
+std::atomic<int64_t> g_segs_released{0}, g_segs_refinalized{0};
 struct Tape {
     std::vector<Seg> segs;
     std::map<std::pair<int, int>, std::shared_ptr<Exec>> stretch;
@@ -364,6 +377,7 @@ struct Tape {
      * the home stream): when it is complete, no command buffer of this tape is still running. */
     sycl::event last;
     bool submitted = false;
+    bool segs_released = false;        /* note 27: the segment executables are gone, the stretch stands */
 };
 std::atomic<uint64_t> g_tape_ids{0};
 struct Rec {
@@ -538,6 +552,7 @@ void seg_close() {
     if (sg.nodes) {
         sg.ex = std::make_shared<Exec>(t_rec.g->finalize());
         run_on_home(t, *sg.ex);
+        sg.g.emplace(*t_rec.g);        /* the handle to the recorded graph, for a later re-finalize */
     }
     t_rec.g.reset();
     if (sg.nodes || !sg.evs.empty()) {
@@ -692,9 +707,23 @@ int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
     return guarded("tape_play", [&] {
         std::shared_ptr<Exec>& ex = t->stretch[{from, to}];
+        /* the submission before this play: when it has completed, every earlier command buffer of
+         * the tape (the recording's segment runs included) is done */
+        const bool had = t->submitted;
+        const sycl::event before = t->last;
         if (!ex) {
             const Dev& D = devs()[t->dev];
             Graph g(D.ctx, D.d);
+            /* a released segment executable is re-finalized from its graph for the composition only */
+            std::vector<std::shared_ptr<Exec>> temps;
+            auto seg_exec = [&](int i) -> Exec* {
+                Seg& s = t->segs[(size_t)i];
+                if (s.ex) return s.ex.get();
+                if (!s.g) return nullptr;
+                temps.push_back(std::make_shared<Exec>(s.g->finalize()));
+                g_segs_refinalized.fetch_add(1, std::memory_order_relaxed);
+                return temps.back().get();
+            };
             /* RADIANCE_L0_TAPE_COMPOSE=record (step 5 experiment): the stretch recorded from a private
              * in-order queue, each segment a sub-graph submission, so the runtime may build an
              * in-order command list; default: explicit nodes chained by depends_on. */
@@ -705,14 +734,14 @@ int play_now(Tape& tr, int from, int to) {
                 sycl::queue rq(D.ctx, D.d, sycl::property_list{sycl::property::queue::in_order()});
                 g.begin_recording(rq);
                 for (int i = from; i < to; ++i)
-                    if (t->segs[(size_t)i].ex) { rq.ext_oneapi_graph(*t->segs[(size_t)i].ex); any = true; }
+                    if (Exec* sub = seg_exec(i)) { rq.ext_oneapi_graph(*sub); any = true; }
                 g.end_recording(rq);
             } else {
                 std::optional<sx::node> prev;
                 for (int i = from; i < to; ++i) {
-                    if (!t->segs[(size_t)i].ex) continue;
-                    Exec& sub = *t->segs[(size_t)i].ex;
-                    auto add = [&](sycl::handler& h) { h.ext_oneapi_graph(sub); };
+                    Exec* sub = seg_exec(i);
+                    if (!sub) continue;
+                    auto add = [&](sycl::handler& h) { h.ext_oneapi_graph(*sub); };
                     prev = prev ? g.add(add, sycl::property_list{sx::property::node::depends_on(*prev)}) : g.add(add);
                 }
                 any = (bool)prev;
@@ -720,6 +749,26 @@ int play_now(Tape& tr, int from, int to) {
             if (any) ex = std::make_shared<Exec>(g.finalize());
         }
         if (ex) run_on_home(*t, *ex);
+        /* note 27: the full-pass stretch stands and nothing of the recording still runs -> release the
+         * segment executables (command lists and scratch surfaces) */
+        if (!t->segs_released && !keep_segs() && from == 0 && to == (int)t->segs.size() && ex) {
+            bool done = !had;
+            if (!done) {
+                try { done = before.get_info<sycl::info::event::command_execution_status>() ==
+                             sycl::info::event_command_status::complete; }
+                catch (const sycl::exception&) { done = false; }
+            }
+            if (done) {
+                int64_t n = 0;
+                for (Seg& s : t->segs) if (s.ex) { s.ex.reset(); ++n; }
+                t->segs_released = true;
+                g_segs_released.fetch_add(n, std::memory_order_relaxed);
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) < 4)
+                    RAD_INFO("l0 tape: %lld segment graph(s) released after the full-pass graph (%zu segments, "
+                             "owner note 27); their recorded graphs stay for re-composition", (long long)n, t->segs.size());
+            }
+        }
         std::vector<L0Event*> evs;
         for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
         rerecord(*t, evs);
