@@ -936,8 +936,13 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     }
     r.used = true;
     r.keep = std::move(keep);
-    g_nplays.fetch_add(1, std::memory_order_relaxed);
+    const int64_t np = g_nplays.fetch_add(1, std::memory_order_relaxed) + 1;
     g_nlists_played.fetch_add(n, std::memory_order_relaxed);
+    if (np % 8192 == 0)   /* the pool's shape over a long run (run 23: the replays' host memory growth) */
+        RAD_INFO("l0 tape: %lld plays; lists created %lld, destroyed %lld (alive %lld); stretches composed %lld, evicted %lld; kernel objects %lld",
+                 (long long)np, (long long)g_nlists_created.load(), (long long)g_nlists_destroyed.load(),
+                 (long long)(g_nlists_created.load() - g_nlists_destroyed.load()), (long long)g_nstretch_composed.load(),
+                 (long long)g_nstretch_evicted.load(), (long long)g_nkernels.load());
     const int slot = (int)(&r - Z.ring.get());
     Z.prev_slot = slot;
     Z.prev_serial = r.serial.load(std::memory_order_relaxed);
@@ -1374,7 +1379,8 @@ int compose_mode() {   /* 0 direct, 1 stretch (unbounded), 2 record, 3 hybrid */
     return m;
 }
 size_t max_stretches() {
-    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_STRETCHES"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)512; }();
+    /* 128 since run 23 (milestone 2's measured choice; 512 let the replays' ~50 tapes grow the pool by 0.6 GB/min a card) */
+    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_STRETCHES"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)128; }();
     return n;
 }
 std::atomic<int64_t> g_stretch_composed{0}, g_stretch_evicted{0}, g_plays_direct{0};
