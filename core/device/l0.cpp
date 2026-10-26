@@ -98,6 +98,10 @@ struct L0Stream {
      * asked for, and stays null when the runtime gives a command queue instead. */
     ze_command_list_handle_t zimm = nullptr;
     bool zimm_tried = false;
+    /* A native play this stream's work must follow (the play ran on the backend's own list): the
+     * next submission to the runtime's queue host-waits for it first (settle). */
+    int npend_dev = -1, npend_slot = -1;
+    uint64_t npend_serial = 0;
     explicit L0Stream(sycl::queue&& x) : q(std::move(x)) {}
 };
 std::mutex& stream_mutex() { static std::mutex m; return m; }
@@ -109,12 +113,25 @@ std::atomic<uint64_t> g_stream_ids{0};
  * named from another thread, and the tape came out empty. */
 thread_local std::set<uint64_t> t_touched;
 thread_local L0Stream* t_last = nullptr;
+struct L0Stream;
+bool native_on(const L0Stream& s);
+void settle(L0Stream& s);
 void touch(L0Stream& s) {
     s.used.store(true, std::memory_order_relaxed);
     t_touched.insert(s.id);
     t_last = &s;
 }
 int flush_held();   /* "recorded passes": submits a held tape play */
+/* Every backend entry that may submit on `s`: name it, submit the held play first, then wait on
+ * the host for a native play the stream's work must follow (settle) -- in that order, so a
+ * submission right after a held play follows it (N9: settling before the flush let the bench's sync
+ * return before the play). */
+int enter(L0Stream& s) {
+    touch(s);
+    RAD_TRY(flush_held());
+    if (!native_on(s)) settle(s);
+    return RAD_OK;
+}
 
 /* A gate: a host task on the queue that returns once the host opens it. */
 struct Gate {
@@ -137,6 +154,10 @@ struct L0Event {
     sycl::event gev;
     uint64_t    gtape = 0;
     int         gseg = -1;
+    /* Recorded for real after a native play: that play's ring slot (its `done` event and serial, see
+     * ZeDev::Ring), so a wait on this event is a native barrier and a query reads the event. */
+    int         zdev = -1, zslot = -1;
+    uint64_t    zserial = 0;
 };
 std::mutex& event_mutex() { static std::mutex m; return m; }
 std::set<L0Event*>& events_alive() { static std::set<L0Event*> s; return s; }
@@ -399,10 +420,14 @@ struct Tape {
     /* native tapes (owner note 28): the segments are regular Level Zero command lists */
     bool native = false;
     size_t ncmds = 0;                  /* commands over every segment */
+    int nslot = -1;                    /* the ring slot of the latest play and its serial (tape_idle) */
+    uint64_t nserial = 0;
     ~Tape();
 };
 std::atomic<uint64_t> g_tape_ids{0};
 std::atomic<int64_t> g_nlists_created{0}, g_nlists_destroyed{0}, g_nplays{0}, g_nlists_played{0}, g_nkernels{0};
+std::atomic<int64_t> g_sig_early{0}, g_bar_early{0};
+std::atomic<int64_t> g_same_tape_waits{0};   /* plays that waited for the same tape's previous play (its lists were still in flight) */   /* N4's diagnostic: the ring event / the barrier already complete right after the play's submission */
 Tape::~Tape() {
     for (Seg& s : segs)
         if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
@@ -413,12 +438,10 @@ struct Rec {
     std::vector<L0Event*> pend;        /* its event records */
     int pause = 0;
     bool stopped = false;              /* recording given up: the rest of the pass runs plainly */
-    /* native tapes: the open regular command list, its command count, and each recorded stream's
-     * last event when the segment opened (a submission that bypassed the recorder moves it) */
+    /* native tapes: the open regular command list and its command count */
     bool native = false;
     ze_command_list_handle_t nlist = nullptr;
     size_t ncmds = 0;
-    std::vector<std::optional<sycl::event>> at_open;
 };
 /* A pass longer than this many segments is not kept. Past the bound the recording stops, the rest
  * of the pass is issued plainly, and the tape is refused (the engine runs that pass plain from then
@@ -497,6 +520,7 @@ void real_record(L0Event* e, L0Stream& st) {
     e->ev = b;
     e->recorded = true;
     e->stamped = stamped;
+    e->zdev = -1;
 }
 /* Submits `ex` on the home stream, fenced against the other recorded streams. */
 void run_on_home(Tape& t, Exec& ex) {
@@ -525,8 +549,11 @@ constexpr size_t kDeadMax = 64;
 std::mutex& dead_mutex() { static std::mutex m; return m; }
 std::deque<Tape*>& dead_tapes() { static std::deque<Tape*> d; return d; }
 std::atomic<int64_t> g_tapes_deferred{0}, g_tapes_waited{0}, g_tapes_freed{0};
+bool n_slot_done(int dev, int slot, uint64_t serial);
+void n_slot_wait(int dev, int slot, uint64_t serial);
 bool tape_idle(Tape* t) {
     if (!t->submitted) return true;
+    if (t->native) return n_slot_done(t->dev, t->nslot, t->nserial);
     try {
         return t->last.get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete;
@@ -542,7 +569,8 @@ void reap_tapes(bool all = false) {
         Tape* t = d.front();
         if (!tape_idle(t)) {
             if (!all && d.size() <= kDeadMax) break;
-            try { t->last.wait(); } catch (const sycl::exception&) {}
+            if (t->native) n_slot_wait(t->dev, t->nslot, t->nserial);
+            else { try { t->last.wait(); } catch (const sycl::exception&) {} }
             g_tapes_waited.fetch_add(1, std::memory_order_relaxed);
         }
         d.pop_front();
@@ -579,12 +607,17 @@ void rerecord(Tape& t, const std::vector<L0Event*>& evs) {
  * sycl::event): both directions of the order hold whether or not the runtime's list is driver-in-order.
  * The recorder owns its kernel objects (zeKernelCreate on the kernel's module, by name), so the
  * runtime's kernel argument state is never touched. Refused, with the segment so far run: a kernel the
- * recorder cannot create, an append the driver rejects, and a recorded stream whose last event moved
- * between a segment's open and close (a submission that bypassed the recorder would run once and never
- * replay). Everything else -- the pass key, the held play, the graveyard -- is shared with the graphs. */
+ * recorder cannot create and an append the driver rejects. A direct SYCL submission on a recorded
+ * stream is not caught (see n_seg_close): it runs once and never replays. Everything else -- the pass
+ * key, the held play, the graveyard -- is shared with the graphs. */
 void sleepy_wait(const sycl::event& e);
+bool sleepy_wait_on();
 bool event_done(const sycl::event& e);
 void stop_recording(const std::string& why);
+int ntape_sync();
+/* the sleeping wait's constants (owner note 25; defined here for the native waits above their use) */
+constexpr int64_t kWaitSpinUs = 100;
+constexpr int64_t kWaitSleepMinUs = 20, kWaitSleepMaxUs = 200;
 
 constexpr uint32_t kRingEvents = 256;
 struct NKernel {
@@ -599,9 +632,25 @@ struct ZeDev {
     ze_context_handle_t ctx = nullptr;
     ze_device_handle_t  dev = nullptr;
     ze_event_pool_handle_t pool = nullptr;
-    struct Ring { ze_event_handle_t ev = nullptr; sycl::event dep; bool used = false; };
+    /* A play's slot: `ev` is signalled when the appended lists complete, `done` by the native barrier
+     * that waits on `ev` (the command that joins the lists to the driver's in-order chain). A slot is
+     * reused only once `done` is signalled -- N6: reusing it on a SYCL marker's completion reset `ev`
+     * under a barrier that had not consumed it yet (the runtime elides a plain barrier at times), which
+     * lost the order (246 wrong rounds of 2000) and hung the lifetime test. `serial` tells a holder of
+     * the slot (a tape, a RadEvent) that the slot has moved on, i.e. its play completed long ago. */
+    struct Ring {
+        ze_event_handle_t ev = nullptr;
+        uint64_t serial = 0;
+        bool used = false;
+        std::vector<sycl::event> keep;   /* the runtime's events the play waited on: alive until the slot's reuse, so the runtime cannot recycle them under the device-side wait */
+    };
     std::vector<Ring> ring;
     size_t next = 0;
+    uint64_t serials = 0;
+    /* the backend's own immediate command list: every native play runs there, chained by events */
+    ze_command_list_handle_t imm = nullptr;
+    int prev_slot = -1;                /* the previous play's slot: the next play waits on it */
+    uint64_t prev_serial = 0;
     bool inorder = true;               /* ZE_COMMAND_LIST_FLAG_IN_ORDER accepted; else a barrier before each command */
     std::mutex m;                      /* the ring and the kernel table (plays may come from another thread) */
     std::map<ze_kernel_handle_t, NKernel> kernels;   /* by the runtime's handle */
@@ -654,13 +703,23 @@ bool ze_ready(int d) {
         Z.ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.ctx);
         Z.dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.d);
     } catch (const sycl::exception& e) { Z.why = std::string("no native handles: ") + e.what(); return false; }
+    /* the pool over every card of the context, so another rank's stream can wait on a play's event */
+    std::vector<ze_device_handle_t> all;
+    for (const Dev& X : devs()) {
+        if (X.cpu || X.ctx != D.ctx) continue;
+        try { all.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(X.d)); } catch (const sycl::exception&) {}
+    }
+    if (all.empty()) all.push_back(Z.dev);
     ze_event_pool_desc_t pd{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, ZE_EVENT_POOL_FLAG_HOST_VISIBLE, kRingEvents};
-    if (zeEventPoolCreate(Z.ctx, &pd, 1, &Z.dev, &Z.pool) != ZE_RESULT_SUCCESS) { Z.why = "zeEventPoolCreate failed"; return false; }
+    if (zeEventPoolCreate(Z.ctx, &pd, (uint32_t)all.size(), all.data(), &Z.pool) != ZE_RESULT_SUCCESS) { Z.why = "zeEventPoolCreate failed"; return false; }
     Z.ring.resize(kRingEvents);
     for (uint32_t i = 0; i < kRingEvents; ++i) {
         ze_event_desc_t ed{ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, i, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_HOST};
         if (zeEventCreate(Z.pool, &ed, &Z.ring[i].ev) != ZE_RESULT_SUCCESS) { Z.why = "zeEventCreate failed"; return false; }
     }
+    /* the backend's own immediate list on the compute queue group */
+    ze_command_queue_desc_t qd{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 0, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+    if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) { Z.why = "zeCommandListCreateImmediate failed"; return false; }
     ze_command_list_handle_t probe = n_list_create(Z, true);
     if (!probe) {
         Z.inorder = false;
@@ -670,63 +729,160 @@ bool ze_ready(int d) {
     zeCommandListDestroy(probe);
     g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
     Z.ok = true;
-    RAD_INFO("l0 tape: native Level Zero command lists on device %d (%s lists, a ring of %u signal events)",
+    RAD_INFO("l0 tape: native Level Zero command lists on device %d (%s lists, the backend's own immediate list, a ring of %u signal events)",
              d, Z.inorder ? "in-order" : "barrier-separated", kRingEvents);
     return true;
 }
-/* Takes the next ring event: once the barrier that depended on its last use has completed, it is reset. */
+/* Waits for a slot's `done` event on the host: a short spin, then sleeps (as the sleeping wait). */
+void done_wait(ze_event_handle_t done) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    int64_t sleep_us = kWaitSleepMinUs;
+    bool told = false;
+    while (zeEventQueryStatus(done) != ZE_RESULT_SUCCESS) {
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
+        if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        if (!told && us > 30000000) { told = true; RAD_WARN("l0 tape: a play's completion event has not signalled for 30 s"); }
+    }
+}
+/* Takes the next ring slot: once its last play has completed, the event is reset. */
 ZeDev::Ring& ring_take(ZeDev& Z) {
     ZeDev::Ring& r = Z.ring[Z.next];
     Z.next = (Z.next + 1) % Z.ring.size();
     if (r.used) {
-        if (!event_done(r.dep)) { sleepy_wait(r.dep); r.dep.wait_and_throw(); }
+        done_wait(r.ev);
         zeEventHostReset(r.ev);
-        r.dep = sycl::event();
         r.used = false;
+        r.keep.clear();
     }
+    r.serial = ++Z.serials;
     return r;
 }
-/* Appends `n` closed lists to the tape's home stream, after the stream's last command (and the
- * other recorded streams' when fenced), and leaves the barrier that follows as t.last. */
+/* A play's slot has completed: the slot moved on to a later play (its reuse needed the event), or
+ * the event is signalled. */
+bool n_slot_done(int dev, int slot, uint64_t serial) {
+    ZeDev& Z = zedev(dev);
+    std::lock_guard<std::mutex> lk(Z.m);
+    if (slot < 0 || slot >= (int)Z.ring.size()) return true;
+    const ZeDev::Ring& r = Z.ring[(size_t)slot];
+    return r.serial != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS;
+}
+void n_slot_wait(int dev, int slot, uint64_t serial) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    int64_t sleep_us = kWaitSleepMinUs;
+    bool told = false;
+    while (!n_slot_done(dev, slot, serial)) {
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
+        if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        if (!told && us > 10000000) {
+            told = true;
+            RAD_WARN("l0 tape: waiting 10 s for a play on device %d, slot %d, serial %llu (plays so far %lld)", dev, slot,
+                     (unsigned long long)serial, (long long)g_nplays.load());
+        }
+    }
+}
+/* The stream's next submission to the runtime follows its pending native play: the host waits here. */
+void settle(L0Stream& s) {
+    if (s.npend_slot < 0) return;
+    n_slot_wait(s.npend_dev, s.npend_slot, s.npend_serial);
+    s.npend_slot = -1;
+}
+/* How a play is ordered against the SYCL runtime's own commands (N2-N10, card1). A play runs on the
+ * backend's OWN immediate command list, never the SYCL queue's: appending there perturbed the
+ * runtime (the v2 adapter's queue wait never returned: the lifetime test hung at its first stream
+ * sync) and the runtime's next command did not wait for a native barrier or an imported event under
+ * either adapter (164 wrong rounds of 2000, bursty: the fold saw the previous round or a mix). No
+ * event handle crosses between the runtime and the backend in either direction: before the append
+ * the host waits for the runtime's queue(s) (the sleeping wait; N10: a device-side wait on the
+ * runtime's last event hung once the v1 adapter recycled the event under it), the plays chain on the
+ * backend's own events, and afterwards the stream's next submission to the runtime host-waits for
+ * the play's event, deferred to that submission (settle, from enter and the library launch hook).
+ * That is the host oracle's semantics at the latest moments; in a decode step the queue is idle at
+ * the play (the engine synced to read the token) and the engine syncs again after it.
+ * RADIANCE_L0_NTAPE_SYNC=host waits at once after the play instead (the oracle). */
+int ntape_sync() {   /* 0 the design, 3 the host oracle */
+    static const int m = [] {
+        const char* v = std::getenv("RADIANCE_L0_NTAPE_SYNC");
+        return v && !std::strcmp(v, "host") ? 3 : 0;
+    }();
+    return m;
+}
+/* Appends `n` closed lists to the backend's own immediate list, after the home stream's last
+ * command (and the other recorded streams' when fenced) and after the previous play; marks the
+ * streams so their next runtime submission waits for it. */
 void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
     if (!n) return;
     ZeDev& Z = zedev(t.dev);
     sycl::queue& H = t.qs[0]->q;
-    ze_command_list_handle_t imm = imm_of(*t.qs[0]);
-    if (!imm) throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported), "the home stream has no immediate command list");
     const bool fence = t.fence && t.qs.size() > 1;
+    const bool host = ntape_sync() == 3;
+    /* this tape's lists must not be in flight twice (an in-order list's counter state is one
+     * submission's): its previous play first */
+    if (t.submitted && !n_slot_done(t.dev, t.nslot, t.nserial)) {
+        g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
+        n_slot_wait(t.dev, t.nslot, t.nserial);
+    }
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
+    /* the runtime's queue(s) first, on the host: never a device-side wait on the runtime's event
+     * handles (N10: the v1 adapter recycles them under such a wait) */
     auto add_wait = [&](sycl::queue& q) {
-        std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
-        if (!e) return;
-        try {
-            waits.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*e));
-            keep.push_back(*e);
-        } catch (const sycl::exception&) {
-            e->wait_and_throw();   /* no native handle (a host event): waited for here */
+        if (!host && sleepy_wait_on() && !devs()[t.dev].cpu) {
+            std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
+            if (e) sleepy_wait(*e);
         }
+        q.wait_and_throw();
     };
     add_wait(H);
     if (fence) for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
     std::lock_guard<std::mutex> lk(Z.m);
+    if (Z.prev_slot >= 0) {   /* the previous play, unless its slot has moved on (then it completed) */
+        const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
+        if (pr.serial == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS) waits.push_back(pr.ev);
+    }
     ZeDev::Ring& r = ring_take(Z);
-    const ze_result_t rc = append_fn()(imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
+    const ze_result_t rc = append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
     if (rc != ZE_RESULT_SUCCESS) {
         char msg[96];
         std::snprintf(msg, sizeof msg, "zeCommandListImmediateAppendCommandListsExp: 0x%x (%u lists)", (unsigned)rc, n);
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
     }
+    r.used = true;
+    r.keep = std::move(keep);
     g_nplays.fetch_add(1, std::memory_order_relaxed);
     g_nlists_played.fetch_add(n, std::memory_order_relaxed);
-    sycl::event se = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
-        {r.ev, sycl::ext::oneapi::level_zero::ownership::keep}, H.get_context());
-    t.last = H.ext_oneapi_submit_barrier({se});
+    const int slot = (int)(&r - Z.ring.data());
+    Z.prev_slot = slot;
+    Z.prev_serial = r.serial;
+    t.nslot = slot;
+    t.nserial = r.serial;
     t.submitted = true;
-    r.dep = t.last;
-    r.used = true;
-    if (fence)
-        for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({t.last});
+    if (zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) g_sig_early.fetch_add(1, std::memory_order_relaxed);
+    if (host) zeEventHostSynchronize(r.ev, UINT64_MAX);
+    for (size_t k = 0; k < (fence ? t.qs.size() : 1); ++k) {
+        t.qs[k]->npend_dev = t.dev;
+        t.qs[k]->npend_slot = slot;
+        t.qs[k]->npend_serial = r.serial;
+    }
+}
+/* Events recorded in a native tape's segments: recorded for real after a play as the play's slot. */
+void n_rerecord(Tape& t, const std::vector<L0Event*>& evs) {
+    std::lock_guard<std::mutex> lk(event_mutex());
+    for (L0Event* e : evs) {
+        if (!events_alive().count(e)) continue;
+        std::lock_guard<std::mutex> le(e->m);
+        e->ev = sycl::event();
+        e->recorded = true;
+        e->stamped = false;
+        e->zdev = t.dev;
+        e->zslot = t.nslot;
+        e->zserial = t.nserial;
+    }
 }
 /* The recorder's kernel object for a library's sycl::kernel: its own, from the kernel's module. */
 NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
@@ -766,7 +922,13 @@ void n_sep(ZeDev& Z) {
 }
 /* ---- the hooks (rad_l0_rec.h) */
 int n_hook_device(const void* queue) {
-    if (!native_recording() || !queue) return -1;
+    if (!native_recording() || !queue) {
+        /* a library launch reaches the queue without a backend call: a held tape play goes first
+         * (N3: a play held past the next libxe launch ran after it) */
+        if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
+        if (queue) settle(S((RadStream)queue));
+        return -1;
+    }
     return recorded_stream(S((RadStream)queue)) ? t_rec.t->dev : -1;
 }
 int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
@@ -775,14 +937,19 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     ZeDev& Z = zedev(t_rec.t->dev);
     NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
     if (!nk.k) { n_stop("a library kernel has no Level Zero kernel object"); return -1; }
-    /* the descriptor's layout against the kernel object's: a mismatch is refused, never guessed */
-    const uint32_t want_args = 1u + (kernel->i_lds >= 0 ? 1u : 0u);
+    /* the descriptor's layout against the kernel object's: a mismatch is refused, never guessed. A
+     * launch_config with work_group_scratch_size gives the kernel one implicit trailing argument the
+     * descriptor does not list (N2 on card1: 2 arguments, the descriptor's one by-value parameter):
+     * that is the dynamic local memory, set by size. */
+    int i_lds = kernel->i_lds;
+    uint32_t want_args = 1u + (i_lds >= 0 ? 1u : 0u);
+    if (i_lds < 0 && nk.nargs == 2) { i_lds = 1; want_args = 2; }
     if ((nk.nargs && nk.nargs != want_args) || (kernel->arg0_size && kernel->arg0_size != arg0_size) ||
-        kernel->i_arg0 < 0 || kernel->i_arg0 > 1 || kernel->i_lds > 1 || (lds && kernel->i_lds < 0)) {
+        kernel->i_arg0 < 0 || kernel->i_arg0 > 1 || i_lds > 1 || i_lds == kernel->i_arg0 || (lds && i_lds < 0)) {
         char msg[160];
         std::snprintf(msg, sizeof msg, "a kernel's layout does not match its descriptor (%u arguments, by-value at %d of %u bytes, "
                       "local memory at %d, %zu bytes asked, %zu given)", nk.nargs, kernel->i_arg0, kernel->arg0_size,
-                      kernel->i_lds, lds, arg0_size);
+                      i_lds, lds, arg0_size);
         n_stop(msg);
         return -1;
     }
@@ -794,15 +961,15 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
         n_stop(msg);
         return -1;
     }
-    if (kernel->i_lds >= 0) {
+    if (i_lds >= 0) {
         /* the dynamic work-group memory (kind_dynamic_work_group_memory): a local argument of `lds` bytes */
-        rc = zeKernelSetArgumentValue(nk.k, (uint32_t)kernel->i_lds, lds, nullptr);
+        rc = zeKernelSetArgumentValue(nk.k, (uint32_t)i_lds, lds, nullptr);
         if (rc != ZE_RESULT_SUCCESS) {
             if (!nk.lds_told) {
                 nk.lds_told = true;
                 static std::atomic<int> told{0};
                 if (told.fetch_add(1) < 2)
-                    RAD_WARN("l0 tape: a kernel's local-memory argument %d refused %zu bytes (0x%x)", kernel->i_lds, lds, (unsigned)rc);
+                    RAD_WARN("l0 tape: a kernel's local-memory argument %d refused %zu bytes (0x%x)", i_lds, lds, (unsigned)rc);
             }
             if (lds) { n_stop("the dynamic local memory argument was refused"); return -1; }
         }
@@ -857,8 +1024,6 @@ void seg_open() {
         t_rec.nlist = n_list_create(Z, Z.inorder);
         if (!t_rec.nlist) throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "zeCommandListCreate failed");
         t_rec.ncmds = 0;
-        t_rec.at_open.clear();
-        for (L0Stream* s : t.qs) t_rec.at_open.push_back(s->q.ext_oneapi_get_last_event());
         return;
     }
     const Dev& D = devs()[t_device];
@@ -866,11 +1031,6 @@ void seg_open() {
     std::vector<sycl::queue> qs;
     for (L0Stream* s : t.qs) qs.push_back(s->q);
     t_rec.g->begin_recording(qs);
-}
-bool same_event(const std::optional<sycl::event>& a, const std::optional<sycl::event>& b) {
-    if (!a && !b) return true;
-    if (!a || !b) return false;
-    return *a == *b;
 }
 /* Closes the open native segment: close the list, run it (a play of one list), keep it. */
 void n_seg_close() {
@@ -880,10 +1040,11 @@ void n_seg_close() {
     Seg sg;
     sg.nodes = t_rec.ncmds;
     sg.evs.swap(t_rec.pend);
-    /* a submission that bypassed the recorder on a recorded stream: it ran once, it would never replay */
-    for (size_t k = 0; k < t.qs.size() && k < t_rec.at_open.size(); ++k)
-        if (!same_event(t_rec.at_open[k], t.qs[k]->q.ext_oneapi_get_last_event()))
-            refuse("a submission on recorded stream " + std::to_string(t.qs[k]->id) + " bypassed the native recorder");
+    /* Not detected: a direct SYCL submission on a recorded stream inside the recording. It runs at
+     * once and is absent from the replay (native_tape_test case 5). N2 attempt 2 tried to catch it by
+     * the stream's last event moving between a segment's open and close, but
+     * ext_oneapi_get_last_event on an in-order queue makes a new event (a barrier) on each call, so
+     * the comparison always differed. The engine and libxe submit only through the recorder. */
     if (sg.nodes) {
         const ze_result_t rc = zeCommandListClose(l);
         if (rc != ZE_RESULT_SUCCESS) {
@@ -902,7 +1063,7 @@ void n_seg_close() {
         t.segs.push_back(std::move(sg));
         Seg& kept = t.segs.back();
         if (kept.list) n_play_lists(t, &kept.list, 1);
-        rerecord(t, kept.evs);
+        if (kept.list) n_rerecord(t, kept.evs); else rerecord(t, kept.evs);
     }
 }
 /* Closes the open segment: finalize, run, keep. */
@@ -1169,7 +1330,7 @@ int play_now(Tape& tr, int from, int to) {
             }
             std::vector<L0Event*> evs;
             for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
-            rerecord(*t, evs);
+            if (lists.empty()) rerecord(*t, evs); else n_rerecord(*t, evs);
         });
     }
     const int mode = compose_mode();
@@ -1363,6 +1524,7 @@ int z_stream_create(RadStream* out, int high_priority) {
 void z_stream_destroy(RadStream s) {
     if (!s) return;
     (void)flush_held();
+    settle(S(s));                    /* a native play the stream's work follows: waited for here */
     try { Q(s).wait_and_throw(); }   /* drains rather than discards, as on the host backend */
     catch (const sycl::exception& e) { RAD_WARN("rad_stream_destroy: %s", e.what()); }
     {
@@ -1380,8 +1542,6 @@ void z_stream_destroy(RadStream s) {
  * spin for the sub-100 us completions, then sleeps that grow to kWaitSleepMaxUs -- and only then calls
  * the runtime's wait, which returns at once and surfaces the asynchronous errors. RADIANCE_L0_WAIT=spin
  * restores the plain runtime wait (the A/B). */
-constexpr int64_t kWaitSpinUs = 100;
-constexpr int64_t kWaitSleepMinUs = 20, kWaitSleepMaxUs = 200;
 std::atomic<int64_t> g_wait_polls{0}, g_wait_sleeps{0};
 bool sleepy_wait_on() {
     static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_WAIT"); return !(v && std::strcmp(v, "spin") == 0); }();
@@ -1418,8 +1578,7 @@ int z_stream_sync(RadStream s) {
      * CPU device (an early return, then a runtime abort). device_test's concurrent-sync case still
      * passes on card1 (run b2). The sleeping wait (above) polls the queue's last event first, on a
      * GPU device and a stream that has never been gated; the runtime's wait still follows. */
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (recording()) return seg_cut("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
     const int rc = guarded("rad_stream_sync", [&] {
         if (sleepy_wait_on() && !devs()[S(s).dev].cpu && !S(s).gated.load()) {
@@ -1440,8 +1599,7 @@ int z_stream_gate(RadStream s, void** out) {
     auto g = std::make_shared<Gate>();
     auto* h = new (std::nothrow) GateHandle{g, &S(s)};
     if (!h) return RAD_E_NOMEM;
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     S(s).gated.store(true);   /* before the host task goes on the queue: real_record reads it */
     auto submit = [&] {
         Q(s).submit([&](sycl::handler& cgh) {
@@ -1509,8 +1667,7 @@ int z_event_record(RadEvent ev, RadStream s) {
         return RAD_E_INVAL;
     }
     auto* e = static_cast<L0Event*>(ev);
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (recording()) {
         if (!recorded_stream(S(s))) { refuse("an event record on a stream outside the recording"); }
         else if (t_rec.native) {
@@ -1540,8 +1697,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
         return RAD_E_INVAL;
     }
     auto* e = static_cast<L0Event*>(ev);
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     sycl::event b;
     if (recording()) {
         bool here = false, earlier = false, never = false;
@@ -1563,10 +1719,17 @@ int z_event_wait(RadStream s, RadEvent ev) {
         }
         return seg_cut("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
     }
+    int zdev = -1, zslot = -1;
+    uint64_t zserial = 0;
     {
         std::lock_guard<std::mutex> lk(e->m);
         if (!e->recorded) return RAD_OK;   /* a never-recorded event is no wait, as hipStreamWaitEvent */
         b = e->ev;
+        zdev = e->zdev; zslot = e->zslot; zserial = e->zserial;
+    }
+    if (zdev >= 0) {   /* recorded after a native play: the host waits for the play (the oracle's semantics) */
+        n_slot_wait(zdev, zslot, zserial);
+        return RAD_OK;
     }
     return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
 }
@@ -1578,6 +1741,7 @@ int z_event_query(RadEvent ev) {
     if (pending_here(e)) RAD_TRY(seg_cut("rad_event_query", [] {}));
     std::lock_guard<std::mutex> lk(e->m);
     if (!e->recorded) return 1;
+    if (e->zdev >= 0) return n_slot_done(e->zdev, e->zslot, e->zserial) ? 1 : 0;
     try {
         return e->ev.get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete ? 1 : 0;
@@ -1597,11 +1761,15 @@ int z_event_sync(RadEvent ev) {
     }
     if (pending_here(e)) RAD_TRY(seg_cut("rad_event_sync", [] {}));
     sycl::event b;
+    int zdev = -1, zslot = -1;
+    uint64_t zserial = 0;
     {
         std::lock_guard<std::mutex> lk(e->m);
         if (!e->recorded) return RAD_OK;
         b = e->ev;
+        zdev = e->zdev; zslot = e->zslot; zserial = e->zserial;
     }
+    if (zdev >= 0) { n_slot_wait(zdev, zslot, zserial); return RAD_OK; }
     return guarded("rad_event_sync", [&] {
         if (sleepy_wait_on() && !devs()[t_device].cpu) sleepy_wait(b);
         b.wait_and_throw();
@@ -1649,8 +1817,7 @@ void z_host_wrote(void) { (void)flush_held(); }   /* a held play was issued befo
 /* ------------------------------------------------------------------ copies and fills */
 int z_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_async"));
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (bytes < 0 || (bytes > 0 && (!dst || !src))) {
         device_set_error("rad_memcpy_async: bad arguments (%p, %p, %lld)", dst, src, (long long)bytes);
         return RAD_E_INVAL;
@@ -1662,8 +1829,7 @@ int z_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
 int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch, int64_t width,
                       int64_t height, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_2d_async"));
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (width < 0 || height < 0 || dpitch < width || spitch < width || (width && height && (!dst || !src))) {
         device_set_error("rad_memcpy_2d_async: bad arguments");
         return RAD_E_INVAL;
@@ -1689,8 +1855,7 @@ int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
 
 int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memset_async"));
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (bytes < 0 || (bytes > 0 && !dst)) { device_set_error("rad_memset_async: bad arguments"); return RAD_E_INVAL; }
     if (bytes == 0) return RAD_OK;
     /* As on a HIP card (device.h, contract note 1): the destination must be device-accessible. */
@@ -1712,8 +1877,7 @@ int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
 int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadCopyRange* ranges, int n,
                           RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_ranges_async"));
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (!dst || !src || prefix < 0 || prefix % 16 || n < 0 || (n > 0 && !ranges)) {
         device_set_error("rad_memcpy_ranges_async: bad arguments (the prefix is a multiple of 16)");
         return RAD_E_INVAL;
@@ -1733,8 +1897,7 @@ int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
 
 int z_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_list_async"));
-    touch(S(s));
-    RAD_TRY(flush_held());
+    RAD_TRY(enter(S(s)));
     if (n < 0 || (n > 0 && !segs)) { device_set_error("rad_memcpy_list_async: bad arguments"); return RAD_E_INVAL; }
     for (int i = 0; i < n; ++i)
         if (segs[i].bytes > 0) RAD_TRY(copy_on(s, segs[i].dst, segs[i].src, (size_t)segs[i].bytes));
@@ -1901,8 +2064,9 @@ extern "C" void rad_l0_event_stats(int64_t out[6]) {
 
 /* For tests and the report (owner note 28): out[0] native command lists created, out[1] destroyed,
  * out[2] plays (append calls), out[3] lists appended over every play, out[4] kernel objects created,
- * out[5] 1 when device 0 records natively (2 with in-order lists), 0 otherwise. */
-extern "C" void rad_l0_ntape_stats(int64_t out[6]) {
+ * out[5] 1 when device 0 records natively (2 with in-order lists), 0 otherwise; out[6], out[7] N4's
+ * early-completion counters. */
+extern "C" void rad_l0_ntape_stats(int64_t out[8]) {
     using namespace rad;
     out[0] = g_nlists_created.load();
     out[1] = g_nlists_destroyed.load();
@@ -1911,6 +2075,8 @@ extern "C" void rad_l0_ntape_stats(int64_t out[6]) {
     out[4] = g_nkernels.load();
     const ZeDev& Z = zedev(0);
     out[5] = Z.ok ? (Z.inorder ? 2 : 1) : 0;
+    out[6] = g_sig_early.load();   /* plays whose ring event was already signalled right after the append */
+    out[7] = g_same_tape_waits.load();   /* plays that waited for the same tape's previous play (its lists still in flight) */
 }
 
 /* For tests (owner note 10): out[0] tapes deferred at release because a play was still running,

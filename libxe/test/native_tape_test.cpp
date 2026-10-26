@@ -12,7 +12,8 @@
  *     host sync: a plain launch writes the round's pattern, the tape (copy + transform) plays, a
  *     plain launch folds the result into a checksum, then everything is checked on the host;
  *  4. a tape with an event record: another stream waits on the event and reads what the tape wrote;
- *  5. a direct SYCL submission inside a recording is refused (the tape would replay without it);
+ *  5. a direct SYCL submission inside a recording runs at record time and is absent from the replay
+ *     (the recorder cannot see it; the engine and libxe submit only through it);
  *  6. the counters: every list created is destroyed once the tapes are gone and the stream drained.
  * On the CPU device (RADIANCE_L0_DEVICE=cpu) the backend records SYCL graphs: prints so and passes.
  *
@@ -30,7 +31,7 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void rad_l0_ntape_stats(int64_t out[6]);
+extern "C" void rad_l0_ntape_stats(int64_t out[8]);
 extern "C" void rad_l0_tape_stats(int64_t out[4]);
 
 namespace {
@@ -117,7 +118,7 @@ int main(int argc, char** argv) {
     rad::tape_mark();
     rad::RadTape t = rad::tape_end(true);
     if (!t) { std::printf("native_tape: tape_end refused: %s\n", rad_dev_last_error()); return 1; }
-    int64_t ns[6];
+    int64_t ns[8];
     rad_l0_ntape_stats(ns);
     std::printf("native_tape: device %s, mode %s (lists created %lld, kernels %lld)\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str(),
@@ -153,23 +154,52 @@ int main(int argc, char** argv) {
     rad::tape_mark();
     rad::RadTape t3 = rad::tape_end(true);
     if (!t3) { std::printf("tape_end refused: %s\n", rad_dev_last_error()); return 1; }
-    for (int r = 1; r <= rounds; ++r) {
-        XE_LAUNCH(&q, pattern_kernel, grid, block, 0, x, kN, (uint32_t)r);
-        rad::tape_play(t3, 0, rad::tape_len(t3));
-        XE_LAUNCH(&q, fold_kernel, grid, block, 0, (const uint32_t*)y, kN, sums + r);
+    /* three variants: no sync at all; a host sync between the pattern and the play (so only the
+     * fold's order after the play is tested); a host sync between the play and the fold (so only the
+     * play's order after the pattern is tested) */
+    const char* names3[3] = {"no host sync", "sync before the play (tests the barrier after)", "sync after the play (tests the wait before)"};
+    for (int v = 0; v < 3; ++v) {
+        rad_memset_async(sums, 0, (size_t)(rounds + 1) * 4, s);
+        rad_stream_sync(s);
+        for (int r = 1; r <= rounds; ++r) {
+            XE_LAUNCH(&q, pattern_kernel, grid, block, 0, x, kN, (uint32_t)r);
+            if (v == 1) rad_stream_sync(s);
+            rad::tape_play(t3, 0, rad::tape_len(t3));
+            if (v == 2) rad_stream_sync(s);
+            XE_LAUNCH(&q, fold_kernel, grid, block, 0, (const uint32_t*)y, kN, sums + r);
+        }
+        rad_stream_sync(s);
+        std::vector<uint32_t> hs((size_t)rounds + 1);
+        rad_memcpy_async(hs.data(), sums, (size_t)(rounds + 1) * 4, s);
+        rad_stream_sync(s);
+        /* a wrong checksum's value says what the fold saw: the copy of this round's pattern without the
+         * scale (the play's second list had not run), the previous round's scaled value (the play had not
+         * started), a mix, or something else */
+        int wrong = 0, first = 0, last = 0, blocks[16] = {0}, unscaled = 0, previous = 0, other = 0;
+        uint32_t prev_want = 0;
+        for (int r = 1; r <= rounds; ++r) {
+            uint32_t want = 0, raw = 0;
+            for (int i = 0; i < kN; ++i) { const uint32_t pv = pattern_host(i, (uint32_t)r); want += pv * 5u; raw += pv; }
+            if (hs[(size_t)r] != want) {
+                ++wrong;
+                if (!first) first = r;
+                last = r;
+                if (r / 256 < 16) ++blocks[r / 256];
+                if (hs[(size_t)r] == raw) ++unscaled;
+                else if (hs[(size_t)r] == prev_want) ++previous;
+                else ++other;
+            }
+            prev_want = want;
+        }
+        std::printf("  3%c. %d rounds of plain -> replay -> plain, %s: %d wrong checksum(s)\n", 'a' + v, rounds, names3[v], wrong);
+        if (wrong) {
+            std::printf("  3%c-detail. first wrong round %d, last %d; unscaled copy %d, previous round %d, other %d; per block of 256 rounds:",
+                        'a' + v, first, last, unscaled, previous, other);
+            for (int b = 0; b < 16 && b * 256 <= rounds; ++b) std::printf(" %d", blocks[b]);
+            std::printf("\n");
+        }
+        check(wrong == 0, v == 0 ? "3a. order held" : v == 1 ? "3b. the barrier after holds" : "3c. the wait before holds");
     }
-    rad_stream_sync(s);
-    std::vector<uint32_t> hs((size_t)rounds + 1);
-    rad_memcpy_async(hs.data(), sums, (size_t)(rounds + 1) * 4, s);
-    rad_stream_sync(s);
-    int wrong = 0;
-    for (int r = 1; r <= rounds; ++r) {
-        uint32_t want = 0;
-        for (int i = 0; i < kN; ++i) want += pattern_host(i, (uint32_t)r) * 5u;
-        if (hs[(size_t)r] != want) ++wrong;
-    }
-    std::printf("  3. %d rounds of plain -> replay -> plain with no host sync: %d wrong checksum(s)\n", rounds, wrong);
-    check(wrong == 0, "3. order held");
     rad::tape_destroy(t3);
 
     /* 4. an event record inside the tape; stream 2 waits on it and reads the tape's output */
@@ -201,16 +231,32 @@ int main(int argc, char** argv) {
     rad::tape_destroy(t4);
     rad_event_destroy(ev);
 
-    /* 5. a direct SYCL submission inside the recording: refused */
+    /* 5. the contract for a direct SYCL submission inside the recording: it runs at record time and
+     *    is absent from the replay (the recorder cannot see it; the engine and libxe never make one) */
+    rad_memset_async(y, 0, kN * 4, s);
+    rad_stream_sync(s);
     if (rad::tape_begin() < 0) { std::printf("tape_begin refused: %s\n", rad_dev_last_error()); return 1; }
+    XE_LAUNCH(&q, pattern_kernel, grid, block, 0, x, kN, 5u);
     XE_LAUNCH(&q, scale_kernel, grid, block, 0, (const uint32_t*)x, y, kN, 1u, 0u);
+    rad::tape_mark();
     q.single_task([=] { y[0] = 1u; });
     rad::tape_mark();
     rad::RadTape t5 = rad::tape_end(true);
-    const char* why5 = rad_dev_last_error();
-    std::printf("  5. tape_end after a direct submission: %s (%s)\n", t5 ? "KEPT" : "refused", why5 ? why5 : "");
-    check(t5 == nullptr && why5 && std::strstr(why5, "bypassed"), "5. the bypass is refused");
-    if (t5) rad::tape_destroy(t5);
+    if (!t5) { std::printf("tape_end refused: %s\n", rad_dev_last_error()); return 1; }
+    rad_stream_sync(s);
+    uint32_t y0 = 0;
+    rad_memcpy_async(&y0, y, 4, s);
+    rad_stream_sync(s);
+    const bool ran5 = y0 == 1u;
+    rad_memset_async(y, 0, kN * 4, s);
+    rad::tape_play(t5, 0, rad::tape_len(t5));
+    rad_stream_sync(s);
+    rad_memcpy_async(&y0, y, 4, s);
+    rad_stream_sync(s);
+    std::printf("  5. a direct submission inside the recording: ran at record time %s, in the replay %s\n",
+                ran5 ? "yes" : "NO", y0 == 1u ? "yes" : "no");
+    check(ran5 && y0 == pattern_host(0, 5u), "5. a direct submission runs once and is absent from the replay");
+    rad::tape_destroy(t5);
 
     /* 6. the counters */
     rad_stream_sync(s);
@@ -218,8 +264,10 @@ int main(int argc, char** argv) {
     int64_t ts[4];
     rad_l0_tape_stats(ts);
     rad_l0_ntape_stats(ns);
-    std::printf("  6. lists created %lld destroyed %lld, plays %lld (lists appended %lld), kernel objects %lld; tapes freed %lld, graveyard %lld\n",
-                (long long)ns[0], (long long)ns[1], (long long)ns[2], (long long)ns[3], (long long)ns[4], (long long)ts[2], (long long)ts[3]);
+    std::printf("  6. lists created %lld destroyed %lld, plays %lld (lists appended %lld), kernel objects %lld; tapes freed %lld, graveyard %lld; "
+                "ring event already signalled right after the append %lld, waits for the same tape in flight %lld\n",
+                (long long)ns[0], (long long)ns[1], (long long)ns[2], (long long)ns[3], (long long)ns[4], (long long)ts[2], (long long)ts[3],
+                (long long)ns[6], (long long)ns[7]);
     check(ns[0] == ns[1] && ts[3] == 0, "6. every list destroyed, graveyard empty");
 
     rad_dev_free(x, RAD_MEM_DEVICE); rad_dev_free(y, RAD_MEM_DEVICE); rad_dev_free(y2, RAD_MEM_DEVICE);

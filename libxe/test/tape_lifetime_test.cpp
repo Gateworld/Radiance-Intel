@@ -64,7 +64,9 @@ int main(int argc, char** argv) {
     long long bad = 0, canary_bad = 0, played = 0;
     int64_t st[4], max_dead = 0;
 
+    const bool verbose = std::getenv("RI_VERBOSE") != nullptr;   /* N7: a per-round line, to see where a hang sits */
     for (int r = 0; r < rounds; ++r) {
+        if (verbose) { std::printf("  round %d start\n", r); std::fflush(stdout); }
         /* this round's per-request buffers: fresh allocations (the previous round's are freed) */
         std::vector<uint8_t*> dst((size_t)tapes);
         for (int k = 0; k < tapes; ++k) {
@@ -85,10 +87,13 @@ int main(int argc, char** argv) {
             rad::tape_play(t, 0, rad::tape_len(t));   /* held, then submitted by the next call */
             rad::tape_destroy(t);                      /* no sync: the play may still be running */
             ++played;
+            if (verbose) { std::printf("  round %d tape %d played+destroyed\n", r, k); std::fflush(stdout); }
             rad_l0_tape_stats(st);
             if (st[3] > max_dead) max_dead = st[3];
         }
+        if (verbose) { std::printf("  round %d sync\n", r); std::fflush(stdout); }
         rad_stream_sync(s);
+        if (verbose) { std::printf("  round %d synced\n", r); std::fflush(stdout); }
         for (int k = 0; k < tapes; ++k) {
             q.memcpy(host.data(), dst[(size_t)k], host.size()).wait();
             for (size_t i = 0; i < kCanary; ++i)
