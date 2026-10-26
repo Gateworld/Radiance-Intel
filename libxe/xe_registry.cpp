@@ -81,6 +81,14 @@ extern "C" int xe_ar2_host_init(const RadParam*, int, int, int, void**);
 extern "C" void xe_ar2_fini(void*);
 extern "C" int xe_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s);
 extern "C" int xe_rad_ar_oneshot_2rank_exact_host(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_gather_2rank(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_gather_2rank_host(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_hc_write_2rank(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_ar_hc_write_2rank_host(const RadArgs* a, RadStream s);
+static const RadConstraint cXeGather2[] = { C_EQ("world_size", 2), C_IN("dtype", "f32 fp32 i32 bf16 fp16"), { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr } };
+static const RadConstraint cXeGather2Host[] = { C_EQ("world_size", 2), C_IN("dtype", "f32 fp32 i32 bf16 fp16") };
+static const RadConstraint cXeArHcW2[] = { C_EQ("world_size", 2), C_EQ("wire", 0), C_IN("dtype", "bf16"), { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr } };
+static const RadConstraint cXeArHcW2Host[] = { C_EQ("world_size", 2), C_EQ("wire", 0), C_IN("dtype", "bf16") };
 #define C_P2P { RAD_FACT_P2P, RAD_C_EQ, 1, nullptr }
 static const RadConstraint cXeAr2[] = {
     C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
@@ -106,6 +114,36 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
   ROW(cXeAr2Host), NOTUNE,
   xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_oneshot_2rank_exact_host, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_gather_2rank", "all_gather", "ar",
+  "all-gather for two ranks over the all-reduce's peer-store mailbox: plain concatenation, or row-interleaved "
+  "(`row`) as the vocab-parallel candidate merge reads",
+  "exactly 2 ranks, peer-accessible; 32-bit words (message and row bytes multiples of 4); graph-safe",
+  "f32 / i32 / bf16 / fp16 payload, a byte move",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cXeGather2), NOTUNE,
+  xe_ar2_init, xe_ar2_fini, xe_rad_ar_gather_2rank, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_gather_2rank_host", "all_gather", "ar",
+  "the same through the pinned host mailbox",
+  "exactly 2 ranks; 32-bit words; graph-safe",
+  "f32 / i32 / bf16 / fp16 payload, a byte move",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
+  ROW(cXeGather2Host), NOTUNE,
+  xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_gather_2rank_host, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_hc_write_2rank", "ar_hc_write", "norm",
+  "the all-reduce of y (peer stores, exact) followed by libxe's hc_write on the reduced y: two launches, the "
+  "bytes of the unfused pair",
+  "exactly 2 ranks, peer-accessible, the exact wire (wire 0); a dense y",
+  "bf16 y, inj and h",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cXeArHcW2), NOTUNE,
+  xe_ar2_init, xe_ar2_fini, xe_rad_ar_hc_write_2rank, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_ar_hc_write_2rank_host", "ar_hc_write", "norm",
+  "the same through the pinned host mailbox",
+  "exactly 2 ranks, the exact wire; a dense y",
+  "bf16 y, inj and h",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT - 1,
+  ROW(cXeArHcW2Host), NOTUNE,
+  xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_hc_write_2rank_host, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 #include "ports/all_rows.inc"
 { "xe_gemm_i8a8_gemv", "gemm_nt_q", "gemm",
   "the trunk's W8A8 product as a sub-group GEMV: exact int32 group sums, scaled per (row, 128 K)",
@@ -189,8 +227,42 @@ static const RadPluginInfo kInfo = {
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
-extern "C" int rad_kernel_schema_count(void) { return 0; }
-extern "C" const RadOpSchema* rad_kernel_schema_at(int) { return nullptr; }
+/* Schemas libxe declares WITHOUT a row (milestone 2, stage 2): libr4d's fused collectives, which the
+ * hyperconnection block asks for under tensor parallel (arch/common/rad_block_hc.h). The builder
+ * needs the op's schema to exist to hand back an unresolved handle (0), on which the architecture
+ * emits the plain all_reduce + hc_write pair instead; with no schema at all declare stops ("op has
+ * no declared schema", the TP2 declare of run 7). Field for field libr4d's (r4d_rows.cpp). */
+#define P_INT(k)   { (k), RAD_P_INT, RAD_REQUIRED }
+#define P_INTO(k)  { (k), RAD_P_INT, RAD_OPTIONAL }
+#define P_STR(k)   { (k), RAD_P_STR, RAD_REQUIRED }
+#define P_STRO(k)  { (k), RAD_P_STR, RAD_OPTIONAL }
+static const RadParamSpec pXeArHcWrite[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("world_size"), P_STR("dtype"), P_INTO("wire"),
+};
+static const RadOperandSpec oXeArHcWrite[] = {
+    { "y", RAD_OPD_INOUT, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pXeArGatherHcWrite[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("top_k"), P_INT("world_size"), P_STR("dtype"),
+    P_STRO("act"), P_INTO("wire"),
+};
+static const RadOperandSpec oXeArGatherHcWrite[] = {
+    { "y_expert", RAD_OPD_IN, 0 }, { "expert_w", RAD_OPD_IN, 0 }, { "sorted_tok", RAD_OPD_IN, 0 },
+    { "shared", RAD_OPD_IN, 1 },   { "shared_gate", RAD_OPD_IN, 1 },
+    { "y", RAD_OPD_INOUT, 0 },     { "inj", RAD_OPD_IN, 0 },       { "h", RAD_OPD_INOUT, 0 },
+};
+static const RadOpSchema kSchemas[] = {
+    { "ar_hc_write", ROW(pXeArHcWrite), ROW(oXeArHcWrite),
+      "libr4d's fused all-reduce + gated residual write; declared here so the op is known and "
+      "unresolved on the Intel build, where the architecture then emits all_reduce + hc_write" },
+    { "ar_gather_hc_write", ROW(pXeArGatherHcWrite), ROW(oXeArGatherHcWrite),
+      "libr4d's fused moe_gather + all-reduce + hc_write; declared, not served (see ar_hc_write)" },
+};
+static const int kNumSchemas = (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
+extern "C" int rad_kernel_schema_count(void) { return kNumSchemas; }
+extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
+    return (i >= 0 && i < kNumSchemas) ? &kSchemas[i] : nullptr;
+}
 extern "C" int rad_kernel_count(void) { return kNumKernels; }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     return (i >= 0 && i < kNumKernels) ? &kKernels[i] : nullptr;

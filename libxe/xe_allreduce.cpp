@@ -96,7 +96,7 @@ int dtype_of(const char* s) {
     if (!s) return -1;
     if (!std::strcmp(s, "bf16")) return 0;
     if (!std::strcmp(s, "fp16") || !std::strcmp(s, "f16")) return 1;
-    if (!std::strcmp(s, "fp32") || !std::strcmp(s, "f32")) return 2;
+    if (!std::strcmp(s, "fp32") || !std::strcmp(s, "f32") || !std::strcmp(s, "i32")) return 2;
     return -1;
 }
 int64_t elem_bytes(int dt) { return dt == 2 ? 4 : 2; }
@@ -145,8 +145,10 @@ int ar_init(const RadParam* p, int n_p, int rank, int world, int host, void** ou
     if (world != 2 || rank < 0 || rank > 1) return RAD_E_SHAPE;
     const long long ws = rad_param_geti(p, n_p, "world_size", world);
     if (ws != world) return RAD_E_SHAPE;
-    /* the message bound: the ranged `numel` arrives collapsed to its ceiling at init */
-    const long long numel = rad_param_getdim(p, n_p, "numel", 0);
+    /* the message bound: the ranged `numel` collapsed to its ceiling at init (all_reduce,
+     * all_gather), or M's ceiling times n (ar_hc_write, which declares M and n instead) */
+    long long numel = rad_param_getdim(p, n_p, "numel", 0);
+    if (numel <= 0) numel = rad_param_getdim(p, n_p, "M", 0) * rad_param_getdim(p, n_p, "n", 0);
     if (numel <= 0) return RAD_E_INVAL;
     const int dt = dtype_of(rad_param_gets(p, n_p, "dtype", nullptr));
     if (dt < 0) return RAD_E_DTYPE;
@@ -296,7 +298,129 @@ int launch(const RadArgs* a, RadStream s, int host_form) {
     return RAD_OK;
 }
 
+
+/* all_gather for two ranks, in 32-bit words: rank r's contribution lands at y[r * nel + i] (plain), or
+ * at y[(i / row) * (2 * row) + r * row + i % row] (row-interleaved, libref's ref_all_gather), for
+ * i in [0, nel). The peer's contribution comes through the same double-buffered slots and flags
+ * as the all-reduce. */
+void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots,
+                   uint32_t* my_slots, uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr,
+                   uint32_t n32, uint32_t row32, uint32_t slot_words, uint32_t rank, uint32_t nblk,
+                   uint32_t spin) {
+    const uint32_t b = blockIdx.x, t = threadIdx.x;
+    const uint32_t s = uc_ld(seq_ctr) + 1u;
+    const uint32_t par = s & 1u;
+    uint32_t* out = peer_slots + par * slot_words;
+    const uint32_t* in = my_slots + par * slot_words;
+    const uint32_t per = (n32 + nblk - 1) / nblk;
+    const uint32_t w0 = b * per, w1 = (w0 + per < n32) ? w0 + per : n32;
+    for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st(out + k, x[k]);
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    __syncthreads();
+    if (t == 0) { uc_st(peer_flags + par * kMaxBlocks + b, s); sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system); }
+    const uint32_t* fp = my_flags + par * kMaxBlocks + b;
+    uint32_t budget = spin, ok = 1;
+    for (;;) {
+        const uint32_t f = uc_ld(fp);
+        if ((f - s) <= 0x7fffffffu) break;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        if (--budget == 0) { ok = 0; break; }
+    }
+    if (!ok) { if (t == 0) uc_st(seq_ctr + 1, s); return; }
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    const uint32_t peer = rank ^ 1u;
+    const bool inter = row32 > 0 && row32 < n32;
+    for (uint32_t k = w0 + t; k < w1; k += kWG) {
+        const uint32_t om = inter ? (k / row32) * (2u * row32) + rank * row32 + (k % row32) : rank * n32 + k;
+        const uint32_t op = inter ? (k / row32) * (2u * row32) + peer * row32 + (k % row32) : peer * n32 + k;
+        y[om] = x[k];
+        y[op] = uc_ld(in + k);
+    }
+    __syncthreads();
+    if (t == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> arr(seq_ctr[2]);
+        if (arr.fetch_add(1u) + 1u == nblk) { arr.store(0u); uc_st(seq_ctr, s); }
+    }
+}
+
+int gather_launch(const RadArgs* a, RadStream s, int host_form) {
+    Inst* in = (Inst*)a->instance;
+    if (!in || in->host != host_form) return R4D_NO(RAD_E_STATE);
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !x->data || !y || !y->data) return R4D_NO(RAD_E_INVAL);
+    const long long nel = r4d_geti_or(a, "numel", r4d_numel(x));
+    if (nel <= 0 || nel > in->numel) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(x) < nel || r4d_numel(y) < 2 * nel) return R4D_NO(RAD_E_SHAPE);
+    const int64_t esz = rad_dtype_bits(x->dtype) / 8;
+    if (esz <= 0 || x->dtype != y->dtype) return R4D_NO(RAD_E_DTYPE);
+    const long long row = r4d_geti_or(a, "row", 0);
+    if (row < 0 || (row > 0 && nel % row)) return R4D_NO(RAD_E_SHAPE);
+    if ((nel * esz) % 4 || (row * esz) % 4) return R4D_NO(RAD_E_SHAPE);   /* 32-bit words */
+    if (((uintptr_t)x->data | (uintptr_t)y->data) % 4) return R4D_NO(RAD_E_STRIDE);
+    const uint32_t n32 = (uint32_t)(nel * esz / 4), row32 = (uint32_t)(row * esz / 4);
+    uint32_t nblk = (n32 + 4 * kWG - 1) / (4 * kWG);
+    if (nblk < 1) nblk = 1;
+    if (nblk > (uint32_t)kResidentBlocks) nblk = kResidentBlocks;
+    static const long env_blocks = [] { const char* v = std::getenv("XE_AR_BLOCKS"); return v ? std::strtol(v, nullptr, 10) : 0L; }();
+    if (env_blocks > 0 && env_blocks <= kMaxBlocks) nblk = (uint32_t)env_blocks;
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        XE_LAUNCH(q, gather_kernel, dim3(nblk), dim3(kWG), 0, (const uint32_t*)x->data, (uint32_t*)y->data,
+                  (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, in->my_flags, in->my_seq,
+                  n32, row32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk, spin_budget());
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
+
 }  // namespace
+/* libxe's hc_write (ports/r4d_hc_bf16.cpp): y, inj, h with M, n, hc, dtype */
+extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream);
+namespace {
+
+/* ar_hc_write (libr4d's fused all-reduce + gated residual write, OPS.md): the all-reduce of y in
+ * place over M * n elements, then libxe's hc_write on the reduced y. Two launches on the stream; the
+ * same bytes as the pair the architecture would otherwise issue. */
+int ar_hc_write_launch(const RadArgs* a, RadStream s, int host_form) {
+    Inst* in = (Inst*)a->instance;
+    if (!in || in->host != host_form) return R4D_NO(RAD_E_STATE);
+    const RadTensor* y = r4d_opt(a, 0);
+    const RadTensor* inj = r4d_opt(a, 1);
+    const RadTensor* h = r4d_opt(a, 2);
+    if (!y || !y->data || !inj || !h) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "wire", 0) != 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0);
+    long long M = 0;
+    const long long y_ld = r4d_rows_pitch(y, n, &M);
+    if (n <= 0 || hc <= 0 || M <= 0 || y_ld != n) return R4D_NO(RAD_E_STRIDE);   /* a dense message */
+    RadTensor xt = *y;
+    RadParam p[3]{};
+    p[0].key = "world_size"; p[0].kind = RAD_P_INT; p[0].ival = 2;
+    p[1].key = "numel"; p[1].kind = RAD_P_INT; p[1].ival = M * n;
+    p[2].key = "dtype"; p[2].kind = RAD_P_STR; p[2].sval = r4d_gets(a, "dtype");
+    RadArgs ar{};
+    ar.t = &xt; ar.n_t = 1; ar.p = p; ar.n_p = 3; ar.instance = in; ar.rank = a->rank; ar.world_size = a->world_size;
+    const int rc = launch(&ar, s, host_form);
+    if (rc != RAD_OK) return rc;
+    RadTensor t3[3] = { *y, *inj, *h };
+    RadParam q[4]{};
+    q[0].key = "M"; q[0].kind = RAD_P_INT; q[0].ival = M;
+    q[1].key = "n"; q[1].kind = RAD_P_INT; q[1].ival = n;
+    q[2].key = "hc"; q[2].kind = RAD_P_INT; q[2].ival = hc;
+    q[3].key = "dtype"; q[3].kind = RAD_P_STR; q[3].sval = r4d_gets(a, "dtype");
+    RadArgs hw{};
+    hw.t = t3; hw.n_t = 3; hw.p = q; hw.n_p = 4; hw.rank = a->rank; hw.world_size = a->world_size;
+    return r4d_rad_hc_write(&hw, s);
+}
+
+}  // namespace
+
+extern "C" int xe_rad_ar_gather_2rank(const RadArgs* a, RadStream s) { return gather_launch(a, s, 0); }
+extern "C" int xe_rad_ar_gather_2rank_host(const RadArgs* a, RadStream s) { return gather_launch(a, s, 1); }
+extern "C" int xe_rad_ar_hc_write_2rank(const RadArgs* a, RadStream s) { return ar_hc_write_launch(a, s, 0); }
+extern "C" int xe_rad_ar_hc_write_2rank_host(const RadArgs* a, RadStream s) { return ar_hc_write_launch(a, s, 1); }
 
 extern "C" int xe_ar2_init(const RadParam* p, int n_p, int rank, int world, void** out) { return ar_init(p, n_p, rank, world, 0, out); }
 extern "C" int xe_ar2_host_init(const RadParam* p, int n_p, int rank, int world, void** out) { return ar_init(p, n_p, rank, world, 1, out); }

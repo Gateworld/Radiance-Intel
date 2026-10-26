@@ -200,6 +200,64 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 2; ++r) { sycl::free(x[r], q[r]); sycl::free(yb[r], q[r]); fini(inst[r]); }
         }
     }
+    /* all_gather (xe_ar_gather_2rank): f32 words, plain and row-interleaved, both forms; y is [2 * numel]
+     * with rank r's x at r * numel (plain) or at (i / row) * (2 row) + r * row + i % row. */
+    LaunchFn glaunch[2] = { (LaunchFn)dlsym(h, "xe_rad_ar_gather_2rank"), (LaunchFn)dlsym(h, "xe_rad_ar_gather_2rank_host") };
+    if (!glaunch[0] || !glaunch[1]) { std::printf("allreduce_test: gather symbols missing\n"); all_ok = false; }
+    const struct { int64_t numel, row; } gcases[] = { { 128, 16 }, { 352, 44 }, { 16384, 2048 }, { 2560, 0 } };
+    for (int form = 0; form < 2 && glaunch[0] && glaunch[1]; ++form) {
+        if (!cpu && form == 0 && !(g_dev[0].ext_oneapi_can_access_peer(g_dev[1]))) continue;
+        for (const auto& gc : gcases) {
+            const int64_t bytes = gc.numel * 4;
+            void* inst[2] = { nullptr, nullptr };
+            int irc[2] = { 0, 0 };
+            RadParam p[4]{};
+            p[0].key = "world_size"; p[0].kind = RAD_P_INT; p[0].ival = 2;
+            p[1].key = "numel"; p[1].kind = RAD_P_INT; p[1].ival = gc.numel;
+            p[2].key = "dtype"; p[2].kind = RAD_P_STR; p[2].sval = "f32";
+            p[3].key = "row"; p[3].kind = RAD_P_INT; p[3].ival = gc.row;
+            {
+                std::thread t0([&] { irc[0] = init[form](p, 4, 0, 2, &inst[0]); });
+                std::thread t1([&] { irc[1] = init[form](p, 4, 1, 2, &inst[1]); });
+                t0.join(); t1.join();
+            }
+            if (irc[0] != RAD_OK || irc[1] != RAD_OK) { std::printf("RESULT allgather %s numel %lld: init failed\n", form ? "host" : "peer", (long long)gc.numel); all_ok = false; continue; }
+            float *x[2], *y[2];
+            std::vector<float> hx[2];
+            for (int r = 0; r < 2; ++r) {
+                x[r] = sycl::malloc_device<float>(gc.numel, q[r]); y[r] = sycl::malloc_device<float>(2 * gc.numel, q[r]);
+                hx[r].resize(gc.numel);
+                for (int64_t i = 0; i < gc.numel; ++i) hx[r][i] = (float)(r * 1000000 + i);
+                q[r].memcpy(x[r], hx[r].data(), bytes).wait();
+                q[r].memset(y[r], 0xff, 2 * bytes).wait();
+            }
+            int lrc[2] = { 0, 0 };
+            std::thread th[2];
+            for (int r = 0; r < 2; ++r) th[r] = std::thread([&, r] {
+                RadTensor t[2]{};
+                t[0].data = x[r]; t[0].dtype = RAD_F32; t[0].rank = 1; t[0].shape[0] = gc.numel; t[0].stride[0] = 1;
+                t[1].data = y[r]; t[1].dtype = RAD_F32; t[1].rank = 1; t[1].shape[0] = 2 * gc.numel; t[1].stride[0] = 1;
+                RadArgs a{};
+                a.t = t; a.n_t = 2; a.p = p; a.n_p = 4; a.instance = inst[r]; a.rank = r; a.world_size = 2;
+                lrc[r] = glaunch[form](&a, (RadStream)&q[r]);
+                q[r].wait();
+            });
+            th[0].join(); th[1].join();
+            bool ok = lrc[0] == RAD_OK && lrc[1] == RAD_OK;
+            for (int r = 0; r < 2 && ok; ++r) {
+                std::vector<float> hy(2 * gc.numel);
+                q[r].memcpy(hy.data(), y[r], 2 * bytes).wait();
+                for (int src = 0; src < 2 && ok; ++src)
+                    for (int64_t i = 0; i < gc.numel; ++i) {
+                        const int64_t o = (gc.row > 0 && gc.row < gc.numel) ? (i / gc.row) * (2 * gc.row) + src * gc.row + (i % gc.row) : src * gc.numel + i;
+                        if (hy[o] != hx[src][i]) { std::printf("  gather rank %d: y[%lld] = %g, want %g (src %d i %lld)\n", r, (long long)o, hy[o], hx[src][i], src, (long long)i); ok = false; break; }
+                    }
+            }
+            std::printf("RESULT allgather %-4s numel %6lld row %5lld: %s\n", form ? "host" : "peer", (long long)gc.numel, (long long)gc.row, ok ? "PASS" : "FAIL");
+            all_ok &= ok;
+            for (int r = 0; r < 2; ++r) { sycl::free(x[r], q[r]); sycl::free(y[r], q[r]); fini(inst[r]); }
+        }
+    }
     std::printf("CANARIES %d broken\nRESULT allreduce_test %s\n", canary_bad, all_ok && !canary_bad ? "PASS" : "FAIL");
     return all_ok && !canary_bad ? 0 : 1;
 }
