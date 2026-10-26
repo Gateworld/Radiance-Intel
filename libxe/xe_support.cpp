@@ -8,6 +8,7 @@
 
 #include "r4d.h"
 #include "r4d_args.h"
+#include "rad_l0_rec.h"
 
 /* r4d_rows.cpp's tuned-key reads for the ported units: the key if the call carries it, else the
  * default of libr4d's tunable table (tTopk: nch 0, pt1 8), as tune_i does. */
@@ -43,6 +44,11 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
     if (!width || !height) return 0;
     try {
         sycl::queue& q = *reinterpret_cast<sycl::queue*>(stream);
+        /* the native recording (owner note 28): the copy engine's region copy in the command list */
+        if (rad_l0k_rec_device && rad_l0k_rec_copy2d && rad_l0k_rec_device(&q) >= 0 &&
+            rad_l0k_rec_copy2d(&q, (void*)dst, (size_t)dpitch, (const void*)src, (size_t)spitch, (size_t)width,
+                               (size_t)height) == 0)
+            return 0;
         if (q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
             uint8_t* d = (uint8_t*)dst;
             const uint8_t* s = (const uint8_t*)src;

@@ -16,15 +16,21 @@
  * backend: device rows run on it). RADIANCE_L0=0 turns the backend off.
  *
  * Compiled only in the Level Zero build (RAD_HAVE_L0, cmake/RadL0.cmake); elsewhere this file is empty.
- * Tapes are SYCL command graphs (see "recorded passes"). Left null (supported, see device.h): elastic memory, the expert prefetch, gates, link holds,
- * code-object checks.
+ * Tapes are direct Level Zero command lists on a card (see "native tapes", owner note 28) and SYCL
+ * command graphs on the CPU device or with RADIANCE_L0_TAPE=graph (see "recorded passes"). Left null
+ * (supported, see device.h): elastic memory, the expert prefetch, gates, link holds, code-object checks.
  */
 #if defined(RAD_HAVE_L0) && RAD_HAVE_L0
 
 #include "device.h"
 #include "../rad_internal.h"
+#include "rad_l0_rec.h"
 
+#include <level_zero/ze_api.h>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +94,10 @@ struct L0Stream {
     std::atomic<bool> used{false};
     uint64_t          id = 0;      /* serial, never reused */
     int               dev = 0;     /* the device it was created on (a tape records one device's streams) */
+    /* The queue's native handle, an immediate command list (native tapes append to it); null until
+     * asked for, and stays null when the runtime gives a command queue instead. */
+    ze_command_list_handle_t zimm = nullptr;
+    bool zimm_tried = false;
     explicit L0Stream(sycl::queue&& x) : q(std::move(x)) {}
 };
 std::mutex& stream_mutex() { static std::mutex m; return m; }
@@ -348,7 +358,8 @@ struct Seg {
     std::shared_ptr<Exec> ex;          /* null when the segment holds only event records, or released (below) */
     std::optional<Graph>  g;           /* the recorded (modifiable) graph: re-finalized if a stretch needs it */
     std::vector<L0Event*> evs;         /* recorded for real after it */
-    size_t nodes = 0;
+    size_t nodes = 0;                  /* graph nodes, or a native segment's commands */
+    ze_command_list_handle_t list = nullptr;   /* native tapes: the segment's closed regular command list */
 };
 /* Owner note 27 (run 12): a recorded decode pass is ~1,036 segment graphs, each an executable with its
  * own command list and -- for the 375 kernels that spill -- its own scratch surface (the largest spill a
@@ -385,14 +396,29 @@ struct Tape {
     std::map<std::pair<int, int>, uint64_t> stretch_used;
     uint64_t stretch_clock = 0;
     std::deque<std::pair<std::shared_ptr<Exec>, sycl::event>> dead_stretch;
+    /* native tapes (owner note 28): the segments are regular Level Zero command lists */
+    bool native = false;
+    size_t ncmds = 0;                  /* commands over every segment */
+    ~Tape();
 };
 std::atomic<uint64_t> g_tape_ids{0};
+std::atomic<int64_t> g_nlists_created{0}, g_nlists_destroyed{0}, g_nplays{0}, g_nlists_played{0}, g_nkernels{0};
+Tape::~Tape() {
+    for (Seg& s : segs)
+        if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+}
 struct Rec {
     Tape* t = nullptr;
-    std::optional<Graph> g;            /* the open segment */
+    std::optional<Graph> g;            /* the open segment (SYCL-graph tapes) */
     std::vector<L0Event*> pend;        /* its event records */
     int pause = 0;
     bool stopped = false;              /* recording given up: the rest of the pass runs plainly */
+    /* native tapes: the open regular command list, its command count, and each recorded stream's
+     * last event when the segment opened (a submission that bypassed the recorder moves it) */
+    bool native = false;
+    ze_command_list_handle_t nlist = nullptr;
+    size_t ncmds = 0;
+    std::vector<std::optional<sycl::event>> at_open;
 };
 /* A pass longer than this many segments is not kept. Past the bound the recording stops, the rest
  * of the pass is issued plainly, and the tape is refused (the engine runs that pass plain from then
@@ -406,11 +432,14 @@ struct Rec {
 constexpr size_t kTapeMaxSegs = 2048;
 thread_local Rec t_rec;
 
-bool recording() { return t_rec.t && t_rec.g && t_rec.pause == 0; }
+bool recording() { return t_rec.t && (t_rec.g || t_rec.nlist) && t_rec.pause == 0; }
+/* The native recorder is open on this thread: commands on its streams go into the command list. */
+bool native_recording() { return t_rec.t && t_rec.native && t_rec.nlist && t_rec.pause == 0 && !t_rec.stopped; }
 bool recorded_stream(const L0Stream& s) {
     for (L0Stream* x : t_rec.t->qs) if (x == &s) return true;
     return false;
 }
+bool native_on(const L0Stream& s) { return native_recording() && recorded_stream(s); }
 void refuse(const std::string& why) {
     if (t_rec.t && t_rec.t->refused.empty()) t_rec.t->refused = why;
 }
@@ -539,16 +568,346 @@ void rerecord(Tape& t, const std::vector<L0Event*>& evs) {
         if (events_alive().count(e)) real_record(e, *t.qs[0]);
 }
 
+/* ------------------------------------------------------------------ native tapes (owner note 28)
+ * On a card a tape's segments are regular Level Zero command lists, not SYCL graphs: a segment is
+ * recorded into one in-order list (every launch, copy and fill appended with the arguments set once;
+ * libxe's launch_as and the core's kernels come in through rad_l0_rec.h), closed at tape_mark and run
+ * at once by appending it to the home stream's immediate command list, and a play appends the
+ * stretch's lists in one call (N1: 1.9 us a list, no per-graph scratch surface or command-list copy).
+ * The SYCL runtime orders its own commands through its last event, so a play waits on that event and
+ * signals one of the device's ring events, which the home stream then barriers on (imported as a
+ * sycl::event): both directions of the order hold whether or not the runtime's list is driver-in-order.
+ * The recorder owns its kernel objects (zeKernelCreate on the kernel's module, by name), so the
+ * runtime's kernel argument state is never touched. Refused, with the segment so far run: a kernel the
+ * recorder cannot create, an append the driver rejects, and a recorded stream whose last event moved
+ * between a segment's open and close (a submission that bypassed the recorder would run once and never
+ * replay). Everything else -- the pass key, the held play, the graveyard -- is shared with the graphs. */
+void sleepy_wait(const sycl::event& e);
+bool event_done(const sycl::event& e);
+void stop_recording(const std::string& why);
+
+constexpr uint32_t kRingEvents = 256;
+struct NKernel {
+    ze_kernel_handle_t k = nullptr;
+    uint32_t nargs = 0;
+    bool own = false;                  /* created here (else the runtime's handle, shared) */
+    bool lds_told = false;             /* the local-memory argument refused a size once (said once) */
+};
+struct ZeDev {
+    bool tried = false, ok = false;
+    std::string why;
+    ze_context_handle_t ctx = nullptr;
+    ze_device_handle_t  dev = nullptr;
+    ze_event_pool_handle_t pool = nullptr;
+    struct Ring { ze_event_handle_t ev = nullptr; sycl::event dep; bool used = false; };
+    std::vector<Ring> ring;
+    size_t next = 0;
+    bool inorder = true;               /* ZE_COMMAND_LIST_FLAG_IN_ORDER accepted; else a barrier before each command */
+    std::mutex m;                      /* the ring and the kernel table (plays may come from another thread) */
+    std::map<ze_kernel_handle_t, NKernel> kernels;   /* by the runtime's handle */
+};
+ZeDev& zedev(int d) { static ZeDev z[kMaxDevices]; return z[d]; }
+using AppendFn = ze_result_t (*)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t,
+                                 uint32_t, ze_event_handle_t*);
+AppendFn append_fn() {
+    static AppendFn f = (AppendFn)dlsym(RTLD_DEFAULT, "zeCommandListImmediateAppendCommandListsExp");
+    return f;
+}
+int tape_mode() {   /* 0 off, 1 graphs, 2 native where the device allows */
+    static const int m = [] {
+        const char* v = std::getenv("RADIANCE_L0_TAPE");
+        if (!v) return 2;
+        if (!std::strcmp(v, "0")) return 0;
+        if (!std::strcmp(v, "graph")) return 1;
+        return 2;
+    }();
+    return m;
+}
+ze_command_list_handle_t n_list_create(ZeDev& Z, bool inorder) {
+    ze_command_list_desc_t d{ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC, nullptr, 0, inorder ? ZE_COMMAND_LIST_FLAG_IN_ORDER : 0u};
+    ze_command_list_handle_t l = nullptr;
+    if (zeCommandListCreate(Z.ctx, Z.dev, &d, &l) != ZE_RESULT_SUCCESS) return nullptr;
+    g_nlists_created.fetch_add(1, std::memory_order_relaxed);
+    return l;
+}
+/* The stream's immediate command list, or null (a command queue, or no native handle). */
+ze_command_list_handle_t imm_of(L0Stream& s) {
+    if (!s.zimm_tried) {
+        s.zimm_tried = true;
+        try {
+            auto nat = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(s.q);
+            if (auto* l = std::get_if<ze_command_list_handle_t>(&nat)) s.zimm = *l;
+        } catch (const sycl::exception&) {}
+    }
+    return s.zimm;
+}
+/* The device's native state, made on first use: the handles, the ring of signal events, the
+ * in-order list check. False (with `why`) when native tapes cannot run here. */
+bool ze_ready(int d) {
+    ZeDev& Z = zedev(d);
+    if (Z.tried) return Z.ok;
+    Z.tried = true;
+    const Dev& D = devs()[d];
+    if (D.cpu) { Z.why = "the CPU device has no Level Zero handles"; return false; }
+    if (!append_fn()) { Z.why = "the loader has no zeCommandListImmediateAppendCommandListsExp"; return false; }
+    try {
+        Z.ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.ctx);
+        Z.dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.d);
+    } catch (const sycl::exception& e) { Z.why = std::string("no native handles: ") + e.what(); return false; }
+    ze_event_pool_desc_t pd{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, ZE_EVENT_POOL_FLAG_HOST_VISIBLE, kRingEvents};
+    if (zeEventPoolCreate(Z.ctx, &pd, 1, &Z.dev, &Z.pool) != ZE_RESULT_SUCCESS) { Z.why = "zeEventPoolCreate failed"; return false; }
+    Z.ring.resize(kRingEvents);
+    for (uint32_t i = 0; i < kRingEvents; ++i) {
+        ze_event_desc_t ed{ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, i, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_HOST};
+        if (zeEventCreate(Z.pool, &ed, &Z.ring[i].ev) != ZE_RESULT_SUCCESS) { Z.why = "zeEventCreate failed"; return false; }
+    }
+    ze_command_list_handle_t probe = n_list_create(Z, true);
+    if (!probe) {
+        Z.inorder = false;
+        probe = n_list_create(Z, false);
+        if (!probe) { Z.why = "zeCommandListCreate failed"; return false; }
+    }
+    zeCommandListDestroy(probe);
+    g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
+    Z.ok = true;
+    RAD_INFO("l0 tape: native Level Zero command lists on device %d (%s lists, a ring of %u signal events)",
+             d, Z.inorder ? "in-order" : "barrier-separated", kRingEvents);
+    return true;
+}
+/* Takes the next ring event: once the barrier that depended on its last use has completed, it is reset. */
+ZeDev::Ring& ring_take(ZeDev& Z) {
+    ZeDev::Ring& r = Z.ring[Z.next];
+    Z.next = (Z.next + 1) % Z.ring.size();
+    if (r.used) {
+        if (!event_done(r.dep)) { sleepy_wait(r.dep); r.dep.wait_and_throw(); }
+        zeEventHostReset(r.ev);
+        r.dep = sycl::event();
+        r.used = false;
+    }
+    return r;
+}
+/* Appends `n` closed lists to the tape's home stream, after the stream's last command (and the
+ * other recorded streams' when fenced), and leaves the barrier that follows as t.last. */
+void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
+    if (!n) return;
+    ZeDev& Z = zedev(t.dev);
+    sycl::queue& H = t.qs[0]->q;
+    ze_command_list_handle_t imm = imm_of(*t.qs[0]);
+    if (!imm) throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported), "the home stream has no immediate command list");
+    const bool fence = t.fence && t.qs.size() > 1;
+    std::vector<sycl::event> keep;
+    std::vector<ze_event_handle_t> waits;
+    auto add_wait = [&](sycl::queue& q) {
+        std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
+        if (!e) return;
+        try {
+            waits.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*e));
+            keep.push_back(*e);
+        } catch (const sycl::exception&) {
+            e->wait_and_throw();   /* no native handle (a host event): waited for here */
+        }
+    };
+    add_wait(H);
+    if (fence) for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
+    std::lock_guard<std::mutex> lk(Z.m);
+    ZeDev::Ring& r = ring_take(Z);
+    const ze_result_t rc = append_fn()(imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
+    if (rc != ZE_RESULT_SUCCESS) {
+        char msg[96];
+        std::snprintf(msg, sizeof msg, "zeCommandListImmediateAppendCommandListsExp: 0x%x (%u lists)", (unsigned)rc, n);
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
+    }
+    g_nplays.fetch_add(1, std::memory_order_relaxed);
+    g_nlists_played.fetch_add(n, std::memory_order_relaxed);
+    sycl::event se = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+        {r.ev, sycl::ext::oneapi::level_zero::ownership::keep}, H.get_context());
+    t.last = H.ext_oneapi_submit_barrier({se});
+    t.submitted = true;
+    r.dep = t.last;
+    r.used = true;
+    if (fence)
+        for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({t.last});
+}
+/* The recorder's kernel object for a library's sycl::kernel: its own, from the kernel's module. */
+NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
+    const ze_kernel_handle_t rk = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(k);
+    std::lock_guard<std::mutex> lk(Z.m);
+    auto it = Z.kernels.find(rk);
+    if (it != Z.kernels.end()) return it->second;
+    NKernel nk;
+    try {
+        const std::string name = k.get_info<sycl::info::kernel::function_name>();
+        auto kb = k.get_kernel_bundle();
+        std::vector<ze_module_handle_t> mods = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(kb);
+        for (ze_module_handle_t m : mods) {
+            ze_kernel_desc_t d{ZE_STRUCTURE_TYPE_KERNEL_DESC, nullptr, 0, name.c_str()};
+            if (zeKernelCreate(m, &d, &nk.k) == ZE_RESULT_SUCCESS) { nk.own = true; break; }
+            nk.k = nullptr;
+        }
+    } catch (const sycl::exception&) { nk.k = nullptr; }
+    if (!nk.k) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 2)
+            RAD_WARN("l0 tape: no kernel object of my own for a library kernel; recording with the runtime's handle");
+        nk.k = rk;
+    } else {
+        g_nkernels.fetch_add(1, std::memory_order_relaxed);
+    }
+    ze_kernel_properties_t p{ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES, nullptr};
+    if (zeKernelGetProperties(nk.k, &p) == ZE_RESULT_SUCCESS) nk.nargs = p.numKernelArgs;
+    return Z.kernels[rk] = nk;
+}
+/* The native recording's own refusal: what the open list holds runs, then the rest of the pass is
+ * issued plainly. */
+void n_stop(const std::string& why) { stop_recording(why); }
+/* A barrier before each command when the driver gave no in-order list. */
+void n_sep(ZeDev& Z) {
+    if (!Z.inorder && t_rec.ncmds) zeCommandListAppendBarrier(t_rec.nlist, nullptr, 0, nullptr);
+}
+/* ---- the hooks (rad_l0_rec.h) */
+int n_hook_device(const void* queue) {
+    if (!native_recording() || !queue) return -1;
+    return recorded_stream(S((RadStream)queue)) ? t_rec.t->dev : -1;
+}
+int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
+                  const void* arg0, size_t arg0_size, size_t lds) {
+    if (!queue || !kernel || !kernel->kernel || !native_on(S((RadStream)queue))) return -1;
+    ZeDev& Z = zedev(t_rec.t->dev);
+    NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
+    if (!nk.k) { n_stop("a library kernel has no Level Zero kernel object"); return -1; }
+    /* the descriptor's layout against the kernel object's: a mismatch is refused, never guessed */
+    const uint32_t want_args = 1u + (kernel->i_lds >= 0 ? 1u : 0u);
+    if ((nk.nargs && nk.nargs != want_args) || (kernel->arg0_size && kernel->arg0_size != arg0_size) ||
+        kernel->i_arg0 < 0 || kernel->i_arg0 > 1 || kernel->i_lds > 1 || (lds && kernel->i_lds < 0)) {
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "a kernel's layout does not match its descriptor (%u arguments, by-value at %d of %u bytes, "
+                      "local memory at %d, %zu bytes asked, %zu given)", nk.nargs, kernel->i_arg0, kernel->arg0_size,
+                      kernel->i_lds, lds, arg0_size);
+        n_stop(msg);
+        return -1;
+    }
+    ze_result_t rc = zeKernelSetArgumentValue(nk.k, (uint32_t)kernel->i_arg0, arg0_size, arg0);
+    if (rc != ZE_RESULT_SUCCESS) {
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "zeKernelSetArgumentValue(%d, %zu bytes): 0x%x (%u arguments)", kernel->i_arg0, arg0_size,
+                      (unsigned)rc, nk.nargs);
+        n_stop(msg);
+        return -1;
+    }
+    if (kernel->i_lds >= 0) {
+        /* the dynamic work-group memory (kind_dynamic_work_group_memory): a local argument of `lds` bytes */
+        rc = zeKernelSetArgumentValue(nk.k, (uint32_t)kernel->i_lds, lds, nullptr);
+        if (rc != ZE_RESULT_SUCCESS) {
+            if (!nk.lds_told) {
+                nk.lds_told = true;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) < 2)
+                    RAD_WARN("l0 tape: a kernel's local-memory argument %d refused %zu bytes (0x%x)", kernel->i_lds, lds, (unsigned)rc);
+            }
+            if (lds) { n_stop("the dynamic local memory argument was refused"); return -1; }
+        }
+    }
+    rc = zeKernelSetGroupSize(nk.k, block[0], block[1], block[2]);
+    if (rc != ZE_RESULT_SUCCESS) { n_stop("zeKernelSetGroupSize refused the block"); return -1; }
+    n_sep(Z);
+    ze_group_count_t gc{grid[0], grid[1], grid[2]};
+    rc = zeCommandListAppendLaunchKernel(t_rec.nlist, nk.k, &gc, nullptr, 0, nullptr);
+    if (rc != ZE_RESULT_SUCCESS) {
+        char msg[96];
+        std::snprintf(msg, sizeof msg, "zeCommandListAppendLaunchKernel: 0x%x", (unsigned)rc);
+        n_stop(msg);
+        return -1;
+    }
+    ++t_rec.ncmds;
+    return 0;
+}
+int n_hook_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
+    if (!queue || !native_on(S((RadStream)queue))) return -1;
+    if (!width || !height) return 0;
+    ZeDev& Z = zedev(t_rec.t->dev);
+    n_sep(Z);
+    ze_copy_region_t dr{0, 0, 0, (uint32_t)width, (uint32_t)height, 1};
+    ze_copy_region_t sr{0, 0, 0, (uint32_t)width, (uint32_t)height, 1};
+    const ze_result_t rc = zeCommandListAppendMemoryCopyRegion(t_rec.nlist, dst, &dr, (uint32_t)dpitch, 0, src, &sr,
+                                                               (uint32_t)spitch, 0, nullptr, 0, nullptr);
+    if (rc != ZE_RESULT_SUCCESS) { n_stop("zeCommandListAppendMemoryCopyRegion refused the copy"); return -1; }
+    ++t_rec.ncmds;
+    return 0;
+}
+/* The backend's own copies and fills while recording natively. */
+int n_copy(void* dst, const void* src, size_t bytes) {
+    n_sep(zedev(t_rec.t->dev));
+    const ze_result_t rc = zeCommandListAppendMemoryCopy(t_rec.nlist, dst, src, bytes, nullptr, 0, nullptr);
+    if (rc != ZE_RESULT_SUCCESS) { n_stop("zeCommandListAppendMemoryCopy refused the copy"); return RAD_E_DEVICE; }
+    ++t_rec.ncmds;
+    return RAD_OK;
+}
+const RadL0RecHooks g_rec_hooks{n_hook_device, n_hook_launch, n_hook_copy2d};
+/* One copy on stream `s`: appended while the native recording is open on it, else -- and after a
+ * refusal, which has run the segment so far -- submitted plainly, so the pass never drops a copy. */
+int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
+    if (native_on(S(s)) && n_copy(dst, src, bytes) == RAD_OK) return RAD_OK;
+    return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, bytes); });
+}
+
 void seg_open() {
     Tape& t = *t_rec.t;
+    if (t_rec.native) {
+        ZeDev& Z = zedev(t.dev);
+        t_rec.nlist = n_list_create(Z, Z.inorder);
+        if (!t_rec.nlist) throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "zeCommandListCreate failed");
+        t_rec.ncmds = 0;
+        t_rec.at_open.clear();
+        for (L0Stream* s : t.qs) t_rec.at_open.push_back(s->q.ext_oneapi_get_last_event());
+        return;
+    }
     const Dev& D = devs()[t_device];
     t_rec.g.emplace(D.ctx, D.d);
     std::vector<sycl::queue> qs;
     for (L0Stream* s : t.qs) qs.push_back(s->q);
     t_rec.g->begin_recording(qs);
 }
+bool same_event(const std::optional<sycl::event>& a, const std::optional<sycl::event>& b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return *a == *b;
+}
+/* Closes the open native segment: close the list, run it (a play of one list), keep it. */
+void n_seg_close() {
+    Tape& t = *t_rec.t;
+    ze_command_list_handle_t l = t_rec.nlist;
+    t_rec.nlist = nullptr;
+    Seg sg;
+    sg.nodes = t_rec.ncmds;
+    sg.evs.swap(t_rec.pend);
+    /* a submission that bypassed the recorder on a recorded stream: it ran once, it would never replay */
+    for (size_t k = 0; k < t.qs.size() && k < t_rec.at_open.size(); ++k)
+        if (!same_event(t_rec.at_open[k], t.qs[k]->q.ext_oneapi_get_last_event()))
+            refuse("a submission on recorded stream " + std::to_string(t.qs[k]->id) + " bypassed the native recorder");
+    if (sg.nodes) {
+        const ze_result_t rc = zeCommandListClose(l);
+        if (rc != ZE_RESULT_SUCCESS) {
+            zeCommandListDestroy(l);
+            g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
+            throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "zeCommandListClose failed");
+        }
+        sg.list = l;
+        t.ncmds += sg.nodes;
+    } else {
+        zeCommandListDestroy(l);
+        g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (sg.nodes || !sg.evs.empty()) {
+        /* kept before it runs: a failed append leaves the list to the tape's destructor, not leaked */
+        t.segs.push_back(std::move(sg));
+        Seg& kept = t.segs.back();
+        if (kept.list) n_play_lists(t, &kept.list, 1);
+        rerecord(t, kept.evs);
+    }
+}
 /* Closes the open segment: finalize, run, keep. */
 void seg_close() {
+    if (t_rec.native) { n_seg_close(); return; }
     Tape& t = *t_rec.t;
     std::vector<sycl::queue> qs;
     for (L0Stream* s : t.qs) qs.push_back(s->q);
@@ -578,16 +937,23 @@ int z_tape_begin(void) {
     if (t_rec.t) { device_set_error("rad tape_begin: a tape is already being recorded on this thread"); return RAD_E_STATE; }
     if (!dev_ok(t_device, "tape_begin")) return RAD_E_INVAL;
     const Dev& D = devs()[t_device];
-    /* RADIANCE_L0_TAPE=0: every pass is issued in full (owner note 1's plain-launch measurement) */
-    static const bool off = [] { const char* v = std::getenv("RADIANCE_L0_TAPE"); return v && std::strcmp(v, "0") == 0; }();
-    if (off) { device_set_error("tape_begin: RADIANCE_L0_TAPE=0"); return RAD_E_UNSUPPORTED; }
-    if (!D.d.has(sycl::aspect::ext_oneapi_graph) && !D.d.has(sycl::aspect::ext_oneapi_limited_graph)) {
-        device_set_error("tape_begin: the device takes no SYCL command graphs");
-        return RAD_E_UNSUPPORTED;
+    /* RADIANCE_L0_TAPE=0: every pass is issued in full (owner note 1's plain-launch measurement);
+     * =graph: SYCL command graphs; else native command lists where the device allows (owner note 28) */
+    if (tape_mode() == 0) { device_set_error("tape_begin: RADIANCE_L0_TAPE=0"); return RAD_E_UNSUPPORTED; }
+    const bool native = tape_mode() == 2 && ze_ready(t_device);
+    if (!native) {
+        static std::atomic<int> told{0};
+        if (tape_mode() == 2 && told.fetch_add(1) < 1)
+            RAD_INFO("l0 tape: SYCL command graphs on device %d (%s)", t_device, zedev(t_device).why.c_str());
+        if (!D.d.has(sycl::aspect::ext_oneapi_graph) && !D.d.has(sycl::aspect::ext_oneapi_limited_graph)) {
+            device_set_error("tape_begin: the device takes no SYCL command graphs");
+            return RAD_E_UNSUPPORTED;
+        }
     }
     auto t = std::make_unique<Tape>();
     t->id = ++g_tape_ids;
     t->dev = t_device;
+    t->native = native;
     {
         std::lock_guard<std::mutex> lk(stream_mutex());
         /* This device's streams only (TP2, run 9: with two rank threads, each recording its own card,
@@ -604,15 +970,26 @@ int z_tape_begin(void) {
         if (home && t->qs.size() > 1) t->qs.resize(1);
     }
     if (t->qs.empty()) { device_set_error("tape_begin: no stream to record"); return RAD_E_STATE; }
+    if (native && !imm_of(*t->qs[0])) {
+        device_set_error("tape_begin: the home stream's native handle is not an immediate command list");
+        return RAD_E_UNSUPPORTED;
+    }
     t_rec = Rec{};
     t_rec.t = t.release();
+    t_rec.native = native;
     const int rc = guarded("tape_begin", [] { seg_open(); });
     if (rc != RAD_OK) { delete t_rec.t; t_rec = Rec{}; }
     return rc;
 }
-/* Gives up the recording: the queues leave record mode and the rest of the pass is issued plainly. */
+/* Gives up the recording: the queues leave record mode and the rest of the pass is issued plainly.
+ * A native segment's commands so far run first (they were appended, not submitted). */
 void stop_recording(const std::string& why) {
     refuse(why);
+    if (t_rec.native && t_rec.nlist) {
+        try { n_seg_close(); }
+        catch (const sycl::exception& e) { RAD_WARN("l0 tape: the refused segment could not be run: %s", e.what()); }
+        t_rec.nlist = nullptr;
+    }
     if (t_rec.g) {
         std::vector<sycl::queue> qs;
         for (L0Stream* s : t_rec.t->qs) qs.push_back(s->q);
@@ -637,7 +1014,7 @@ int z_tape_mark(void) {
 void z_tape_pause(int on) {
     if (!t_rec.t || t_rec.stopped) return;
     if (on) {
-        if (t_rec.pause++ == 0 && t_rec.g && guarded("tape_pause", [] { seg_close(); }) != RAD_OK)
+        if (t_rec.pause++ == 0 && (t_rec.g || t_rec.nlist) && guarded("tape_pause", [] { seg_close(); }) != RAD_OK)
             stop_recording("a segment could not be closed at a pause");
     } else if (t_rec.pause > 0 && --t_rec.pause == 0) {
         if (guarded("tape_pause", [] { seg_open(); }) != RAD_OK) stop_recording("no segment after a pause");
@@ -646,7 +1023,7 @@ void z_tape_pause(int on) {
 RadTape z_tape_end(int keep) {
     Tape* t = t_rec.t;
     if (!t) return nullptr;
-    if (t_rec.g && guarded("tape_end", [] { seg_close(); }) != RAD_OK) refuse("the last segment could not be closed");
+    if ((t_rec.g || t_rec.nlist) && guarded("tape_end", [] { seg_close(); }) != RAD_OK) refuse("the last segment could not be closed");
     t_rec = Rec{};
     /* A pass always puts work on the card; an empty recording means it went to a stream outside
      * the recording, and replaying nothing would be silently wrong. */
@@ -664,8 +1041,9 @@ RadTape z_tape_end(int keep) {
     t->fence = evs > 0;
     static std::atomic<int> told{0};
     if (told.fetch_add(1) < 8)
-        RAD_INFO("l0 tape: %zu segment(s), %zu graph node(s), %zu event record(s), %zu stream(s) recorded%s",
-                 t->segs.size(), nodes, evs, t->qs.size(), t->fence ? "" : ", played unfenced");
+        RAD_INFO("l0 tape: %zu segment(s), %zu %s, %zu event record(s), %zu stream(s) recorded%s",
+                 t->segs.size(), nodes, t->native ? "command(s) in native lists" : "graph node(s)", evs, t->qs.size(),
+                 t->fence ? "" : ", played unfenced");
     return (RadTape)t;
 }
 
@@ -777,6 +1155,23 @@ void reap_stretches(Tape& t, bool all = false) {
 }
 int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
+    if (t->native) {
+        return guarded("tape_play", [&] {
+            std::vector<ze_command_list_handle_t> lists;
+            lists.reserve((size_t)(to - from));
+            for (int i = from; i < to; ++i)
+                if (t->segs[(size_t)i].list) lists.push_back(t->segs[(size_t)i].list);
+            n_play_lists(*t, lists.data(), (uint32_t)lists.size());
+            if (t->plays_told < 6) {
+                ++t->plays_told;
+                RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s), %zu native list(s)", (unsigned long long)t->id,
+                         from, to, t->segs.size(), lists.size());
+            }
+            std::vector<L0Event*> evs;
+            for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
+            rerecord(*t, evs);
+        });
+    }
     const int mode = compose_mode();
     if (mode == 0 || (mode == 3 && to - from < kComposeMin)) {
         return guarded("tape_play", [&] {
@@ -1118,6 +1513,14 @@ int z_event_record(RadEvent ev, RadStream s) {
     RAD_TRY(flush_held());
     if (recording()) {
         if (!recorded_stream(S(s))) { refuse("an event record on a stream outside the recording"); }
+        else if (t_rec.native) {
+            /* one in-order list: no device command; recorded for real after the segment runs */
+            std::lock_guard<std::mutex> lk(e->m);
+            e->gtape = t_rec.t->id;
+            e->gseg = (int)t_rec.t->segs.size();
+            t_rec.pend.push_back(e);
+            return RAD_OK;
+        }
         else return guarded("rad_event_record", [&] {
             sycl::event b = Q(s).ext_oneapi_submit_barrier();   /* a graph node */
             std::lock_guard<std::mutex> lk(e->m);
@@ -1149,6 +1552,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
             never = !e->recorded && e->gtape != t_rec.t->id;
             b = e->gev;
         }
+        if (here && t_rec.native) return RAD_OK;   /* one in-order list */
         if (here) return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
         if (earlier || never) return RAD_OK;   /* the segments run in order; a never-recorded event is no wait */
         /* a graph cannot depend on outside work: refused, and this pass waits for real between segments */
@@ -1252,7 +1656,7 @@ int z_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
         return RAD_E_INVAL;
     }
     if (bytes == 0) return RAD_OK;
-    return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, (size_t)bytes); });
+    return copy_on(s, dst, src, (size_t)bytes);
 }
 
 int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch, int64_t width,
@@ -1265,6 +1669,8 @@ int z_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
         return RAD_E_INVAL;
     }
     if (!width || !height) return RAD_OK;
+    if (native_on(S(s)) && n_hook_copy2d(s, dst, (size_t)dpitch, src, (size_t)spitch, (size_t)width, (size_t)height) == 0)
+        return RAD_OK;
     return guarded("rad_memcpy_2d_async", [&] {
         /* sycl_ext_oneapi_graph does not record ext_oneapi_memcpy2d (it throws): on a tape the rows
          * are plain copies, one a row (one copy when both sides are dense). */
@@ -1295,8 +1701,8 @@ int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     }
     /* Only the low byte, as hipMemsetAsync and memset. Host memory is filled by a kernel
      * (l0_kernels.sycl rad_l0k_fill): queue::memset left the tail of a pinned range unwritten on
-     * card1. Device memory keeps the runtime's fill. */
-    if (sycl::get_pointer_type(dst, Q(s).get_context()) != sycl::usm::alloc::device)
+     * card1. Device memory keeps the runtime's fill; a native recording takes the kernel for both. */
+    if (native_on(S(s)) || sycl::get_pointer_type(dst, Q(s).get_context()) != sycl::usm::alloc::device)
         return rad_l0k_fill(s, dst, value & 0xff, bytes) == 0 ? RAD_OK : RAD_E_DEVICE;
     return guarded("rad_memset_async", [&] { Q(s).memset(dst, value & 0xff, (size_t)bytes); });
 }
@@ -1318,13 +1724,11 @@ int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
         device_set_error("rad_memcpy_ranges_async: both bases must be 16-byte aligned");
         return RAD_E_UNSUPPORTED;
     }
-    return guarded("rad_memcpy_ranges_async", [&] {
-        auto& q = Q(s);
-        if (prefix) q.memcpy(dst, src, (size_t)prefix);
-        for (int i = 0; i < n; ++i)
-            if (ranges[i].bytes > 0)
-                q.memcpy((char*)dst + ranges[i].dst, (const char*)src + ranges[i].src, (size_t)ranges[i].bytes);
-    });
+    if (prefix) RAD_TRY(copy_on(s, dst, src, (size_t)prefix));
+    for (int i = 0; i < n; ++i)
+        if (ranges[i].bytes > 0)
+            RAD_TRY(copy_on(s, (char*)dst + ranges[i].dst, (const char*)src + ranges[i].src, (size_t)ranges[i].bytes));
+    return RAD_OK;
 }
 
 int z_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
@@ -1332,10 +1736,9 @@ int z_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
     touch(S(s));
     RAD_TRY(flush_held());
     if (n < 0 || (n > 0 && !segs)) { device_set_error("rad_memcpy_list_async: bad arguments"); return RAD_E_INVAL; }
-    return guarded("rad_memcpy_list_async", [&] {
-        for (int i = 0; i < n; ++i)
-            if (segs[i].bytes > 0) Q(s).memcpy(segs[i].dst, segs[i].src, (size_t)segs[i].bytes);
-    });
+    for (int i = 0; i < n; ++i)
+        if (segs[i].bytes > 0) RAD_TRY(copy_on(s, segs[i].dst, segs[i].src, (size_t)segs[i].bytes));
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ identity */
@@ -1402,6 +1805,7 @@ DeviceBackend make_backend() {
     b.tape_record = z_tape_record;
     b.tape_set_overlap = z_tape_set_overlap;
     rad_l0k_set_flush(flush_held_hook);
+    rad_l0k_set_rec(&g_rec_hooks);
     return b;
 }
 
@@ -1493,6 +1897,20 @@ extern "C" void rad_l0_event_stats(int64_t out[6]) {
         for (L0Stream* s : streams()) mx = std::max(mx, s->tags.load());
     }
     out[5] = mx;
+}
+
+/* For tests and the report (owner note 28): out[0] native command lists created, out[1] destroyed,
+ * out[2] plays (append calls), out[3] lists appended over every play, out[4] kernel objects created,
+ * out[5] 1 when device 0 records natively (2 with in-order lists), 0 otherwise. */
+extern "C" void rad_l0_ntape_stats(int64_t out[6]) {
+    using namespace rad;
+    out[0] = g_nlists_created.load();
+    out[1] = g_nlists_destroyed.load();
+    out[2] = g_nplays.load();
+    out[3] = g_nlists_played.load();
+    out[4] = g_nkernels.load();
+    const ZeDev& Z = zedev(0);
+    out[5] = Z.ok ? (Z.inorder ? 2 : 1) : 0;
 }
 
 /* For tests (owner note 10): out[0] tapes deferred at release because a play was still running,

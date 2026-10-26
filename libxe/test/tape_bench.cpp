@@ -18,6 +18,7 @@
  */
 #include "device/device.h"
 #include "rad_device.h"
+#include "xe_lanes.h"   /* the launch path a kernel library takes (milestone 3: it records natively) */
 
 #include <sycl/sycl.hpp>
 
@@ -39,11 +40,12 @@ uint32_t expect(int n, uint32_t v0) {
     return v;
 }
 
+__global__ void bump_kernel(uint32_t* c, uint32_t add) { *c = *c * 2u + add; }
+/* Through xe::launch_as, as every libxe kernel: a native tape records only what comes that way
+ * (a direct queue submission inside a recording is refused, native_tape_test case 5). */
 void launch_all(sycl::queue& q, uint32_t* c, int n) {
-    for (int k = 0; k < n; ++k) {
-        const uint32_t add = (uint32_t)(k + 1);
-        q.single_task([=] { *c = *c * 2u + add; });
-    }
+    for (int k = 0; k < n; ++k)
+        XE_LAUNCH(&q, bump_kernel, xe::dim3(1), xe::dim3(1), 0, c, (uint32_t)(k + 1));
 }
 
 }  // namespace

@@ -17,6 +17,7 @@
  */
 #include "device/device.h"
 #include "rad_device.h"
+#include "xe_lanes.h"   /* the launch path a kernel library takes (milestone 3: it records natively) */
 
 #include <sycl/sycl.hpp>
 
@@ -35,6 +36,17 @@ constexpr uint8_t kPat = 0xC5;
 constexpr int64_t kW = 96, kH = 32, kSP = 128, kDP = 160;   /* the 2D copy */
 
 uint8_t pat(int round, int k, size_t i) { return (uint8_t)(i * 7 + (size_t)k * 31 + (size_t)round * 13 + 1); }
+
+/* a slow fill, so the play is still running when the tape is destroyed */
+__global__ void slow_fill_kernel(uint8_t* src, size_t n, int kk, int rr) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t x = (uint32_t)i;
+    for (int spin = 0; spin < 2000; ++spin) x = x * 1664525u + 1013904223u;
+    /* x is never 0x9E3779B9 for these seeds in practice; the test checks the bytes anyway */
+    src[i] = (uint8_t)(i * 7 + (size_t)kk * 31 + (size_t)rr * 13 + 1) ^ (uint8_t)(x == 0x9E3779B9u);
+}
+__global__ void count_kernel(uint32_t* cnt) { cnt[0] += 1; }
 
 }  // namespace
 
@@ -63,15 +75,8 @@ int main(int argc, char** argv) {
         for (int k = 0; k < tapes; ++k) {
             uint8_t* d = dst[(size_t)k] + kCanary;
             if (rad::tape_begin() < 0) { std::printf("tape_begin refused: %s\n", rad_dev_last_error()); return 1; }
-            const int rr = r, kk = k;
-            /* a slow fill, so the play is still running when the tape is destroyed */
-            q.parallel_for(sycl::range<1>(kN + kSP * kH), [=](sycl::id<1> id) {
-                const size_t i = id[0];
-                uint32_t x = (uint32_t)i;
-                for (int spin = 0; spin < 2000; ++spin) x = x * 1664525u + 1013904223u;
-                /* x is never 0x9E3779B9 for these seeds in practice; the test checks the bytes anyway */
-                src[i] = (uint8_t)(i * 7 + (size_t)kk * 31 + (size_t)rr * 13 + 1) ^ (uint8_t)(x == 0x9E3779B9u);
-            });
+            XE_LAUNCH(&q, slow_fill_kernel, xe::dim3((unsigned)((kN + kSP * kH + 255) / 256)), xe::dim3(256), 0,
+                      src, (size_t)(kN + kSP * kH), k, r);
             rad_memcpy_async(d, src, kN, s);
             rad_memcpy_2d_async(d + kN, kDP, src + kN, kSP, kW, kH, s);
             rad::tape_mark();
@@ -118,7 +123,7 @@ int main(int argc, char** argv) {
         rad_stream_sync(s);
         bool ok1 = rad::tape_begin() >= 0;
         for (int i = 0; i < L.segs && ok1; ++i) {
-            q.single_task([=] { cnt[0] += 1; });
+            XE_LAUNCH(&q, count_kernel, xe::dim3(1), xe::dim3(1), 0, cnt);
             rad::tape_mark();
         }
         rad::RadTape lt = ok1 ? rad::tape_end(true) : nullptr;

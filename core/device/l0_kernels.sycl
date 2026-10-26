@@ -16,12 +16,50 @@
 
 #include "sched/advance_impl.h"
 #include "runtime/wtab.h"
+#include "rad_l0_rec.h"
 
 /* The backend's hook that submits a held-back tape play (l0.cpp, "recorded passes"): these
  * launches reach the queue without passing through the backend, so they flush it first. */
 static void (*g_flush)(void) = nullptr;
 extern "C" __attribute__((visibility("default"))) void rad_l0k_set_flush(void (*f)(void)) { g_flush = f; }
 static inline void flush_pending() { if (g_flush) g_flush(); }
+
+/* The native recorder (abi/rad_l0_rec.h, owner note 28): the backend's hooks, exported to the kernel
+ * libraries. Without a backend (or on the SYCL-graph tapes) every query says "not recording". */
+static const RadL0RecHooks* g_rec = nullptr;
+extern "C" __attribute__((visibility("default"))) void rad_l0k_set_rec(const RadL0RecHooks* h) { g_rec = h; }
+extern "C" __attribute__((visibility("default"))) int rad_l0k_rec_device(const void* queue) {
+    return g_rec && g_rec->device ? g_rec->device(queue) : -1;
+}
+extern "C" __attribute__((visibility("default")))
+int rad_l0k_rec_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
+                       const void* arg0, size_t arg0_size, size_t lds) {
+    return g_rec && g_rec->launch ? g_rec->launch(queue, kernel, grid, block, arg0, arg0_size, lds) : -1;
+}
+extern "C" __attribute__((visibility("default")))
+int rad_l0k_rec_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, size_t spitch,
+                       size_t width, size_t height) {
+    return g_rec && g_rec->copy2d ? g_rec->copy2d(queue, dst, dpitch, src, spitch, width, height) : -1;
+}
+/* A 1-D launch of the lambda `kfn` (one by-value capture, `args`) on `stream`: natively while the
+ * calling thread records that stream, else through the queue. */
+template <class A, class F>
+static int launch_1d(void* stream, const A& args, const F& kfn, size_t global, size_t wg) {
+    sycl::queue& q = *static_cast<sycl::queue*>(stream);
+    const int rd = rad_l0k_rec_device(stream);
+    if (rd >= 0) {
+        if (const RadL0RecKernel* k = rad_l0_rec::kernel_of<F>(q, rd)) {
+            const uint32_t grid[3] = {(uint32_t)(global / wg), 1, 1}, block[3] = {(uint32_t)wg, 1, 1};
+            if (rad_l0k_rec_launch(stream, k, grid, block, &args, sizeof args, 0) == 0) return 0;
+        }
+    }
+    try {
+        q.parallel_for(sycl::nd_range<1>(global, wg), kfn);
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
 
 /* The backend's devices for kernel libraries that allocate at init (milestone 2: libxe's all-reduce
  * rows allocate their scratch and flags per rank before load, when they have no stream yet). The
@@ -48,16 +86,11 @@ int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     flush_pending();
     const rad::AdvanceArgs a = *args;
     const size_t threads = 64, blocks = (size_t)((a.n_seq + 63) / 64);
-    try {
-        static_cast<sycl::queue*>(stream)->parallel_for(
-            sycl::nd_range<1>(blocks * threads, threads), [=](sycl::nd_item<1> it) {
-                const int i = (int)it.get_global_id(0);
-                if (i < a.n_seq) rad::adv_row(a, i);
-            });
-    } catch (const sycl::exception&) {
-        return -1;
-    }
-    return 0;
+    auto kfn = [=](sycl::nd_item<1> it) {
+        const int i = (int)it.get_global_id(0);
+        if (i < a.n_seq) rad::adv_row(a, i);
+    };
+    return launch_1d(stream, a, kfn, blocks * threads, threads);
 }
 
 /* A byte fill as a kernel, for host-memory destinations: queue::memset into pinned host memory left
@@ -66,29 +99,27 @@ int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
 extern "C" __attribute__((visibility("default")))
 int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes) {
     if (!dst || bytes <= 0) return 0;
-    unsigned char* p = (unsigned char*)dst;
-    const unsigned char v = (unsigned char)value;
-    const int64_t head = (int64_t)((16 - ((uintptr_t)p & 15)) & 15) < bytes ? (int64_t)((16 - ((uintptr_t)p & 15)) & 15) : bytes;
-    const int64_t body = (bytes - head) / 16, tail = bytes - head - body * 16;
-    const size_t items = (size_t)(body + 16);   /* + 16 lanes for head and tail bytes */
+    struct Fill { unsigned char* p; int64_t head, body, tail; unsigned char v; };
+    Fill f;
+    f.p = (unsigned char*)dst;
+    f.v = (unsigned char)value;
+    f.head = (int64_t)((16 - ((uintptr_t)f.p & 15)) & 15) < bytes ? (int64_t)((16 - ((uintptr_t)f.p & 15)) & 15) : bytes;
+    f.body = (bytes - f.head) / 16;
+    f.tail = bytes - f.head - f.body * 16;
+    const size_t items = (size_t)(f.body + 16);   /* + 16 lanes for head and tail bytes */
     const size_t wg = 256, global = (items + wg - 1) / wg * wg;
-    try {
-        static_cast<sycl::queue*>(stream)->parallel_for(
-            sycl::nd_range<1>(global, wg), [=](sycl::nd_item<1> it) {
-                const int64_t i = (int64_t)it.get_global_id(0);
-                if (i < body) {
-                    sycl::vec<unsigned char, 16> x(v);
-                    *(sycl::vec<unsigned char, 16>*)(p + head + 16 * i) = x;
-                } else if (i < body + 16) {
-                    const int64_t k = i - body;   /* lane k writes head byte k and tail byte k */
-                    if (k < head) p[k] = v;
-                    if (k < tail) p[head + 16 * body + k] = v;
-                }
-            });
-    } catch (const sycl::exception&) {
-        return -1;
-    }
-    return 0;
+    auto kfn = [=](sycl::nd_item<1> it) {
+        const int64_t i = (int64_t)it.get_global_id(0);
+        if (i < f.body) {
+            sycl::vec<unsigned char, 16> x(f.v);
+            *(sycl::vec<unsigned char, 16>*)(f.p + f.head + 16 * i) = x;
+        } else if (i < f.body + 16) {
+            const int64_t k = i - f.body;   /* lane k writes head byte k and tail byte k */
+            if (k < f.head) f.p[k] = f.v;
+            if (k < f.tail) f.p[f.head + 16 * f.body + k] = f.v;
+        }
+    };
+    return launch_1d(stream, f, kfn, global, wg);
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -96,14 +127,9 @@ int rad_wtab_patch_launch(const rad::WtabPatch* p, void* stream) {
     if (!p || p->n == 0) return 0;
     flush_pending();
     const rad::WtabPatch w = *p;
-    try {
-        static_cast<sycl::queue*>(stream)->parallel_for(
-            sycl::nd_range<1>(64, 64), [=](sycl::nd_item<1> it) {
-                const uint32_t i = (uint32_t)it.get_local_id(0);
-                if (i < w.n) *w.dst[i] = w.val[i];
-            });
-    } catch (const sycl::exception&) {
-        return -1;
-    }
-    return 0;
+    auto kfn = [=](sycl::nd_item<1> it) {
+        const uint32_t i = (uint32_t)it.get_local_id(0);
+        if (i < w.n) *w.dst[i] = w.val[i];
+    };
+    return launch_1d(stream, w, kfn, 64, 64);
 }

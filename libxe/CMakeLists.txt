@@ -129,7 +129,7 @@ if(RAD_BUILD_TESTS)
   # Owner note 1's per-launch figure: N tiny kernels launched plainly and replayed from a tape.
   add_executable(xe_tape_bench test/tape_bench.cpp)
   rad_l0_sycl(xe_tape_bench)
-  target_include_directories(xe_tape_bench PRIVATE ${CMAKE_SOURCE_DIR}/core)
+  target_include_directories(xe_tape_bench PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(xe_tape_bench PRIVATE stdc++ rad_core)
   set_target_properties(xe_tape_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME xe_tape_bench_cpu COMMAND xe_tape_bench 200 3 dev)
@@ -147,11 +147,21 @@ if(RAD_BUILD_TESTS)
   # GPU faults 3-4 (owner note 10): tapes destroyed while a play runs, per-request buffers reallocated.
   add_executable(xe_tape_lifetime_test test/tape_lifetime_test.cpp)
   rad_l0_sycl(xe_tape_lifetime_test)
-  target_include_directories(xe_tape_lifetime_test PRIVATE ${CMAKE_SOURCE_DIR}/core)
+  target_include_directories(xe_tape_lifetime_test PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(xe_tape_lifetime_test PRIVATE stdc++ rad_core)
   set_target_properties(xe_tape_lifetime_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME xe_tape_lifetime_cpu COMMAND xe_tape_lifetime_test 200 16)
   set_tests_properties(xe_tape_lifetime_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Milestone 3, owner note 28: tapes on direct Level Zero command lists -- the native recorder through
+  # the backend's tape API and launch_as (mode, LDS kernel, order against the runtime, events, bypass).
+  add_executable(xe_native_tape_test test/native_tape_test.cpp)
+  rad_l0_sycl(xe_native_tape_test)
+  target_include_directories(xe_native_tape_test PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(xe_native_tape_test PRIVATE stdc++ rad_core)
+  set_target_properties(xe_native_tape_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_native_tape_cpu COMMAND xe_native_tape_test 20)
+  set_tests_properties(xe_native_tape_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RADIANCE_L0_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
   # The OpenCL CPU compiler crash (note 5's oracle on amd-host): the ported MoE unit alone, SPIR-V only,
   # one device image a kernel, and a harness that builds them one at a time (test/cpu_probe.cpp).

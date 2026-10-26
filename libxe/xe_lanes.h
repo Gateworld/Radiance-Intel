@@ -34,6 +34,7 @@
 #include <utility>
 
 #include "rad_plugin.h"   /* rad_f32_to_fp8e4m3 / rad_fp8e4m3_to_f32: the ABI's E4M3 */
+#include "rad_l0_rec.h"   /* the native recorder (owner note 28): launch_as records into a command list */
 
 namespace xe {
 namespace sx  = sycl::ext::oneapi;
@@ -241,6 +242,21 @@ struct dim3 {
 /* The launch: every argument converted to its parameter's type (as r4d_emit does), HIP's
  * grid x block mapped to an nd_range<3> with x fastest, sub-group 32 (or SG), and `lds` bytes of
  * dynamic work-group memory for XE_DYN_LDS. */
+/* The native recording (abi/rad_l0_rec.h, owner note 28): while the calling thread records the
+ * queue into a Level Zero command list, the launch is appended there instead of submitted -- the
+ * kernel's sycl::kernel (once per device), the shape, the tuple as its one by-value parameter and
+ * the dynamic work-group memory. The recorder's refusal (-1) falls through to the plain submit. */
+template <class KN>
+inline bool launch_native(sycl::queue& q, dim3 g, dim3 b, size_t lds, const void* arg0, size_t arg0_size) {
+    if (!rad_l0k_rec_device || !rad_l0k_rec_launch) return false;   /* weak: no librad_l0k in this process */
+    const int rd = rad_l0k_rec_device(&q);
+    if (rd < 0) return false;
+    const RadL0RecKernel* k = rad_l0_rec::kernel_of<KN>(q, rd);
+    if (!k) return false;
+    const uint32_t grid[3] = {g.x, g.y, g.z}, block[3] = {b.x, b.y, b.z};
+    return rad_l0k_rec_launch(&q, k, grid, block, arg0, arg0_size, lds) == 0;
+}
+
 template <auto K, int SG = 32, class... P, class... A>
 sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds, const A&... a) {
     static_assert(sizeof...(P) == sizeof...(A),
@@ -254,11 +270,11 @@ sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds
      * which clang warns about as if it might hold a sub-group size too */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wignored-attributes"
-    return sxe::submit_with_event(q, [&](sycl::handler& h) {
-        sxe::nd_launch(h, cfg, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
-            std::apply([](auto... x) { K(x...); }, v);
-        });
-    });
+    auto kfn = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
+        std::apply([](auto... x) { K(x...); }, v);
+    };
+    if (launch_native<decltype(kfn)>(q, g, b, lds, &v, sizeof v)) return sycl::event{};
+    return sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
 #pragma clang diagnostic pop
 }
 inline void* dyn_lds() { return sxe::get_work_group_scratch_memory(); }
@@ -280,12 +296,13 @@ sycl::event launch_as_grf256(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, con
     std::tuple<P...> v(static_cast<P>(a)...);
     const sycl::range<3> local(b.z, b.y, b.x);
     const sycl::range<3> global((size_t)g.z * b.z, (size_t)g.y * b.y, (size_t)g.x * b.x);
+    auto kfn = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
+        std::apply([](auto... x) { K(x...); }, v);
+    };
+    if (launch_native<decltype(kfn)>(q, g, b, 0, &v, sizeof v)) return sycl::event{};
     return q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<3>(global, local),
-                       sxe::properties{sycl::ext::intel::experimental::grf_size<256>},
-                       [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
-                           std::apply([](auto... x) { K(x...); }, v);
-                       });
+                       sxe::properties{sycl::ext::intel::experimental::grf_size<256>}, kfn);
     });
 }
 
