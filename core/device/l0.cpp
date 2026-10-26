@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -814,6 +815,37 @@ void z_stream_destroy(RadStream s) {
     delete &S(s);
 }
 
+/* The sleeping wait (owner note 25, run 11). queue::wait and event::wait busy-poll in the driver: with
+ * two rank threads each waiting out a 27 ms step, the container sat at 100% of its CPU cap and intel-host's
+ * CPU at 70-77 C while the step was all card time. Here the host polls the event's status -- a short
+ * spin for the sub-100 us completions, then sleeps that grow to kWaitSleepMaxUs -- and only then calls
+ * the runtime's wait, which returns at once and surfaces the asynchronous errors. RADIANCE_L0_WAIT=spin
+ * restores the plain runtime wait (the A/B). */
+constexpr int64_t kWaitSpinUs = 100;
+constexpr int64_t kWaitSleepMinUs = 20, kWaitSleepMaxUs = 200;
+std::atomic<int64_t> g_wait_polls{0}, g_wait_sleeps{0};
+bool sleepy_wait_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_WAIT"); return !(v && std::strcmp(v, "spin") == 0); }();
+    return on;
+}
+bool event_done(const sycl::event& e) {
+    return e.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete;
+}
+void sleepy_wait(const sycl::event& e) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    int64_t sleep_us = kWaitSleepMinUs;
+    for (;;) {
+        if (event_done(e)) return;
+        g_wait_polls.fetch_add(1, std::memory_order_relaxed);
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
+        if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        g_wait_sleeps.fetch_add(1, std::memory_order_relaxed);
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+    }
+}
+
 /* Waits for the stream's work. */
 int z_stream_sync(RadStream s) {
     RAD_TRY(check_stream(s, "rad_stream_sync"));
@@ -825,11 +857,18 @@ int z_stream_sync(RadStream s) {
      * work before the call), the simplest form that is never short. Run 3 tried barriers that name
      * the queue's last event: ext_oneapi_get_last_event misbehaved behind a gate's host task on the
      * CPU device (an early return, then a runtime abort). device_test's concurrent-sync case still
-     * passes on card1 (run b2). */
+     * passes on card1 (run b2). The sleeping wait (above) polls the queue's last event first, on a
+     * GPU device and a stream that has never been gated; the runtime's wait still follows. */
     touch(S(s));
     RAD_TRY(flush_held());
     if (recording()) return seg_cut("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
-    const int rc = guarded("rad_stream_sync", [&] { Q(s).wait_and_throw(); });
+    const int rc = guarded("rad_stream_sync", [&] {
+        if (sleepy_wait_on() && !devs()[S(s).dev].cpu && !S(s).gated.load()) {
+            std::optional<sycl::event> last = Q(s).ext_oneapi_get_last_event();
+            if (last) sleepy_wait(*last);
+        }
+        Q(s).wait_and_throw();
+    });
     if (rc == RAD_OK) S(s).tags.store(0);   /* the queue is drained: its timestamp events are released */
     reap_tapes();
     return rc;
@@ -995,7 +1034,10 @@ int z_event_sync(RadEvent ev) {
         if (!e->recorded) return RAD_OK;
         b = e->ev;
     }
-    return guarded("rad_event_sync", [&] { b.wait_and_throw(); });
+    return guarded("rad_event_sync", [&] {
+        if (sleepy_wait_on() && !devs()[t_device].cpu) sleepy_wait(b);
+        b.wait_and_throw();
+    });
 }
 
 /* From the records' end timestamps (profiling tags, or the CPU device's profiling queues). */
