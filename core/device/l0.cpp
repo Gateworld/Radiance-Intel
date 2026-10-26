@@ -705,8 +705,52 @@ int z_tape_play(RadTape p, int from, int to) {
     g_have_held[t->dev].store(true, std::memory_order_release);
     return prev.t ? play_now(*prev.t, prev.a, prev.b) : RAD_OK;
 }
+/* Owner note 27, G2 (run 12): a step plays the pass as dozens of stretches whose ranges change with the
+ * mover's refresh points, so composing a stretch graph per range grew the pool without bound (one
+ * executable per distinct range; +8 GB of host memory over two requests), and releasing the segment
+ * executables made every new range re-finalize its segments (minutes a request). Default now: play the
+ * segment executables directly, in order, fenced once at the stretch's ends -- the pool is the segments
+ * alone, nothing is composed or re-finalized. RADIANCE_L0_TAPE_COMPOSE=stretch|record = the old modes. */
+bool compose_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("RADIANCE_L0_TAPE_COMPOSE");
+        return !v ? 0 : std::strcmp(v, "record") == 0 ? 2 : std::strcmp(v, "stretch") == 0 ? 1 : 0;
+    }();
+    return m != 0;
+}
+void run_on_home_direct(Tape& t, int from, int to) {
+    sycl::queue& H = t.qs[0]->q;
+    const bool fence = t.fence && t.qs.size() > 1;
+    if (fence) {
+        std::vector<sycl::event> pre;
+        for (size_t k = 1; k < t.qs.size(); ++k) pre.push_back(t.qs[k]->q.ext_oneapi_submit_barrier());
+        H.ext_oneapi_submit_barrier(pre);
+    }
+    bool any = false;
+    for (int i = from; i < to; ++i) {
+        Seg& s = t.segs[(size_t)i];
+        if (!s.ex) continue;
+        t.last = H.ext_oneapi_graph(*s.ex);
+        any = true;
+    }
+    if (any) t.submitted = true;
+    if (fence && any)
+        for (size_t k = 1; k < t.qs.size(); ++k) t.qs[k]->q.ext_oneapi_submit_barrier({t.last});
+}
 int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
+    if (!compose_mode()) {
+        return guarded("tape_play", [&] {
+            run_on_home_direct(*t, from, to);
+            if (t->plays_told < 6) {
+                ++t->plays_told;
+                RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s), direct", (unsigned long long)t->id, from, to, t->segs.size());
+            }
+            std::vector<L0Event*> evs;
+            for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
+            rerecord(*t, evs);
+        });
+    }
     return guarded("tape_play", [&] {
         std::shared_ptr<Exec>& ex = t->stretch[{from, to}];
         /* the submission before this play: when it has completed, every earlier command buffer of
