@@ -847,10 +847,13 @@ void settle(L0Stream& s) {
  * That is the host oracle's semantics at the latest moments; in a decode step the queue is idle at
  * the play (the engine synced to read the token) and the engine syncs again after it.
  * RADIANCE_L0_NTAPE_SYNC=host waits at once after the play instead (the oracle). */
-int ntape_sync() {   /* 0 the design, 3 the host oracle */
+int ntape_sync() {   /* 0 the design, 3 the host oracle, 4 the host wait before the play only */
     static const int m = [] {
         const char* v = std::getenv("RADIANCE_L0_NTAPE_SYNC");
-        return v && !std::strcmp(v, "host") ? 3 : 0;
+        if (!v) return 0;
+        if (!std::strcmp(v, "host")) return 3;
+        if (!std::strcmp(v, "hostbefore")) return 4;
+        return 0;
     }();
     return m;
 }
@@ -871,14 +874,29 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
     }
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
-    /* the runtime's queue(s) first, on the host: never a device-side wait on the runtime's event
-     * handles (N10: the v1 adapter recycles them under such a wait) */
+    /* the runtime's queue(s) first: a device-side wait on the queue's last event, the sycl::event
+     * kept alive in the slot until its reuse (so the handle cannot be recycled under the wait). T6:
+     * a host wait here blocked a rank inside a cycle between the ranks' plays (the N10 hypothesis
+     * behind it -- recycled handles -- was the same list in flight twice, fixed since).
+     * RADIANCE_L0_NTAPE_SYNC=hostbefore keeps the host form for the A/B. */
+    const bool host_before = host || ntape_sync() == 4;
     auto add_wait = [&](sycl::queue& q) {
-        if (!host && sleepy_wait_on() && !devs()[t.dev].cpu) {
-            std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
-            if (e) sleepy_wait(*e);
+        if (host_before) {
+            if (!host && sleepy_wait_on() && !devs()[t.dev].cpu) {
+                std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
+                if (e) sleepy_wait(*e);
+            }
+            q.wait_and_throw();
+            return;
         }
-        q.wait_and_throw();
+        std::optional<sycl::event> e = q.ext_oneapi_get_last_event();
+        if (!e) return;
+        try {
+            waits.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*e));
+            keep.push_back(*e);
+        } catch (const sycl::exception&) {
+            e->wait_and_throw();   /* no native handle (a host event): waited for here */
+        }
     };
     add_wait(H);
     if (fence) for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
@@ -933,7 +951,8 @@ NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
     auto it = Z.kernels.find(rk);
     if (it != Z.kernels.end()) return it->second;
     NKernel nk;
-    try {
+    static const bool own = [] { const char* v = std::getenv("RADIANCE_L0_NTAPE_OWN_KERNELS"); return !(v && !std::strcmp(v, "0")); }();
+    if (own) try {
         const std::string name = k.get_info<sycl::info::kernel::function_name>();
         auto kb = k.get_kernel_bundle();
         std::vector<ze_module_handle_t> mods = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(kb);
@@ -945,7 +964,7 @@ NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
     } catch (const sycl::exception&) { nk.k = nullptr; }
     if (!nk.k) {
         static std::atomic<int> told{0};
-        if (told.fetch_add(1) < 2)
+        if (own && told.fetch_add(1) < 2)
             RAD_WARN("l0 tape: no kernel object of my own for a library kernel; recording with the runtime's handle");
         nk.k = rk;
     } else {
