@@ -107,6 +107,16 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_kernel_props_cpu COMMAND xe_kernel_props $<TARGET_FILE:libxe>)
   set_tests_properties(xe_kernel_props_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Milestone 2, owner note 28: the feasibility probe for tapes on direct Level Zero command lists (a
+  # launch_as kernel launched natively, and the cost of a submission: SYCL graphs vs native lists).
+  add_executable(xe_native_launch_test test/native_launch_test.cpp)
+  rad_l0_sycl(xe_native_launch_test)
+  target_include_directories(xe_native_launch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_native_launch_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_native_launch_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_native_launch_cpu COMMAND xe_native_launch_test 10)
+  set_tests_properties(xe_native_launch_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Milestone 2: device timing of the planes expert GEMV at Flash-Next's decode shapes (dlopen of
   # libxe.so; RADIANCE_XE_MOE_V1=1 for the old kernel). Not a ctest: a bench for card1.
   add_executable(xe_moe_planes_bench test/moe_planes_bench.cpp)
