@@ -921,6 +921,26 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b or vgen_b carries, which no key
      * below reads. */
     if (b->gen) return 0;
+    /* RADIANCE_TAPE_SKIP=<draft_pass values, comma-separated>: those passes are never recorded
+     * (issued live), the bisection of milestone 3's wrong drafts under recording (m2 section 5.3:
+     * draft acceptance 46 % plain, 11 % with graph tapes, 30 % with native ones). "-1,1,2,3" leaves
+     * every draft pass plain, "0" the trunk pass. */
+    {
+        static const std::vector<int> skip = [] {
+            std::vector<int> v;
+            const char* e = std::getenv("RADIANCE_TAPE_SKIP");
+            if (!e) return v;
+            for (const char* p = e; *p;) {
+                char* q = nullptr;
+                const long x = std::strtol(p, &q, 10);
+                if (q == p) break;
+                v.push_back((int)x);
+                p = *q == ',' ? q + 1 : q;
+            }
+            return v;
+        }();
+        for (int d : skip) if (d == b->draft_pass) return 0;
+    }
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);

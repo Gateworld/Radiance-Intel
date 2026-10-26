@@ -379,6 +379,7 @@ using Exec  = sx::command_graph<sx::graph_state::executable>;
 struct NCmd {
     int kind = 0;                      /* 0 launch, 1 copy, 2 2D copy */
     ze_kernel_handle_t k = nullptr;
+    const std::string* name = nullptr; /* the kernel's name (owned by the device's kernel table) */
     uint32_t i_arg0 = 0;
     int i_lds = -1;
     std::vector<uint8_t> arg0;
@@ -653,6 +654,7 @@ struct NKernel {
     uint32_t nargs = 0;
     bool own = false;                  /* created here (else the runtime's handle, shared) */
     bool lds_told = false;             /* the local-memory argument refused a size once (said once) */
+    std::string name;                  /* the kernel's function name (the tape audit's message) */
 };
 struct ZeDev {
     bool tried = false, ok = false;
@@ -868,7 +870,6 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     if (!n) return;
     ZeDev& Z = zedev(t.dev);
     sycl::queue& H = t.qs[0]->q;
-    const bool fence = t.fence && t.qs.size() > 1;
     const bool host = ntape_sync() == 3;
     /* this tape's lists must not be in flight twice (an in-order list's counter state is one
      * submission's): its previous play first */
@@ -903,8 +904,12 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
             e->wait_and_throw();
         }
     };
+    /* every recorded stream, fence or not: the play moves every lane's commands onto the backend's
+     * list, so each lane's own queue must come before it and (below) follow it. M4: a draft pass
+     * records two lanes and no event, so it was "played unfenced" and only the home lane was ordered;
+     * the second lane's next plain submission (the draft head's sampler) ran ahead of the replay */
     add_wait(H);
-    if (fence) for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
+    for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
     std::lock_guard<std::mutex> lk(Z.m);
     if (Z.prev_slot >= 0) {   /* the previous play (or cross-stream wait), unless its slot has moved on (then it completed) */
         const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
@@ -929,7 +934,7 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     t.submitted = true;
     if (zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) g_sig_early.fetch_add(1, std::memory_order_relaxed);
     if (host) zeEventHostSynchronize(r.ev, UINT64_MAX);
-    for (size_t k = 0; k < (fence ? t.qs.size() : 1); ++k) {
+    for (size_t k = 0; k < t.qs.size(); ++k) {
         t.qs[k]->npend_dev = t.dev;
         t.qs[k]->npend_slot = slot;
         t.qs[k]->npend_serial = Z.prev_serial;
@@ -956,9 +961,10 @@ NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
     auto it = Z.kernels.find(rk);
     if (it != Z.kernels.end()) return it->second;
     NKernel nk;
+    try { nk.name = k.get_info<sycl::info::kernel::function_name>(); } catch (const sycl::exception&) { nk.name = "?"; }
     static const bool own = [] { const char* v = std::getenv("RADIANCE_L0_NTAPE_OWN_KERNELS"); return !(v && !std::strcmp(v, "0")); }();
     if (own) try {
-        const std::string name = k.get_info<sycl::info::kernel::function_name>();
+        const std::string& name = nk.name;
         auto kb = k.get_kernel_bundle();
         std::vector<ze_module_handle_t> mods = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(kb);
         for (ze_module_handle_t m : mods) {
@@ -1053,7 +1059,7 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     }
     ++t_rec.ncmds;
     NCmd c;
-    c.kind = 0; c.k = nk.k; c.i_arg0 = (uint32_t)kernel->i_arg0; c.i_lds = i_lds; c.lds = lds;
+    c.kind = 0; c.k = nk.k; c.name = &nk.name; c.i_arg0 = (uint32_t)kernel->i_arg0; c.i_lds = i_lds; c.lds = lds;
     c.arg0.assign((const uint8_t*)arg0, (const uint8_t*)arg0 + arg0_size);
     for (int d = 0; d < 3; ++d) { c.gc[d] = grid[d]; c.bs[d] = block[d]; }
     t_rec.cmds.push_back(std::move(c));
@@ -1621,11 +1627,65 @@ int play_now(Tape& tr, int from, int to) {
 }
 /* Segment by segment: node and event-record counts (SYCL keeps a graph's arguments to itself, so
  * this is weaker than the AQL tape's packet comparison; the pass key fixes the buffers). */
+/* Native tapes: the segments' command descriptors byte for byte. 0 when they agree, else the
+ * segment's index with the first difference in `why`. */
+int n_tape_diff(const Tape& a, const Tape& b, size_t i, char* why, int cap) {
+    const std::vector<NCmd>& x = a.segs[i].cmds;
+    const std::vector<NCmd>& y = b.segs[i].cmds;
+    if (x.size() != y.size()) {
+        if (why && cap > 0) std::snprintf(why, (size_t)cap, "segment %zu: %zu commands against %zu", i, x.size(), y.size());
+        return 1;
+    }
+    for (size_t j = 0; j < x.size(); ++j) {
+        const NCmd& c = x[j];
+        const NCmd& d = y[j];
+        const char* nm = c.name ? c.name->c_str() : (c.kind == 1 ? "copy" : "2D copy");
+        if (c.kind != d.kind || c.k != d.k) {
+            if (why && cap > 0) std::snprintf(why, (size_t)cap, "segment %zu, command %zu: %s against %s", i, j, nm,
+                                              d.name ? d.name->c_str() : (d.kind == 1 ? "copy" : "2D copy"));
+            return 1;
+        }
+        if (c.kind == 0) {
+            if (std::memcmp(c.gc, d.gc, sizeof c.gc) || std::memcmp(c.bs, d.bs, sizeof c.bs) || c.lds != d.lds) {
+                if (why && cap > 0)
+                    std::snprintf(why, (size_t)cap, "segment %zu, command %zu (%s): the launch shape differs (%ux%ux%u blocks of %ux%ux%u, %zu B local"
+                                  " against %ux%ux%u of %ux%ux%u, %zu B)", i, j, nm, c.gc[0], c.gc[1], c.gc[2], c.bs[0], c.bs[1], c.bs[2], c.lds,
+                                  d.gc[0], d.gc[1], d.gc[2], d.bs[0], d.bs[1], d.bs[2], d.lds);
+                return 1;
+            }
+            if (c.arg0.size() != d.arg0.size()) {
+                if (why && cap > 0) std::snprintf(why, (size_t)cap, "segment %zu, command %zu (%s): %zu argument bytes against %zu", i, j, nm, c.arg0.size(), d.arg0.size());
+                return 1;
+            }
+            for (size_t o = 0; o < c.arg0.size(); ++o)
+                if (c.arg0[o] != d.arg0[o]) {
+                    const size_t w = o & ~(size_t)7;
+                    uint64_t u = 0, v = 0;
+                    std::memcpy(&u, c.arg0.data() + w, std::min<size_t>(8, c.arg0.size() - w));
+                    std::memcpy(&v, d.arg0.data() + w, std::min<size_t>(8, d.arg0.size() - w));
+                    if (why && cap > 0)
+                        std::snprintf(why, (size_t)cap, "segment %zu, command %zu (%s): the by-value argument differs at byte %zu of %zu "
+                                      "(the 8 bytes at %zu: 0x%016llx recorded, 0x%016llx now)", i, j, nm, o, c.arg0.size(), w,
+                                      (unsigned long long)u, (unsigned long long)v);
+                    return 1;
+                }
+        } else if (c.dst != d.dst || c.src != d.src || c.bytes != d.bytes || c.dp != d.dp || c.sp != d.sp || c.w != d.w || c.h != d.h) {
+            if (why && cap > 0)
+                std::snprintf(why, (size_t)cap, "segment %zu, command %zu (%s): %p <- %p %zu B (%zu/%zu pitch, %zux%zu) against %p <- %p %zu B (%zu/%zu, %zux%zu)",
+                              i, j, nm, c.dst, c.src, c.bytes, c.dp, c.sp, c.w, c.h, d.dst, d.src, d.bytes, d.dp, d.sp, d.w, d.h);
+            return 1;
+        }
+    }
+    return 0;
+}
 int z_tape_diff(RadTape pa, RadTape pb, char* why, int cap) {
     auto* a = static_cast<Tape*>(pa);
     auto* b = static_cast<Tape*>(pb);
     if (!a || !b) return RAD_E_INVAL;
     const size_t n = std::min(a->segs.size(), b->segs.size());
+    if (a->native && b->native)
+        for (size_t i = 0; i < n; ++i)
+            if (n_tape_diff(*a, *b, i, why, cap)) return (int)i;
     for (size_t i = 0; i < n; ++i)
         if (a->segs[i].nodes != b->segs[i].nodes || a->segs[i].evs.size() != b->segs[i].evs.size()) {
             if (why && cap > 0)

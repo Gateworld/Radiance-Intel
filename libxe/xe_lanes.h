@@ -35,6 +35,7 @@
 
 #include "rad_plugin.h"   /* rad_f32_to_fp8e4m3 / rad_fp8e4m3_to_f32: the ABI's E4M3 */
 #include "rad_l0_rec.h"   /* the native recorder (owner note 28): launch_as records into a command list */
+#include <new>
 
 namespace xe {
 namespace sx  = sycl::ext::oneapi;
@@ -273,7 +274,14 @@ sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds
     auto kfn = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
         std::apply([](auto... x) { K(x...); }, v);
     };
-    if (launch_native<decltype(kfn)>(q, g, b, lds, &v, sizeof v)) return sycl::event{};
+    if (rad_l0k_rec_device && rad_l0k_rec_device(&q) >= 0) {
+        /* the native argument in zeroed storage: a tuple's padding bytes are otherwise whatever the
+         * stack held, and the tape audit compares the argument bytes (M2: a false difference at a
+         * padding byte of hc_up_mix_kernel's tuple) */
+        alignas(std::tuple<P...>) unsigned char vz[sizeof v] = {};
+        new (vz) std::tuple<P...>(v);
+        if (launch_native<decltype(kfn)>(q, g, b, lds, vz, sizeof v)) return sycl::event{};
+    }
     return sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
 #pragma clang diagnostic pop
 }
@@ -299,7 +307,11 @@ sycl::event launch_as_grf256(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, con
     auto kfn = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
         std::apply([](auto... x) { K(x...); }, v);
     };
-    if (launch_native<decltype(kfn)>(q, g, b, 0, &v, sizeof v)) return sycl::event{};
+    if (rad_l0k_rec_device && rad_l0k_rec_device(&q) >= 0) {
+        alignas(std::tuple<P...>) unsigned char vz[sizeof v] = {};   /* zeroed padding, as in launch_as */
+        new (vz) std::tuple<P...>(v);
+        if (launch_native<decltype(kfn)>(q, g, b, 0, vz, sizeof v)) return sycl::event{};
+    }
     return q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<3>(global, local),
                        sxe::properties{sycl::ext::intel::experimental::grf_size<256>}, kfn);
