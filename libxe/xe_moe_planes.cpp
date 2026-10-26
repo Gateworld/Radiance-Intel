@@ -150,6 +150,12 @@ constexpr uint32_t kV2MaxK = 4096;
 inline float h2f(uint32_t bits16) { return (float)sycl::bit_cast<sycl::half>((uint16_t)bits16); }
 inline uint32_t f2h(float f) { return (uint32_t)sycl::bit_cast<uint16_t>((sycl::half)f); }
 
+/* UPL: 16-byte chunks a lane (K / 32 / 16, rounded up; the last may be partial): every lane's weight
+ * loads of the row pair are issued together before the arithmetic, so the memory system sees
+ * 2 x UPL loads a lane in flight (v2 issued one and waited: 144 us, 114 GB/s, 3x round 2 M6's 43 us
+ * for this configuration). The level table is one packed f16 pair a byte and the products are f16,
+ * exact (levels and activations are E4M3), summed in f32, as M6's v2 (DEC1). */
+template <int UPL>
 void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict__ As, PCls c0, PCls c1,
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
                           uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
@@ -157,8 +163,7 @@ void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict
                           uint32_t a_rows) {
     XE_SHARED(uint32_t, s_a, kV2MaxK / 2);      /* the activation row as f16 pairs */
     XE_SHARED(float, s_as, kV2MaxK / 128);      /* its per-128 scales */
-    XE_SHARED(float, s_lo, 256);                /* byte -> level of its low nibble */
-    XE_SHARED(float, s_hi, 256);                /* byte -> level of its high nibble */
+    XE_SHARED(uint32_t, s_lut, 256);            /* byte -> (level of its low nibble, of its high) as f16 */
     XE_SHARED(float, s_e4, 256);                /* byte -> E4M3 value */
     const int tid = (int)threadIdx.x;
     const uint32_t i = blockIdx.y, nb = blockIdx.x;
@@ -195,8 +200,7 @@ void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict
         for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kV2WG) s_as[g] = As[(size_t)tok * as_ld + g];
         for (uint32_t t = (uint32_t)tid; t < 256u; t += kV2WG) {
             s_e4[t] = e4m3(t);
-            s_lo[t] = lvp[t & 15u];
-            s_hi[t] = lvp[t >> 4];
+            s_lut[t] = f2h(lvp[t & 15u]) | (f2h(lvp[t >> 4]) << 16);
         }
     }
     __syncthreads();
@@ -217,21 +221,29 @@ void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict
         const uint32_t rb = K / 2u, sb = K / 64u;       /* bytes a codes row, a scale row */
         const uint8_t* wrow0 = we + c.c_off;
         const uint8_t* srow0 = se + c.s_off;
-        for (uint32_t jc = (uint32_t)l; jc < CPR; jc += kV2LPR) {
-            const uint32_t bo = jc * 16u;               /* byte offset in the codes row */
-            const uint32_t k0 = bo * 2u;                /* its first K index (32 codes) */
+        /* all weight loads of this lane first (chunk u of row r), then the arithmetic */
+        uint4 w[UPL][kV2R];
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * kV2LPR;
+#pragma unroll
+            for (int r = 0; r < kV2R; ++r)
+                w[u][r] = (jc < CPR && rowok[r]) ? *(const uint4*)(wrow0 + (size_t)rowr[r] * rb + jc * 16u)
+                                                 : uint4{0, 0, 0, 0};
+        }
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * kV2LPR;
+            if (jc >= CPR) break;                       /* uniform over the sub-group's tail */
+            const uint32_t k0 = jc * 32u;               /* the chunk's first K index (32 codes) */
             const float asc = s_as[k0 / 128u];
             const uint32_t g = k0 / 64u;
             uint32_t a[16];
 #pragma unroll
             for (int t = 0; t < 16; ++t) a[t] = s_a[k0 / 2u + (uint32_t)t];
-            uint4 w[kV2R];
-#pragma unroll
-            for (int r = 0; r < kV2R; ++r)
-                w[r] = rowok[r] ? *(const uint4*)(wrow0 + (size_t)rowr[r] * rb + bo) : uint4{0, 0, 0, 0};
 #pragma unroll
             for (int r = 0; r < kV2R; ++r) {
-                const uint32_t d[4] = { w[r].x, w[r].y, w[r].z, w[r].w };
+                const uint32_t d[4] = { w[u][r].x, w[u][r].y, w[u][r].z, w[u][r].w };
                 float s = 0.0f;
 #pragma unroll
                 for (int x = 0; x < 4; ++x)
@@ -239,8 +251,13 @@ void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict
                     for (int b = 0; b < 4; ++b) {
                         const uint32_t byte = (d[x] >> (8 * b)) & 0xffu;
                         const uint32_t ab = a[x * 4 + b];
-                        s = sycl::fma(s_lo[byte], h2f(ab & 0xffffu), s);
-                        s = sycl::fma(s_hi[byte], h2f(ab >> 16), s);
+                        const uint32_t lv = s_lut[byte];
+                        const sycl::half l0 = sycl::bit_cast<sycl::half>((uint16_t)(lv & 0xffffu));
+                        const sycl::half l1 = sycl::bit_cast<sycl::half>((uint16_t)(lv >> 16));
+                        const sycl::half a0 = sycl::bit_cast<sycl::half>((uint16_t)(ab & 0xffffu));
+                        const sycl::half a1 = sycl::bit_cast<sycl::half>((uint16_t)(ab >> 16));
+                        s += (float)(sycl::half)(l0 * a0);
+                        s += (float)(sycl::half)(l1 * a1);
                     }
                 if (rowok[r]) acc[r] += (s * asc) * s_e4[srow0[(size_t)rowr[r] * sb + g]];
             }
@@ -396,13 +413,29 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
                   (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
                   (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u,
                   (uint32_t)parts, (uint32_t)M);
-        else if (K <= (long long)kV2MaxK && !v1_forced())
-            XE_LAUNCH_SG(16, qq, moe_planes_v2_kernel, dim3((unsigned)((N + kV2RPW - 1) / kV2RPW), (unsigned)T),
-                         dim3(kV2WG), 0, (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1],
-                         (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T,
-                         (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);
-        else
+        else if (K <= (long long)kV2MaxK && !v1_forced()) {
+            /* chunks a lane: K / 32 chunks a row over 16 lanes, rounded up (both classes' K are equal
+             * in the shipped model; the larger decides, the smaller leaves lanes idle in the tail) */
+            const int upl = (int)((K / 32 + kV2LPR - 1) / kV2LPR);
+            const dim3 grid((unsigned)((N + kV2RPW - 1) / kV2RPW), (unsigned)T), block(kV2WG);
+#define XE_MOE_V2(U)                                                                                        \
+    XE_LAUNCH_SG(16, qq, moe_planes_v2_kernel<U>, grid, block, 0, (const uint8_t*)Aq->data,                 \
+                 (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
+                 (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
+                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts,       \
+                 (uint32_t)M)
+            switch (upl) {
+                case 1: XE_MOE_V2(1); break;
+                case 2: XE_MOE_V2(2); break;
+                case 3: XE_MOE_V2(3); break;
+                case 4: XE_MOE_V2(4); break;
+                case 5: XE_MOE_V2(5); break;
+                case 6: XE_MOE_V2(6); break;
+                case 7: XE_MOE_V2(7); break;
+                default: XE_MOE_V2(8); break;   /* K = 4096: 128 chunks, 8 a lane */
+            }
+#undef XE_MOE_V2
+        } else
             XE_LAUNCH(qq, moe_planes_kernel<false>, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
                   (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data,
                   (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
