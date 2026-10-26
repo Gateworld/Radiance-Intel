@@ -578,7 +578,7 @@ std::mutex& dead_mutex() { static std::mutex m; return m; }
 std::deque<Tape*>& dead_tapes() { static std::deque<Tape*> d; return d; }
 std::atomic<int64_t> g_tapes_deferred{0}, g_tapes_waited{0}, g_tapes_freed{0};
 bool n_slot_done(int dev, int slot, uint64_t serial);
-void n_slot_wait(int dev, int slot, uint64_t serial);
+void n_slot_wait(int dev, int slot, uint64_t serial, const char* who = "");
 bool tape_idle(Tape* t) {
     if (!t->submitted) return true;
     if (t->native) return n_slot_done(t->dev, t->nslot, t->nserial);
@@ -597,7 +597,7 @@ void reap_tapes(bool all = false) {
         Tape* t = d.front();
         if (!tape_idle(t)) {
             if (!all && d.size() <= kDeadMax) break;
-            if (t->native) n_slot_wait(t->dev, t->nslot, t->nserial);
+            if (t->native) n_slot_wait(t->dev, t->nslot, t->nserial, "the graveyard");
             else { try { t->last.wait(); } catch (const sycl::exception&) {} }
             g_tapes_waited.fetch_add(1, std::memory_order_relaxed);
         }
@@ -774,11 +774,15 @@ void done_wait(ze_event_handle_t done) {
         if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
         sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
-        if (!told && us > 30000000) { told = true; RAD_WARN("l0 tape: a play's completion event has not signalled for 30 s"); }
+        if (!told && us > 10000000) {
+            told = true;
+            RAD_WARN("l0 tape: a thread on device %d has waited 10 s for a ring slot's last play to complete (slot reuse; plays so far %lld)",
+                     t_device, (long long)g_nplays.load());
+        }
     }
 }
 bool n_slot_done(int dev, int slot, uint64_t serial);
-void n_slot_wait(int dev, int slot, uint64_t serial);
+void n_slot_wait(int dev, int slot, uint64_t serial, const char* who);
 /* Takes the next ring slot: once its last play has completed -- and every list of another device that
  * waited on its event has passed that wait -- the event is reset. */
 ZeDev::Ring& ring_take(ZeDev& Z) {
@@ -786,7 +790,7 @@ ZeDev::Ring& ring_take(ZeDev& Z) {
     Z.next = (Z.next + 1) % kRingEvents;
     if (r.used) {
         done_wait(r.ev);
-        for (const ZeDev::Consumer& c : r.consumers) n_slot_wait(c.dev, c.slot, c.serial);
+        for (const ZeDev::Consumer& c : r.consumers) n_slot_wait(c.dev, c.slot, c.serial, "a slot's consumer");
         r.consumers.clear();
         zeEventHostReset(r.ev);
         r.used = false;
@@ -811,7 +815,7 @@ ze_event_handle_t n_slot_event(int dev, int slot, uint64_t serial) {
     if (r.serial.load(std::memory_order_acquire) != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) return nullptr;
     return r.ev;
 }
-void n_slot_wait(int dev, int slot, uint64_t serial) {
+void n_slot_wait(int dev, int slot, uint64_t serial, const char* who) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     int64_t sleep_us = kWaitSleepMinUs;
@@ -823,15 +827,15 @@ void n_slot_wait(int dev, int slot, uint64_t serial) {
         sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
         if (!told && us > 10000000) {
             told = true;
-            RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (plays so far %lld)",
-                     t_device, dev, slot, (unsigned long long)serial, (long long)g_nplays.load());
+            RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (%s; plays so far %lld)",
+                     t_device, dev, slot, (unsigned long long)serial, who, (long long)g_nplays.load());
         }
     }
 }
 /* The stream's next submission to the runtime follows its pending native play: the host waits here. */
 void settle(L0Stream& s) {
     if (s.npend_slot < 0) return;
-    n_slot_wait(s.npend_dev, s.npend_slot, s.npend_serial);
+    n_slot_wait(s.npend_dev, s.npend_slot, s.npend_serial, "settle before a runtime submission");
     s.npend_slot = -1;
 }
 /* How a play is ordered against the SYCL runtime's own commands (N2-N10, card1). A play runs on the
@@ -860,7 +864,7 @@ int ntape_sync() {   /* 0 the design, 3 the host oracle, 4 the host wait before 
 /* Appends `n` closed lists to the backend's own immediate list, after the home stream's last
  * command (and the other recorded streams' when fenced) and after the previous play; marks the
  * streams so their next runtime submission waits for it. */
-void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
+void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool replay = true) {
     if (!n) return;
     ZeDev& Z = zedev(t.dev);
     sycl::queue& H = t.qs[0]->q;
@@ -868,9 +872,9 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
     const bool host = ntape_sync() == 3;
     /* this tape's lists must not be in flight twice (an in-order list's counter state is one
      * submission's): its previous play first */
-    if (t.submitted && !n_slot_done(t.dev, t.nslot, t.nserial)) {
+    if (replay && t.submitted && !n_slot_done(t.dev, t.nslot, t.nserial)) {
         g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
-        n_slot_wait(t.dev, t.nslot, t.nserial);
+        n_slot_wait(t.dev, t.nslot, t.nserial, "the same tape's previous play");
     }
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
@@ -895,7 +899,8 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n) {
             waits.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*e));
             keep.push_back(*e);
         } catch (const sycl::exception&) {
-            e->wait_and_throw();   /* no native handle (a host event): waited for here */
+            sleepy_wait(*e);       /* no native handle (a host event): waited for here */
+            e->wait_and_throw();
         }
     };
     add_wait(H);
@@ -1135,7 +1140,7 @@ void n_seg_close() {
         /* kept before it runs: a failed append leaves the list to the tape's destructor, not leaked */
         t.segs.push_back(std::move(sg));
         Seg& kept = t.segs.back();
-        if (kept.list) n_play_lists(t, &kept.list, 1);
+        if (kept.list) n_play_lists(t, &kept.list, 1, false);   /* a recording's segments are distinct lists: no same-tape wait */
         if (kept.list) n_rerecord(t, kept.evs); else rerecord(t, kept.evs);
     }
 }
@@ -1452,7 +1457,7 @@ int play_now(Tape& tr, int from, int to) {
             /* phase 2 of the pool: from the first play on, every range is a composed list; the segment
              * lists (one a segment, 1,036 a decode pass) go once the recording's own plays have completed */
             if (compose_mode() != 0 && !t->segs_dropped) {
-                if (t->submitted && !n_slot_done(t->dev, t->nslot, t->nserial)) n_slot_wait(t->dev, t->nslot, t->nserial);
+                if (t->submitted && !n_slot_done(t->dev, t->nslot, t->nserial)) n_slot_wait(t->dev, t->nslot, t->nserial, "the segment lists' release");
                 int64_t n = 0;
                 for (Seg& s : t->segs)
                     if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; ++n; }
@@ -1723,6 +1728,7 @@ void sleepy_wait(const sycl::event& e) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     int64_t sleep_us = kWaitSleepMinUs;
+    bool told = false;
     for (;;) {
         if (event_done(e)) return;
         g_wait_polls.fetch_add(1, std::memory_order_relaxed);
@@ -1731,6 +1737,11 @@ void sleepy_wait(const sycl::event& e) {
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
         g_wait_sleeps.fetch_add(1, std::memory_order_relaxed);
         sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        if (!told && us > 10000000) {   /* M1: which host wait holds a rank (a stream or event sync) */
+            told = true;
+            RAD_WARN("l0: a thread on device %d has waited 10 s in a sleeping wait for the runtime's event (a stream or event sync; plays so far %lld)",
+                     t_device, (long long)g_nplays.load());
+        }
     }
 }
 
@@ -1902,7 +1913,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
          * fresh slot's signal that the stream's next submission settles on and the next play follows */
         L0Stream& st = S(s);
         ZeDev& Z = zedev(st.dev);
-        if (!Z.ok || !Z.imm) { n_slot_wait(zdev, zslot, zserial); return RAD_OK; }
+        if (!Z.ok || !Z.imm) { n_slot_wait(zdev, zslot, zserial, "rad_event_wait without a native list"); return RAD_OK; }
         int slot;
         uint64_t serial;
         {
@@ -1970,7 +1981,7 @@ int z_event_sync(RadEvent ev) {
         b = e->ev;
         zdev = e->zdev; zslot = e->zslot; zserial = e->zserial;
     }
-    if (zdev >= 0) { n_slot_wait(zdev, zslot, zserial); return RAD_OK; }
+    if (zdev >= 0) { n_slot_wait(zdev, zslot, zserial, "rad_event_sync"); return RAD_OK; }
     return guarded("rad_event_sync", [&] {
         if (sleepy_wait_on() && !devs()[t_device].cpu) sleepy_wait(b);
         b.wait_and_throw();
