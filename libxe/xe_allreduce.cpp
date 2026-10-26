@@ -33,6 +33,7 @@
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 
 #include <atomic>
+#include <sycl/ext/oneapi/experimental/builtins.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -52,7 +53,7 @@ namespace intelex = sycl::ext::intel::experimental;
 constexpr int      kWG = 256;            /* work-items a block */
 constexpr int      kMaxBlocks = 512;       /* flag words a slot */
 constexpr int      kResidentBlocks = 64;   /* the launch's block cap (see launch) */
-constexpr uint32_t kSpin = 400000000u;   /* bounded wait: ~seconds, never a hung card */
+constexpr uint32_t kSpin = 400000000u;   /* bounded wait: minutes at ~0.3 us an uncached poll (XE_AR_SPIN lowers it), never a hung card */
 constexpr int      kMaxRanks = 2;
 
 /* uncached stores and loads for flags and payload (M2a/M2b's working mailbox) */
@@ -61,6 +62,24 @@ using uc_u32 = syclex::annotated_ptr<uint32_t, decltype(syclex::properties(
     intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>))>;
 inline void uc_st(uint32_t* p, uint32_t v) { uc_u32 a(p); a[0] = v; }
 inline uint32_t uc_ld(const uint32_t* p) { uc_u32 a((uint32_t*)p); return a[0]; }
+#ifdef __SYCL_DEVICE_ONLY__
+#define XE_AR_CONSTANT __attribute__((opencl_constant))
+#else
+#define XE_AR_CONSTANT
+#endif
+/* A block that exhausted its budget: counted in seq_ctr[3], the first two blocks of the launch say so
+ * from the device (run 18: a stall was silent, and its skipped arrival desynchronized every later
+ * launch of the rank). */
+inline void ar_gave_up(uint32_t* seq_ctr, uint32_t rank, uint32_t s, uint32_t b, uint32_t nblk, uint32_t t) {
+    if (t != 0) return;
+    uc_st(seq_ctr + 1, s);
+    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> stalls(seq_ctr[3]);
+    const uint32_t n = stalls.fetch_add(1u) + 1u;
+    if (b < 2u) {
+        static const XE_AR_CONSTANT char fmt[] = "W xe all-reduce: rank %u gave up waiting for the peer at sequence %u (block %u of %u; stalled blocks so far %u)\n";
+        sycl::ext::oneapi::experimental::printf(fmt, rank, s, b, nblk, n);
+    }
+}
 
 struct Inst {
     int       rank = 0, world = 2, dtype = 0;   /* dtype: 0 bf16, 1 fp16, 2 fp32 */
@@ -230,22 +249,26 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
-    if (!ok) { if (t == 0) uc_st(seq_ctr + 1, s); return; }
-    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-    for (uint32_t k = w0 + t; k < w1; k += kWG) {
-        const uint32_t mine = x[k], theirs = uc_ld(in + k);
-        const uint32_t r0 = rank == 0 ? mine : theirs, r1 = rank == 0 ? theirs : mine;
-        uint32_t o;
-        if constexpr (DT == 2) o = from_f<2>(to_f<2>(r0) + to_f<2>(r1));
-        else {
-            const uint32_t lo = from_f<DT>(to_f<DT>(r0 & 0xffffu) + to_f<DT>(r1 & 0xffffu));
-            const uint32_t hi = from_f<DT>(to_f<DT>(r0 >> 16) + to_f<DT>(r1 >> 16));
-            o = lo | (hi << 16);
+    if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
+    else {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        for (uint32_t k = w0 + t; k < w1; k += kWG) {
+            const uint32_t mine = x[k], theirs = uc_ld(in + k);
+            const uint32_t r0 = rank == 0 ? mine : theirs, r1 = rank == 0 ? theirs : mine;
+            uint32_t o;
+            if constexpr (DT == 2) o = from_f<2>(to_f<2>(r0) + to_f<2>(r1));
+            else {
+                const uint32_t lo = from_f<DT>(to_f<DT>(r0 & 0xffffu) + to_f<DT>(r1 & 0xffffu));
+                const uint32_t hi = from_f<DT>(to_f<DT>(r0 >> 16) + to_f<DT>(r1 >> 16));
+                o = lo | (hi << 16);
+            }
+            y[k] = o;
         }
-        y[k] = o;
     }
     /* the counter advances once per launch, after every block has read it: the last block to
-     * finish does it (an atomic arrival count in seq_ctr[2]) */
+     * finish does it (an atomic arrival count in seq_ctr[2]); a block that gave up arrives too, so
+     * the next launch's sequence stays in step with the peer's (run 18: the skipped arrival left the
+     * counter behind for the rest of the run, a stall at every later collective) */
     __syncthreads();
     if (t == 0) {
         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> arr(seq_ctr[2]);
@@ -328,15 +351,17 @@ void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uin
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
-    if (!ok) { if (t == 0) uc_st(seq_ctr + 1, s); return; }
-    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-    const uint32_t peer = rank ^ 1u;
-    const bool inter = row32 > 0 && row32 < n32;
-    for (uint32_t k = w0 + t; k < w1; k += kWG) {
-        const uint32_t om = inter ? (k / row32) * (2u * row32) + rank * row32 + (k % row32) : rank * n32 + k;
-        const uint32_t op = inter ? (k / row32) * (2u * row32) + peer * row32 + (k % row32) : peer * n32 + k;
-        y[om] = x[k];
-        y[op] = uc_ld(in + k);
+    if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
+    else {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        const uint32_t peer = rank ^ 1u;
+        const bool inter = row32 > 0 && row32 < n32;
+        for (uint32_t k = w0 + t; k < w1; k += kWG) {
+            const uint32_t om = inter ? (k / row32) * (2u * row32) + rank * row32 + (k % row32) : rank * n32 + k;
+            const uint32_t op = inter ? (k / row32) * (2u * row32) + peer * row32 + (k % row32) : peer * n32 + k;
+            y[om] = x[k];
+            y[op] = uc_ld(in + k);
+        }
     }
     __syncthreads();
     if (t == 0) {
@@ -484,6 +509,14 @@ extern "C" int xe_ar2_host_init(const RadParam* p, int n_p, int rank, int world,
 extern "C" void xe_ar2_fini(void* instance) { ar_fini(instance); }
 extern "C" int xe_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) { return launch(a, s, 0); }
 extern "C" int xe_rad_ar_oneshot_2rank_exact_host(const RadArgs* a, RadStream s) { return launch(a, s, 1); }
+/* the blocks that gave up so far (seq_ctr[3]), for tests */
+extern "C" uint32_t xe_ar2_stalls(void* instance, RadStream s) {
+    Inst* in = (Inst*)instance;
+    if (!in) return 0;
+    uint32_t v = 0;
+    ((sycl::queue*)s)->memcpy(&v, in->my_seq + 3, 4).wait();
+    return v;
+}
 /* a stalled handshake, for tests: the launch's sequence at which a block gave up, 0 if none */
 extern "C" uint32_t xe_ar2_stalled(void* instance, RadStream s) {
     Inst* in = (Inst*)instance;
