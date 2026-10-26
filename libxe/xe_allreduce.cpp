@@ -266,9 +266,11 @@ int launch(const RadArgs* a, RadStream s, int host_form) {
     const RadTensor* y = r4d_opt(a, 1);
     if (!x || !x->data) return R4D_NO(RAD_E_INVAL);
     if (!y || !y->data) y = x;   /* in place */
-    const long long nel = r4d_geti_or(a, "numel", r4d_numel(x));
+    /* the message is the operand; `numel` is the band's ceiling (libref's band_rows): the engine
+     * hands the collapsed geometry (numel 10,485,760) with a 38,400-element row slice (T1, run 8) */
+    const long long nel = r4d_numel(x);
     if (nel <= 0 || nel > in->numel) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_numel(x) < nel || r4d_numel(y) < nel) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(y) < nel) return R4D_NO(RAD_E_SHAPE);
     const int64_t bytes = nel * elem_bytes(in->dtype);
     if (bytes % 4) return R4D_NO(RAD_E_SHAPE);   /* 32-bit words: an odd bf16 count is not served */
     if (((uintptr_t)x->data | (uintptr_t)y->data) % 4) return R4D_NO(RAD_E_STRIDE);
@@ -349,9 +351,9 @@ int gather_launch(const RadArgs* a, RadStream s, int host_form) {
     const RadTensor* x = r4d_opt(a, 0);
     const RadTensor* y = r4d_opt(a, 1);
     if (!x || !x->data || !y || !y->data) return R4D_NO(RAD_E_INVAL);
-    const long long nel = r4d_geti_or(a, "numel", r4d_numel(x));
+    const long long nel = r4d_numel(x);   /* the contribution is the operand; `numel` the band */
     if (nel <= 0 || nel > in->numel) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_numel(x) < nel || r4d_numel(y) < 2 * nel) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(y) < 2 * nel) return R4D_NO(RAD_E_SHAPE);
     const int64_t esz = rad_dtype_bits(x->dtype) / 8;
     if (esz <= 0 || x->dtype != y->dtype) return R4D_NO(RAD_E_DTYPE);
     const long long row = r4d_geti_or(a, "row", 0);
