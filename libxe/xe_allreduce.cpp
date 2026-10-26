@@ -202,7 +202,7 @@ template <> inline uint32_t from_f<2>(float f) { return __float_as_uint(f); }
 template <int DT>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
-               uint32_t rank, uint32_t nblk) {
+               uint32_t rank, uint32_t nblk, uint32_t spin) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
@@ -215,13 +215,19 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
     __syncthreads();
     if (t == 0) { uc_st(peer_flags + par * kMaxBlocks + b, s); sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system); }
-    /* the poll is an atomic load (relaxed, system scope) on this rank's own flag word: a plain load
-     * may legally be hoisted out of the loop, which would read the flag once and spin on the stale
-     * value (run 5's CPU test: whichever rank polled first always stalled) */
-    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
-                     sycl::access::address_space::global_space> flag(my_flags[par * kMaxBlocks + b]);
-    uint32_t budget = kSpin, ok = 1;
-    while ((flag.load() - s) > 0x7fffffffu) if (--budget == 0) { ok = 0; break; }
+    /* The poll: an uncached load of this rank's own flag word, with a system-scope acquire fence in
+     * the loop. The fence keeps the compiler from hoisting the load out of the loop (run 5's CPU test:
+     * a plain load was read once and whichever rank polled first always stalled), and the uncached
+     * hint keeps the GPU from serving a stale cached line (M2a/M2b's mailbox). Not an atomic load: a
+     * system-scope atomic on the host mailbox hung the card pair (run 6, B3's host form). */
+    const uint32_t* fp = my_flags + par * kMaxBlocks + b;
+    uint32_t budget = spin, ok = 1;
+    for (;;) {
+        const uint32_t f = uc_ld(fp);
+        if ((f - s) <= 0x7fffffffu) break;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        if (--budget == 0) { ok = 0; break; }
+    }
     if (!ok) { if (t == 0) uc_st(seq_ctr + 1, s); return; }
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
     for (uint32_t k = w0 + t; k < w1; k += kWG) {
@@ -243,6 +249,12 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> arr(seq_ctr[2]);
         if (arr.fetch_add(1u) + 1u == nblk) { arr.store(0u); uc_st(seq_ctr, s); }
     }
+}
+
+/* XE_AR_SPIN: the poll budget (default kSpin); a probe lowers it so a stalled pair fails in seconds */
+uint32_t spin_budget() {
+    static const uint32_t v = [] { const char* e = std::getenv("XE_AR_SPIN"); const long n = e ? std::strtol(e, nullptr, 10) : 0; return n > 0 ? (uint32_t)n : kSpin; }();
+    return v;
 }
 
 int launch(const RadArgs* a, RadStream s, int host_form) {
@@ -275,7 +287,7 @@ int launch(const RadArgs* a, RadStream s, int host_form) {
         const dim3 grid(nblk), block(kWG);
 #define XE_AR(DT) XE_LAUNCH(q, ar_kernel<DT>, grid, block, 0, (const uint32_t*)x->data, (uint32_t*)y->data,              \
                             (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, in->my_flags,       \
-                            in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk)
+                            in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk, spin_budget())
         switch (in->dtype) { case 0: XE_AR(0); break; case 1: XE_AR(1); break; default: XE_AR(2); break; }
 #undef XE_AR
     } catch (const sycl::exception&) {

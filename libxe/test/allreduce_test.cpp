@@ -62,6 +62,7 @@ struct Case { int dt; int64_t numel; bool inplace; };
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: allreduce_test LIBXE.so [iters]\n"); return 2; }
     const int iters = argc > 2 ? std::atoi(argv[2]) : 50;
+    setvbuf(stdout, nullptr, _IONBF, 0);   /* progress survives a timeout kill */
     void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::printf("allreduce_test: dlopen %s: %s\n", argv[1], dlerror()); return 2; }
     InitFn init[2] = { (InitFn)dlsym(h, "xe_ar2_init"), (InitFn)dlsym(h, "xe_ar2_host_init") };
@@ -102,6 +103,7 @@ int main(int argc, char** argv) {
         if (!cpu && form == 0 && !(g_dev[0].ext_oneapi_can_access_peer(g_dev[1]))) continue;
         for (const Case& c : cases) {
             const int64_t eb = c.dt == 2 ? 4 : 2, bytes = c.numel * eb;
+            std::printf("case %s dt%d numel %lld %s: init...\n", form ? "host" : "peer", c.dt, (long long)c.numel, c.inplace ? "in-place" : "into y");
             /* the instance per rank: init in two threads, as the engine's rank threads do */
             void* inst[2] = { nullptr, nullptr };
             int irc[2] = { 0, 0 };
@@ -127,6 +129,7 @@ int main(int argc, char** argv) {
                 yb[r] = sycl::malloc_device<uint8_t>(bytes + 2 * kCanary, q[r]);
                 hx[r].resize(bytes);
             }
+            std::printf("  init ok; launching\n");
             double worst = 0; bool ok = true; double us_sum = 0; int timed = 0;
             for (int it = 0; it < iters && ok; ++it) {
                 for (int r = 0; r < 2; ++r) {
