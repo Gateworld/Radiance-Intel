@@ -375,12 +375,26 @@ namespace sx = sycl::ext::oneapi::experimental;
 using Graph = sx::command_graph<sx::graph_state::modifiable>;
 using Exec  = sx::command_graph<sx::graph_state::executable>;
 
+/* A native segment's command, kept so a stretch of segments can be composed into one list. */
+struct NCmd {
+    int kind = 0;                      /* 0 launch, 1 copy, 2 2D copy */
+    ze_kernel_handle_t k = nullptr;
+    uint32_t i_arg0 = 0;
+    int i_lds = -1;
+    std::vector<uint8_t> arg0;
+    size_t lds = 0;
+    uint32_t gc[3] = {1, 1, 1}, bs[3] = {1, 1, 1};
+    void* dst = nullptr;
+    const void* src = nullptr;
+    size_t bytes = 0, dp = 0, sp = 0, w = 0, h = 0;
+};
 struct Seg {
     std::shared_ptr<Exec> ex;          /* null when the segment holds only event records, or released (below) */
     std::optional<Graph>  g;           /* the recorded (modifiable) graph: re-finalized if a stretch needs it */
     std::vector<L0Event*> evs;         /* recorded for real after it */
     size_t nodes = 0;                  /* graph nodes, or a native segment's commands */
     ze_command_list_handle_t list = nullptr;   /* native tapes: the segment's closed regular command list */
+    std::vector<NCmd> cmds;            /* native tapes: the segment's commands, for a composed stretch */
 };
 /* Owner note 27 (run 12): a recorded decode pass is ~1,036 segment graphs, each an executable with its
  * own command list and -- for the 375 kernels that spill -- its own scratch surface (the largest spill a
@@ -422,15 +436,27 @@ struct Tape {
     size_t ncmds = 0;                  /* commands over every segment */
     int nslot = -1;                    /* the ring slot of the latest play and its serial (tape_idle) */
     uint64_t nserial = 0;
+    /* composed stretches: one list per played range (owner note 28's shape), the hybrid's bounded cache;
+     * an evicted list is destroyed once the tape's play that followed its eviction has completed */
+    std::map<std::pair<int, int>, ze_command_list_handle_t> nstretch;
+    std::map<std::pair<int, int>, uint64_t> nstretch_used;
+    uint64_t nclock = 0;
+    struct NDead { ze_command_list_handle_t list; int slot; uint64_t serial; };
+    std::deque<NDead> ndead;
     ~Tape();
 };
 std::atomic<uint64_t> g_tape_ids{0};
 std::atomic<int64_t> g_nlists_created{0}, g_nlists_destroyed{0}, g_nplays{0}, g_nlists_played{0}, g_nkernels{0};
 std::atomic<int64_t> g_sig_early{0}, g_bar_early{0};
 std::atomic<int64_t> g_same_tape_waits{0};   /* plays that waited for the same tape's previous play (its lists were still in flight) */   /* N4's diagnostic: the ring event / the barrier already complete right after the play's submission */
+std::atomic<int64_t> g_nstretch_composed{0}, g_nstretch_evicted{0};
 Tape::~Tape() {
     for (Seg& s : segs)
         if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+    for (auto& kv : nstretch)
+        if (kv.second) { zeCommandListDestroy(kv.second); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+    for (NDead& d : ndead)
+        if (d.list) { zeCommandListDestroy(d.list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
 }
 struct Rec {
     Tape* t = nullptr;
@@ -442,6 +468,7 @@ struct Rec {
     bool native = false;
     ze_command_list_handle_t nlist = nullptr;
     size_t ncmds = 0;
+    std::vector<NCmd> cmds;            /* the open segment's commands (descriptors) */
 };
 /* A pass longer than this many segments is not kept. Past the bound the recording stops, the rest
  * of the pass is issued plainly, and the tape is refused (the engine runs that pass plain from then
@@ -986,6 +1013,11 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
         return -1;
     }
     ++t_rec.ncmds;
+    NCmd c;
+    c.kind = 0; c.k = nk.k; c.i_arg0 = (uint32_t)kernel->i_arg0; c.i_lds = i_lds; c.lds = lds;
+    c.arg0.assign((const uint8_t*)arg0, (const uint8_t*)arg0 + arg0_size);
+    for (int d = 0; d < 3; ++d) { c.gc[d] = grid[d]; c.bs[d] = block[d]; }
+    t_rec.cmds.push_back(std::move(c));
     return 0;
 }
 int n_hook_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
@@ -999,6 +1031,9 @@ int n_hook_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, 
                                                                (uint32_t)spitch, 0, nullptr, 0, nullptr);
     if (rc != ZE_RESULT_SUCCESS) { n_stop("zeCommandListAppendMemoryCopyRegion refused the copy"); return -1; }
     ++t_rec.ncmds;
+    NCmd c;
+    c.kind = 2; c.dst = dst; c.src = src; c.dp = dpitch; c.sp = spitch; c.w = width; c.h = height;
+    t_rec.cmds.push_back(std::move(c));
     return 0;
 }
 /* The backend's own copies and fills while recording natively. */
@@ -1007,6 +1042,9 @@ int n_copy(void* dst, const void* src, size_t bytes) {
     const ze_result_t rc = zeCommandListAppendMemoryCopy(t_rec.nlist, dst, src, bytes, nullptr, 0, nullptr);
     if (rc != ZE_RESULT_SUCCESS) { n_stop("zeCommandListAppendMemoryCopy refused the copy"); return RAD_E_DEVICE; }
     ++t_rec.ncmds;
+    NCmd c;
+    c.kind = 1; c.dst = dst; c.src = src; c.bytes = bytes;
+    t_rec.cmds.push_back(std::move(c));
     return RAD_OK;
 }
 const RadL0RecHooks g_rec_hooks{n_hook_device, n_hook_launch, n_hook_copy2d};
@@ -1040,6 +1078,7 @@ void n_seg_close() {
     Seg sg;
     sg.nodes = t_rec.ncmds;
     sg.evs.swap(t_rec.pend);
+    sg.cmds.swap(t_rec.cmds);
     /* Not detected: a direct SYCL submission on a recorded stream inside the recording. It runs at
      * once and is absent from the replay (native_tape_test case 5). N2 attempt 2 tried to catch it by
      * the stream's last event moving between a segment's open and close, but
@@ -1314,19 +1353,101 @@ void reap_stretches(Tape& t, bool all = false) {
         d.pop_front();
     }
 }
+/* Composes segments [from, to) into one in-order list from their descriptors (owner note 28's "one
+ * command list per recorded stretch"). Null when the range holds no command. */
+ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
+    ZeDev& Z = zedev(t.dev);
+    size_t n = 0;
+    for (int i = from; i < to; ++i) n += t.segs[(size_t)i].cmds.size();
+    if (!n) return nullptr;
+    ze_command_list_handle_t l = n_list_create(Z, Z.inorder);
+    if (!l) throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "zeCommandListCreate failed (a composed stretch)");
+    size_t k = 0;
+    auto fail = [&](const char* what, ze_result_t rc) {
+        zeCommandListDestroy(l);
+        g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "%s: 0x%x (composing a stretch)", what, (unsigned)rc);
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
+    };
+    for (int i = from; i < to; ++i)
+        for (const NCmd& c : t.segs[(size_t)i].cmds) {
+            if (!Z.inorder && k) zeCommandListAppendBarrier(l, nullptr, 0, nullptr);
+            ze_result_t rc = ZE_RESULT_SUCCESS;
+            if (c.kind == 0) {
+                rc = zeKernelSetArgumentValue(c.k, c.i_arg0, c.arg0.size(), c.arg0.data());
+                if (rc == ZE_RESULT_SUCCESS && c.i_lds >= 0) {
+                    const ze_result_t rl = zeKernelSetArgumentValue(c.k, (uint32_t)c.i_lds, c.lds, nullptr);
+                    if (rl != ZE_RESULT_SUCCESS && c.lds) rc = rl;
+                }
+                if (rc == ZE_RESULT_SUCCESS) rc = zeKernelSetGroupSize(c.k, c.bs[0], c.bs[1], c.bs[2]);
+                ze_group_count_t gc{c.gc[0], c.gc[1], c.gc[2]};
+                if (rc == ZE_RESULT_SUCCESS) rc = zeCommandListAppendLaunchKernel(l, c.k, &gc, nullptr, 0, nullptr);
+                if (rc != ZE_RESULT_SUCCESS) fail("a launch", rc);
+            } else if (c.kind == 1) {
+                rc = zeCommandListAppendMemoryCopy(l, c.dst, c.src, c.bytes, nullptr, 0, nullptr);
+                if (rc != ZE_RESULT_SUCCESS) fail("a copy", rc);
+            } else {
+                ze_copy_region_t dr{0, 0, 0, (uint32_t)c.w, (uint32_t)c.h, 1};
+                ze_copy_region_t sr{0, 0, 0, (uint32_t)c.w, (uint32_t)c.h, 1};
+                rc = zeCommandListAppendMemoryCopyRegion(l, c.dst, &dr, (uint32_t)c.dp, 0, c.src, &sr, (uint32_t)c.sp, 0, nullptr, 0, nullptr);
+                if (rc != ZE_RESULT_SUCCESS) fail("a 2D copy", rc);
+            }
+            ++k;
+        }
+    const ze_result_t rc = zeCommandListClose(l);
+    if (rc != ZE_RESULT_SUCCESS) fail("zeCommandListClose", rc);
+    g_nstretch_composed.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 4)
+        RAD_INFO("l0 tape %llu: segments [%d, %d) composed into one native list of %zu command(s)", (unsigned long long)t.id, from, to, n);
+    return l;
+}
+/* Destroys the evicted stretch lists whose follow-up play has completed. */
+void n_reap_stretches(Tape& t) {
+    while (!t.ndead.empty() && n_slot_done(t.dev, t.ndead.front().slot, t.ndead.front().serial)) {
+        if (t.ndead.front().list) { zeCommandListDestroy(t.ndead.front().list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        t.ndead.pop_front();
+    }
+}
 int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
     if (t->native) {
         return guarded("tape_play", [&] {
             std::vector<ze_command_list_handle_t> lists;
-            lists.reserve((size_t)(to - from));
-            for (int i = from; i < to; ++i)
-                if (t->segs[(size_t)i].list) lists.push_back(t->segs[(size_t)i].list);
+            const bool compose = compose_mode() != 0 && to - from >= kComposeMin;
+            if (compose) {
+                ze_command_list_handle_t& l = t->nstretch[{from, to}];
+                if (!l && !t->nstretch_used.count({from, to})) l = n_compose(*t, from, to);
+                t->nstretch_used[{from, to}] = ++t->nclock;
+                if (l) lists.push_back(l);
+            } else {
+                lists.reserve((size_t)(to - from));
+                for (int i = from; i < to; ++i)
+                    if (t->segs[(size_t)i].list) lists.push_back(t->segs[(size_t)i].list);
+            }
             n_play_lists(*t, lists.data(), (uint32_t)lists.size());
+            if (compose) {
+                /* the bounded cache: the least recently played range out, its list destroyed once this play
+                 * (which the tape's next play waits for) has completed */
+                while (t->nstretch.size() > max_stretches()) {
+                    auto lru = t->nstretch_used.begin();
+                    for (auto it = t->nstretch_used.begin(); it != t->nstretch_used.end(); ++it)
+                        if (it->second < lru->second) lru = it;
+                    auto victim = t->nstretch.find(lru->first);
+                    if (victim != t->nstretch.end()) {
+                        if (victim->second) t->ndead.push_back(Tape::NDead{victim->second, t->nslot, t->nserial});
+                        t->nstretch.erase(victim);
+                    }
+                    t->nstretch_used.erase(lru);
+                    g_nstretch_evicted.fetch_add(1, std::memory_order_relaxed);
+                }
+                n_reap_stretches(*t);
+            }
             if (t->plays_told < 6) {
                 ++t->plays_told;
-                RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s), %zu native list(s)", (unsigned long long)t->id,
-                         from, to, t->segs.size(), lists.size());
+                RAD_INFO("l0 tape %llu: play [%d, %d) of %zu segment(s), %zu native list(s)%s", (unsigned long long)t->id,
+                         from, to, t->segs.size(), lists.size(), compose ? " (composed)" : "");
             }
             std::vector<L0Event*> evs;
             for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
