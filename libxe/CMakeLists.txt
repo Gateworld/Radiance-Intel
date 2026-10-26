@@ -83,6 +83,15 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_w4_cpu COMMAND xe_moe_w4_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_w4_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Milestone 2: device timing of the planes expert GEMV at Flash-Next's decode shapes (dlopen of
+  # libxe.so; RADIANCE_XE_MOE_V1=1 for the old kernel). Not a ctest: a bench for card1.
+  add_executable(xe_moe_planes_bench test/moe_planes_bench.cpp)
+  rad_l0_sycl(xe_moe_planes_bench)
+  target_include_directories(xe_moe_planes_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
+                             ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_link_libraries(xe_moe_planes_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_moe_planes_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_moe_planes_bench libxe)
   # Owner note 1's per-launch figure: N tiny kernels launched plainly and replayed from a tape.
   add_executable(xe_tape_bench test/tape_bench.cpp)
   rad_l0_sycl(xe_tape_bench)
