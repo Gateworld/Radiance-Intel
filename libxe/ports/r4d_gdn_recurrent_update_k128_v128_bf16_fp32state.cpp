@@ -909,7 +909,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   /* KT = 4 threads a v row (milestone 3, kernel 4): 32 state + 32 key + 32 query floats a lane fit
    * the large register file; the shipped two-thread layout spilled 32 KB a thread on Xe */
-  constexpr int RC_KT = 4;
+  constexpr int RC_KT = 8;   /* 8 (run 26): 16 state + 16 key + 16 query floats a lane -- KT = 4 still spilled 7.5 KB at SIMD32 */
   const dim3 grid(N, H, 1), blk(RU_V * RC_KT);
 #define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
   do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
