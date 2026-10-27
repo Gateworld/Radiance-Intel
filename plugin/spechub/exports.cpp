@@ -18,16 +18,21 @@
  */
 #include "spechub.h"
 
+#ifdef RAD_SPECHUB_WITH_DEVICE
 #include "../../libr4d/r4d_emit.h"   /* only for the three globals it declares */
 
 /* THE DISPATCH LOG IS THIS DSO'S OWN. r4d_emit.h routes every launch through this recorder so a test
  * can name the functions it dispatched, but the loader maps plugins RTLD_LOCAL: a plugin cannot
  * import libr4d's copy, and an unresolved symbol refuses the whole library at load. Defining them
  * here gives r4d_emit.h exactly what it declares and leaves the recorder inert -- nothing in this
- * plugin sets the log. It is a tool's, never consulted on a serving path. */
+ * plugin sets the log. It is a tool's, never consulted on a serving path.
+ *
+ * Intel port: the header is HIP's (hip/hip_runtime.h), so a tree without a HIP device build -- the
+ * host-reference-only plugin the CMake already provides -- does not include it. */
 const void** r4d_dispatch_log = nullptr;
 int          r4d_dispatch_cap = 0;
 int          r4d_dispatch_n   = 0;
+#endif
 
 namespace {
 const RadPluginInfo kInfo = {
