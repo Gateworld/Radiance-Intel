@@ -49,6 +49,30 @@ int main(int argc, char** argv) {
     sycl::device dev = devs[(size_t)want];
     std::printf("matrix_query: %s (%s)\n", dev.get_info<sycl::info::device::name>().c_str(),
                 dev.get_backend() == sycl::backend::ext_oneapi_level_zero ? "level_zero" : "not level_zero");
+    /* milestone 3, run 53 (owner note 47 item 2): the MTP coupling's kernels are strict FP64, so whether the
+     * device has it, and whether as a native or an emulated capability, decides their port */
+    std::printf("matrix_query: fp64 aspect %s, double_fp_config %zu flag(s)%s\n", dev.has(sycl::aspect::fp64) ? "yes" : "no",
+                dev.get_info<sycl::info::device::double_fp_config>().size(),
+                dev.get_info<sycl::info::device::double_fp_config>().empty() ? " (none: no double arithmetic)" : "");
+    if (dev.has(sycl::aspect::fp64)) {
+        /* a 1,000-term double sum on the device against the host's: emulated FP64 is slow but exact */
+        try {
+            sycl::queue q(dev);
+            double* d = sycl::malloc_shared<double>(1, q);
+            *d = 0.0;
+            q.single_task([=] {
+                double s = 0.0;
+                for (int i = 1; i <= 1000; ++i) s += 1.0 / (double)i;
+                *d = s;
+            }).wait();
+            double h = 0.0;
+            for (int i = 1; i <= 1000; ++i) h += 1.0 / (double)i;
+            std::printf("matrix_query: fp64 harmonic(1000) device %.17g host %.17g %s\n", *d, h, *d == h ? "equal" : "DIFFER");
+            sycl::free(d, q);
+        } catch (const sycl::exception& e) {
+            std::printf("matrix_query: the fp64 kernel failed: %s\n", e.what());
+        }
+    }
     std::vector<sycl::ext::oneapi::experimental::matrix::combination> combs;
     try {
         combs = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();

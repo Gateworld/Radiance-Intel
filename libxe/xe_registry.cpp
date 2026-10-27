@@ -11,6 +11,7 @@
  */
 #include "rad_abi.h"
 #include "r4d_plugin.h"   /* R4D_PRIO_*, as libr4d's rows use them */
+#include "../plugin/spechub/spechub.h"   /* the MTP coupling's shape hooks (owner note 47 item 2) */
 
 #include <cstdint>
 
@@ -65,6 +66,16 @@ extern "C" int xe_moe_planes_unrelayout(const RadParam*, int, int, const RadEnco
 static const RadConstraint cXeMoePlanes[] = {
     C_GE("M", 1), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
     C_EQ("group", 128), C_IN("dtype", "w4nl64a8h"),
+};
+/* the MTP coupling (owner note 47 item 2): the rows' launches in xe_mtp_couple.cpp, the shape hooks the spechub
+ * plugin's (plugin/spechub/spechub.h, compiled into libxe) */
+extern "C" int xe_rad_mtp_couple_propose(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_mtp_couple_verify(const RadArgs* a, RadStream s);
+static const RadConstraint cXeCouplePropose[] = {
+    C_GE("M", 1), C_GE("n_vocab", 1), C_GE("round", 1), C_LE("max_rounds", 8),
+};
+static const RadConstraint cXeCoupleVerify[] = {
+    C_GE("M", 1), C_GE("n_cand", 1), C_GE("n_vocab", 1),
 };
 extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
@@ -214,6 +225,23 @@ static const RadKernelInfo kKernels[] = {
   ROW(cXeLogitsI8), NOTUNE,
   nullptr, nullptr, xe_rad_logits_gemm_i8, nullptr,
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits, nullptr, r4d_rad_unrelayout_i8_logits, nullptr },
+{ "xe_mtp_couple_propose", "mtp_couple_propose", "draft",
+  "the linear-MTP coupling's draw: x ~ Q over the head's final top-8 (FP64 T1 softmax), one work-item a row; "
+  "upstream's arithmetic (abi/rad_spechub.h), the spechub plugin's readers and shape hooks (owner note 47 item 2)",
+  "M rows, n_vocab, round 1..max_rounds <= 8", "f32 scores, i32 ids, u32 wire rows",
+  RAD_DOMAIN_DEVICE, 100,
+  ROW(cXeCouplePropose), NOTUNE,
+  nullptr, nullptr, xe_rad_mtp_couple_propose, nullptr, nullptr, nullptr, rad_mtp_couple_propose_shape, nullptr,
+  nullptr },
+{ "xe_mtp_couple_verify", "mtp_couple_verify", "draft",
+  "the linear-MTP coupling's verify after sample_pick: the maximal coupling of the bound state over the surviving "
+  "candidates in FP64 (accept with min(1, P/Q), else a residual draw), one work-item a row -- the serial form of "
+  "spechub.hip's cooperative verify",
+  "M rows, n_cand candidates, n_vocab", "f32 scores, i32 ids, u32 wire rows",
+  RAD_DOMAIN_DEVICE, 100,
+  ROW(cXeCoupleVerify), NOTUNE,
+  nullptr, nullptr, xe_rad_mtp_couple_verify, nullptr, nullptr, nullptr, rad_mtp_couple_verify_shape, nullptr,
+  nullptr },
 { "xe_moe_gemm_w4nl64_planes", "moe_gemm_q", "moe",
   "the w4nl64a8h experts read from their canonical planes, joined (abi/rad_planes.h), as a sub-group "
   "GEMV: the load copies the experts instead of rearranging them (owner note 4)",

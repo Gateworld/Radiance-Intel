@@ -10,6 +10,9 @@ file(GLOB XE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CUR
 # libr4d's host-side weight layouts (E4M3 / int8 planes joined at load), compiled unchanged: the rows
 # libxe copies from libr4d name them (rows_from_r4d.py keeps a hook defined here).
 list(APPEND XE_SRC ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp ${CMAKE_SOURCE_DIR}/libr4d/r4d_layout.cpp)
+# The MTP coupling's argument readers and shape hooks (plugin/spechub, upstream d912c69), compiled unchanged: the
+# Xe rows in xe_mtp_couple.cpp read their operands through them (milestone 3, owner note 47 item 2).
+list(APPEND XE_SRC ${CMAKE_SOURCE_DIR}/plugin/spechub/spechub.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
@@ -114,6 +117,17 @@ if(RAD_BUILD_TESTS)
   set_target_properties(xe_matrix_query PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_test(NAME xe_matrix_query_cpu COMMAND xe_matrix_query)
   set_tests_properties(xe_matrix_query_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
+  # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
+  add_executable(xe_mtp_couple_test test/mtp_couple_test.cpp)
+  rad_l0_sycl(xe_mtp_couple_test)
+  target_include_directories(xe_mtp_couple_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_mtp_couple_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_mtp_couple_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_mtp_couple_test libxe spechub)
+  add_test(NAME xe_mtp_couple_cpu COMMAND xe_mtp_couple_test $<TARGET_FILE:libxe> $<TARGET_FILE:spechub>)
+  set_tests_properties(xe_mtp_couple_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Milestone 2, owner note 28: the feasibility probe for tapes on direct Level Zero command lists (a
   # launch_as kernel launched natively, and the cost of a submission: SYCL graphs vs native lists).
