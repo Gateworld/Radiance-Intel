@@ -2151,6 +2151,35 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * filled either way, e.g. for a sequence still in the middle of a long prompt. */
     const int depth = draft_.next_depth();
     bool may_draft = depth > 0;
+    /* RADIANCE_SPEC_MAX_SEQS=N (milestone 3): draft only while at most N sequences decode. Past it the
+     * step runs as the backed-off state does, which on the Intel port's two cards beat drafting from
+     * three users up (C2 against C3b). 0, the default, keeps the behaviour without the limit. */
+    {
+        static const int spec_max = [] {
+            const char* v = std::getenv("RADIANCE_SPEC_MAX_SEQS");
+            const int n = (v && *v) ? std::atoi(v) : 0;
+            return n > 0 ? n : 0;
+        }();
+        if (may_draft && spec_max > 0) {
+            int running = 0;
+            bool admission = false;         /* a prefill chunk shares the step: the switch holds */
+            for (const StepEntry& e : plan_.e) {
+                if (e.is_prefill) admission = true;
+                if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+                const SchedReq& s = *reqs_[(size_t)e.slot];
+                if (s.req && s.req->state == ReqState::Running && s.running) ++running;
+            }
+            /* Hysteresis (owner note 42): the switch flips only after two consecutive decode-only steps on
+             * the other side of the limit, never in a step that admits a request (C5: three users
+             * oscillated with every admission). */
+            if (!admission) {
+                const bool over = running > spec_max;
+                if (over == spec_gate_off_) spec_gate_streak_ = 0;
+                else if (++spec_gate_streak_ >= 2) { spec_gate_off_ = over; spec_gate_streak_ = 0; }
+            }
+            if (spec_gate_off_) may_draft = false;
+        }
+    }
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
 

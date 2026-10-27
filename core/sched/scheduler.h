@@ -464,6 +464,10 @@ private:
     int32_t       serial_rot_shift_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
+    /* RADIANCE_SPEC_MAX_SEQS's switch (owner note 42): off after two consecutive decode-only steps over the
+     * limit, on again after two under it; a step that admits a request leaves it as it is. */
+    bool    spec_gate_off_ = false;
+    int     spec_gate_streak_ = 0;
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
