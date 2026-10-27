@@ -346,6 +346,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["demotions"]  = s.experts.demotions;
             e["distinct_promoted"] = s.experts.distinct_promoted;
             e["readmits"]    = s.experts.readmits;
+            e["readmit_delay"] = { s.experts.readmit_delay[0], s.experts.readmit_delay[1], s.experts.readmit_delay[2],
+                                   s.experts.readmit_delay[3], s.experts.readmit_delay[4] };
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
             e["dispatches"]  = s.experts.dispatches;

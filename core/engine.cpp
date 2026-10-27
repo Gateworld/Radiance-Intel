@@ -2023,6 +2023,7 @@ int Engine::run_server() {
                 s.experts.no_candidate      = (int64_t)hs.no_candidate;
                 s.experts.distinct_promoted = (int64_t)hs.distinct_promoted;
                 s.experts.readmits          = (int64_t)hs.readmits;
+                for (int i = 0; i < 5; ++i) s.experts.readmit_delay[i] = (int64_t)hs.readmit_delay[i];
                 /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
