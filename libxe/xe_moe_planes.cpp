@@ -19,6 +19,7 @@
 #include "xe_lanes.h"
 #include "r4d_args.h"
 #include "rad_planes.h"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include <cstdint>
 #include <cstdio>
@@ -436,6 +437,201 @@ void moe_planes_v2m_kernel(const uint8_t* __restrict__ A, const float* __restric
     }
 }
 
+/* ---- the matrix-unit form for prefill rows (milestone 3, stage B) ----
+ *
+ * The rows are sorted by expert, so an expert's routed rows are one run (off[e] .. off[e+1]); the work-group whose
+ * row starts a 64-row block of the run ((i - off[e]) % 64 == 0) computes the block's 64 rows by its 64 output
+ * columns and the block's other work-groups return (v2m's leader rule at 64). Sub-group w owns rows 8w..8w+7 and
+ * the four 16-column tiles. Per 64-K group: the block's activation rows staged as f16 (E4M3 -> f16 is exact; a
+ * dead row -- past the run, padding, or past the activation rows -- stages zeros), the 64 weight rows' u4 codes
+ * dequantised through the expert's 16-level table to f16 (v2m's rounding of the levels) straight into the packed B
+ * layout (one code byte = two consecutive k = one packed word), four f16 joint_matrix_mad steps of K = 16 into f32
+ * tiles (v2m's products without its per-product f16 rounding), then each tile stored
+ * to the sub-group's LDS scratch and element (row, n) scaled by a_scale[row, g128] * e4m3(scale[n, g64]) into the
+ * lane's accumulators (lane = column, 8 rows a lane): v2m's order per 64-K group.
+ * y = acc * scale.1, one bf16 rounding; rows outside the run or dead, and columns past N or past a narrower
+ * class's width, write zeros as v2m does. */
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kMxSG = 16, kMxWaves = 8, kMxThreads = kMxSG * kMxWaves;   /* 128 */
+constexpr int kMxRows = 8 * kMxWaves;                                    /* 64 rows a block */
+constexpr int kMxCols = 64;                                              /* 4 tiles of 16 outputs */
+constexpr int kMxAP = kMxCols + 8;                                       /* the A stage's row pitch in bf16 (64 + 8) */
+
+void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict__ As, PCls c0, PCls c1,
+                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+                          uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+                          uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, uint32_t parts,
+                          uint32_t a_rows) {
+    XE_SHARED(uint16_t, s_a, kMxRows * kMxAP);        /* the block's activation rows, 64 k a group, f16 */
+    XE_SHARED(uint32_t, s_b, 4 * 4 * 128);            /* [k step 4][n tile 4][packed 8 x 16 words]: 64 k x 64 n */
+    XE_SHARED(float, s_c, kMxWaves * 8 * 16);         /* one 8 x 16 f32 tile a sub-group */
+    XE_SHARED(float, s_as, kMxRows);                  /* the rows' a_scale of the current 128-K group */
+    XE_SHARED(uint16_t, s_lv, 16);                    /* the expert's levels as f16 (v2m's rounding) */
+    XE_SHARED(float, s_e4, 256);                      /* byte -> E4M3 value */
+    const int tid = (int)threadIdx.x, wave = tid / kMxSG, lane = tid % kMxSG;
+    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    if (i >= T) return;
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        e = (int32_t)lo;
+    }
+    uint32_t r0 = i, rn = 1;
+    if (e >= 0) {
+        const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % (uint32_t)kMxRows != 0) return;
+        rn = (last - i) < (uint32_t)kMxRows ? (last - i) : (uint32_t)kMxRows;
+    }
+    const PCls& c = (e >= 0 && (e & 1)) ? c1 : c0;
+    const uint32_t fy = N / parts;
+    const uint32_t fc = e >= 0 ? c.n / parts : 0u;
+    const uint32_t K = e >= 0 ? c.k : 0u;
+    const uint32_t n0 = nb * kMxCols;
+    /* this lane's four output columns: the weight row and whether it exists */
+    uint32_t rowr[4];
+    bool rowok[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const uint32_t n = n0 + (uint32_t)(t * 16 + lane);
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        rowok[t] = e >= 0 && n < N && j < fc;
+        rowr[t] = pp * fc + j;
+    }
+    /* this sub-group's 8 rows: their tokens and whether they are live */
+    uint32_t tokr[8];
+    bool liver[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const uint32_t r = (uint32_t)(wave * 8 + q);
+        tokr[q] = 0; liver[q] = false;
+        if (e >= 0 && r < rn) {
+            const int32_t fq = sorted[r0 + r];
+            const uint32_t tk = a_sorted ? r0 + r : (uint32_t)fq / top_k;
+            tokr[q] = tk;
+            liver[q] = fq >= 0 && tk < a_rows;
+        }
+    }
+    const uint8_t* we = nullptr;
+    const uint8_t* se = nullptr;
+    float s1 = 0.0f;
+    if (e >= 0) {
+        const uint32_t entry = (uint32_t)e >> 1;
+        we = entry_of(c.base, c.tab, c.stride, entry);
+        se = entry_of(c.sbase, c.stab, c.sstride, entry);
+        s1 = *(const float*)(se + c.s1_off);
+        const float* lvp = (const float*)(we + c.t_off);
+        if (tid < 16) s_lv[tid] = (uint16_t)f2h(lvp[tid]);
+        for (uint32_t t = (uint32_t)tid; t < 256u; t += kMxThreads) s_e4[t] = e4m3(t);
+    }
+    float acc[4][8];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int q = 0; q < 8; ++q) acc[t][q] = 0.0f;
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> Am;
+    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm;
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    float* s_cw = s_c + wave * 128;
+    const uint8_t* wrow0 = e >= 0 ? we + c.c_off : nullptr;
+    const uint8_t* srow0 = e >= 0 ? se + c.s_off : nullptr;
+    const uint32_t rb = K / 2u, sb = K / 64u;
+    if (e >= 0) {
+        for (uint32_t g = 0; g < K / 64u; ++g) {
+            const uint32_t k0 = g * 64u;
+            xe::syncthreads();                                  /* the previous group's stages are consumed */
+            /* the activation rows: 64 rows x 64 k, E4M3 -> bf16; a dead row stages zeros */
+            for (int idx = tid; idx < kMxRows * 32; idx += kMxThreads) {   /* 2048 pairs: 16 a thread */
+                const int r = idx / 32, kp = (idx % 32) * 2;
+                uint32_t w = 0;
+                const uint32_t rr = (uint32_t)r;
+                if (rr < rn) {
+                    const int32_t fq = sorted[r0 + rr];
+                    const uint32_t tk = a_sorted ? r0 + rr : (uint32_t)fq / top_k;
+                    if (fq >= 0 && tk < a_rows) {
+                        const uint8_t* ar = A + (size_t)tk * a_ld + k0 + (uint32_t)kp;
+                        w = f2h(e4m3(ar[0])) | (f2h(e4m3(ar[1])) << 16);
+                    }
+                }
+                *(uint32_t*)(s_a + r * kMxAP + kp) = w;
+            }
+            if ((k0 & 127u) == 0u)                               /* a new 128-K group: the rows' activation scales */
+                for (int r = tid; r < kMxRows; r += kMxThreads) {
+                    float v = 0.0f;
+                    const uint32_t rr = (uint32_t)r;
+                    if (rr < rn) {
+                        const int32_t fq = sorted[r0 + rr];
+                        const uint32_t tk = a_sorted ? r0 + rr : (uint32_t)fq / top_k;
+                        if (fq >= 0 && tk < a_rows) v = As[(size_t)tk * as_ld + k0 / 128u];
+                    }
+                    s_as[r] = v;
+                }
+            /* the weight rows: 64 n x 64 k of u4 codes, through the table to bf16, packed (one byte = one word) */
+            for (int idx = tid; idx < kMxCols * 32; idx += kMxThreads) {   /* 2048 words: 16 a thread */
+                const int n = idx / 32, byte = idx % 32;
+                const int step = byte / 8, k2 = byte % 8;
+                const uint32_t nn = n0 + (uint32_t)n;
+                const uint32_t pp = fy ? nn / fy : 0u, j = nn - pp * fy;
+                uint32_t w = 0;
+                if (nn < N && j < fc) {
+                    const uint8_t code = wrow0[(size_t)(pp * fc + j) * rb + k0 / 2u + (uint32_t)byte];
+                    w = (uint32_t)s_lv[code & 15u] | ((uint32_t)s_lv[code >> 4] << 16);
+                }
+                s_b[((step * 4 + n / 16) * 8 + k2) * 16 + (n % 16)] = w;
+            }
+            xe::syncthreads();
+#pragma unroll
+            for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                jm::joint_matrix_load(sg, Am, lptr((sycl::half*)(s_a + wave * 8 * kMxAP + step * 16)), (size_t)kMxAP);
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    jm::joint_matrix_load(sg, Bm, lptr((sycl::half*)(s_b + (step * 4 + t) * 128)), 32);
+                    jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+                }
+            }
+            /* the group's sums, scaled per element: a_scale[row, g128] * e4m3(scale[n, g64]) */
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_store(sg, Cm[t], lptr(s_cw), 16, jm::layout::row_major);
+                xe::wave_barrier();
+                const float sbv = rowok[t] ? s_e4[srow0[(size_t)rowr[t] * sb + g]] : 0.0f;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) acc[t][q] += (s_cw[q * 16 + lane] * s_as[wave * 8 + q]) * sbv;
+                xe::wave_barrier();
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const uint32_t n = n0 + (uint32_t)(t * 16 + lane);
+        if (n >= N) continue;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const uint32_t r = (uint32_t)(wave * 8 + q);
+            if (r >= rn) continue;
+            Y[(size_t)(r0 + r) * y_ld + n] = to_bf16(rowok[t] && liver[q] ? acc[t][q] * s1 : 0.0f);
+        }
+    }
+}
+
+bool mx_on(sycl::queue* q) {   /* RADIANCE_XE_MOE_MX=1: prefill rows take the matrix-unit form (off by default: the
+                                * service's numerics stay v2m's, which production ranks with -- STATE.md, run 50);
+                                * the CPU device has no matrix unit */
+    static const bool want = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MX"); return s && *s == '1'; }();
+    static const bool gpu = q->get_device().is_gpu();
+    return want && gpu;
+}
+
 bool multi_on() {   /* RADIANCE_XE_MOE_MULTI=0: one work-group a routed row (v2) */
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MULTI"); return !(s && *s == '0'); }();
     return v;
@@ -587,8 +783,17 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
             /* several tokens (T past one token's top_k rows): runs of one expert's rows share the weight
              * stream (milestone 3); a single token keeps v2 (its rows are distinct experts) */
             const bool multi = multi_on() && T > top_k;
+            /* prefill-sized routing (64 rows or more) under RADIANCE_XE_MOE_MX=1: the matrix-unit form, 64-row
+             * blocks of each expert's run (exact products; v2m rounds each to f16) */
+            const bool mx = multi && T >= (long long)kMxRows && mx_on(qq);
 #define XE_MOE_V2(U)                                                                                        \
-    if (multi)                                                                                              \
+    if (mx)                                                                                                 \
+    XE_LAUNCH_SG(kMxSG, qq, moe_planes_mx_kernel, dim3((unsigned)((N + kMxCols - 1) / kMxCols), (unsigned)T),  \
+                 dim3(kMxThreads), 0, (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1],       \
+                 (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T,  \
+                 (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,          \
+                 (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);                          \
+    else if (multi)                                                                                         \
     XE_LAUNCH_SG(16, qq, (moe_planes_v2m_kernel<U, kV2MT>), grid, block, 0, (const uint8_t*)Aq->data,       \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
