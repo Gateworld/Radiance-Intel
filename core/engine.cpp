@@ -599,6 +599,24 @@ int Engine::step_loop() {
          * the ranks enqueueing. The split separates host-bound from device-bound steps. */
         if (t_on) phase_mark(PH_PRE);
 
+        /* Owner note 42 item 3: the ranks' record / skip / drop decisions are made here, once a step,
+         * while every rank thread is parked at the barrier: the floor verdict is the lowest reading's, and a
+         * key one rank refused is refused by all, so no rank plays a pass another issues live (a latent hang
+         * on the two-card backend). */
+        auto agree_tapes = [&] {
+            bool room = true;
+            std::vector<uint64_t> refused;
+            for (const auto& rk : ranks_) {
+                room = room && rk->ctx.tape_room();
+                const std::vector<uint64_t>& r = rk->ctx.tape_refused_now();
+                refused.insert(refused.end(), r.begin(), r.end());
+            }
+            for (const auto& rk : ranks_) {
+                rk->ctx.tape_room_set(room);
+                for (uint64_t k : refused) rk->ctx.tape_refuse_key(k);
+                rk->ctx.tape_refused_now_clear();
+            }
+        };
         if (!issued) {
             /* Reset the gate while every rank is parked, so none sees a stale ready flag. */
             {
@@ -608,6 +626,7 @@ int Engine::step_loop() {
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
             /* An embedding program has no sampler to issue behind its pass. */
+            agree_tapes();
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             barrier_->arrive_and_wait();      /* release the ranks */
@@ -632,6 +651,7 @@ int Engine::step_loop() {
                 build_ready_  = true;
                 build_status_ = bst;
             }
+            agree_tapes();
             issue_what_.store(kIssueSampler, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             barrier_->arrive_and_wait();

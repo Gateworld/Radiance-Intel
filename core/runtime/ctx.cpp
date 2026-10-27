@@ -1047,6 +1047,7 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     if (b->n_tok > kTapeMaxTok) {
         if (std::find(tape_refused_.begin(), tape_refused_.end(), key) == tape_refused_.end()) {
             tape_refused_.push_back(key);
+            tape_refused_now_.push_back(key);
             RAD_INFO("rank %d: draft pass %d at %lld tokens is issued in full (not recorded): a pass "
                      "wider than %lld tokens is prefill-sized, and recordings are kept per shape",
                      rank_, b->draft_pass, (long long)b->n_tok, (long long)kTapeMaxTok);
@@ -1067,6 +1068,7 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     if (!t) {
         if (step_status_ >= 0) {
             tape_refused_.push_back(key);
+            tape_refused_now_.push_back(key);
             RAD_WARN("rank %d: draft pass %d at %lld tokens is issued in full every step: %s",
                      rank_, b->draft_pass, (long long)b->n_tok, rad_dev_last_error());
         }
@@ -1306,6 +1308,16 @@ int Ctx::play_pass(PassTape& t) {
     return RAD_OK;
 }
 
+/* RADIANCE_TAPE_VRAM_FLOOR_MIB in bytes (default 1024 MiB; 0 turns the floor off). */
+static int64_t tape_floor_b() {
+    static const int64_t floor_b = [] {
+        const char* v = std::getenv("RADIANCE_TAPE_VRAM_FLOOR_MIB");
+        const long long m = (v && *v) ? std::atoll(v) : 1024;
+        return (int64_t)(m > 0 ? m : 0) << 20;
+    }();
+    return floor_b;
+}
+
 /* Runs one pass: played from its tape, or issued live (and possibly recorded or audited). */
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
@@ -1363,16 +1375,14 @@ int Ctx::run_pass(const RadBatch* b) {
         return RAD_OK;
     }
 
-    /* The card's free VRAM before a new recording (milestone 3, m3 fault 7): below the floor the least
-     * recently used tape goes and this pass is issued live, so recordings never take the card under it. */
+    /* The cards' free VRAM before a new recording (milestone 3, m3 fault 7): below the floor the least
+     * recently used tape goes and this pass is issued live, so recordings never take a card under it. The
+     * verdict is every rank's (owner note 42 item 3): each rank reads its own card at the end of a step
+     * (tape_room_read) and the engine gives all of them the lowest reading's answer before the next step,
+     * so no rank records while another skips. */
     {
-        static const int64_t floor_b = [] {
-            const char* v = std::getenv("RADIANCE_TAPE_VRAM_FLOOR_MIB");
-            const long long m = (v && *v) ? std::atoll(v) : 1024;
-            return (int64_t)(m > 0 ? m : 0) << 20;
-        }();
-        RadDeviceProps dp{};
-        if (floor_b > 0 && rad_dev_props(device_, &dp) == RAD_OK && dp.vram_free > 0 && dp.vram_free < floor_b) {
+        const int64_t floor_b = tape_floor_b();
+        if (floor_b > 0 && !tape_room_agreed_) {
             if (!tapes_.empty()) {
                 size_t lru = 0;
                 for (size_t q = 1; q < tapes_.size(); ++q) if (tapes_[q].used < tapes_[lru].used) lru = q;
@@ -1381,10 +1391,10 @@ int Ctx::run_pass(const RadBatch* b) {
             }
             if (!tape_low_told_) {
                 tape_low_told_ = true;
-                RAD_WARN("rank %d: the card has %lld MiB free, under the recordings' floor of %lld MiB: the least "
-                         "recently used tape is dropped and new pass shapes run live until room returns "
-                         "(RADIANCE_TAPE_VRAM_FLOOR_MIB)", rank_, (long long)(dp.vram_free >> 20),
-                         (long long)(floor_b >> 20));
+                RAD_WARN("rank %d: the ranks' lowest free VRAM is under the recordings' floor of %lld MiB (this "
+                         "card: %lld MiB): the least recently used tape is dropped and new pass shapes run live "
+                         "until room returns (RADIANCE_TAPE_VRAM_FLOOR_MIB)", rank_, (long long)(floor_b >> 20),
+                         (long long)(tape_vram_free_ >> 20));
             }
             bump(pc_refused_);
             arch_step_(this, b);
@@ -1423,6 +1433,7 @@ int Ctx::run_step(const RadBatch* b) {
      * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
 
+    tape_refusals_apply();   /* owner note 42 item 3: the refusals the engine made common */
     sync_residency();
 
     batch_       = b;
@@ -1457,7 +1468,39 @@ int Ctx::run_step(const RadBatch* b) {
     if (profiling_) profile_collect();
     flush_issued();
     ar_stalls_read();
+    tape_room_read();
     return step_status_;
+}
+
+/* Owner note 42 item 3: this rank's reading for the record decision, once at the end of a step (one device
+ * query a step instead of one a recorded pass); the engine turns every rank's reading into one verdict. */
+void Ctx::tape_room_read() {
+    const int64_t floor_b = tape_floor_b();
+    tape_vram_free_ = -1;
+    tape_room_ = true;
+    if (floor_b <= 0) return;
+    RadDeviceProps dp{};
+    if (rad_dev_props(device_, &dp) == RAD_OK && dp.vram_free > 0) {
+        tape_vram_free_ = dp.vram_free;
+        tape_room_ = dp.vram_free >= floor_b;
+    }
+}
+
+/* The refusals the engine made common, applied on this rank's own thread: the key is issued live from
+ * here, and a tape this rank holds for it (recorded in the step another rank refused it) goes, so the
+ * ranks never split between play and issue. */
+void Ctx::tape_refusals_apply() {
+    for (uint64_t key : tape_refused_in_) {
+        if (std::find(tape_refused_.begin(), tape_refused_.end(), key) == tape_refused_.end())
+            tape_refused_.push_back(key);
+        for (size_t i = 0; i < tapes_.size(); ++i)
+            if (tapes_[i].key == key) {
+                tape_drop(tapes_[i]);
+                tapes_.erase(tapes_.begin() + (std::ptrdiff_t)i);
+                break;
+            }
+    }
+    tape_refused_in_.clear();
 }
 
 /* owner note 42 (run 38): a block of the two-rank all-reduce that exhausted its poll budget "still arrives"

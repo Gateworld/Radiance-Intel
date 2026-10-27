@@ -306,6 +306,18 @@ public:
      * device (owner note 42): read after every step; 0 where the library has no such counter. */
     int64_t     ar_stalls() const { return ar_stalls_.load(std::memory_order_relaxed); }
 
+    /* Owner note 42 item 3 (milestone 3): the record / skip / drop decisions are made once a step for
+     * every rank, by the engine thread while the rank threads are parked at the barrier (the agree lambda
+     * in Engine's step loop). `tape_room()` is this rank's reading at the end of its last step (its free
+     * VRAM against the recordings' floor) and `tape_room_set` gives every rank the same verdict;
+     * `tape_refused_now()` lists the keys this rank refused in its last step and `tape_refuse_key` makes a
+     * refusal common to every rank, applied by the rank thread at the start of its next step. */
+    bool        tape_room() const { return tape_room_; }
+    void        tape_room_set(bool room) { tape_room_agreed_ = room; }
+    const std::vector<uint64_t>& tape_refused_now() const { return tape_refused_now_; }
+    void        tape_refused_now_clear() { tape_refused_now_.clear(); }
+    void        tape_refuse_key(uint64_t key) { tape_refused_in_.push_back(key); }
+
     /* How each pass was run. A play writes recorded packets; every other outcome walks the issue
      * path. `issued_*` split unplayed passes by cause: no key, key refused, key seen first time.
      * `audited` counts plays re-issued to check the tape. `dispatched` is the kernels plays wrote,
@@ -492,6 +504,14 @@ private:
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
     bool                  tape_low_told_ = false;   /* the VRAM floor's warning, said once (milestone 3) */
+    /* owner note 42 item 3: this rank's reading, every rank's verdict, and the refusals exchanged */
+    bool                  tape_room_ = true;          /* this card's free VRAM is above the floor (the step's end) */
+    bool                  tape_room_agreed_ = true;   /* every rank's verdict, set by the engine before the step */
+    int64_t               tape_vram_free_ = -1;       /* the reading behind tape_room_, for the warning */
+    std::vector<uint64_t> tape_refused_now_;          /* keys this rank refused since the last agreement */
+    std::vector<uint64_t> tape_refused_in_;           /* keys the engine made common, applied at the step's start */
+    void                  tape_room_read();
+    void                  tape_refusals_apply();
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
