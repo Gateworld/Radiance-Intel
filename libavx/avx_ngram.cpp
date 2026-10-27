@@ -782,6 +782,45 @@ struct TableFile { int fd = -1; };
 inline const TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
 #endif
 
+/* RADIANCE_NGRAM_TRACE=<file> (Intel port, milestone 3, owner note 48: the lookups' skew, measured before
+ * any hot tier is designed): every call appends one record -- six int64 (-1, M, row_bytes, rank, voff,
+ * n_vocab) then M global row ids, -1 for a row outside this rank's shard (zero-filled here, read by the
+ * rank that holds it, so the ranks' records together count each read once). One write() a record, so
+ * records from several ranks or processes stay whole; nothing else changes. m3/ngram_tiers.py reads it. */
+void ngram_trace(const avx::RowGather& q) {
+#if defined(__linux__)
+    static const int fd = [] {
+        const char* p = std::getenv("RADIANCE_NGRAM_TRACE");
+        return p && *p ? ::open(p, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+    }();
+    if (fd < 0) return;
+    static std::mutex mu;
+    std::vector<int64_t> rec;
+    rec.reserve((size_t)q.M + 6);
+    rec.push_back(-1);
+    rec.push_back(q.M);
+    rec.push_back(q.row_bytes);
+    rec.push_back(q.rank);
+    rec.push_back(q.voff);
+    rec.push_back(q.n_vocab);
+    for (int64_t m = 0; m < q.M; ++m) {
+        const int64_t id = (int64_t)q.ids[m] - q.voff;
+        rec.push_back(id < 0 || id >= q.n_vocab ? -1 : (int64_t)q.ids[m]);
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    const uint8_t* p = (const uint8_t*)rec.data();
+    size_t left = rec.size() * sizeof(int64_t);
+    while (left) {
+        const ssize_t w = ::write(fd, p, left);
+        if (w <= 0) break;
+        p += w;
+        left -= (size_t)w;
+    }
+#else
+    (void)q;
+#endif
+}
+
 }  // namespace
 
 int avx::row_gather(const RowGather& q, RowDecode decode) {
@@ -798,6 +837,8 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     uint16_t lut[256];
     for (int b = 0; b < 256; ++b)
         lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+
+    ngram_trace(q);   /* the lookups' record under RADIANCE_NGRAM_TRACE (owner note 48); off by default */
 
     /* File-backed tables go through the shared cache; others are read from memory. The caller
      * has already refused ids past the table, which matters once they become file offsets. */

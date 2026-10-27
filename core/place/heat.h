@@ -114,6 +114,10 @@ struct HeatStats {
     uint64_t distinct_promoted = 0, readmits = 0;
     /* Units that came of age (HeatParams::min_age) and became candidates again. */
     uint64_t aged = 0;
+    /* Readmits by the steps since the unit's demotion: < 16, < 64, < 256, < 1024, 1024 or more. Says
+     * whether a residency age could have held them (the bounce is short) or the working set is just
+     * larger than the resident set (the bounce is a rotation's period). */
+    uint64_t readmit_delay[5] = { 0, 0, 0, 0, 0 };
     /* Routed experts and how many were resident, counted on the histogram pass observe() already
      * makes. A miss does not stall: the GEMM reads the expert from its tier, which for a
      * host-pinned unit crosses the link on the step's critical path. `stream_bytes` is that

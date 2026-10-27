@@ -20,6 +20,14 @@
 #include "ref_ops.h"
 #include "ref_planes.h"
 
+#include <cstdlib>
+#include <mutex>
+#include <vector>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 using namespace ref;
 
 namespace {
@@ -517,6 +525,49 @@ int ref_logits_gemm(const RadArgs* a, RadStream) {
  * vocabulary, so the check is the caller's (the sampler and tokeniser are bounded by it).
  *
  * Every row read is multiplied by `factor`: embed_lookup's `mult`, embed_lookup_q's table scale. */
+
+/* RADIANCE_NGRAM_TRACE=<file> (Intel port, milestone 3, owner note 48: the n-gram lookups' skew, measured
+ * before any hot tier is designed; the same record libavx's row_gather writes): every gather appends six
+ * int64 (-1, M, row_bytes, rank, voff, n_vocab) then M global row ids, -1 for a row outside this rank's
+ * slice (a zero row here, read by the rank that holds it). One write() a record, so records from several
+ * ranks or processes stay whole; nothing else changes. m3/ngram_tiers.py reads it. */
+static void ngram_trace(const RadArgs* a, const RadTensor* tok, const RadTensor* wte, int64_t M,
+                        int64_t voff, int64_t n_vocab) {
+#if defined(__linux__)
+    static const int fd = [] {
+        const char* p = std::getenv("RADIANCE_NGRAM_TRACE");
+        return p && *p ? ::open(p, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+    }();
+    if (fd < 0) return;
+    static std::mutex mu;
+    const int64_t bits = rad_dtype_bits(wte->dtype);
+    const int64_t ws = wte->rank >= 2 ? wte->stride[wte->rank - 2] : 0;
+    std::vector<int64_t> rec;
+    rec.reserve((size_t)M + 6);
+    rec.push_back(-1);
+    rec.push_back(M);
+    rec.push_back(bits > 0 ? ws * bits / 8 : ws);
+    rec.push_back(a->rank);
+    rec.push_back(voff);
+    rec.push_back(n_vocab);
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t g = ld_int(tok->dtype, tok->data, offlin(tok, m)), id = g - voff;
+        rec.push_back(id < 0 || id >= n_vocab ? -1 : g);
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    const uint8_t* p = (const uint8_t*)rec.data();
+    size_t left = rec.size() * sizeof(int64_t);
+    while (left) {
+        const ssize_t w = ::write(fd, p, left);
+        if (w <= 0) break;
+        p += w;
+        left -= (size_t)w;
+    }
+#else
+    (void)a; (void)tok; (void)wte; (void)M; (void)voff; (void)n_vocab;
+#endif
+}
+
 static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor* wte,
                         const RadTensor* x, float factor) {
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
@@ -525,6 +576,7 @@ static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor*
     if (n_embd <= 0 || n_vocab <= 0 || voff < 0) return RAD_E_SHAPE;
     const int64_t M = numel(x) / n_embd;
     if (M <= 0 || numel(tok) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
+    ngram_trace(a, tok, wte, M, voff, n_vocab);   /* off unless RADIANCE_NGRAM_TRACE names a file */
 
     /* Validated before the loop, since an OpenMP body cannot return. The guard keys on holding the
      * whole vocabulary, not on a zero offset: rank 0 of a vocab-parallel split has offset 0, and

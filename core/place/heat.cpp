@@ -276,11 +276,17 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
         else if (was != Tier::VRAM && t == Tier::VRAM) ++res_count_[(size_t)l];
     }
     tier_[(size_t)unit] = t;
+    const bool changed = (was == Tier::VRAM) != (t == Tier::VRAM) && movable_[(size_t)unit];
+    /* A readmit's delay since the demotion, before the clock restarts (stats.readmit_delay). */
+    if (changed && t == Tier::VRAM && (ever_[(size_t)unit] & 2u)) {
+        const int64_t d = steps_ - since_[(size_t)unit];
+        ++stats_.readmit_delay[d < 16 ? 0 : d < 64 ? 1 : d < 256 ? 2 : d < 1024 ? 3 : 4];
+    }
     /* The age clock starts at a real tier change (publish); a unit the mover re-publishes in its
-     * own tier keeps its age. */
-    if (params_.min_age > 0 && (was == Tier::VRAM) != (t == Tier::VRAM) && movable_[(size_t)unit]) {
+     * own tier keeps its age. Kept whatever min_age, for the delay histogram. */
+    if (changed) {
         since_[(size_t)unit] = steps_;
-        if (!young_[(size_t)unit]) { young_[(size_t)unit] = 1u; young_list_.push_back(unit); }
+        if (params_.min_age > 0 && !young_[(size_t)unit]) { young_[(size_t)unit] = 1u; young_list_.push_back(unit); }
     }
     set_place(unit);
     end_invalidate(unit);
@@ -594,6 +600,12 @@ std::string HeatEngine::report() const {
     if (params_.min_age > 0)
         s += fmt("  minimum residency age %d steps: %llu units came of age, %zu still under it\n",
                  params_.min_age, (unsigned long long)stats_.aged, young_list_.size());
+    if (stats_.readmits) {
+        const uint64_t* r = stats_.readmit_delay;
+        s += fmt("  readmits by steps since the demotion: <16 %llu, <64 %llu, <256 %llu, <1024 %llu, 1024+ %llu\n",
+                 (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2],
+                 (unsigned long long)r[3], (unsigned long long)r[4]);
+    }
 
     /* The per-layer resident distribution: a layer starved of slots misses on nearly every token
      * however good its internal ranking, so the spread matters more than the mean. */
