@@ -45,6 +45,7 @@
 #include <mutex>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <thread>
 #include <vector>
@@ -688,7 +689,26 @@ struct ZeDev {
     bool inorder = true;               /* ZE_COMMAND_LIST_FLAG_IN_ORDER accepted; else a barrier before each command */
     std::mutex m;                      /* the ring and the kernel table (plays may come from another thread) */
     std::map<ze_kernel_handle_t, NKernel> kernels;   /* by the runtime's handle */
+    double timer_ns = 0;               /* the device timer's resolution (ns a tick) and valid bits (the tape profiler) */
+    uint32_t ts_bits = 64;
 };
+/* RADIANCE_L0_NTAPE_PROFILE=1 (run 27): composed stretches time every command with device timestamps. */
+bool ntape_profile() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_NTAPE_PROFILE"); return e && e[0] == '1'; }();
+    return v;
+}
+struct NProf {
+    uint64_t* ts = nullptr;            /* host-visible: [2k] before, [2k + 1] after command k */
+    std::vector<const std::string*> names;
+    std::vector<int> kinds;
+    uint32_t n = 0;
+    bool played = false;               /* the timestamps hold a completed play */
+};
+std::mutex& nprof_mutex() { static std::mutex m; return m; }
+std::unordered_map<ze_command_list_handle_t, NProf>& nprof_lists() { static std::unordered_map<ze_command_list_handle_t, NProf> m; return m; }
+struct NProfAcc { uint64_t ticks = 0, count = 0; };
+std::unordered_map<std::string, NProfAcc>& nprof_acc() { static std::unordered_map<std::string, NProfAcc> m; return m; }
+uint64_t g_nprof_harvested = 0;
 ZeDev& zedev(int d) { static ZeDev z[kMaxDevices]; return z[d]; }
 using AppendFn = ze_result_t (*)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t,
                                  uint32_t, ze_event_handle_t*);
@@ -744,6 +764,10 @@ bool ze_ready(int d) {
         try { all.push_back(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(X.d)); } catch (const sycl::exception&) {}
     }
     if (all.empty()) all.push_back(Z.dev);
+    {   /* the device timer, for the tape profiler (ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES: timerResolution in ns a tick) */
+        ze_device_properties_t dp{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, nullptr};
+        if (zeDeviceGetProperties(Z.dev, &dp) == ZE_RESULT_SUCCESS) { Z.timer_ns = (double)dp.timerResolution; Z.ts_bits = dp.timestampValidBits ? dp.timestampValidBits : 64; }
+    }
     ze_event_pool_desc_t pd{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, ZE_EVENT_POOL_FLAG_HOST_VISIBLE, kRingEvents};
     if (zeEventPoolCreate(Z.ctx, &pd, (uint32_t)all.size(), all.data(), &Z.pool) != ZE_RESULT_SUCCESS) { Z.why = "zeEventPoolCreate failed"; return false; }
     Z.ring = std::make_unique<ZeDev::Ring[]>(kRingEvents);
@@ -872,9 +896,47 @@ int ntape_sync() {   /* 0 the design, 3 the host oracle, 4 the host wait before 
     }();
     return m;
 }
+/* The tape profiler's harvest: the list's previous play has completed, so its timestamps are final;
+ * every command's device time goes to its kernel's total. Every 8192 plays the table is printed. */
+void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
+    std::lock_guard<std::mutex> lk(nprof_mutex());
+    auto it = nprof_lists().find(l);
+    if (it == nprof_lists().end()) return;
+    NProf& p = it->second;
+    if (played_before && p.played) {
+        const uint64_t mask = Z.ts_bits >= 64 ? ~0ull : ((1ull << Z.ts_bits) - 1);
+        for (uint32_t k = 0; k < p.n; ++k) {
+            const uint64_t a = p.ts[2 * k] & mask, b = p.ts[2 * k + 1] & mask;
+            const uint64_t d = b >= a ? b - a : (mask - a) + b + 1;
+            const std::string& nm = p.names[k] ? *p.names[k] : (p.kinds[k] == 1 ? std::string("(copy)") : std::string("(2D copy)"));
+            NProfAcc& acc = nprof_acc()[nm];
+            acc.ticks += d;
+            acc.count += 1;
+        }
+        if (++g_nprof_harvested % 8192 == 0) {
+            std::vector<std::pair<std::string, NProfAcc>> rows(nprof_acc().begin(), nprof_acc().end());
+            std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second.ticks > y.second.ticks; });
+            uint64_t tot = 0;
+            for (const auto& r : rows) tot += r.second.ticks;
+            RAD_INFO("l0 tape profile: %llu lists harvested, %zu kernels, %.1f ms of device time in all (timer %.3f ns a tick); the top 30:",
+                     (unsigned long long)g_nprof_harvested, rows.size(), tot * Z.timer_ns * 1e-6, Z.timer_ns);
+            for (size_t i = 0; i < rows.size() && i < 30; ++i) {
+                const NProfAcc& a = rows[i].second;
+                std::string nm = rows[i].first;
+                const size_t z = nm.find("_Z");   /* the mangled kernel after launch_as's own prefix */
+                if (z != std::string::npos && z + 2 < nm.size() && nm.find("_Z", z + 2) != std::string::npos) nm = nm.substr(nm.find("_Z", z + 2));
+                if (nm.size() > 96) nm.resize(96);
+                RAD_INFO("  %6.1f%%  %8.1f ms  %8llu x  %7.1f us  %s", 100.0 * a.ticks / (tot ? tot : 1), a.ticks * Z.timer_ns * 1e-6,
+                         (unsigned long long)a.count, a.count ? a.ticks * Z.timer_ns * 1e-3 / a.count : 0.0, nm.c_str());
+            }
+        }
+    }
+    p.played = true;
+}
 /* Appends `n` closed lists to the backend's own immediate list, after the home stream's last
  * command (and the other recorded streams' when fenced) and after the previous play; marks the
  * streams so their next runtime submission waits for it. */
+void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before);
 void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool replay = true) {
     if (!n) return;
     ZeDev& Z = zedev(t.dev);
@@ -885,9 +947,11 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     if (replay)
         for (uint32_t i = 0; i < n; ++i) {   /* this list's own previous play (one step ago, as a rule: no wait) */
             auto it = t.nlast.find(lists[i]);
-            if (it == t.nlast.end() || n_slot_done(t.dev, it->second.first, it->second.second)) continue;
-            g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
-            n_slot_wait(t.dev, it->second.first, it->second.second, "this list's previous play");
+            if (it != t.nlast.end() && !n_slot_done(t.dev, it->second.first, it->second.second)) {
+                g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
+                n_slot_wait(t.dev, it->second.first, it->second.second, "this list's previous play");
+            }
+            if (ntape_profile()) n_prof_harvest(Z, lists[i], it != t.nlast.end());
         }
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
@@ -1430,6 +1494,18 @@ ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
     if (!n) return nullptr;
     ze_command_list_handle_t l = n_list_create(Z, Z.inorder);
     if (!l) throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "zeCommandListCreate failed (a composed stretch)");
+    NProf prof;
+    if (ntape_profile()) {
+        ze_host_mem_alloc_desc_t hd{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr, 0};
+        void* pm = nullptr;
+        if (zeMemAllocHost(Z.ctx, &hd, 16 * n, 64, &pm) == ZE_RESULT_SUCCESS && pm) {
+            prof.ts = (uint64_t*)pm;
+            std::memset(pm, 0, 16 * n);
+            prof.n = (uint32_t)n;
+            prof.names.reserve(n);
+            prof.kinds.reserve(n);
+        }
+    }
     size_t k = 0;
     auto fail = [&](const char* what, ze_result_t rc) {
         zeCommandListDestroy(l);
@@ -1442,6 +1518,11 @@ ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
         for (const NCmd& c : t.segs[(size_t)i].cmds) {
             if (!Z.inorder && k) zeCommandListAppendBarrier(l, nullptr, 0, nullptr);
             ze_result_t rc = ZE_RESULT_SUCCESS;
+            if (prof.ts) {
+                zeCommandListAppendWriteGlobalTimestamp(l, prof.ts + 2 * k, nullptr, 0, nullptr);
+                prof.names.push_back(c.name);
+                prof.kinds.push_back(c.kind);
+            }
             if (c.kind == 0) {
                 rc = zeKernelSetArgumentValue(c.k, c.i_arg0, c.arg0.size(), c.arg0.data());
                 if (rc == ZE_RESULT_SUCCESS && c.i_lds >= 0) {
@@ -1461,10 +1542,12 @@ ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
                 rc = zeCommandListAppendMemoryCopyRegion(l, c.dst, &dr, (uint32_t)c.dp, 0, c.src, &sr, (uint32_t)c.sp, 0, nullptr, 0, nullptr);
                 if (rc != ZE_RESULT_SUCCESS) fail("a 2D copy", rc);
             }
+            if (prof.ts) zeCommandListAppendWriteGlobalTimestamp(l, prof.ts + 2 * k + 1, nullptr, 0, nullptr);
             ++k;
         }
     const ze_result_t rc = zeCommandListClose(l);
     if (rc != ZE_RESULT_SUCCESS) fail("zeCommandListClose", rc);
+    if (prof.ts) { std::lock_guard<std::mutex> lk(nprof_mutex()); nprof_lists()[l] = std::move(prof); }
     g_nstretch_composed.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<int> told{0};
     if (told.fetch_add(1) < 4)
