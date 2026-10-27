@@ -959,6 +959,17 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         }();
         for (int d : skip) if (d == b->draft_pass) return 0;
     }
+    /* A history pass with no drafting row (the head's K and V only: the speculation gate's crowded
+     * steps, the acceptance controller's backed-off state) is issued live. Recorded, it deadlocked
+     * the two ranks at its first multi-row play on the Intel port's cards (milestone 3, C6 against
+     * C7); it is ~15 launches. RADIANCE_TAPE_HISTORY_ONLY=1 records it again. */
+    {
+        static const bool rec_hist_only = [] {
+            const char* e = std::getenv("RADIANCE_TAPE_HISTORY_ONLY");
+            return e && !std::strcmp(e, "1");
+        }();
+        if (!rec_hist_only && b->draft_pass < 0 && b->n_draft_out == 0) return 0;
+    }
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
