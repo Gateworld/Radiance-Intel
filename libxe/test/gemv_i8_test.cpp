@@ -136,13 +136,20 @@ int main(int argc, char** argv) {
     std::printf("gemv_i8_test: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     int fails = 0;
     /* small, odd N, M 1..6 (the 4-row pass and its remainder) */
-    const int small[][3] = { {1, 40, 256}, {2, 77, 384}, {4, 64, 1024}, {5, 33, 640}, {6, 130, 2560} };
+    /* milestone 3 stage B: M >= 64 takes the matrix-unit form on the GPU (full 64-row blocks, the GEMV for the
+     * tail rows): 64 exactly, 70 (one block + 6 tail rows), 128 at an N that is not a multiple of 64 */
+    const int small[][3] = { {1, 40, 256}, {2, 77, 384}, {4, 64, 1024}, {5, 33, 640}, {6, 130, 2560},
+                             {64, 130, 2560}, {70, 96, 1024}, {128, 200, 384} };
     for (auto& c : small) fails += !run_case(q, c[0], c[1], c[2], 0x1234 + c[1], 0).ok;
     if (full) {
         /* Flash-Next's trunk at batch 1 (round 2 M1's shapes) */
         const int big[][2] = { {16384, 2560}, {2560, 6144}, {12288, 2560}, {512, 2560}, {1280, 2560}, {2560, 640} };
         for (auto& c : big) fails += !run_case(q, 1, c[0], c[1], 0x77 + c[0], 20).ok;
         fails += !run_case(q, 4, 12288, 2560, 0x99, 10).ok;
+        /* milestone 3 stage B: a prefill-shaped block on the matrix unit (256 rows: the reference check is
+         * 256 x 512 columns x K on the host) */
+        fails += !run_case(q, 256, 12288, 2560, 0xa1, 5).ok;
+        fails += !run_case(q, 256, 2560, 6144, 0xa2, 5).ok;
     }
     std::printf("gemv_i8_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

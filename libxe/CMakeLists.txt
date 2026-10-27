@@ -107,6 +107,14 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_kernel_props_cpu COMMAND xe_kernel_props $<TARGET_FILE:libxe>)
   set_tests_properties(xe_kernel_props_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
+  # Milestone 3, stage B: the device's joint_matrix (DPAS) combinations from the runtime's query, for the
+  # prefill GEMM kernels' tile shapes. A card probe; on the CPU device the list may be empty.
+  add_executable(xe_matrix_query test/matrix_query.cpp)
+  rad_l0_sycl(xe_matrix_query)
+  set_target_properties(xe_matrix_query PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_matrix_query_cpu COMMAND xe_matrix_query)
+  set_tests_properties(xe_matrix_query_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Milestone 2, owner note 28: the feasibility probe for tapes on direct Level Zero command lists (a
   # launch_as kernel launched natively, and the cost of a submission: SYCL graphs vs native lists).
   add_executable(xe_native_launch_test test/native_launch_test.cpp)

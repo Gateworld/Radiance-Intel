@@ -25,8 +25,10 @@
 #include "xe_lanes.h"
 #include "r4d_args.h"
 #include <sycl/ext/oneapi/dot_product.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -86,11 +88,118 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
     }
 }
 
+/* ---- the matrix-unit form for the prefill shapes (milestone 3, stage B): M >= 64 on the GPU ----
+ *
+ * A work-group of kDpasWaves sub-groups (sub-group 16: the DPAS width, B1's query) owns kDpasRT activation rows
+ * by kDpasNT output columns; sub-group w owns rows 8w..8w+7 and all four 16-column tiles. Per 128-K group the
+ * work-group stages the weight block packed for the B operand (word (n, k4) = the 4 consecutive int8 of row n at
+ * 4*k4: the stored [N][K] row read as uint32, scattered into the (K/4) x N word layout the matrix unit takes),
+ * then each sub-group runs the four 32-wide steps of the group with joint_matrix_mad into exact int32 tiles,
+ * stores each tile to its own LDS scratch and scales element (m, n) by a_scale[m, g] * b_scale[n, g] into float
+ * accumulators (lane = column n of the tile, 8 rows a lane): isum exact as the GEMV's, the group terms added
+ * in ascending g, one bf16 rounding at the end. The weight is read from memory once per kDpasRT rows instead of
+ * once per 4. The launcher sends full 64-row blocks here and the tail rows to the GEMV. */
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kDpasSG = 16, kDpasWaves = 8, kDpasThreads = kDpasSG * kDpasWaves;
+constexpr int kDpasRT = 8 * kDpasWaves;   /* 64 activation rows a work-group */
+constexpr int kDpasNT = 64;               /* 4 tiles of 16 output columns a work-group */
+constexpr int kDpasTileB = 8 * 16 * 4;    /* bytes of one packed B tile: 32 k x 16 n int8 */
+
+template <bool WS_BF16>
+void gemm_i8a8_dpas_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
+                           const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
+                           uint16_t* __restrict__ y, long y_ld, int N, int K) {
+    XE_SHARED(int8_t, sB, 4 * 4 * kDpasTileB);          /* [step 4][n tile 4][packed 32 x 16]: one 128-K group */
+    XE_SHARED(int32_t, sC, kDpasWaves * 8 * 16);        /* one 8 x 16 int32 tile a sub-group */
+    const int tid = (int)threadIdx.x, wave = tid / kDpasSG, lane = tid % kDpasSG;
+    const int m0 = (int)blockIdx.y * kDpasRT + wave * 8;   /* always a full 8-row tile: the launcher's blocks */
+    const int n0 = (int)blockIdx.x * kDpasNT;
+    const int G = K / 128;
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> A;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> Bt;
+    jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> C[4];
+    float acc[4][8];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[t][e] = 0.0f;
+    const int8_t* arow = a + (size_t)m0 * a_ld;
+    const float* asg = as + (size_t)m0 * as_ld;
+    uint32_t* sBw = (uint32_t*)sB;
+    int32_t* sCw = sC + wave * 128;
+    auto gptr = [](const int8_t* p) {
+        return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+    };
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    for (int g = 0; g < G; ++g) {
+        xe::syncthreads();                                  /* the previous group's tiles are consumed */
+        for (int idx = tid; idx < kDpasNT * 32; idx += kDpasThreads) {   /* 2048 words: 16 a thread */
+            const int n = idx / 32, k4 = idx % 32, nn = n0 + n;
+            uint32_t w = 0;
+            if (nn < N) w = *(const uint32_t*)(b + (size_t)nn * b_ld + (size_t)g * 128 + 4 * k4);
+            sBw[((k4 / 8) * 4 + n / 16) * 128 + (k4 % 8) * 16 + (n % 16)] = w;
+        }
+        xe::syncthreads();
+#pragma unroll
+        for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, C[t], 0);
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            jm::joint_matrix_load(sg, A, gptr(arow + (size_t)g * 128 + step * 32), (size_t)a_ld);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bt, lptr(sB + (step * 4 + t) * kDpasTileB), 64);
+                jm::joint_matrix_mad(sg, C[t], A, Bt, C[t]);   /* the toolchain's form: D = A * B + C */
+            }
+        }
+        /* the group's exact sums, scaled: lane = column, 8 rows a lane */
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
+            xe::wave_barrier();
+            const int nn = n0 + t * 16 + lane;
+            float sb = 0.0f;
+            if (nn < N) sb = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)bs)[(size_t)nn * bs_ld + g] << 16)
+                                     : ((const float*)bs)[(size_t)nn * bs_ld + g];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[t][e] += ((float)sCw[e * 16 + lane] * asg[(size_t)e * as_ld + g]) * sb;
+            xe::wave_barrier();
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int nn = n0 + t * 16 + lane;
+        if (nn >= N) continue;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const uint32_t u = __float_as_uint(acc[t][e]);   /* round to nearest even, NaN kept quiet */
+            y[(size_t)(m0 + e) * y_ld + nn] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
+                                                                                            : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+        }
+    }
+}
+
+bool dpas_on(sycl::queue* q) {
+    static const bool want = [] { const char* v = std::getenv("RADIANCE_XE_GEMM_DPAS"); return !(v && !std::strcmp(v, "0")); }();
+    static const bool gpu = q->get_device().is_gpu();   /* the CPU device has no matrix unit for int8 */
+    return want && gpu;
+}
+
 template <bool WS_BF16>
 void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as_ld, const int8_t* b, long b_ld,
             const void* bs, long bs_ld, uint16_t* y, long y_ld, int N, int K, int M) {
+    int m_start = 0;
+    if (M >= kDpasRT && dpas_on(q)) {
+        const int blocks = M / kDpasRT;
+        const dim3 dgrid((unsigned)((N + kDpasNT - 1) / kDpasNT), (unsigned)blocks), dblock(kDpasThreads);
+        XE_LAUNCH_SG(kDpasSG, q, (gemm_i8a8_dpas_kernel<WS_BF16>), dgrid, dblock, 0, a, a_ld, as, as_ld, b, b_ld, bs, bs_ld, y, y_ld, N, K);
+        m_start = blocks * kDpasRT;
+        if (m_start >= M) return;
+    }
     const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
-    for (int m0 = 0; m0 < M; m0 += kMaxM) {
+    for (int m0 = m_start; m0 < M; m0 += kMaxM) {
         const int mb = M - m0 < kMaxM ? M - m0 : kMaxM;
         const int8_t* am = a + (size_t)m0 * a_ld;
         const float* asm_ = as + (size_t)m0 * as_ld;
