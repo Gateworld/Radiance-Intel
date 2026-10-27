@@ -488,6 +488,7 @@ private:
     int  haz_mark(PassTape& t);
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    bool                  tape_low_told_ = false;   /* the VRAM floor's warning, said once (milestone 3) */
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;

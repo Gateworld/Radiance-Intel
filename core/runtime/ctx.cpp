@@ -1334,11 +1334,44 @@ int Ctx::run_pass(const RadBatch* b) {
         return RAD_OK;
     }
 
+    /* The card's free VRAM before a new recording (milestone 3, m3 fault 7): below the floor the least
+     * recently used tape goes and this pass is issued live, so recordings never take the card under it. */
+    {
+        static const int64_t floor_b = [] {
+            const char* v = std::getenv("RADIANCE_TAPE_VRAM_FLOOR_MIB");
+            const long long m = (v && *v) ? std::atoll(v) : 1024;
+            return (int64_t)(m > 0 ? m : 0) << 20;
+        }();
+        RadDeviceProps dp{};
+        if (floor_b > 0 && rad_dev_props(device_, &dp) == RAD_OK && dp.vram_free > 0 && dp.vram_free < floor_b) {
+            if (!tapes_.empty()) {
+                size_t lru = 0;
+                for (size_t q = 1; q < tapes_.size(); ++q) if (tapes_[q].used < tapes_[lru].used) lru = q;
+                tape_drop(tapes_[lru]);
+                tapes_.erase(tapes_.begin() + (std::ptrdiff_t)lru);
+            }
+            if (!tape_low_told_) {
+                tape_low_told_ = true;
+                RAD_WARN("rank %d: the card has %lld MiB free, under the recordings' floor of %lld MiB: the least "
+                         "recently used tape is dropped and new pass shapes run live until room returns "
+                         "(RADIANCE_TAPE_VRAM_FLOOR_MIB)", rank_, (long long)(dp.vram_free >> 20),
+                         (long long)(floor_b >> 20));
+            }
+            bump(pc_refused_);
+            arch_step_(this, b);
+            return RAD_OK;
+        }
+    }
     bump(pc_recorded_);
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
-    if (tapes_.size() < kTapes) {
+    static const size_t tape_max = [] {
+        const char* v = std::getenv("RADIANCE_TAPE_MAX");
+        const long long m = (v && *v) ? std::atoll(v) : (long long)kTapes;
+        return (size_t)(m > 0 ? m : 1);
+    }();
+    if (tapes_.size() < tape_max) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];
