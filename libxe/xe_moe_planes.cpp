@@ -275,6 +275,172 @@ void moe_planes_v2_kernel(const uint8_t* __restrict__ A, const float* __restrict
     }
 }
 
+/* moe_planes_v2m (milestone 3): moe_planes_v2 over a run of up to MT routed rows of one expert. The rows
+ * are sorted by expert, so a run is contiguous: the work-group whose row i starts a run ((i - off[e]) % MT
+ * == 0) stages the run's activations, loads each weight chunk once, applies it to every row and writes
+ * them all; the run's other work-groups return. A padding row (no expert) writes its zeros as before.
+ * Per output the arithmetic and its order are v2's: bit for bit. */
+constexpr int kV2MT = 4;
+template <int UPL, int MT>
+void moe_planes_v2m_kernel(const uint8_t* __restrict__ A, const float* __restrict__ As, PCls c0, PCls c1,
+                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+                           uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+                           uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, uint32_t parts,
+                           uint32_t a_rows) {
+    XE_SHARED(uint32_t, s_a, MT * (kV2MaxK / 2));   /* the run's activation rows as f16 pairs */
+    XE_SHARED(float, s_as, MT * (kV2MaxK / 128));   /* their per-128 scales */
+    XE_SHARED(uint32_t, s_lut, 256);
+    XE_SHARED(float, s_e4, 256);
+    const int tid = (int)threadIdx.x;
+    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    if (i >= T) return;
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        e = (int32_t)lo;
+    }
+    /* the run this row belongs to; a non-leader row is written by its run's leader */
+    uint32_t r0 = i, rn = 1;
+    if (e >= 0) {
+        const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % MT != 0) return;
+        r0 = i;
+        rn = (last - i) < (uint32_t)MT ? (last - i) : (uint32_t)MT;
+    }
+    /* each row's token (a row past the activation rows has no expert: zeros, as in v2) */
+    uint32_t tokr[MT];
+    bool liver[MT];
+#pragma unroll
+    for (int q = 0; q < MT; ++q) {
+        tokr[q] = 0; liver[q] = false;
+        if (e >= 0 && (uint32_t)q < rn) {
+            const int32_t fq = sorted[r0 + q];
+            const uint32_t t = a_sorted ? r0 + q : (uint32_t)fq / top_k;
+            tokr[q] = t;
+            liver[q] = fq >= 0 && t < a_rows;
+        }
+    }
+    const PCls& c = (e >= 0 && (e & 1)) ? c1 : c0;
+    const uint32_t fy = N / parts;
+    const uint32_t fc = e >= 0 ? c.n / parts : 0u;
+    const uint32_t K = e >= 0 ? c.k : 0u;
+    const uint8_t* we = nullptr;
+    const uint8_t* se = nullptr;
+    float s1 = 0.0f;
+    if (e >= 0) {
+        const uint32_t entry = (uint32_t)e >> 1;
+        we = entry_of(c.base, c.tab, c.stride, entry);
+        se = entry_of(c.sbase, c.stab, c.sstride, entry);
+        s1 = *(const float*)(se + c.s1_off);
+        const float* lvp = (const float*)(we + c.t_off);
+#pragma unroll
+        for (int q = 0; q < MT; ++q) {
+            if ((uint32_t)q >= rn || !liver[q]) continue;
+            const uint8_t* arow = A + (size_t)tokr[q] * a_ld;
+            for (uint32_t b = (uint32_t)tid; b < K / 2u; b += kV2WG)
+                s_a[q * (kV2MaxK / 2) + b] = f2h(e4m3(arow[2 * b])) | (f2h(e4m3(arow[2 * b + 1])) << 16);
+            for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kV2WG)
+                s_as[q * (kV2MaxK / 128) + g] = As[(size_t)tokr[q] * as_ld + g];
+        }
+        for (uint32_t t = (uint32_t)tid; t < 256u; t += kV2WG) {
+            s_e4[t] = e4m3(t);
+            s_lut[t] = f2h(lvp[t & 15u]) | (f2h(lvp[t >> 4]) << 16);
+        }
+    }
+    __syncthreads();
+    const int team = tid / kV2LPR, l = tid % kV2LPR;
+    float acc[MT][kV2R];
+    uint32_t rowr[kV2R];
+    bool rowok[kV2R];
+#pragma unroll
+    for (int r = 0; r < kV2R; ++r) {
+        const uint32_t n = nb * kV2RPW + (uint32_t)(team * kV2R + r);
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        rowok[r] = e >= 0 && n < N && j < fc;
+        rowr[r] = pp * fc + j;
+#pragma unroll
+        for (int q = 0; q < MT; ++q) acc[q][r] = 0.0f;
+    }
+    if (e >= 0) {
+        const uint32_t CPR = K / 32u;
+        const uint32_t rb = K / 2u, sb = K / 64u;
+        const uint8_t* wrow0 = we + c.c_off;
+        const uint8_t* srow0 = se + c.s_off;
+        uint4 w[UPL][kV2R];
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * kV2LPR;
+#pragma unroll
+            for (int r = 0; r < kV2R; ++r)
+                w[u][r] = (jc < CPR && rowok[r]) ? *(const uint4*)(wrow0 + (size_t)rowr[r] * rb + jc * 16u)
+                                                 : uint4{0, 0, 0, 0};
+        }
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * kV2LPR;
+            if (jc >= CPR) break;
+            const uint32_t k0 = jc * 32u;
+            const uint32_t g = k0 / 64u;
+            float sbr[kV2R];
+#pragma unroll
+            for (int r = 0; r < kV2R; ++r) sbr[r] = rowok[r] ? s_e4[srow0[(size_t)rowr[r] * sb + g]] : 0.0f;
+#pragma unroll
+            for (int q = 0; q < MT; ++q) {
+                if ((uint32_t)q >= rn) break;                /* uniform over the work-group */
+                const float asc = s_as[q * (kV2MaxK / 128) + k0 / 128u];
+                uint32_t a[16];
+#pragma unroll
+                for (int t = 0; t < 16; ++t) a[t] = s_a[q * (kV2MaxK / 2) + k0 / 2u + (uint32_t)t];
+#pragma unroll
+                for (int r = 0; r < kV2R; ++r) {
+                    const uint32_t d[4] = { w[u][r].x, w[u][r].y, w[u][r].z, w[u][r].w };
+                    float sacc = 0.0f;
+#pragma unroll
+                    for (int x = 0; x < 4; ++x)
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const uint32_t byte = (d[x] >> (8 * b)) & 0xffu;
+                            const uint32_t ab = a[x * 4 + b];
+                            const uint32_t lv = s_lut[byte];
+                            const sycl::half l0 = sycl::bit_cast<sycl::half>((uint16_t)(lv & 0xffffu));
+                            const sycl::half l1 = sycl::bit_cast<sycl::half>((uint16_t)(lv >> 16));
+                            const sycl::half a0 = sycl::bit_cast<sycl::half>((uint16_t)(ab & 0xffffu));
+                            const sycl::half a1 = sycl::bit_cast<sycl::half>((uint16_t)(ab >> 16));
+                            sacc += (float)(sycl::half)(l0 * a0);
+                            sacc += (float)(sycl::half)(l1 * a1);
+                        }
+                    if (rowok[r]) acc[q][r] += (sacc * asc) * sbr[r];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < MT; ++q) {
+        if ((uint32_t)q >= rn) break;
+#pragma unroll
+        for (int r = 0; r < kV2R; ++r) {
+            float v = acc[q][r];
+            v += __shfl_xor(v, 8);
+            v += __shfl_xor(v, 4);
+            v += __shfl_xor(v, 2);
+            v += __shfl_xor(v, 1);
+            const uint32_t n = nb * kV2RPW + (uint32_t)(team * kV2R + r);
+            if (l == 0 && n < N)
+                Y[(size_t)(r0 + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] ? v * s1 : 0.0f);
+        }
+    }
+}
+
+bool multi_on() {   /* RADIANCE_XE_MOE_MULTI=0: one work-group a routed row (v2) */
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MULTI"); return !(s && *s == '0'); }();
+    return v;
+}
+
 /* Where the planes of an entry start: rad_planes_plan's arithmetic for two planes. */
 uint32_t first_plane() {
     return (uint32_t)rad_planes_round((int64_t)sizeof(RadPlanesHeader) + 2 * (int64_t)sizeof(RadPlanesEntry));
@@ -418,7 +584,17 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
              * in the shipped model; the larger decides, the smaller leaves lanes idle in the tail) */
             const int upl = (int)((K / 32 + kV2LPR - 1) / kV2LPR);
             const dim3 grid((unsigned)((N + kV2RPW - 1) / kV2RPW), (unsigned)T), block(kV2WG);
+            /* several tokens (T past one token's top_k rows): runs of one expert's rows share the weight
+             * stream (milestone 3); a single token keeps v2 (its rows are distinct experts) */
+            const bool multi = multi_on() && T > top_k;
 #define XE_MOE_V2(U)                                                                                        \
+    if (multi)                                                                                              \
+    XE_LAUNCH_SG(16, qq, (moe_planes_v2m_kernel<U, kV2MT>), grid, block, 0, (const uint8_t*)Aq->data,       \
+                 (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
+                 (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
+                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts,       \
+                 (uint32_t)M);                                                                              \
+    else                                                                                                    \
     XE_LAUNCH_SG(16, qq, moe_planes_v2_kernel<U>, grid, block, 0, (const uint8_t*)Aq->data,                 \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
