@@ -218,9 +218,18 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsign
     if (t < T) sp[(size_t)(t + NH) * cs_tok] = xs[t];
 }
 
+/* The sum over a v row's KT lanes (consecutive lanes of one sub-group). */
+template <int KT>
+__device__ __forceinline__ float ru_row_sum(float x) {
+  if constexpr (KT >= 2) x += r4d_xor_lane<1>(x);
+  if constexpr (KT >= 4) x += r4d_xor_lane<2>(x);
+  if constexpr (KT >= 8) x += r4d_xor_lane<4>(x);
+  return x;
+}
+
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
-__global__ __launch_bounds__(RU_V / VS * 2)
+          int CV = 0, int KT = 2>
+__global__ __launch_bounds__(RU_V / VS * KT)
 void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
                                      const unsigned short* __restrict__ v,
@@ -245,7 +254,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 {
   using ST = typename ru_state<SDT>::T;
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
-  constexpr int THR = NR * 2;
+  constexpr int THR = NR * KT;          // KT threads a v row (milestone 3: 4 for the decode shape)
+  constexpr int HK = RU_K / KT;         // k elements a thread
+  static_assert(KT == 2 || KT == 4 || KT == 8, "a v row's lanes must be a power of two in one sub-group");
+  static_assert(!STG || KT == 2, "the staged path's thread layout is two halves");
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
   XE_SHARED(float, wsum, THR / 32);
   XE_SHARED(float, spart, STG ? RU_TMAX * 4 : 1);   // per (token, half): sum q^2, sum k^2
@@ -258,7 +270,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   if (empty && !ANC) return;
 
   const int tid = threadIdx.x;
-  const int row = (tid >> 1) + (VS > 1 ? blockIdx.z * NR : 0), half = tid & 1, k0 = half * RU_HK;
+  const int row = (tid / KT) + (VS > 1 ? blockIdx.z * NR : 0), half = tid & (KT - 1), k0 = half * HK;
   const int hk = hv / (H / Hg);
   /* Read early so their latency overlaps the prologue's loads. */
   const float a_log_h = A_log[hv], dtb = dt_bias[hv];
@@ -290,6 +302,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   unsigned short* spa = nullptr;
   unsigned short* spb = nullptr;
   unsigned int arrived = 0;
+  const bool cvt = tid < 2 * RU_K;                      // this thread stages one q|k channel
   if constexpr (CV) {
     if (!empty) {
       const int cslot = cv.cidx[(size_t)n * cv.ci_stride];
@@ -300,17 +313,19 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       const int ca = tid < RU_K ? hk * RU_K + tid : (Hg + hk) * RU_K + (tid - RU_K);
       const int cb = (2 * Hg + hv) * RU_V + tid;
       const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
+      if (cvt) {
 #pragma unroll
-      for (int t = 0; t < RU_CVT; ++t)
-        if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
-      {
-        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
-        cwa[0] = bf2f(w4.x); cwa[1] = bf2f(w4.y); cwa[2] = bf2f(w4.z); cwa[3] = bf2f(w4.w);
-        if (cv.b) cba = bf2f(cv.b[ca]);
+        for (int t = 0; t < RU_CVT; ++t)
+          if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
+        {
+          const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
+          cwa[0] = bf2f(w4.x); cwa[1] = bf2f(w4.y); cwa[2] = bf2f(w4.z); cwa[3] = bf2f(w4.w);
+          if (cv.b) cba = bf2f(cv.b[ca]);
+        }
+        spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
+#pragma unroll
+        for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
       }
-      spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
-#pragma unroll
-      for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
       if (tid < RU_V) {
 #pragma unroll
         for (int t = 0; t < RU_CVT; ++t)
@@ -403,30 +418,30 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
    * VGPR offsets live across the token loop. */
   const int grp = __builtin_amdgcn_readfirstlane(row >> 5);
 
-  float h[RU_HK];
+  float h[HK];
   {
     const ST* p = state + (size_t)si * st_slot + (size_t)hv * st_head
                 + (size_t)row * RU_K + k0;
 #pragma unroll
-    for (int j = 0; j < RU_HK; j += 8) ru_load8<NT, SDT>(&h[j], p + j);
+    for (int j = 0; j < HK; j += 8) ru_load8<NT, SDT>(&h[j], p + j);
   }
 
   if (ANC) {
     for (int t = 0; t < nacc; ++t) {
       const ST* f = fr + (size_t)t * RU_FSTR;
-      float kk[RU_HK];
+      float kk[HK];
 #pragma unroll
-      for (int j = 0; j < RU_HK; j += 8) ru_load8<0, SDT>(&kk[j], f + grp * RU_K + k0 + j);
+      for (int j = 0; j < HK; j += 8) ru_load8<0, SDT>(&kk[j], f + grp * RU_K + k0 + j);
       const float vv = (float)f[4 * RU_K + row];
       const float eg = __expf((float)f[4 * RU_K + RU_V + 2 * grp]);
       const float bt = (float)f[4 * RU_K + RU_V + 2 * grp + 1];
       float dot = 0.0f;
 #pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
-      dot += r4d_xor_lane<1>(dot);          // DPP, no LDS round trip
+      for (int j = 0; j < HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+      dot = ru_row_sum<KT>(dot);            // the row's lanes, no LDS round trip
       const float u = (vv - dot) * bt;
 #pragma unroll
-      for (int j = 0; j < RU_HK; ++j) h[j] += u * kk[j];
+      for (int j = 0; j < HK; ++j) h[j] += u * kk[j];
     }
     // Publish the advanced anchor, then barrier: every replay read above must complete before the
     // token loop overwrites the factor block with this step's factors.
@@ -435,12 +450,12 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     ST* p0 = state + (size_t)sa0 * st_slot + rowoff;
     ST* p2 = state + (size_t)sa2 * st_slot + rowoff;
 #pragma unroll
-    for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+    for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
     if (dup_a && !RU_ANC_MARK) {
 #pragma unroll
-      for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p0 + j, &h[j]);
+      for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p0 + j, &h[j]);
 #pragma unroll
-      for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p2 + j, &h[j]);
+      for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p2 + j, &h[j]);
     }
     __syncthreads();
     // Stamp after the barrier: every thread read fb's marker at the top, and stamping earlier
@@ -473,12 +488,14 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
         }
       }
     };
-    conv(cwa, cba, cha, cxa, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
+    if (cvt) {
+      conv(cwa, cba, cha, cxa, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
 #pragma unroll
-    for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = cha[i];
+      for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = cha[i];
 #pragma unroll
-    for (int t = 0; t < RU_CVT; ++t)
-      if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
+      for (int t = 0; t < RU_CVT; ++t)
+        if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
+    }
     if (tid < RU_V) {
       conv(cwb, cbb, chb, cxb, cvv + tid);
       ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
@@ -502,12 +519,12 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   if (STG) {
     // One lane per (token, half) computes the same sums each v row computes on the STG=0 path.
     if (tid < 2 * T) {
-      const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
+      const int ut = tid >> 1, uk0 = (tid & 1) * HK;
       const unsigned short* qp = q + ((size_t)(bos + ut) * Hg + hk) * RU_K + uk0;
       const unsigned short* kp = k + ((size_t)(bos + ut) * Hg + hk) * RU_K + uk0;
       float ssq = 0.0f, ssk = 0.0f;
 #pragma unroll
-      for (int j = 0; j < RU_HK; j += 8) {
+      for (int j = 0; j < HK; j += 8) {
         const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
         const unsigned short* aq = (const unsigned short*)&wq;
         const unsigned short* ak = (const unsigned short*)&wk;
@@ -536,9 +553,9 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     const unsigned short* qp = CV ? cvq + t * RU_K + k0 : q + ((size_t)tok * Hg + hk) * RU_K + k0;
     const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
 
-    float qq[RU_HK], kk[RU_HK];
+    float qq[HK], kk[HK];
 #pragma unroll
-    for (int j = 0; j < RU_HK; j += 8) {
+    for (int j = 0; j < HK; j += 8) {
       const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
       const unsigned short* sq = (const unsigned short*)&wq;
       const unsigned short* sk = (const unsigned short*)&wk;
@@ -553,13 +570,13 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     } else {
       float sq = 0.0f, sk = 0.0f;
 #pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { sq += qq[j] * qq[j]; sk += kk[j] * kk[j]; }
-      sq += r4d_xor_lane<1>(sq);
-      sk += r4d_xor_lane<1>(sk);
+      for (int j = 0; j < HK; ++j) { sq += qq[j] * qq[j]; sk += kk[j] * kk[j]; }
+      sq = ru_row_sum<KT>(sq);
+      sk = ru_row_sum<KT>(sk);
       qs = __frsqrt_rn(sq + 1e-6f) * scale; ks = __frsqrt_rn(sk + 1e-6f);
     }
 #pragma unroll
-    for (int j = 0; j < RU_HK; ++j) { qq[j] *= qs; kk[j] *= ks; }
+    for (int j = 0; j < HK; ++j) { qq[j] *= qs; kk[j] *= ks; }
 
     const float ra  = CV ? sab[t]     : ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
     const float rb  = CV ? sab[T + t] : ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
@@ -569,8 +586,8 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 
     float dot = 0.0f;
 #pragma unroll
-    for (int j = 0; j < RU_HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
-    dot += r4d_xor_lane<1>(dot);
+    for (int j = 0; j < HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+    dot = ru_row_sum<KT>(dot);
 
     const float vraw = bf2f(CV ? cvv[t * RU_V + row] : v[((size_t)tok * H + hv) * RU_V + row]);
     const float u = (vraw - dot) * bt;
@@ -583,7 +600,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       ST* f2 = fb2 + (size_t)t * RU_FSTR;
       if ((row & 31) == 0) {
 #pragma unroll
-        for (int j = 0; j < RU_HK; j += 8) {
+        for (int j = 0; j < HK; j += 8) {
           float kn[8];
 #pragma unroll
           for (int e = 0; e < 8; ++e) kn[e] = kk[j + e];
@@ -612,8 +629,8 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 
     float on = 0.0f;
 #pragma unroll
-    for (int j = 0; j < RU_HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
-    on += r4d_xor_lane<1>(on);
+    for (int j = 0; j < HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
+    on = ru_row_sum<KT>(on);
 
     if (NORM) {
       // sum of squares over the row: one channel per thread pair, 16 per wave
@@ -677,7 +694,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
         ST* p = state + (size_t)so * st_slot + (size_t)hv * st_head
               + (size_t)row * RU_K + k0;
 #pragma unroll
-        for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+        for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
       }
     }
   }
@@ -695,6 +712,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       __syncthreads();
       if (!cvlast) return;
     }
+    if (!cvt) return;                           /* no channel of its own (KT > 2) */
     unsigned short rh[CS], rx[RU_CVT];
     rh[0] = 0;                                  /* never read: the oldest entry is shifted out */
 #pragma unroll
@@ -889,12 +907,15 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const long slots_written = anc ? 1 : sidx_stride;
   const long flood = (long)N * slots_written * st_slot * (sdt ? 2 : 4);
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
-  const dim3 grid(N, H, 1), blk(RU_V * 2);
+  /* KT = 4 threads a v row (milestone 3, kernel 4): 32 state + 32 key + 32 query floats a lane fit
+   * the large register file; the shipped two-thread layout spilled 32 KB a thread on Xe */
+  constexpr int RC_KT = 4;
+  const dim3 grid(N, H, 1), blk(RU_V * RC_KT);
 #define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
   do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
   while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC)                                                     \
-  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1, RC_KT>), \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
