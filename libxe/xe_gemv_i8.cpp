@@ -24,6 +24,7 @@
  */
 #include "xe_lanes.h"
 #include "r4d_args.h"
+#include <sycl/ext/oneapi/dot_product.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -60,11 +61,10 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
             if (gl && m < M) {
                 const uint4 x = *(const uint4*)(a + (size_t)m * a_ld + (size_t)g * 128 + chunk * 16);
                 const unsigned wv[4] = {w.x, w.y, w.z, w.w}, xv[4] = {x.x, x.y, x.z, x.w};
+                /* the 4-way int8 dot (DP4A): the packed words whole, the same exact int32 sum (milestone 3) */
 #pragma unroll
                 for (int u = 0; u < 4; ++u)
-#pragma unroll
-                    for (int k = 0; k < 4; ++k)
-                        s += (int)(int8_t)(wv[u] >> (8 * k)) * (int)(int8_t)(xv[u] >> (8 * k));
+                    s = sycl::ext::oneapi::dot_acc((int32_t)wv[u], (int32_t)xv[u], s);
             }
             /* the group's exact int32 sum over its 8 lanes */
             s += __builtin_amdgcn_ds_bpermute((lane ^ 1) << 2, s);
