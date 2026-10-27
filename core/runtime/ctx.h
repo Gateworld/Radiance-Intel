@@ -302,6 +302,9 @@ public:
      * Relaxed atomics: written by this rank's step thread, read by any thread. */
     int64_t     ar_calls() const { return ar_calls_.load(std::memory_order_relaxed); }
     int64_t     ar_bytes() const { return ar_bytes_.load(std::memory_order_relaxed); }
+    /* Blocks of the all-reduce that gave up waiting for the peer, as the kernel library counts them on the
+     * device (owner note 42): read after every step; 0 where the library has no such counter. */
+    int64_t     ar_stalls() const { return ar_stalls_.load(std::memory_order_relaxed); }
 
     /* How each pass was run. A play writes recorded packets; every other outcome walks the issue
      * path. `issued_*` split unplayed passes by cause: no key, key refused, key seen first time.
@@ -744,6 +747,13 @@ private:
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
+    /* owner note 42 (run 38): the all-reduce's stalled-block count, read from the device after every step */
+    std::atomic<int64_t> ar_stalls_{0};
+    /* (the reader, the instance): only instances whose own plugin exports the counter -- libxe's
+     * xe_ar2_stalls; libref's host-domain all_reduce has none and its instance is another type */
+    typedef uint32_t (*ArStallsFn)(void*, RadStream);
+    std::vector<std::pair<ArStallsFn, void*>> ar_insts_;
+    void ar_stalls_read();
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
     std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};

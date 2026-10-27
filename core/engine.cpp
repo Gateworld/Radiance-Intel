@@ -2030,6 +2030,8 @@ int Engine::run_server() {
             s.link.world          = (int)ranks_.size();
             s.link.ar_calls       = ranks_[0]->ctx.ar_calls();
             s.link.ar_bytes       = ranks_[0]->ctx.ar_bytes();
+            s.link.ar_stalls      = 0;
+            for (const auto& rk : ranks_) s.link.ar_stalls += rk->ctx.ar_stalls();
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
             s.link.ssd_bytes = s.link.prefetched = s.link.prefetch_bytes = 0;
             s.link.stream_bytes = s.link.staged_bytes = 0;

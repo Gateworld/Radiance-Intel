@@ -48,6 +48,7 @@
 #include <unordered_map>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 /* core/device/l0_kernels.sycl (librad_l0k) */
@@ -448,6 +449,11 @@ struct Tape {
     struct NDead { ze_command_list_handle_t list; int slot; uint64_t serial; };
     std::deque<NDead> ndead;
     bool segs_dropped = false;         /* the segment lists went at the first play (the pool's phase 2) */
+    /* owner note 42: the recorded waits whose signaller is inside the tape (the event, the waiter's segment),
+     * checked at tape_end; the event-only segments closed after native work, whose records follow the
+     * tape's latest play instead of the runtime queue */
+    std::vector<std::pair<L0Event*, int>> rec_waits;
+    int dangling_fixed = 0;
     ~Tape();
 };
 std::atomic<uint64_t> g_tape_ids{0};
@@ -678,6 +684,14 @@ struct ZeDev {
         bool used = false;
         std::vector<sycl::event> keep;   /* the runtime's events the play waited on: alive until the slot's reuse, so the runtime cannot recycle them under the device-side wait */
         std::vector<Consumer> consumers;  /* slots of other devices whose lists wait on this one's event (rad_event_wait across streams): reuse waits for them too */
+        /* what the slot carries, for the 10 s wait warnings (owner note 42): a play's tape, range and list
+         * count, or a cross-stream wait (kind 1); the slot it followed; the runtime events it waited on */
+        int kind = 0;
+        uint64_t tape = 0;
+        int from = -1, to = -1;
+        uint32_t nlists = 0, nwaits = 0;
+        int dep_dev = -1, dep_slot = -1;
+        uint64_t dep_serial = 0;
     };
     std::unique_ptr<Ring[]> ring;
     size_t next = 0;
@@ -850,6 +864,28 @@ ze_event_handle_t n_slot_event(int dev, int slot, uint64_t serial) {
     if (r.serial.load(std::memory_order_acquire) != serial || zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS) return nullptr;
     return r.ev;
 }
+/* What a slot carries, for the 10 s warnings (owner note 42): read without the device's lock (plain fields
+ * written before the slot's serial was published; a stale read only misdescribes a slot that moved on). */
+std::string slot_story(int dev, int slot, uint64_t serial) {
+    ZeDev& Z = zedev(dev);
+    if (slot < 0 || slot >= (int)kRingEvents || !Z.ring) return "no slot";
+    const ZeDev::Ring& r = Z.ring[(size_t)slot];
+    char buf[320];
+    if (r.serial.load(std::memory_order_acquire) != serial) {
+        std::snprintf(buf, sizeof buf, "the slot moved on (serial %llu now)", (unsigned long long)r.serial.load());
+        return buf;
+    }
+    const char* ev = zeEventQueryStatus(r.ev) == ZE_RESULT_SUCCESS ? "signalled" : "pending";
+    const char* dep = r.dep_slot < 0 ? "none" : n_slot_done(r.dep_dev, r.dep_slot, r.dep_serial) ? "completed" : "pending";
+    if (r.kind == 1)
+        std::snprintf(buf, sizeof buf, "a cross-stream wait on device %d slot %d serial %llu (%s), its own signal %p %s",
+                      r.dep_dev, r.dep_slot, (unsigned long long)r.dep_serial, dep, (void*)r.ev, ev);
+    else
+        std::snprintf(buf, sizeof buf, "tape %llu range [%d, %d) in %u list(s), signal event %p %s; after slot %d serial %llu of device %d (%s) and %u runtime event(s)",
+                      (unsigned long long)r.tape, r.from, r.to, r.nlists, (void*)r.ev, ev, r.dep_slot, (unsigned long long)r.dep_serial,
+                      r.dep_dev, dep, r.nwaits);
+    return buf;
+}
 void n_slot_wait(int dev, int slot, uint64_t serial, const char* who) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -862,8 +898,8 @@ void n_slot_wait(int dev, int slot, uint64_t serial, const char* who) {
         sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
         if (!told && us > 10000000) {
             told = true;
-            RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (%s; plays so far %lld)",
-                     t_device, dev, slot, (unsigned long long)serial, who, (long long)g_nplays.load());
+            RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (%s; plays so far %lld): %s",
+                     t_device, dev, slot, (unsigned long long)serial, who, (long long)g_nplays.load(), slot_story(dev, slot, serial).c_str());
         }
     }
 }
@@ -937,7 +973,7 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
  * command (and the other recorded streams' when fenced) and after the previous play; marks the
  * streams so their next runtime submission waits for it. */
 void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before);
-void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool replay = true) {
+void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool replay = true, int from = -1, int to = -1) {
     if (!n) return;
     ZeDev& Z = zedev(t.dev);
     sycl::queue& H = t.qs[0]->q;
@@ -987,6 +1023,8 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     add_wait(H);
     for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
     std::lock_guard<std::mutex> lk(Z.m);
+    const int dep_slot = Z.prev_slot;          /* named by the 10 s warning (owner note 42) */
+    const uint64_t dep_serial = Z.prev_serial;
     if (Z.prev_slot >= 0) {   /* the previous play (or cross-stream wait), unless its slot has moved on (then it completed) */
         const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
         if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS) waits.push_back(pr.ev);
@@ -1000,6 +1038,8 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     }
     r.used = true;
     r.keep = std::move(keep);
+    r.kind = 0; r.tape = t.id; r.from = from; r.to = to; r.nlists = n; r.nwaits = (uint32_t)waits.size();
+    r.dep_dev = t.dev; r.dep_slot = dep_slot; r.dep_serial = dep_serial;
     const int64_t np = g_nplays.fetch_add(1, std::memory_order_relaxed) + 1;
     g_nlists_played.fetch_add(n, std::memory_order_relaxed);
     if (np % 8192 == 0)   /* the pool's shape over a long run (run 23: the replays' host memory growth) */
@@ -1228,8 +1268,11 @@ void n_seg_close() {
         /* kept before it runs: a failed append leaves the list to the tape's destructor, not leaked */
         t.segs.push_back(std::move(sg));
         Seg& kept = t.segs.back();
-        if (kept.list) n_play_lists(t, &kept.list, 1, false);   /* a recording's segments are distinct lists: no same-tape wait */
-        if (kept.list) n_rerecord(t, kept.evs); else rerecord(t, kept.evs);
+        const int si = (int)t.segs.size() - 1;
+        if (kept.list) n_play_lists(t, &kept.list, 1, false, si, si + 1);   /* a recording's segments are distinct lists: no same-tape wait */
+        if (kept.list) n_rerecord(t, kept.evs);
+        else if (t.nslot >= 0) { n_rerecord(t, kept.evs); ++t.dangling_fixed; }   /* owner note 42: event-only after native work: a runtime-queue record would not follow the lists */
+        else rerecord(t, kept.evs);
     }
 }
 /* Closes the open segment: finalize, run, keep. */
@@ -1356,6 +1399,30 @@ RadTape z_tape_end(int keep) {
      * the recording, and replaying nothing would be silently wrong. */
     if (t->segs.empty() && t->refused.empty())
         t->refused = "nothing was recorded (the pass's work went to a stream outside the recording)";
+    /* owner note 42 (run 38): every recorded wait must have its signaller in the tape -- the event's record kept
+     * in a segment at or before the waiter's -- or in the runtime's prior work (an event recorded before the
+     * pass, which z_event_wait does not list). One without is refused: the pass runs live, and the warning
+     * says which tape. */
+    if (t->native && t->refused.empty() && !t->rec_waits.empty()) {
+        int lost = 0;
+        for (const auto& w : t->rec_waits) {
+            bool found = false;
+            for (int k = 0; k <= w.second && k < (int)t->segs.size() && !found; ++k)
+                for (L0Event* e : t->segs[(size_t)k].evs) if (e == w.first) { found = true; break; }
+            if (!found) ++lost;
+        }
+        if (lost) {
+            RAD_WARN("l0 tape %llu: %d of %zu recorded wait(s) have no signaller in the tape (the event's record is in no segment at or before the waiter's): the pass runs live",
+                     (unsigned long long)t->id, lost, t->rec_waits.size());
+            t->refused = "a recorded wait has no signaller in the tape";
+        }
+    }
+    if (t->native && t->dangling_fixed) {
+        static std::atomic<int> told_fix{0};
+        if (told_fix.fetch_add(1) < 8)
+            RAD_INFO("l0 tape %llu: %d event-only segment(s) closed after native work: their event records follow the tape's latest play, not the runtime queue",
+                     (unsigned long long)t->id, t->dangling_fixed);
+    }
     if (!keep || !t->refused.empty()) {
         if (keep) device_set_error("the pass cannot be replayed from a SYCL graph: %s", t->refused.c_str());
         release_tape(t);   /* its segments ran while recorded and may still be running */
@@ -1604,7 +1671,7 @@ int play_now(Tape& tr, int from, int to) {
                 for (int i = from; i < to; ++i)
                     if (t->segs[(size_t)i].list) lists.push_back(t->segs[(size_t)i].list);
             }
-            n_play_lists(*t, lists.data(), (uint32_t)lists.size());
+            n_play_lists(*t, lists.data(), (uint32_t)lists.size(), true, from, to);
             if (compose) {
                 /* the bounded cache: the least recently played range out, its list destroyed once this play
                  * (which the tape's next play waits for) has completed */
@@ -1629,7 +1696,8 @@ int play_now(Tape& tr, int from, int to) {
             }
             std::vector<L0Event*> evs;
             for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
-            if (lists.empty()) rerecord(*t, evs); else n_rerecord(*t, evs);
+            /* an event-only range after played segments follows the tape's latest play (owner note 42) */
+            if (!lists.empty() || (from > 0 && t->nslot >= 0)) n_rerecord(*t, evs); else rerecord(*t, evs);
         });
     }
     const int mode = compose_mode();
@@ -2067,6 +2135,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
             never = !e->recorded && e->gtape != t_rec.t->id;
             b = e->gev;
         }
+        if (t_rec.native && (here || earlier)) t_rec.t->rec_waits.emplace_back(e, (int)t_rec.t->segs.size());   /* checked at tape_end (owner note 42) */
         if (here && t_rec.native) return RAD_OK;   /* one in-order list */
         if (here) return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
         if (earlier || never) return RAD_OK;   /* the segments run in order; a never-recorded event is no wait */
@@ -2115,6 +2184,8 @@ int z_event_wait(RadStream s, RadEvent ev) {
         if (rc == ZE_RESULT_SUCCESS) rc = zeCommandListAppendSignalEvent(Z.imm, r.ev);
         if (rc != ZE_RESULT_SUCCESS) { device_set_error("rad_event_wait: the native wait failed (0x%x)", (unsigned)rc); return RAD_E_DEVICE; }
         r.used = true;
+        r.kind = 1; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = 1;
+        r.dep_dev = zdev; r.dep_slot = zslot; r.dep_serial = zserial;
         Z.prev_slot = slot;
         Z.prev_serial = serial;
         st.npend_dev = st.dev;

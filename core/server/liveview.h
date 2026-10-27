@@ -108,6 +108,7 @@ struct LinkStat {
     bool    present = false;       /* false when nothing measured any of it */
     int     world = 1;
     int64_t ar_calls = 0, ar_bytes = 0;
+    int64_t ar_stalls = 0;   /* all-reduce blocks that gave up waiting for the peer, over the ranks (owner note 42) */
     int64_t h2d_bytes = 0, d2h_bytes = 0;
     int64_t ssd_reads = 0, ssd_bytes = 0;
     /* The MoE GEMM reading a routed expert that was not resident: the traffic promotions aim to

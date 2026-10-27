@@ -5,8 +5,10 @@
 #include "ctx.h"
 #include "xp_state.h"
 #include "../device/device.h"
+#include "../plugin/registry.h"
 
 #include <algorithm>
+#include <dlfcn.h>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -346,6 +348,22 @@ int Ctx::bind_ops() {
                     ip.args.scratch       = arena_.scratch();
                     ip.args.scratch_bytes = r.scratch_bytes;
                     ip.args.instance      = r.instance;
+                    /* owner note 42 (run 38): the all-reduce instances, for the stalled-block read after
+                     * every step; the reader is the row's plugin's xe_ar2_stalls, where it has one */
+                    if (p.billed && r.instance && registry_) {
+                        /* the row's own plugin's reader, if it exports one (libxe); libref's host
+                         * all_reduce has none and its instance is another type (run 39: reading it with
+                         * libxe's reader crashed the server at its first step) */
+                        ArStallsFn fn = nullptr;
+                        for (const Plugin& pl : registry_->plugins())
+                            if (pl.handle && pl.name == r.row->plugin) {
+                                fn = reinterpret_cast<ArStallsFn>(dlsym(pl.handle, "xe_ar2_stalls"));
+                                break;
+                            }
+                        bool seen = false;
+                        for (const auto& ai : ar_insts_) if (ai.second == r.instance) seen = true;
+                        if (fn && !seen) ar_insts_.emplace_back(fn, r.instance);
+                    }
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
                     /* A launch that ends its own link hold gets the hold word as an extra
@@ -1427,7 +1445,25 @@ int Ctx::run_step(const RadBatch* b) {
 
     if (profiling_) profile_collect();
     flush_issued();
+    ar_stalls_read();
     return step_status_;
+}
+
+/* owner note 42 (run 38): a block of the two-rank all-reduce that exhausted its poll budget "still arrives"
+ * (c85f419), so the collective completes with garbage; its device printf never surfaces under native
+ * launches (M10), and the host learned nothing. The kernel library counts those blocks on the device
+ * (xe_ar2_stalls: a small device-to-host read on the stream, after the step's submissions); every step reads
+ * the total over the rank's instances and warns when it rose. The read is on the runtime queue, not behind
+ * the step's native play, so a rise shows a step late at most. */
+void Ctx::ar_stalls_read() {
+    if (ar_insts_.empty()) return;
+    int64_t total = 0;
+    for (const auto& ai : ar_insts_) total += ai.first(ai.second, stream_);
+    const int64_t prev = ar_stalls_.exchange(total, std::memory_order_relaxed);
+    if (total > prev)
+        RAD_WARN("rank %d: xe all-reduce: %lld block(s) have given up waiting for the peer (%lld more since the "
+                 "last step): that collective completed with garbage and its launches are desynchronised from here",
+                 rank_, (long long)total, (long long)(total - prev));
 }
 
 /* Copies OpPlan::issued into the Program for the graph dump. Walks only ops not yet seen issued

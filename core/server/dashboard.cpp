@@ -371,6 +371,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["world"]          = s.link.world;
             l["ar_calls"]       = s.link.ar_calls;
             l["ar_bytes"]       = s.link.ar_bytes;
+            l["ar_stalls"]      = s.link.ar_stalls;
             l["h2d_bytes"]      = s.link.h2d_bytes;
             l["d2h_bytes"]      = s.link.d2h_bytes;
             l["ssd_reads"]      = s.link.ssd_reads;
