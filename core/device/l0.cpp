@@ -1367,6 +1367,7 @@ int z_tape_play(RadTape p, int from, int to) {
  * = the other modes (stretch = the old unbounded cache, with the segment release above);
  * RADIANCE_L0_TAPE_STRETCHES=N sets the bound. */
 constexpr int kComposeMin = 8;
+constexpr int kBlock = 16;   /* a composed block's segments (run 23): a 1,036-segment pass is 65 blocks */
 int compose_mode() {   /* 0 direct, 1 stretch (unbounded), 2 record, 3 hybrid */
     static const int m = [] {
         const char* v = std::getenv("RADIANCE_L0_TAPE_COMPOSE");
@@ -1379,8 +1380,8 @@ int compose_mode() {   /* 0 direct, 1 stretch (unbounded), 2 record, 3 hybrid */
     return m;
 }
 size_t max_stretches() {
-    /* 128 since run 23 (milestone 2's measured choice; 512 let the replays' ~50 tapes grow the pool by 0.6 GB/min a card) */
-    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_STRETCHES"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)128; }();
+    /* 512: with fixed blocks (run 23) a tape holds its blocks and the recurring partials, a few hundred at most */
+    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_STRETCHES"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)512; }();
     return n;
 }
 std::atomic<int64_t> g_stretch_composed{0}, g_stretch_evicted{0}, g_plays_direct{0};
@@ -1498,10 +1499,23 @@ int play_now(Tape& tr, int from, int to) {
             }
             const bool compose = compose_mode() != 0 && (t->segs_dropped || to - from >= kComposeMin);
             if (compose) {
-                ze_command_list_handle_t& l = t->nstretch[{from, to}];
-                if (!l && !t->nstretch_used.count({from, to})) l = n_compose(*t, from, to);
-                t->nstretch_used[{from, to}] = ++t->nclock;
-                if (l) lists.push_back(l);
+                /* fixed blocks + the partial head and tail (run 23, H2c): the ranges the mover cuts move every
+                 * step, so one list a range was 160 composed lists a second under the rotation; the blocks
+                 * are composed once and the partials recur */
+                auto take = [&](int a, int b) {
+                    if (a >= b) return;
+                    ze_command_list_handle_t& l = t->nstretch[{a, b}];
+                    if (!l && !t->nstretch_used.count({a, b})) l = n_compose(*t, a, b);
+                    t->nstretch_used[{a, b}] = ++t->nclock;
+                    if (l) lists.push_back(l);
+                };
+                const int b0 = (from + kBlock - 1) / kBlock * kBlock, b1 = to / kBlock * kBlock;
+                if (b0 >= b1) take(from, to);
+                else {
+                    take(from, b0);
+                    for (int a = b0; a < b1; a += kBlock) take(a, a + kBlock);
+                    take(b1, to);
+                }
             } else {
                 lists.reserve((size_t)(to - from));
                 for (int i = from; i < to; ++i)
