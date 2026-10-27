@@ -3321,6 +3321,144 @@ extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };
 
+/* ==================================================== mtp_enter, few rows on Xe (milestone 3)
+ *
+ * The tiled kernel's WMMA tiles are emulated on Xe with sub-group shuffles (xe_lanes.h), so a draft
+ * round's call cost 6.5 ms where the AMD figure is ~50 us (the tape profiler: a quarter of the MTP
+ * step). At a few rows the op is a multi-row GEMV: every E4M3 weight is read and decoded once and
+ * multiplied into up to kMtpRowsMax output rows kept as per-lane accumulators. The A rows are
+ * normalised once by mtp_rows_prep_kernel into bf16 scratch (scale and gain folded in, the tiled
+ * kernel's A values bit for bit); mtp_rows_gemv_kernel gives one output column to each sub-group,
+ * stages the A chunk in LDS for the work-group's eight columns, and sums each row over the lanes at
+ * the end. The accumulation order differs from the tiled kernel's; acceptable for a draft head. */
+constexpr int kMtpRowsMax = 32;             /* output rows R = rows * hc a call takes */
+constexpr int kMtpGvK = 8 * kWave;          /* K a chunk: eight elements a lane */
+constexpr int kMtpGvPitch = kMtpGvK + 8;    /* LDS row pitch in shorts */
+
+static long long mtp_rows_bytes(long long rows, long long n, long long hc) {
+    auto al = [](long long b) { return (b + 255) & ~255LL; };
+    const long long R = rows * hc;
+    return al(R * 4) + al(rows * 4) + al(R * n * 2) + al(rows * n * 2);
+}
+
+/* One work-group per row: rows [0, R) are (token, sub-stream) rows of `h`, rows [R, R + rows) the
+ * tokens of `e`. The scale sums squares over the row's norm length (the wide row when `flat`), then
+ * the row's n elements are written normalised: bf16(v * s * (gain + wadd)). */
+__global__ __launch_bounds__(kThreads)
+void mtp_rows_prep_kernel(const unsigned short* __restrict__ h, const unsigned short* __restrict__ e,
+                          const float* __restrict__ wh, const float* __restrict__ we,
+                          float* __restrict__ rs, float* __restrict__ re,
+                          unsigned short* __restrict__ nh, unsigned short* __restrict__ ne,
+                          long rows, long n, int hc, int flat, float eps, float wadd,
+                          long hrow, long erow) {
+    XE_SHARED(float, red, kWaves);
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long row = blockIdx.x;
+    const long R = rows * hc;
+    if (row >= R + rows) return;
+    const bool tok = row >= R;
+    const long rt = tok ? row - R : row / hc, kt = tok ? 0 : row % hc;
+    const long len = tok ? n : (flat ? (long)hc * n : n);
+    const unsigned short* p = tok ? e + rt * erow : h + rt * hrow + (flat ? 0 : kt * n);
+    float acc = 0.0f;
+    for (long j = tid; j < len; j += kThreads) { const float f = bf2f(p[j]); acc += f * f; }
+    acc = wave_sum(acc);
+    if (lane == 0) red[wave] = acc;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) tot += red[w];
+    const float sc = __frsqrt_rn(tot / (float)len + eps);
+    if (tid == 0) { if (tok) re[rt] = sc; else rs[row] = sc; }
+    const unsigned short* src = tok ? e + rt * erow : h + rt * hrow + kt * n;
+    const float* gain = tok ? we : wh + kt * n;
+    unsigned short* dst = tok ? ne + rt * n : nh + row * n;
+    for (long j = tid; j < n; j += kThreads) dst[j] = f2bf(bf2f(src[j]) * sc * (gain[j] + wadd));
+}
+
+/* One column j a sub-group (kWaves columns a work-group), eight consecutive K elements a lane. For
+ * each K chunk the work-group stages the R + rows normalised A rows into LDS once; a lane decodes
+ * its eight E4M3 codes of fc_h[j] and fc_e[j] (one group scale each) and multiplies them into every
+ * row's accumulator. x[(t, k)][j] = nh[(t, k)] . fc_h[j] + ne[t] . fc_e[j]. */
+template <int RMAX>
+__global__ __launch_bounds__(kThreads)
+void mtp_rows_gemv_kernel(const unsigned short* __restrict__ nh, const unsigned short* __restrict__ ne,
+                          const void* __restrict__ fchv, const void* __restrict__ fcev, long fld,
+                          unsigned short* __restrict__ x, long rows, long n, int hc, long xrow) {
+    XE_SHARED(unsigned short, sA, (RMAX + RMAX / 2) * kMtpGvPitch);
+    XE_SHARED(float, sE, kWaves * (RMAX / 2));   /* each wave's per-token embedding sums (lane 0 only) */
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long R = rows * hc, NA = R + rows;
+    const long j = (long)blockIdx.x * kWaves + wave;
+    const bool live = j < n;
+    const unsigned char* rh = (const unsigned char*)fchv + (live ? j : n - 1) * fld;
+    const unsigned char* re8 = (const unsigned char*)fcev + (live ? j : n - 1) * fld;
+    /* compile-time indices only: a runtime-indexed array lives in private memory on Xe */
+    float accH[RMAX], accE[RMAX / 2];
+#pragma unroll
+    for (int r = 0; r < RMAX; ++r) accH[r] = 0.0f;
+#pragma unroll
+    for (int t = 0; t < RMAX / 2; ++t) accE[t] = 0.0f;
+    for (long k0 = 0; k0 < n; k0 += kMtpGvK) {
+        __syncthreads();
+        /* the A chunk: NA rows x kMtpGvK elements, 16-byte pieces round-robin over the threads */
+        for (int i = tid; i < (int)NA * (kMtpGvK / 8); i += kThreads) {
+            const int r = i / (kMtpGvK / 8), c8 = (i % (kMtpGvK / 8)) * 8;
+            const unsigned short* src = r < R ? nh + (long)r * n : ne + (long)(r - R) * n;
+            *(uint4*)(sA + r * kMtpGvPitch + c8) = *(const uint4*)(src + k0 + c8);
+        }
+        __syncthreads();
+        const long k = k0 + lane * 8;
+        float wdh[8], wde[8];
+        {
+            const uint2 ch = *(const uint2*)(rh + k), ce = *(const uint2*)(re8 + k);
+            const float sh = ((const float*)(rh + n))[k / r4d_hc8::kDownGroup];
+            const float se = ((const float*)(re8 + n))[k / r4d_hc8::kDownGroup];
+            e4m3x8(ch.x, ch.y, wdh);
+            e4m3x8(ce.x, ce.y, wde);
+#pragma unroll
+            for (int q = 0; q < 8; ++q) { wdh[q] *= sh; wde[q] *= se; }
+        }
+#pragma unroll
+        for (int r = 0; r < RMAX; ++r) {
+            if (r >= R) break;                     /* uniform */
+            float av[8];
+            bf8_f(*(const uint4*)(sA + r * kMtpGvPitch + lane * 8), av);
+            float d = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) d += av[q] * wdh[q];
+            accH[r] += d;
+        }
+#pragma unroll
+        for (int t = 0; t < RMAX / 2; ++t) {
+            if (t >= rows) break;                  /* uniform */
+            float av[8];
+            bf8_f(*(const uint4*)(sA + ((int)R + t) * kMtpGvPitch + lane * 8), av);
+            float d = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) d += av[q] * wde[q];
+            accE[t] += d;
+        }
+    }
+    (void)NA;
+    /* each row over the lanes; row r's output adds its token's embedding term */
+#pragma unroll
+    for (int t = 0; t < RMAX / 2; ++t) {
+        if (t >= rows) break;
+        const float ve = wave_sum(accE[t]);
+        if (lane == 0) sE[wave * (RMAX / 2) + t] = ve;
+    }
+#pragma unroll
+    for (int r = 0; r < RMAX; ++r) {
+        if (r >= R) break;
+        const float vh = wave_sum(accH[r]);
+        if (lane == 0 && live) {
+            const long t = r / hc;
+            x[t * xrow + (long)(r % hc) * n + j] = f2bf(vh + sE[wave * (RMAX / 2) + t]);
+        }
+    }
+}
+
 extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* h   = r4d_opt(a, MTE_H);
@@ -3422,6 +3560,28 @@ extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
 #undef MTP_PF
         return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
     }
+    /* The few-row form (milestone 3): E4M3 weights, R <= kMtpRowsMax output rows, K a multiple of the
+     * chunk, with the scratch the hook sized; otherwise the tiled kernel. */
+    if (f8 && tileable && R <= kMtpRowsMax && R + rows <= kMtpRowsMax + kMtpRowsMax / 2 &&
+        (n % kMtpGvK) == 0 && a->scratch && a->scratch_bytes >= mtp_rows_bytes(rows, n, hc)) {
+        auto al = [](long long b) { return (b + 255) & ~255LL; };
+        unsigned char* sp = (unsigned char*)a->scratch;
+        float* rs = (float*)sp;
+        float* re = (float*)(sp + al(R * 4));
+        unsigned short* nh = (unsigned short*)(sp + al(R * 4) + al(rows * 4));
+        unsigned short* ne = (unsigned short*)(sp + al(R * 4) + al(rows * 4) + al(R * n * 2));
+        emit_rc = R4D_EMIT(stream, mtp_rows_prep_kernel, dim3((unsigned)(R + rows)), dim3(kThreads), 0,
+                           (const unsigned short*)h->data, (const unsigned short*)e->data,
+                           (const float*)wh->data, (const float*)we->data, rs, re, nh, ne, (long)rows,
+                           (long)n, (int)hc, ngroup == 1 ? 1 : 0, eps, wadd, (long)hrow, (long)erow);
+        if (emit_rc != RAD_OK) return emit_rc;
+        XE_LAUNCH_GGL_GRF256((mtp_rows_gemv_kernel<kMtpRowsMax>),
+                             dim3((unsigned)((n + kWaves - 1) / kWaves)), dim3(kThreads), 0, stream,
+                             (const unsigned short*)nh, (const unsigned short*)ne, (const void*)fch->data,
+                             (const void*)fce->data, (long)fld, (unsigned short*)x->data, (long)rows,
+                             (long)n, (int)hc, (long)xrow);
+        return (int)hipGetLastError();
+    }
     if ((f8 || rows >= kMtpTileMinRows) && tileable) {
         const int rt = (R > 64) ? 128 : (R > 32) ? 64 : 32;
         const int nt = rt >= 128 ? kMtpTNTWide : kMtpTNTNarrow;
@@ -3465,7 +3625,8 @@ extern "C" int64_t r4d_rad_mtp_enter_scratch(const RadArgs* a) {
     const long long n  = r4d_geti_or(a, "n", 0);
     const long long hc = r4d_geti_or(a, "hc", 0);
     if (M <= 0 || n <= 0 || hc <= 0) return R4D_NO(RAD_E_SHAPE);
-    return M >= kMtpPrefillRows ? mtp_prefill_bytes(M, n, hc) : 0;
+    /* below the prefill form: the few-row form's normalised A rows and scales (milestone 3) */
+    return M >= kMtpPrefillRows ? mtp_prefill_bytes(M, n, hc) : mtp_rows_bytes(M, n, hc);
 }
 /* `d` between the two kernels, with the per-stream norm scales beside it. Sized from the band's `M`,
  * not the operand: the arena is sized once per band and the launch checks the same number. */
