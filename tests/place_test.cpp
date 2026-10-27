@@ -699,6 +699,48 @@ TEST(heat_does_not_thrash_on_an_alternating_pattern) {
     CHECK(unguarded > 100);
 }
 
+/* HeatParams::min_age (Intel port, milestone 3 stage C): a unit whose tier changed fewer than min_age
+ * steps ago is not a candidate at either end. Expert 7 is promoted (published) and expert 0 demoted;
+ * then expert 0 is credited hard every step. Shipped policy: expert 0 is proposed back on the next
+ * step (a readmit). With min_age 4: nothing is proposed for three steps, and on the fourth both
+ * units are candidates again and the readmit happens. */
+TEST(heat_min_age_keeps_a_fresh_move_in_place) {
+    auto run = [](int min_age) {
+        HeatFixture hf;
+        HeatEngine h;
+        HeatParams hp;
+        hp.min_age = min_age;
+        CHECK_OK(h.init(hf.plan, hp));
+        const int32_t e0 = hf.unit_of_expert(0), e7 = hf.unit_of_expert(7);
+        CHECK(h.tier(e0) == Tier::VRAM);
+        CHECK(h.tier(e7) != Tier::VRAM);
+        /* Publish a swap as the mover would: 7 in, 0 out. */
+        h.set_busy(e7, true); h.set_busy(e0, true);
+        h.set_tier(e7, Tier::VRAM);
+        h.set_tier(e0, Tier::HostPinned);
+        h.set_busy(e7, false); h.set_busy(e0, false);
+        CHECK_EQ(h.stats().promotions, (uint64_t)1);
+        /* Expert 0 is now the hottest unit off the device, by far. */
+        const int32_t ids[1] = {0};
+        const int32_t counts[1] = {50};
+        int first = -1;
+        for (int step = 1; step <= 8; ++step) {
+            h.observe_ids(0, ids, counts, 1);
+            std::vector<Swap> sw;
+            CHECK_OK(h.step(&sw));
+            const bool back = !sw.empty() && sw[0].promote == e0;
+            for (const Swap& s : sw) h.abandon(s);
+            if (back && first < 0) first = step;
+            /* Under age, neither the fresh resident (7) nor the fresh demotee (0) may be proposed. */
+            if (step < min_age)
+                for (const Swap& s : sw) { CHECK(s.promote != e0); CHECK(s.demote != e7); }
+        }
+        return first;
+    };
+    CHECK_EQ(run(0), 1);   /* the shipped policy readmits at once */
+    CHECK_EQ(run(4), 4);   /* the age bar holds three steps, then the readmit goes through */
+}
+
 /* A prefill chunk is credited as one capped histogram. Ten times the cap's selections credits a
  * tenth of each count, keeping the experts' order while one chunk cannot outweigh the decode steps
  * around it; a histogram under the cap is credited in full. */

@@ -80,6 +80,15 @@ struct HeatParams {
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
     int warmup_dispatches = 0;
+
+    /* A minimum residency age, in steps (Intel port, milestone 3 stage C; RADIANCE_PLACE_MIN_AGE).
+     * A unit whose tier changed fewer than this many step() calls ago is not a candidate at either
+     * end: one just promoted is not demoted on the next step's noise, and one just demoted is not
+     * fetched straight back (a readmit: link traffic both ways for nothing). The guards above bound
+     * the heat gap a swap needs; this bounds how soon a swap can be undone. 0 is the shipped
+     * policy (production 1.11.0). Under MTP the draft passes route to other experts than the
+     * accepted tokens, which is where the readmits came from in the heat replays. */
+    int min_age = 0;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
@@ -103,6 +112,8 @@ struct HeatStats {
      * working set); `readmits` counts promotions of units demoted earlier, link traffic spent to
      * return to where it started. Readmits say whether the guards are set right. */
     uint64_t distinct_promoted = 0, readmits = 0;
+    /* Units that came of age (HeatParams::min_age) and became candidates again. */
+    uint64_t aged = 0;
     /* Routed experts and how many were resident, counted on the histogram pass observe() already
      * makes. A miss does not stall: the GEMM reads the expert from its tier, which for a
      * host-pinned unit crosses the link on the step's critical path. `stream_bytes` is that
@@ -213,6 +224,14 @@ private:
     std::vector<int32_t> layer_of_;
     /* Bit 0: promoted before. Bit 1: demoted before. Feeds the readmit counters. */
     std::vector<uint8_t> ever_;
+    /* HeatParams::min_age: step() calls so far, the step of each unit's last tier change, whether
+     * the unit is still under age (then set_place ranks it 0), and the under-age units, which
+     * step() re-places as they come of age. */
+    int64_t              steps_ = 0;
+    std::vector<int64_t> since_;
+    std::vector<uint8_t> young_;
+    std::vector<int32_t> young_list_;
+    void age_out();
 
     /* Resident units per layer. A layer starved of slots misses on nearly every token however
      * good the ranking inside it is. Most resident units are cold, so exact `heat == 0.0f` ties

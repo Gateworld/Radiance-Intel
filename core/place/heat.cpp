@@ -25,6 +25,10 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     layer_of_.assign(n, -1);
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
+    steps_ = 0;
+    since_.assign(n, 0);
+    young_.assign(n, 0u);
+    young_list_.clear();
 
     /* The movable units' slab classes as dense indices (heat.h: `cls_`). */
     cls_.assign(n, -1);
@@ -138,12 +142,27 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     }
     enabled_ = true;
     RAD_INFO("heat engine: %lld movable units, %d move%s a step, "
-             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f",
+             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f min-age %d step%s",
              (long long)movable, params_.moves_per_step,
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
-             (double)params_.credit_cap);
+             (double)params_.credit_cap, params_.min_age, params_.min_age == 1 ? "" : "s");
     return RAD_OK;
+}
+
+/* Units whose tier change is min_age steps old become candidates again (HeatParams::min_age). */
+void HeatEngine::age_out() {
+    if (params_.min_age <= 0 || young_list_.empty()) return;
+    size_t w = 0;
+    for (size_t i = 0; i < young_list_.size(); ++i) {
+        const int32_t u = young_list_[i];
+        if (steps_ - since_[(size_t)u] < (int64_t)params_.min_age) { young_list_[w++] = u; continue; }
+        young_[(size_t)u] = 0u;
+        set_place(u);
+        end_invalidate(u);
+        ++stats_.aged;
+    }
+    young_list_.resize(w);
 }
 
 
@@ -257,6 +276,12 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
         else if (was != Tier::VRAM && t == Tier::VRAM) ++res_count_[(size_t)l];
     }
     tier_[(size_t)unit] = t;
+    /* The age clock starts at a real tier change (publish); a unit the mover re-publishes in its
+     * own tier keeps its age. */
+    if (params_.min_age > 0 && (was == Tier::VRAM) != (t == Tier::VRAM) && movable_[(size_t)unit]) {
+        since_[(size_t)unit] = steps_;
+        if (!young_[(size_t)unit]) { young_[(size_t)unit] = 1u; young_list_.push_back(unit); }
+    }
     set_place(unit);
     end_invalidate(unit);
 
@@ -280,7 +305,7 @@ void HeatEngine::set_busy(int32_t unit, bool busy) {
 void HeatEngine::set_place(int32_t unit) {
     const size_t u = (size_t)unit, p = (size_t)pos_[u];
     const bool vram = tier_[u] == Tier::VRAM;
-    rank_as_[p] = (!movable_[u] || busy_[u]) ? 0u : vram ? 2u : 1u;
+    rank_as_[p] = (!movable_[u] || busy_[u] || young_[u]) ? 0u : vram ? 2u : 1u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
 }
@@ -324,7 +349,7 @@ bool HeatEngine::pick(Swap* out) const {
     std::vector<int32_t> hot_res((size_t)n_cls_, 0), cold_res((size_t)n_cls_, 0);
 
     for (size_t i = 0; i < movable_.size(); ++i) {
-        if (!movable_[i] || busy_[i]) continue;
+        if (!movable_[i] || busy_[i] || young_[i]) continue;
         const size_t c = (size_t)cls_[i];
         const int32_t l = layer_of_[i];
         const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
@@ -400,6 +425,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!out) return RAD_E_INVAL;
     out->clear();
     if (!enabled_) return RAD_OK;
+    ++steps_;
+    age_out();
     const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
 
@@ -564,6 +591,9 @@ std::string HeatEngine::report() const {
              "something already demoted)\n",
              (unsigned long long)stats_.distinct_promoted, (unsigned long long)stats_.readmits,
              stats_.promotions ? 100.0 * (double)stats_.readmits / (double)stats_.promotions : 0.0);
+    if (params_.min_age > 0)
+        s += fmt("  minimum residency age %d steps: %llu units came of age, %zu still under it\n",
+                 params_.min_age, (unsigned long long)stats_.aged, young_list_.size());
 
     /* The per-layer resident distribution: a layer starved of slots misses on nearly every token
      * however good its internal ranking, so the spread matters more than the mean. */

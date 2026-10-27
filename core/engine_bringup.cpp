@@ -2579,8 +2579,16 @@ int Engine::load_weights() {
                  humanb(r->pools.weights().used() + r->pools.weights().avail()).c_str());
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
-         * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+         * returns RAD_OK with `enabled() == false`. RADIANCE_PLACE_MIN_AGE=<steps> (Intel port,
+         * milestone 3 stage C) sets HeatParams::min_age; unset or 0 is the shipped policy. */
+        HeatParams hp{};
+        if (const char* ma = std::getenv("RADIANCE_PLACE_MIN_AGE")) {
+            const long v = std::strtol(ma, nullptr, 10);
+            hp.min_age = v > 0 && v < 1000000 ? (int)v : 0;
+            if (hp.min_age > 0)
+                RAD_INFO("heat engine: minimum residency age %d steps (RADIANCE_PLACE_MIN_AGE)", hp.min_age);
+        }
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
