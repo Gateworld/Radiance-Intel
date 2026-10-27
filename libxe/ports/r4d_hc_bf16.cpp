@@ -60,6 +60,7 @@
 // tolerance.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <type_traits>
 #include <cstdlib>
@@ -3560,9 +3561,13 @@ extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
 #undef MTP_PF
         return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
     }
-    /* The few-row form (milestone 3): E4M3 weights, R <= kMtpRowsMax output rows, K a multiple of the
-     * chunk, with the scratch the hook sized; otherwise the tiled kernel. */
-    if (f8 && tileable && R <= kMtpRowsMax && R + rows <= kMtpRowsMax + kMtpRowsMax / 2 &&
+    /* The few-row form (milestone 3): E4M3 weights, K a multiple of the chunk, with the scratch the hook
+     * sized; otherwise the tiled kernel. Below the prefill form's kMtpPrefillRows tokens every row count
+     * takes it: the GEMV runs over the tokens in chunks of at most kMtpRowsMax output rows (and
+     * kMtpRowsMax / 2 tokens), each chunk reading the weights once (run 30: at 3-6 drafting sequences the
+     * rows passed 32 and the call fell back to the 6.5 ms tiled kernel, so MTP on collapsed with
+     * concurrency: 35.5 tok/s aggregate at 6 users against 71.1 with MTP off). */
+    if (f8 && tileable && hc <= kMtpRowsMax && rows < kMtpPrefillRows &&
         (n % kMtpGvK) == 0 && a->scratch && a->scratch_bytes >= mtp_rows_bytes(rows, n, hc)) {
         auto al = [](long long b) { return (b + 255) & ~255LL; };
         unsigned char* sp = (unsigned char*)a->scratch;
@@ -3575,11 +3580,16 @@ extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
                            (const float*)wh->data, (const float*)we->data, rs, re, nh, ne, (long)rows,
                            (long)n, (int)hc, ngroup == 1 ? 1 : 0, eps, wadd, (long)hrow, (long)erow);
         if (emit_rc != RAD_OK) return emit_rc;
-        XE_LAUNCH_GGL_GRF256((mtp_rows_gemv_kernel<kMtpRowsMax>),
-                             dim3((unsigned)((n + kWaves - 1) / kWaves)), dim3(kThreads), 0, stream,
-                             (const unsigned short*)nh, (const unsigned short*)ne, (const void*)fch->data,
-                             (const void*)fce->data, (long)fld, (unsigned short*)x->data, (long)rows,
-                             (long)n, (int)hc, (long)xrow);
+        /* tokens a chunk: its output rows fit kMtpRowsMax, its embedding rows kMtpRowsMax / 2 */
+        const long long tc = std::min<long long>(kMtpRowsMax / hc, kMtpRowsMax / 2);
+        for (long long t0 = 0; t0 < rows; t0 += tc) {
+            const long long nt = std::min<long long>(tc, rows - t0);
+            XE_LAUNCH_GGL_GRF256((mtp_rows_gemv_kernel<kMtpRowsMax>),
+                                 dim3((unsigned)((n + kWaves - 1) / kWaves)), dim3(kThreads), 0, stream,
+                                 (const unsigned short*)(nh + t0 * hc * n), (const unsigned short*)(ne + t0 * n),
+                                 (const void*)fch->data, (const void*)fce->data, (long)fld,
+                                 (unsigned short*)x->data + t0 * xrow, (long)nt, (long)n, (int)hc, (long)xrow);
+        }
         return (int)hipGetLastError();
     }
     if ((f8 || rows >= kMtpTileMinRows) && tileable) {
