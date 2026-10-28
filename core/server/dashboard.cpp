@@ -348,6 +348,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["readmits"]    = s.experts.readmits;
             e["readmit_delay"] = { s.experts.readmit_delay[0], s.experts.readmit_delay[1], s.experts.readmit_delay[2],
                                    s.experts.readmit_delay[3], s.experts.readmit_delay[4] };
+            e["miss_hist"] = { s.experts.miss_hist[0], s.experts.miss_hist[1], s.experts.miss_hist[2],
+                               s.experts.miss_hist[3], s.experts.miss_hist[4], s.experts.miss_hist[5],
+                               s.experts.miss_hist[6] };
+            e["layer_routed"] = s.experts.layer_routed;
+            e["layer_missed"] = s.experts.layer_missed;
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
             e["dispatches"]  = s.experts.dispatches;

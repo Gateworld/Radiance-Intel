@@ -2039,6 +2039,9 @@ int Engine::run_server() {
                 s.experts.distinct_promoted = (int64_t)hs.distinct_promoted;
                 s.experts.readmits          = (int64_t)hs.readmits;
                 for (int i = 0; i < 5; ++i) s.experts.readmit_delay[i] = (int64_t)hs.readmit_delay[i];
+                for (int i = 0; i < 7; ++i) s.experts.miss_hist[i] = (int64_t)hs.miss_hist[i];
+                s.experts.layer_routed.assign(heat.layer_routed().begin(), heat.layer_routed().end());
+                s.experts.layer_missed.assign(heat.layer_missed().begin(), heat.layer_missed().end());
                 /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;

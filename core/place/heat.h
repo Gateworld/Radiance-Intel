@@ -124,6 +124,10 @@ struct HeatStats {
      * traffic, the cost promotions exist to avoid. Weighted by the histogram's `weight`, since a
      * draft head's histogram stands for several routing passes; the hit rate is unaffected. */
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
+    /* Owner note 53 (Intel port, milestone 3): one dispatch is one layer's routing, so its misses are the
+     * units a host hand-off for that layer would take. Dispatches by their misses: 0, 1, 2, 3-4, 5-8, 9-16,
+     * 17 or more (unweighted: one count a dispatch). The per-layer sums are layer_counts(). */
+    uint64_t miss_hist[7] = { 0, 0, 0, 0, 0, 0, 0 };
 };
 
 class HeatEngine {
@@ -181,6 +185,9 @@ public:
         return l >= 0 && (size_t)l < res_count_.size() ? res_count_[(size_t)l] : 0;
     }
     const HeatStats& stats() const { return stats_; }
+    /* Owner note 53: routed experts and misses per layer, cumulative, weighted as HeatStats::routed. */
+    const std::vector<uint64_t>& layer_routed() const { return layer_routed_; }
+    const std::vector<uint64_t>& layer_missed() const { return layer_missed_; }
 
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
@@ -190,6 +197,7 @@ private:
     HeatParams params_;
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
+    std::vector<uint64_t> layer_routed_, layer_missed_;   /* owner note 53 */
     HeatStats  stats_;
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by

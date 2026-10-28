@@ -74,6 +74,9 @@ struct ExpertPlane {
     int64_t distinct_promoted = 0, readmits = 0;
     /* Readmits by the steps since the unit's demotion (<16, <64, <256, <1024, 1024+; HeatStats). */
     int64_t readmit_delay[5] = { 0, 0, 0, 0, 0 };
+    /* Owner note 53: dispatches by their misses (0, 1, 2, 3-4, 5-8, 9-16, 17+) and per-layer routed / missed. */
+    int64_t miss_hist[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    std::vector<int64_t> layer_routed, layer_missed;
     /* Why a dispatch moved nothing. `refused` is the guard declining (the healthy steady state);
      * the starved counts mean the mover had nowhere to put the bytes. */
     int64_t dispatches = 0, refused = 0, no_candidate = 0;
