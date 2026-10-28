@@ -62,6 +62,20 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_bf16_cpu COMMAND xe_gemv_bf16_test)
   set_tests_properties(xe_gemv_bf16_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
+  # Milestone 3 (the brief's #11): moe_gemm at bf16, the decode GEMV and the WMMA form, against a double reference.
+  add_executable(xe_moe_bf16_test test/moe_bf16_test.cpp)
+  rad_l0_sycl(xe_moe_bf16_test)
+  target_include_directories(xe_moe_bf16_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_compile_options(xe_moe_bf16_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_moe_bf16_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_moe_bf16_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_moe_bf16_test libxe)
+  add_test(NAME xe_moe_bf16_cpu COMMAND xe_moe_bf16_test $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_moe_bf16_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_MOE_BF16_GEMV=1" TIMEOUT 600)
+  add_test(NAME xe_moe_bf16_wmma_cpu COMMAND xe_moe_bf16_test $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_moe_bf16_wmma_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_MOE_BF16_GEMV=0" TIMEOUT 600)
   # Milestone 3 (owner note 52 item 2): the shim's branch-free E4M3 decode against the ABI's, all 256 codes.
   add_executable(xe_e4m3_decode_test test/e4m3_decode_test.cpp)
   rad_l0_sycl(xe_e4m3_decode_test)

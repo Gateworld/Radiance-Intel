@@ -3018,6 +3018,60 @@ extern "C" int r4d_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
     return moe_gemm_launch<1>(a, stream, 4);
 }
 
+/* ================================================================== libxe: moe_gemm at bf16 as a GEMV
+ *
+ * Intel port, milestone 3 (the bottleneck brief's #11; owner note 55's M-pair rule). At decode the routed rows
+ * of one call are a handful -- a layer's protected experts take one or two rows each -- yet the WMMA form
+ * computes a 16-row tile per (expert, 64 columns) through the shim's shuffle-emulated bf16 WMMA (P6: 307 us a
+ * launch, eight launches a rank-step). This is the w4 GEMV's shape at bf16: a sub-group of 32 lanes computes one
+ * (row, column) output, lanes stepping K eight elements (one 16-byte load) at a time, f32 sums, one bf16 rounding
+ * of the result (opt-in: RADIANCE_XE_MOE_BF16_GEMV=1, see moe_bf16_gemv_on). The row semantics are moe_gemm_bf16_kernel's: a row below off[0] belongs to another call and is
+ * not touched; a row past the live count or a dropped slot (sorted < 0) is written as zero. */
+__global__ void xe_moe_bf16_gemv(const uint16_t* __restrict__ A, const void* const* __restrict__ Wt, size_t w_s0,
+                                 const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+                                 uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert,
+                                 uint32_t top_k, uint32_t a_sorted, uint32_t a_ld, uint32_t w_ld, uint32_t y_ld) {
+    const int lane = (int)threadIdx.x & 31;
+    const uint32_t n = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const uint32_t i = blockIdx.y;
+    if (n >= N || i >= T) return;   /* whole sub-groups: no barrier below */
+    if (i < (uint32_t)off[0]) return;
+    const uint32_t live = (uint32_t)off[n_expert];
+    const int32_t flat = i < live ? sorted[i] : -1;
+    float acc = 0.0f;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        const uint32_t tok = a_sorted ? i : (uint32_t)flat / top_k;
+        const uint16_t* wrow = (const uint16_t*)wtab_at(Wt, w_s0, lo) + (size_t)n * w_ld;
+        const uint16_t* arow = A + (size_t)tok * a_ld;
+        for (uint32_t k = (uint32_t)lane * 8u; k < K; k += 32u * 8u) {
+            const uint4 wv = *(const uint4*)(wrow + k);
+            const uint4 av = *(const uint4*)(arow + k);
+            const uint32_t ww[4] = { wv.x, wv.y, wv.z, wv.w }, aa[4] = { av.x, av.y, av.z, av.w };
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                acc += __uint_as_float(ww[q] << 16) * __uint_as_float(aa[q] << 16);
+                acc += __uint_as_float(ww[q] & 0xffff0000u) * __uint_as_float(aa[q] & 0xffff0000u);
+            }
+        }
+        for (int x = 16; x >= 1; x >>= 1) acc += __shfl_xor(acc, x);
+    }
+    if (lane == 0) Y[(size_t)i * y_ld + n] = f32_to_bf16(acc);
+}
+
+/* RADIANCE_XE_MOE_BF16_GEMV=1 takes the GEMV at decode; default the WMMA form. Off by default on the agreement
+ * rule set before the measurement (STATE.md, run 68): with the GEMV the 11 requests agreed with production's
+ * answers fully on 2 of 11 against 3 with the WMMA form (one reasoning near-tie, 0.45 / 0.17 nat, moved), while
+ * the single prompt ran 37.4 / 51.7 tok/s against 34.9 / 45.8 (MTP off / on). The owner decides the default. */
+static bool moe_bf16_gemv_on() {
+    static const bool on = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_GEMV"); return s && *s == '1'; }();
+    return on;
+}
+
 /* `moe_gemm` at bf16: operands a, w (one table), sorted_tok, expert_offset -> y. Band and forms
  * follow moe_gemm_launch's rule, so the same scratch hook sizes the run map.
  *
@@ -3069,7 +3123,17 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
 
     const uint32_t ny = (uint32_t)(N / 64);
     const int form = g_moe_prefill_form;
-    if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
+    /* By the call's row count, not the decode band: a layer's protected experts are a call of a few experts
+     * (n_expert = the protected count), so 2T <= 3 n_expert fails at decode and the prefill form ran there
+     * (P6: moe_gemm_bf16_kernel<2, 8, 2, 4, false, true, true>, 307 us). 256 rows covers decode and MTP's
+     * verify (16 tokens x top_k 10 = 160); a prompt chunk keeps the WMMA forms. */
+    if (form == 0 && T <= 256 && moe_bf16_gemv_on()) {
+        emit_rc = R4D_EMIT(stream, xe_moe_bf16_gemv, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
+                           (const uint16_t*)A->data, tab, w_s0, (const int32_t*)sorted->data,
+                           (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,
+                           (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0), (uint32_t)a_ld,
+                           (uint32_t)w_ld, (uint32_t)y_ld);
+    } else if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         const unsigned tiles = (unsigned)((T + 15) / 16);
         emit_rc = R4D_EMIT(stream, (moe_gemm_bf16_kernel<1, 4, 1, 4, true>),
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
