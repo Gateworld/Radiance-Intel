@@ -156,6 +156,13 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_matrix_query_cpu COMMAND xe_matrix_query)
   set_tests_properties(xe_matrix_query_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Milestone 3, owner note 59 phase 0: what the driver holds per recorded command list, the GPU time a command in
+  # a played list, the immediate round trip, and whether a polled ring keeps the engine busy at idle. A card probe
+  # only (its own context and kernel, no model); no CPU test.
+  add_executable(xe_list_pool_probe test/list_pool_probe.cpp)
+  rad_l0_sycl(xe_list_pool_probe)
+  target_link_libraries(xe_list_pool_probe PRIVATE ${RAD_ZE_LOADER} ${CMAKE_DL_LIBS})
+  set_target_properties(xe_list_pool_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
   # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
   add_executable(xe_mtp_couple_test test/mtp_couple_test.cpp)
