@@ -326,6 +326,7 @@ public:
         int64_t played = 0, recorded = 0, audited = 0;
         int64_t issued_unkeyed = 0, issued_refused = 0, issued_first = 0;
         int64_t dispatched = 0, unordered = 0;
+        int64_t floor_drops = 0, floor_kept = 0;   /* owner note 52: under the VRAM floor, tapes dropped / kept */
     };
     PassCounts  pass_counts() const {
         PassCounts c;
@@ -337,6 +338,8 @@ public:
         c.issued_first   = pc_first_.load(std::memory_order_relaxed);
         c.dispatched     = pc_dispatched_.load(std::memory_order_relaxed);
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
+        c.floor_drops    = tape_floor_drops_.load(std::memory_order_relaxed);
+        c.floor_kept     = tape_floor_kept_.load(std::memory_order_relaxed);
         return c;
     }
     void*       arena_base()   const { return arena_.base(); }
@@ -479,6 +482,7 @@ private:
         bool     scratch_open[2] = {};
         int64_t  plays = 0;
         uint64_t used = 0;
+        uint64_t last_pass = 0;   /* tape_pass_ when it was last played, audited or recorded (owner note 52) */
         int32_t  dispatches = 0, unordered = 0;   /* its kernels, and those haz_mark left unordered */
     };
     /* The byte ranges each device op of a recorded pass reads and writes, so haz_mark can leave
@@ -516,6 +520,11 @@ private:
 
     std::vector<PassTape> tapes_;
     uint64_t              tape_clock_ = 0;
+    /* Passes run on this rank (owner note 52): under the VRAM floor only a tape not played in the last
+     * RADIANCE_TAPE_KEEP_PASSES passes is dropped, so the pool keeps what the traffic still plays. */
+    uint64_t              tape_pass_ = 0;
+    std::atomic<int64_t>  tape_floor_drops_{0}, tape_floor_kept_{0};
+    bool                  tape_kept_told_ = false;
     /* Keys seen once, and keys recorded once and not yet verified. */
     uint64_t              tape_seen_[32] = {};
     size_t                tape_seen_at_ = 0;

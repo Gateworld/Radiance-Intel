@@ -130,6 +130,7 @@ struct PassStat {
     int64_t played = 0, recorded = 0, audited = 0;
     int64_t issued_unkeyed = 0, issued_refused = 0, issued_first = 0;
     int64_t dispatched = 0, unordered = 0;
+    int64_t floor_drops = 0, floor_kept = 0;   /* owner note 52: tapes dropped / kept under the VRAM floor */
 };
 
 struct LiveSnapshot {

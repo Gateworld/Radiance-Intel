@@ -1305,6 +1305,7 @@ int Ctx::play_pass(PassTape& t) {
     scratch_open_[1] = t.scratch_open[1];
     ++t.plays;
     t.used = ++tape_clock_;
+    t.last_pass = tape_pass_;
     return RAD_OK;
 }
 
@@ -1316,6 +1317,21 @@ static int64_t tape_floor_b() {
         return (int64_t)(m > 0 ? m : 0) << 20;
     }();
     return floor_b;
+}
+
+/* RADIANCE_TAPE_KEEP_PASSES (owner note 52, Intel port milestone 3): under the VRAM floor a tape played in
+ * the last this-many passes on the rank is never dropped (default 2048, about four of the rotation's
+ * requests with MTP on; 0 = the earlier rule, any least recently used tape). The earlier rule dropped one
+ * tape for every tape-less pass while under the floor, so the pass shapes that recur only now and then
+ * (a new context bucket, a history pass) emptied the pool of the shapes played every step: H11's
+ * rotation went from 35.75 tok/s taped to 17.0 with every pass live (briefs/2026-10-28-bottleneck.md). */
+static uint64_t tape_keep_passes() {
+    static const uint64_t keep = [] {
+        const char* v = std::getenv("RADIANCE_TAPE_KEEP_PASSES");
+        const long long m = (v && *v) ? std::atoll(v) : 2048;
+        return (uint64_t)(m > 0 ? m : 0);
+    }();
+    return keep;
 }
 
 /* Runs one pass: played from its tape, or issued live (and possibly recorded or audited). */
@@ -1363,6 +1379,7 @@ int Ctx::run_pass(const RadBatch* b) {
         tape_drop(fresh);
         ++t->plays;
         t->used = ++tape_clock_;
+        t->last_pass = tape_pass_;
         return RAD_OK;
     }
 
@@ -1383,18 +1400,36 @@ int Ctx::run_pass(const RadBatch* b) {
     {
         const int64_t floor_b = tape_floor_b();
         if (floor_b > 0 && !tape_room_agreed_) {
-            if (!tapes_.empty()) {
-                size_t lru = 0;
-                for (size_t q = 1; q < tapes_.size(); ++q) if (tapes_[q].used < tapes_[lru].used) lru = q;
+            /* The least recently used tape goes only if the traffic has not played it lately; otherwise
+             * nothing goes and this shape runs live (it is recorded once room returns). Every rank runs the
+             * same passes in the same order, so every rank drops the same tape or none. */
+            const uint64_t keep = tape_keep_passes();
+            size_t lru = tapes_.size();
+            for (size_t q = 0; q < tapes_.size(); ++q) {
+                if (keep > 0 && tape_pass_ - tapes_[q].last_pass < keep) continue;
+                if (lru == tapes_.size() || tapes_[q].used < tapes_[lru].used) lru = q;
+            }
+            if (lru < tapes_.size()) {
                 tape_drop(tapes_[lru]);
                 tapes_.erase(tapes_.begin() + (std::ptrdiff_t)lru);
+                tape_floor_drops_.fetch_add(1, std::memory_order_relaxed);
+            } else if (!tapes_.empty()) {
+                tape_floor_kept_.fetch_add(1, std::memory_order_relaxed);
+                if (!tape_kept_told_ && rank_ == 0) {
+                    tape_kept_told_ = true;
+                    RAD_INFO("rank %d: under the recordings' floor every one of the %zu tapes was played in the "
+                             "last %llu passes, so none is dropped: the new shape runs live "
+                             "(RADIANCE_TAPE_KEEP_PASSES)", rank_, tapes_.size(), (unsigned long long)keep);
+                }
             }
             if (!tape_low_told_) {
                 tape_low_told_ = true;
                 RAD_WARN("rank %d: the ranks' lowest free VRAM is under the recordings' floor of %lld MiB (this "
-                         "card: %lld MiB): the least recently used tape is dropped and new pass shapes run live "
-                         "until room returns (RADIANCE_TAPE_VRAM_FLOOR_MIB)", rank_, (long long)(floor_b >> 20),
-                         (long long)(tape_vram_free_ >> 20));
+                         "card: %lld MiB): a tape not played in the last %llu passes is dropped, the tapes still "
+                         "played are kept, and new pass shapes run live until room returns "
+                         "(RADIANCE_TAPE_VRAM_FLOOR_MIB, RADIANCE_TAPE_KEEP_PASSES)", rank_,
+                         (long long)(floor_b >> 20), (long long)(tape_vram_free_ >> 20),
+                         (unsigned long long)keep);
             }
             bump(pc_refused_);
             arch_step_(this, b);
@@ -1405,6 +1440,7 @@ int Ctx::run_pass(const RadBatch* b) {
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
+    nt.last_pass = tape_pass_;
     static const size_t tape_max = [] {
         const char* v = std::getenv("RADIANCE_TAPE_MAX");
         const long long m = (v && *v) ? std::atoll(v) : (long long)kTapes;
@@ -1440,6 +1476,7 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    ++tape_pass_;
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;

@@ -394,6 +394,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["issued_first"]   = s.passes.issued_first;
             p["dispatched"]     = s.passes.dispatched;
             p["unordered"]      = s.passes.unordered;
+            p["floor_drops"]    = s.passes.floor_drops;
+            p["floor_kept"]     = s.passes.floor_kept;
             o["passes"] = std::move(p);
         }
     }
