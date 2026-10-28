@@ -2588,6 +2588,25 @@ int Engine::load_weights() {
             if (hp.min_age > 0)
                 RAD_INFO("heat engine: minimum residency age %d steps (RADIANCE_PLACE_MIN_AGE)", hp.min_age);
         }
+        /* RADIANCE_PLACE_DECAY=<0.5 .. 0.999> and RADIANCE_PLACE_MOVES=<1 .. RAD_PLACE_MOVES_PER_STEP> (Intel
+         * port, milestone 3, owner note 50 item 2): the decay constant and the per-class swap budget, for the
+         * rotation A/B (0.98 / 0.99 and 32 / 16 against the shipped 0.95 / 64). The budget can only be lowered
+         * here: the shadow and turnover slots are sized from RAD_PLACE_MOVES_PER_STEP at plan time (heat.h), so
+         * a larger value would be spent on `starved_slab`. Unset = the shipped policy. */
+        if (const char* dc = std::getenv("RADIANCE_PLACE_DECAY")) {
+            const double v = std::strtod(dc, nullptr);
+            if (v >= 0.5 && v < 1.0) {
+                hp.decay = (float)v;
+                RAD_INFO("heat engine: decay %.3f a step (RADIANCE_PLACE_DECAY)", v);
+            }
+        }
+        if (const char* mv = std::getenv("RADIANCE_PLACE_MOVES")) {
+            const long v = std::strtol(mv, nullptr, 10);
+            if (v >= 1 && v <= RAD_PLACE_MOVES_PER_STEP) {
+                hp.moves_per_step = (int)v;
+                RAD_INFO("heat engine: %d swaps a class a step (RADIANCE_PLACE_MOVES)", hp.moves_per_step);
+            }
+        }
         RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
