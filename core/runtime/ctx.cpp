@@ -1536,10 +1536,13 @@ void Ctx::tape_room_read() {
  * tape is dropped at the start of each step, whatever its recency, until a step's reading is back above the
  * floor -- the cards must not sit at the VRAM ceiling, where an append can fail out of device memory (H21).
  * Above the floor nothing is shed and 89bf7fb's rule stands. Every rank gets the same verdict and has played the
- * same passes in the same order, so every rank sheds the same tape. RADIANCE_TAPE_SHED=0 keeps run 63's rule
- * (the A/B). */
+ * same passes in the same order, so every rank sheds the same tape. OFF by default since run 73: M38 measured
+ * that a dropped tape returns no VRAM (the cards stayed at 658 MiB free with both of the single prompt's tapes
+ * shed), so shedding only turned every pass live (29.4 tok/s against 37.3, and the CPUs into the heat guard).
+ * Owner note 58's fallback holds instead -- a 2 GiB recordings floor, set in the service's run.sh.
+ * RADIANCE_TAPE_SHED=1 turns shedding on (the A/B). */
 void Ctx::tape_shed_one() {
-    static const bool shed = [] { const char* v = std::getenv("RADIANCE_TAPE_SHED"); return !(v && v[0] == '0'); }();
+    static const bool shed = [] { const char* v = std::getenv("RADIANCE_TAPE_SHED"); return v && v[0] == '1'; }();
     if (!shed || tapes_.empty()) return;
     size_t lru = 0;
     for (size_t q = 1; q < tapes_.size(); ++q) if (tapes_[q].used < tapes_[lru].used) lru = q;
