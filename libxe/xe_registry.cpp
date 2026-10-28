@@ -307,9 +307,14 @@ static const RadOpSchema kSchemas[] = {
       "libr4d's fused moe_gather + all-reduce + hc_write; declared, not served (see ar_hc_write)" },
 };
 static const int kNumSchemas = (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
-extern "C" int rad_kernel_schema_count(void) { return kNumSchemas; }
+/* libxe's own schemas, then the MTP coupling's two (plugin/spechub/spechub.cpp, compiled into libxe): the loader
+ * refuses a row whose op no loaded plugin declares a schema for, and the service's kernel list is libxe:libref
+ * without the spechub plugin; two plugins declaring the same schema is accepted when they agree (loader.cpp,
+ * schema_same), which these do, being the same definition. */
+extern "C" int rad_kernel_schema_count(void) { return kNumSchemas + rad_spechub_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
-    return (i >= 0 && i < kNumSchemas) ? &kSchemas[i] : nullptr;
+    if (i >= 0 && i < kNumSchemas) return &kSchemas[i];
+    return rad_spechub_schema_at(i - kNumSchemas);
 }
 extern "C" int rad_kernel_count(void) { return kNumKernels; }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
