@@ -150,14 +150,29 @@ inline int cvt_pk_fp8_f32(float a, float b, int old, bool hi) {
     const unsigned o = (unsigned)old;
     return (int)(hi ? ((o & 0xffffu) | (pk << 16)) : ((o & 0xffff0000u) | pk));
 }
+/* One OCP E4M3 code (the low byte of b) to f32, branch-free and bit-identical to the ABI's
+ * rad_fp8e4m3_to_f32 on all 256 codes (Intel port, milestone 3, owner note 52 item 2: the
+ * HyperConnection mixes decode every E4M3 code through this, and the ABI's form branches and loops
+ * on a subnormal code -- Xe2 has no FP8 conversion instruction). A normal code is the f32 with
+ * exponent e + 120 and the three mantissa bits on top; a subnormal one (e = 0) is the same pattern
+ * read at exponent 1 less 2^-6, which is exact (m * 2^-9) and never makes an f32 denormal, so a
+ * flush-to-zero mode cannot touch it; zero comes out signed as the ABI's; S1111111 is the NaN. */
+inline float e4m3_to_f32(unsigned b) {
+    const unsigned m = b & 0x7u, e = (b >> 3) & 0xfu;
+    const float nrm = sycl::bit_cast<float>(((e + 120u) << 23) | (m << 20));
+    const float sub = sycl::bit_cast<float>((121u << 23) | (m << 20)) - 0.015625f;
+    unsigned u = sycl::bit_cast<unsigned>(e ? nrm : sub) | ((b & 0x80u) << 24);
+    if ((b & 0x7fu) == 0x7fu) u = ((b & 0x80u) << 24) | 0x7fc00000u;
+    return sycl::bit_cast<float>(u);
+}
 /* v_cvt_pk_f32_fp8: bytes 0,1 (hi false) or 2,3 of v to two floats; exact */
 inline v2f cvt_pk_f32_fp8(int v, bool hi) {
     const unsigned u = (unsigned)v >> (hi ? 16 : 0);
-    return v2f{rad_fp8e4m3_to_f32((uint8_t)(u & 0xffu)), rad_fp8e4m3_to_f32((uint8_t)((u >> 8) & 0xffu))};
+    return v2f{e4m3_to_f32(u & 0xffu), e4m3_to_f32((u >> 8) & 0xffu)};
 }
 /* v_cvt_f32_fp8: byte `sel` of v to a float; exact */
 inline float cvt_f32_fp8(int v, int sel) {
-    return rad_fp8e4m3_to_f32((uint8_t)(((unsigned)v >> (8 * (sel & 3))) & 0xffu));
+    return e4m3_to_f32(((unsigned)v >> (8 * (sel & 3))) & 0xffu);
 }
 /* f32 -> f16 rounding toward zero (v_cvt_pkrtz_f16_f32): no rounding up, overflow to the largest
  * finite, NaN kept quiet */
