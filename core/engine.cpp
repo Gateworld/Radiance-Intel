@@ -1616,8 +1616,20 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * Qwen3.8-Flash-Next at TP2 (two R9700, 12 GiB host pool) the span loses to one-interval
          * steps up to 12K tokens and wins from 18K, hence eight intervals. With every expert on
          * the card there is no such cost and every lone prefill spans. */
-        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
-                                ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        int64_t span_min = stage_rows > 0 && arena_span_rows_ > 0
+                               ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0;
+        /* RADIANCE_PREFILL_SPAN_MIN=<tokens> (Intel port, milestone 3, owner note 50 item 1): the shortest
+         * prompt a span is taken for, in place of the eight intervals above, for the chunk-size A/B on the
+         * B70s (7K and 20K prompts at 8,192- and 16,384-token chunks); 0 = every lone prefill spans. Unset is
+         * the rule above. */
+        if (const char* sm = std::getenv("RADIANCE_PREFILL_SPAN_MIN")) {
+            const long v = std::strtol(sm, nullptr, 10);
+            if (v >= 0) {
+                span_min = v;
+                RAD_INFO("scheduler: --prefill-span minimum %ld tokens (RADIANCE_PREFILL_SPAN_MIN)", v);
+            }
+        }
+        sched_.set_span_min(span_min);
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
