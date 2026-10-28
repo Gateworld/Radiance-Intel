@@ -75,7 +75,7 @@ if(RAD_BUILD_TESTS)
   add_dependencies(xe_moe_bf16_test libxe)
   add_test(NAME xe_moe_bf16_cpu COMMAND xe_moe_bf16_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_bf16_cpu PROPERTIES LABELS "xe"
-    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_MOE_BF16_GEMV=1" TIMEOUT 600)
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_test(NAME xe_moe_bf16_wmma_cpu COMMAND xe_moe_bf16_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_bf16_wmma_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_MOE_BF16_GEMV=0" TIMEOUT 600)

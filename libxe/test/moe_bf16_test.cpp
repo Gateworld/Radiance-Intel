@@ -5,8 +5,8 @@
  * sizes against a double-precision reference re-done on the host: per sorted row r of expert e (off[e] <= r <
  * off[e+1]), y[r, n] = sum_k a[tok, k] * w_e[n, k] with tok = sorted[r] / top_k (token rows) or r (sorted rows);
  * a dropped slot or a row past the live count is zero; a row below off[0] (another call's, the trailing-segment
- * form a layer's protected experts use) is not touched. A call of at most 256 rows takes the GEMV form under
- * RADIANCE_XE_MOE_BF16_GEMV=1 and the WMMA form by default; both pass the same check. 4 KiB canaries
+ * form a layer's protected experts use) is not touched. A call of at most 256 rows takes the GEMV form by default
+ * (owner note 57) and the WMMA form under RADIANCE_XE_MOE_BF16_GEMV=0; both pass the same check. 4 KiB canaries
  * around y; untouched rows keep their fill.
  *
  *   moe_bf16_test LIBXE.so      RI_DEVICE=cpu for the CPU SYCL device
@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
     sycl::queue q(cpu ? sycl::device(sycl::cpu_selector_v) : sycl::device(sycl::gpu_selector_v), sycl::property::queue::in_order());
     const char* f = std::getenv("RADIANCE_XE_MOE_BF16_GEMV");
     std::printf("moe_bf16_test: %s, the %s form\n", q.get_device().get_info<sycl::info::device::name>().c_str(),
-                f && *f == '1' ? "GEMV" : "WMMA");
+                f && *f == '0' ? "WMMA" : "GEMV");
     int fails = 0;
     fails += !run_case(q, fn, false, 2, 4, 16, 128, 256, 0, 1);
     fails += !run_case(q, fn, true, 3, 2, 16, 192, 128, 0, 2);

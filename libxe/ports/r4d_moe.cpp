@@ -3025,7 +3025,7 @@ extern "C" int r4d_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
  * computes a 16-row tile per (expert, 64 columns) through the shim's shuffle-emulated bf16 WMMA (P6: 307 us a
  * launch, eight launches a rank-step). This is the w4 GEMV's shape at bf16: a sub-group of 32 lanes computes one
  * (row, column) output, lanes stepping K eight elements (one 16-byte load) at a time, f32 sums, one bf16 rounding
- * of the result (opt-in: RADIANCE_XE_MOE_BF16_GEMV=1, see moe_bf16_gemv_on). The row semantics are moe_gemm_bf16_kernel's: a row below off[0] belongs to another call and is
+ * of the result (the default since owner note 57; RADIANCE_XE_MOE_BF16_GEMV=0 the WMMA form). The row semantics are moe_gemm_bf16_kernel's: a row below off[0] belongs to another call and is
  * not touched; a row past the live count or a dropped slot (sorted < 0) is written as zero. */
 __global__ void xe_moe_bf16_gemv(const uint16_t* __restrict__ A, const void* const* __restrict__ Wt, size_t w_s0,
                                  const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
@@ -3063,12 +3063,12 @@ __global__ void xe_moe_bf16_gemv(const uint16_t* __restrict__ A, const void* con
     if (lane == 0) Y[(size_t)i * y_ld + n] = f32_to_bf16(acc);
 }
 
-/* RADIANCE_XE_MOE_BF16_GEMV=1 takes the GEMV at decode; default the WMMA form. Off by default on the agreement
- * rule set before the measurement (STATE.md, run 68): with the GEMV the 11 requests agreed with production's
- * answers fully on 2 of 11 against 3 with the WMMA form (one reasoning near-tie, 0.45 / 0.17 nat, moved), while
- * the single prompt ran 37.4 / 51.7 tok/s against 34.9 / 45.8 (MTP off / on). The owner decides the default. */
+/* The GEMV at decode is the default (owner note 57: the speed, as note 49 chose -- the 11 requests agreed with
+ * production fully on 2 of 11 against 3 with the WMMA form, one reasoning near-tie at 0.45 / 0.17 nat, while the
+ * single prompt ran 37.4 / 51.7 tok/s against 34.9 / 45.8 and the rotation 41.7 against 35.5).
+ * RADIANCE_XE_MOE_BF16_GEMV=0 keeps the WMMA form, one flag away. */
 static bool moe_bf16_gemv_on() {
-    static const bool on = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_GEMV"); return s && *s == '1'; }();
+    static const bool on = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_GEMV"); return !(s && *s == '0'); }();
     return on;
 }
 
