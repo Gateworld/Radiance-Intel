@@ -1470,6 +1470,7 @@ int Ctx::run_step(const RadBatch* b) {
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
 
     tape_refusals_apply();   /* owner note 42 item 3: the refusals the engine made common */
+    if (tape_shed_pending_) { tape_shed_pending_ = false; tape_shed_one(); }   /* owner note 58 */
     sync_residency();
 
     batch_       = b;
@@ -1520,6 +1521,27 @@ void Ctx::tape_room_read() {
     if (rad_dev_props(device_, &dp) == RAD_OK && dp.vram_free > 0) {
         tape_vram_free_ = dp.vram_free;
         tape_room_ = dp.vram_free >= floor_b;
+    }
+}
+
+/* Owner note 58 (m3 fault 14): while the ranks' verdict is under the recordings' floor, the least recently played
+ * tape is dropped at the start of each step, whatever its recency, until a step's reading is back above the
+ * floor -- the cards must not sit at the VRAM ceiling, where an append can fail out of device memory (H21).
+ * Above the floor nothing is shed and 89bf7fb's rule stands. Every rank gets the same verdict and has played the
+ * same passes in the same order, so every rank sheds the same tape. RADIANCE_TAPE_SHED=0 keeps run 63's rule
+ * (the A/B). */
+void Ctx::tape_shed_one() {
+    static const bool shed = [] { const char* v = std::getenv("RADIANCE_TAPE_SHED"); return !(v && v[0] == '0'); }();
+    if (!shed || tapes_.empty()) return;
+    size_t lru = 0;
+    for (size_t q = 1; q < tapes_.size(); ++q) if (tapes_[q].used < tapes_[lru].used) lru = q;
+    tape_drop(tapes_[lru]);
+    tapes_.erase(tapes_.begin() + (std::ptrdiff_t)lru);
+    tape_floor_drops_.fetch_add(1, std::memory_order_relaxed);
+    if (!tape_shed_told_ && rank_ == 0) {
+        tape_shed_told_ = true;
+        RAD_INFO("rank %d: under the recordings' floor a tape is shed each step, least recently played first, "
+                 "until the free VRAM is back above it (owner note 58; RADIANCE_TAPE_SHED)", rank_);
     }
 }
 

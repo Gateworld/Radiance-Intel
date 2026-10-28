@@ -449,6 +449,7 @@ struct Tape {
     struct NDead { ze_command_list_handle_t list; int slot; uint64_t serial; };
     std::deque<NDead> ndead;
     bool segs_dropped = false;         /* the segment lists went at the first play (the pool's phase 2) */
+    bool oom_told = false;             /* owner note 58: an out-of-memory append retried, said once a tape */
     /* owner note 42: the recorded waits whose signaller is inside the tape (the event, the waiter's segment),
      * checked at tape_end; the event-only segments closed after native work, whose records follow the
      * tape's latest play instead of the runtime queue */
@@ -461,6 +462,7 @@ std::atomic<int64_t> g_nlists_created{0}, g_nlists_destroyed{0}, g_nplays{0}, g_
 std::atomic<int64_t> g_sig_early{0}, g_bar_early{0};
 std::atomic<int64_t> g_same_tape_waits{0};   /* plays that waited for the same tape's previous play (its lists were still in flight) */   /* N4's diagnostic: the ring event / the barrier already complete right after the play's submission */
 std::atomic<int64_t> g_nstretch_composed{0}, g_nstretch_evicted{0};
+std::atomic<int64_t> g_append_retries{0};   /* owner note 58: appends retried after an out-of-memory result */
 Tape::~Tape() {
     for (Seg& s : segs)
         if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
@@ -1030,10 +1032,40 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
         if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS) waits.push_back(pr.ev);
     }
     ZeDev::Ring& r = ring_take(Z);
-    const ze_result_t rc = append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
+    /* Owner note 58 (m3 fault 14): at the VRAM ceiling the append can fail out of device memory -- a segment
+     * closed while recording (H21) or a play -- and the commands of that list then never ran on this rank while
+     * the other rank ran its own: the ranks' collectives no longer matched and the engine hung. Issuing the pass
+     * live from here would run the stretches already played twice, so the same append is retried instead, after
+     * draining this device's immediate list (its completed work returns the driver's command buffers and the
+     * graveyard's tapes can go): the same commands then run on both ranks. RADIANCE_L0_FAKE_APPEND_FAIL=N makes
+     * the first N appends fail as out of device memory once each (the test). Retries are logged, once a tape. */
+    static std::atomic<int> fake_left{[] {
+        const char* v = std::getenv("RADIANCE_L0_FAKE_APPEND_FAIL");
+        return v ? std::atoi(v) : 0;
+    }()};
+    auto do_append = [&]() -> ze_result_t {
+        if (fake_left.load(std::memory_order_relaxed) > 0 && fake_left.fetch_sub(1) > 0)
+            return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        return append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
+    };
+    ze_result_t rc = do_append();
+    for (int attempt = 1; attempt <= 3 && (rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
+                                           rc == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY); ++attempt) {
+        if (!t.oom_told) {
+            t.oom_told = true;
+            RAD_WARN("l0 tape %llu: appending %u list(s) failed out of %s memory (0x%x); draining device %d's "
+                     "immediate list and retrying (attempt %d of 3; owner note 58)", (unsigned long long)t.id, n,
+                     rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ? "device" : "host", (unsigned)rc, t.dev, attempt);
+        }
+        g_append_retries.fetch_add(1, std::memory_order_relaxed);
+        zeCommandListHostSynchronize(Z.imm, UINT64_MAX);
+        rc = do_append();
+    }
     if (rc != ZE_RESULT_SUCCESS) {
         char msg[96];
         std::snprintf(msg, sizeof msg, "zeCommandListImmediateAppendCommandListsExp: 0x%x (%u lists)", (unsigned)rc, n);
+        RAD_ERR("l0 tape %llu: %s after 3 retries -- this rank's step fails rather than waiting for commands that "
+                "never ran (owner note 58)", (unsigned long long)t.id, msg);
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
     }
     r.used = true;

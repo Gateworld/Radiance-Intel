@@ -313,7 +313,8 @@ public:
      * `tape_refused_now()` lists the keys this rank refused in its last step and `tape_refuse_key` makes a
      * refusal common to every rank, applied by the rank thread at the start of its next step. */
     bool        tape_room() const { return tape_room_; }
-    void        tape_room_set(bool room) { tape_room_agreed_ = room; }
+    /* owner note 58: under the floor one tape is shed at the start of each step (tape_shed_one) */
+    void        tape_room_set(bool room) { tape_room_agreed_ = room; if (!room) tape_shed_pending_ = true; }
     const std::vector<uint64_t>& tape_refused_now() const { return tape_refused_now_; }
     void        tape_refused_now_clear() { tape_refused_now_.clear(); }
     void        tape_refuse_key(uint64_t key) { tape_refused_in_.push_back(key); }
@@ -525,6 +526,9 @@ private:
     uint64_t              tape_pass_ = 0;
     std::atomic<int64_t>  tape_floor_drops_{0}, tape_floor_kept_{0};
     bool                  tape_kept_told_ = false;
+    bool                  tape_shed_pending_ = false;   /* owner note 58: the step's verdict was under the floor */
+    bool                  tape_shed_told_ = false;
+    void                  tape_shed_one();
     /* Keys seen once, and keys recorded once and not yet verified. */
     uint64_t              tape_seen_[32] = {};
     size_t                tape_seen_at_ = 0;
