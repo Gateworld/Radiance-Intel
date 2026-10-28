@@ -1922,10 +1922,15 @@ int z_stream_create(RadStream* out, int high_priority) {
         using sycl::property::queue::in_order;
         using sycl::property::queue::enable_profiling;
         using sycl::ext::oneapi::property::queue::priority_high;
+        /* RADIANCE_L0_QUEUE_PROFILING=1 (Intel port, milestone 3, run 57): the card's queues with profiling
+         * too, for libxe's launch profiler (RADIANCE_XE_LAUNCH_PROFILE: the live launches' device times, which
+         * the tape profiler does not see -- a prefill). Off by default, as the tagged devices were. */
+        static const bool prof_all = [] { const char* e = std::getenv("RADIANCE_L0_QUEUE_PROFILING"); return e && *e == '1'; }();
         sycl::property_list pl =
-            D.tag ? (high_priority ? sycl::property_list{in_order(), priority_high()} : sycl::property_list{in_order()})
-                  : (high_priority ? sycl::property_list{in_order(), priority_high(), enable_profiling()}
-                                   : sycl::property_list{in_order(), enable_profiling()});
+            (D.tag && !prof_all)
+                ? (high_priority ? sycl::property_list{in_order(), priority_high()} : sycl::property_list{in_order()})
+                : (high_priority ? sycl::property_list{in_order(), priority_high(), enable_profiling()}
+                                 : sycl::property_list{in_order(), enable_profiling()});
         auto* st = new L0Stream(sycl::queue(D.ctx, D.d, async_errors, pl));
         st->id = ++g_stream_ids;
         st->dev = dev;

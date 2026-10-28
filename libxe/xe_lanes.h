@@ -32,6 +32,16 @@
 #include <cstring>
 #include <tuple>
 #include <utility>
+#include <algorithm>   /* the launch profiler (RADIANCE_XE_LAUNCH_PROFILE): its table */
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <typeinfo>
+#include <unordered_map>
+#include <vector>
 
 #include "rad_plugin.h"   /* rad_f32_to_fp8e4m3 / rad_fp8e4m3_to_f32: the ABI's E4M3 */
 #include "rad_l0_rec.h"   /* the native recorder (owner note 28): launch_as records into a command list */
@@ -240,6 +250,81 @@ struct dim3 {
     constexpr dim3(unsigned a = 1, unsigned b = 1, unsigned c = 1) : x(a), y(b), z(c) {}
 };
 
+/* RADIANCE_XE_LAUNCH_PROFILE=1 (Intel port, milestone 3, run 57): every plain (not recorded) launch keeps its
+ * event in a per-thread ring; the entries that have completed are drained at the next launch and their device
+ * times -- the queue's own profiling, which the backend enables under RADIANCE_L0_QUEUE_PROFILING=1 -- accumulate
+ * per kernel (the launch lambda's type name, which carries the kernel function's); the table goes to stderr every
+ * 65,536 launches and at exit. The tape profiler (RADIANCE_L0_NTAPE_PROFILE) covers the replayed passes; this
+ * covers the live ones, which is what a prefill is. Off, it costs one branch a launch. */
+inline bool launch_profile_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_LAUNCH_PROFILE"); return e && *e == '1'; }();
+    return v;
+}
+struct LaunchProfAcc { double ns = 0.0; uint64_t count = 0; };
+inline std::mutex& lp_mutex() { static std::mutex m; return m; }
+inline std::unordered_map<std::string, LaunchProfAcc>& lp_acc() {
+    static auto* m = new std::unordered_map<std::string, LaunchProfAcc>;   /* process lifetime: threads drain at exit */
+    return *m;
+}
+inline std::atomic<uint64_t>& lp_count() { static std::atomic<uint64_t> n{0}; return n; }
+/* The table: device ms per kernel, launches, us a launch; the kernel's name after launch_as's own prefix. */
+inline void lp_report(const char* when) {
+    std::lock_guard<std::mutex> lk(lp_mutex());
+    std::vector<std::pair<std::string, LaunchProfAcc>> rows(lp_acc().begin(), lp_acc().end());
+    std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second.ns > y.second.ns; });
+    double tot = 0.0;
+    uint64_t n = 0;
+    for (const auto& r : rows) { tot += r.second.ns; n += r.second.count; }
+    std::fprintf(stderr, "xe launch profile (%s): %llu launches timed, %zu kernels, %.1f ms of device time in all; the top 40:\n",
+                 when, (unsigned long long)n, rows.size(), tot * 1e-6);
+    for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+        std::string nm = rows[i].first;
+        const size_t z = nm.find("_Z");
+        if (z != std::string::npos && z + 2 < nm.size() && nm.find("_Z", z + 2) != std::string::npos) nm = nm.substr(nm.find("_Z", z + 2));
+        if (nm.size() > 110) nm.resize(110);
+        const LaunchProfAcc& a = rows[i].second;
+        std::fprintf(stderr, "  %6.1f%%  %9.1f ms  %8llu x  %8.1f us  %s\n", 100.0 * a.ns / (tot > 0 ? tot : 1.0), a.ns * 1e-6,
+                     (unsigned long long)a.count, a.count ? a.ns * 1e-3 / (double)a.count : 0.0, nm.c_str());
+    }
+    std::fflush(stderr);
+}
+struct LaunchProfRing {
+    struct Entry { sycl::event ev; const char* name; };
+    std::deque<Entry> q;
+    ~LaunchProfRing() { drain(true); }
+    void drain(bool all) {
+        while (!q.empty()) {
+            Entry& e = q.front();
+            try {
+                if (!all && e.ev.get_info<sycl::info::event::command_execution_status>() !=
+                                sycl::info::event_command_status::complete)
+                    break;
+                if (all) e.ev.wait();
+                const uint64_t s = e.ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+                const uint64_t t = e.ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+                std::lock_guard<std::mutex> lk(lp_mutex());
+                LaunchProfAcc& a = lp_acc()[e.name];
+                a.ns += (double)(t >= s ? t - s : 0);
+                a.count += 1;
+            } catch (const sycl::exception&) {   /* a queue without profiling: nothing to count */
+            }
+            q.pop_front();
+        }
+    }
+    void push(sycl::event ev, const char* name) {
+        drain(false);
+        q.push_back(Entry{std::move(ev), name});
+        if (q.size() > 4096) { q.front().ev.wait(); drain(false); }
+        if ((lp_count().fetch_add(1, std::memory_order_relaxed) + 1) % 65536 == 0) lp_report("running");
+    }
+};
+inline LaunchProfRing& lp_ring() {
+    static thread_local LaunchProfRing r;
+    static std::once_flag once;
+    std::call_once(once, [] { std::atexit([] { lp_report("exit"); }); });
+    return r;
+}
+
 /* The launch: every argument converted to its parameter's type (as r4d_emit does), HIP's
  * grid x block mapped to an nd_range<3> with x fastest, sub-group 32 (or SG), and `lds` bytes of
  * dynamic work-group memory for XE_DYN_LDS. */
@@ -282,7 +367,9 @@ sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds
         new (vz) std::tuple<P...>(v);
         if (launch_native<decltype(kfn)>(q, g, b, lds, vz, sizeof v)) return sycl::event{};
     }
-    return sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
+    sycl::event ev = sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
+    if (launch_profile_on()) lp_ring().push(ev, typeid(kfn).name());
+    return ev;
 #pragma clang diagnostic pop
 }
 inline void* dyn_lds() { return sxe::get_work_group_scratch_memory(); }
@@ -312,10 +399,12 @@ sycl::event launch_as_grf256(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, con
         new (vz) std::tuple<P...>(v);
         if (launch_native<decltype(kfn)>(q, g, b, 0, vz, sizeof v)) return sycl::event{};
     }
-    return q.submit([&](sycl::handler& h) {
+    sycl::event ev = q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<3>(global, local),
                        sxe::properties{sycl::ext::intel::experimental::grf_size<256>}, kfn);
     });
+    if (launch_profile_on()) lp_ring().push(ev, typeid(kfn).name());
+    return ev;
 }
 
 }  /* namespace xe */
