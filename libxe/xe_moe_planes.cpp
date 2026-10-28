@@ -624,10 +624,11 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
     }
 }
 
-bool mx_on(sycl::queue* q) {   /* RADIANCE_XE_MOE_MX=1: prefill rows take the matrix-unit form (off by default: the
-                                * service's numerics stay v2m's, which production ranks with -- STATE.md, run 50);
-                                * the CPU device has no matrix unit */
-    static const bool want = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MX"); return s && *s == '1'; }();
+bool mx_on(sycl::queue* q) {   /* the matrix-unit form for prefill rows is the default (owner note 49, run 60: the
+                                * exact arithmetic and the speed; the one-prompt near-tie against production is a
+                                * recorded divergence); RADIANCE_XE_MOE_MX=0 keeps v2m -- the GEMV form one flag
+                                * away; the CPU device has no matrix unit */
+    static const bool want = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MX"); return !(s && *s == '0'); }();
     static const bool gpu = q->get_device().is_gpu();
     return want && gpu;
 }
