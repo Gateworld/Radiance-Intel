@@ -1065,6 +1065,14 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     tape_cut();
     rec_ = nullptr;
     RadTape t = tape_end(step_status_ >= 0);
+    if (!t && std::strncmp(rad_dev_last_error(), "l0 tape lost:", 13) == 0) {
+        /* owner note 58: the pass is incomplete on this rank -- fail the step, never serve its output */
+        step_fail_ = fmt("rank %d: draft pass %d at %lld tokens: %s", rank_, b->draft_pass, (long long)b->n_tok,
+                         rad_dev_last_error());
+        RAD_ERR("%s", step_fail_.c_str());
+        step_status_ = RAD_E_DEVICE;
+        return 0;
+    }
     if (!t) {
         if (step_status_ >= 0) {
             tape_refused_.push_back(key);

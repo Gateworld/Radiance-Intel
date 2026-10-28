@@ -477,6 +477,7 @@ struct Rec {
     std::vector<L0Event*> pend;        /* its event records */
     int pause = 0;
     bool stopped = false;              /* recording given up: the rest of the pass runs plainly */
+    bool lost = false;                 /* owner note 58: a segment's close failed, so its commands never ran */
     /* native tapes: the open regular command list and its command count */
     bool native = false;
     ze_command_list_handle_t nlist = nullptr;
@@ -1405,6 +1406,7 @@ int z_tape_mark(void) {
     if (recording()) {
         const bool cap = t_rec.t->segs.size() + 1 >= kTapeMaxSegs;
         const int rc = guarded("tape_mark", [cap] { seg_close(); if (!cap) seg_open(); });
+        if (rc != RAD_OK) t_rec.lost = true;
         if (rc != RAD_OK)
             stop_recording(std::string("a segment could not be closed: ") + rad_dev_last_error());
         else if (cap)
@@ -1416,8 +1418,10 @@ int z_tape_mark(void) {
 void z_tape_pause(int on) {
     if (!t_rec.t || t_rec.stopped) return;
     if (on) {
-        if (t_rec.pause++ == 0 && (t_rec.g || t_rec.nlist) && guarded("tape_pause", [] { seg_close(); }) != RAD_OK)
+        if (t_rec.pause++ == 0 && (t_rec.g || t_rec.nlist) && guarded("tape_pause", [] { seg_close(); }) != RAD_OK) {
+            t_rec.lost = true;
             stop_recording("a segment could not be closed at a pause");
+        }
     } else if (t_rec.pause > 0 && --t_rec.pause == 0) {
         if (guarded("tape_pause", [] { seg_open(); }) != RAD_OK) stop_recording("no segment after a pause");
     }
@@ -1425,8 +1429,21 @@ void z_tape_pause(int on) {
 RadTape z_tape_end(int keep) {
     Tape* t = t_rec.t;
     if (!t) return nullptr;
-    if ((t_rec.g || t_rec.nlist) && guarded("tape_end", [] { seg_close(); }) != RAD_OK) refuse("the last segment could not be closed");
+    if ((t_rec.g || t_rec.nlist) && guarded("tape_end", [] { seg_close(); }) != RAD_OK) {
+        t_rec.lost = true;
+        refuse("the last segment could not be closed");
+    }
+    const bool lost = t_rec.lost;
     t_rec = Rec{};
+    /* Owner note 58 (E11): a segment whose close failed never ran, so this pass is incomplete on this rank --
+     * reported with a fixed prefix the context turns into a failed step, never a silent refusal (the rest of
+     * the pass ran plainly without that segment's commands and gave a different answer). */
+    if (lost) {
+        device_set_error("l0 tape lost: a recorded segment's commands never ran (its list could not be "
+                         "appended): the pass is incomplete on this rank");
+        release_tape(t);
+        return nullptr;
+    }
     /* A pass always puts work on the card; an empty recording means it went to a stream outside
      * the recording, and replaying nothing would be silently wrong. */
     if (t->segs.empty() && t->refused.empty())
