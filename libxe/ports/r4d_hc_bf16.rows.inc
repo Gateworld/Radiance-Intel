@@ -87,6 +87,8 @@ static const RadConstraint cHcReadE4m3[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHcReadE4m3), NOTUNE,
   nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch,
-  r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
-  nullptr, r4d_rad_unrelayout_hc_e4m3 },
+  /* Intel port, milestone 3 (owner note 56): libxe's wrappers (xe_hc_f16_layout.cpp) -- libr4d's hooks unless
+   * RADIANCE_XE_HC_F16=1, which stores the matrices with each code expanded to FP16 */
+  xe_hc_layout_e4m3, xe_hc_relayout_e4m3,
+  nullptr, xe_hc_unrelayout_e4m3 },
 #endif

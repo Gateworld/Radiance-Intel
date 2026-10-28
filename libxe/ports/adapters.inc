@@ -37,6 +37,10 @@ extern "C" int r4d_rad_layernorm(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
 extern "C" int r4d_rad_layout_fp8_logits(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
 extern "C" int r4d_rad_layout_hc_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
+/* Intel port, milestone 3 (owner note 56): the wrappers in libxe/xe_hc_f16_layout.cpp */
+extern "C" int xe_hc_layout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
+extern "C" int xe_hc_relayout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, void* dst, int64_t dst_bytes);
+extern "C" int xe_hc_unrelayout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const void* src, int64_t src_bytes, const RadTensor* pl, int n);
 extern "C" int r4d_rad_layout_i8_logits(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
 extern "C" int r4d_rad_layout_moe_w4(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);
 extern "C" int r4d_rad_layout_mtp_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n, RadLayout* out);

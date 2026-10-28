@@ -13,6 +13,9 @@ list(APPEND XE_SRC ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp ${CMAKE_SOURCE_
 # The MTP coupling's argument readers and shape hooks (plugin/spechub, upstream d912c69), compiled unchanged: the
 # Xe rows in xe_mtp_couple.cpp read their operands through them (milestone 3, owner note 47 item 2).
 list(APPEND XE_SRC ${CMAKE_SOURCE_DIR}/plugin/spechub/spechub.cpp)
+# milestone 3, owner note 56: hc_read's mixing matrices expanded to FP16 at load under RADIANCE_XE_HC_F16=1 (the
+# hooks wrap libr4d's, which stay as they are for the AMD build)
+list(APPEND XE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/xe_hc_f16_layout.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
