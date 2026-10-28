@@ -12,8 +12,10 @@
  */
 #include "xe_lanes.h"
 #include "r4d_args.h"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the prefill form on the matrix unit (run 58) */
 
 #include <cstdint>
+#include <cstdlib>
 
 extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream s);   /* ports/r4d_moe.cpp */
 
@@ -83,11 +85,128 @@ void gemv_bf16_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __r
     }
 }
 
+/* ---- the matrix-unit form for prefill rows (milestone 3, stage B, run 58) ----
+ *
+ * The 7K prefill's profile (B10) showed gemm_nt's GEMV launched once a token a layer -- 204,546 launches of 19 us
+ * on a rank, 12 % of the first token -- for products at M = a chunk's rows. For M >= 64 a work-group of 8
+ * sub-groups (sub-group 16, the DPAS width) owns 64 activation rows by 64 output columns: per 64-K group it stages
+ * the rows' activations as bf16 (an f32 activation rounded to nearest even; the GEMV reads bf16 exactly and f32 as
+ * it is -- the products of bf16 pairs are exact in f32 either way) and the 64 weight rows in the packed B layout
+ * (word (k2, n) = b[n][2 k2] | b[n][2 k2 + 1] << 16), runs four bf16 8 x 16 x 16 joint_matrix_mad steps into f32
+ * tiles that persist over the whole K (no per-group scaling here), and writes y with one rounding to its dtype.
+ * The summation order differs from the GEMV's butterfly as that differs from libref's ascending k: f32 sums of
+ * exact products, a tolerance check. K's tail past a multiple of 64 is staged as zeros. The launcher sends full
+ * 64-row blocks here (RADIANCE_XE_GEMM_BF16_DPAS=0 keeps the GEMV) and the tail rows to the GEMV. */
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kBfSG = 16, kBfWaves = 8, kBfThreads = kBfSG * kBfWaves;   /* 128 */
+constexpr int kBfRT = 8 * kBfWaves;                                      /* 64 rows a work-group */
+constexpr int kBfNT = 64;                                                /* 4 tiles of 16 columns */
+constexpr int kBfAP = 64 + 8;                                            /* the A stage's row pitch in bf16 */
+
+template <bool A_F32, bool Y_F32>
+void gemm_bf16_dpas_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
+                           void* __restrict__ y, long y_ld, int N, int K, int M) {
+    XE_SHARED(uint16_t, sA, kBfRT * kBfAP);   /* 64 rows x 64 k bf16, pitch 72 */
+    XE_SHARED(uint32_t, sB, 4 * 4 * 128);     /* [k step 4][n tile 4][packed 8 x 16 words]: 64 k x 64 n */
+    XE_SHARED(float, sC, kBfWaves * 8 * 16);  /* one 8 x 16 f32 tile a sub-group */
+    const int tid = (int)threadIdx.x, wave = tid / kBfSG, lane = tid % kBfSG;
+    const int m0 = (int)blockIdx.y * kBfRT;   /* a full 64-row block: the launcher's choice */
+    const int n0 = (int)blockIdx.x * kBfNT;
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::a, 8, 16, jm::layout::row_major> Am;
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm;
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+#pragma unroll
+    for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+    const int G = (K + 63) / 64;
+    for (int g = 0; g < G; ++g) {
+        const int k0 = g * 64;
+        xe::syncthreads();                                  /* the previous group's stages are consumed */
+        /* the activation rows: 64 rows x 64 k, two k a word (zeros past K or past M) */
+        for (int idx = tid; idx < kBfRT * 32; idx += kBfThreads) {   /* 2048 words: 16 a thread */
+            const int r = idx / 32, kp = (idx % 32) * 2, mm = m0 + r, kk = k0 + kp;
+            uint32_t w = 0;
+            if (mm < M) {
+                uint16_t lo = 0, hi = 0;
+                if constexpr (A_F32) {
+                    const float* ar = (const float*)a + (size_t)mm * a_ld;
+                    if (kk < K) lo = to_bf16(ar[kk]);
+                    if (kk + 1 < K) hi = to_bf16(ar[kk + 1]);
+                } else {
+                    const uint16_t* ar = (const uint16_t*)a + (size_t)mm * a_ld;
+                    if (kk < K) lo = ar[kk];
+                    if (kk + 1 < K) hi = ar[kk + 1];
+                }
+                w = (uint32_t)lo | ((uint32_t)hi << 16);
+            }
+            *(uint32_t*)(sA + r * kBfAP + kp) = w;
+        }
+        /* the weight rows: 64 n x 64 k, packed (word (k2, n)); zeros past N or K */
+        for (int idx = tid; idx < kBfNT * 32; idx += kBfThreads) {   /* 2048 words: 16 a thread */
+            const int n = idx / 32, k2 = idx % 32, nn = n0 + n, kk = k0 + 2 * k2;
+            uint32_t w = 0;
+            if (nn < N) {
+                const uint16_t* br = b + (size_t)nn * b_ld;
+                const uint16_t lo = kk < K ? br[kk] : (uint16_t)0, hi = kk + 1 < K ? br[kk + 1] : (uint16_t)0;
+                w = (uint32_t)lo | ((uint32_t)hi << 16);
+            }
+            const int step = k2 / 8, kw = k2 % 8;
+            sB[((step * 4 + n / 16) * 8 + kw) * 16 + (n % 16)] = w;
+        }
+        xe::syncthreads();
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            jm::joint_matrix_load(sg, Am, lptr((sycl::ext::oneapi::bfloat16*)(sA + wave * 8 * kBfAP + step * 16)), (size_t)kBfAP);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bm, lptr((sycl::ext::oneapi::bfloat16*)(sB + (step * 4 + t) * 128)), 32);
+                jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+            }
+        }
+    }
+    /* the tiles out: lane = column, 8 rows a lane */
+    float* sCw = sC + wave * 128;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        jm::joint_matrix_store(sg, Cm[t], lptr(sCw), 16, jm::layout::row_major);
+        xe::wave_barrier();
+        const int nn = n0 + t * 16 + lane;
+        if (nn < N) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int mm = m0 + wave * 8 + e;
+                if (mm >= M) continue;
+                const float v = sCw[e * 16 + lane];
+                if constexpr (Y_F32) ((float*)y)[(size_t)mm * y_ld + nn] = v;
+                else ((uint16_t*)y)[(size_t)mm * y_ld + nn] = to_bf16(v);
+            }
+        }
+        xe::wave_barrier();
+    }
+}
+
+bool bf16_dpas_on(sycl::queue* q) {   /* RADIANCE_XE_GEMM_BF16_DPAS=0: prefill rows keep the GEMV; the CPU device has no matrix unit */
+    static const bool want = [] { const char* v = std::getenv("RADIANCE_XE_GEMM_BF16_DPAS"); return !(v && *v == '0'); }();
+    static const bool gpu = q->get_device().is_gpu();
+    return want && gpu;
+}
+
 template <bool A_F32, bool Y_F32>
 void launch(sycl::queue* q, const void* a, long a_ld, const uint16_t* b, long b_ld, void* y, long y_ld, int N, int K, int M) {
+    int m_start = 0;
+    if (M >= kBfRT && bf16_dpas_on(q)) {
+        const int blocks = M / kBfRT;
+        const dim3 dgrid((unsigned)((N + kBfNT - 1) / kBfNT), (unsigned)blocks), dblock(kBfThreads);
+        XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_kernel<A_F32, Y_F32>), dgrid, dblock, 0, a, a_ld, b, b_ld, y, y_ld, N, K, M);
+        m_start = blocks * kBfRT;
+        if (m_start >= M) return;
+    }
     const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
     const size_t ae = A_F32 ? 4 : 2, ye = Y_F32 ? 4 : 2;
-    for (int m0 = 0; m0 < M; m0 += kMaxM) {
+    for (int m0 = m_start; m0 < M; m0 += kMaxM) {
         const int mb = M - m0 < kMaxM ? M - m0 : kMaxM;
         const void* am = (const char*)a + (size_t)m0 * a_ld * ae;
         void* ym = (char*)y + (size_t)m0 * y_ld * ye;

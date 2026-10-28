@@ -50,6 +50,18 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_i8_cpu COMMAND xe_gemv_i8_test)
   set_tests_properties(xe_gemv_i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Milestone 3, stage B: gemm_nt over bf16 weights -- the sub-group GEMV and the matrix-unit form for M >= 64 (the
+  # latter on a GPU) -- against a double reference, canaries on y.
+  add_executable(xe_gemv_bf16_test test/gemv_bf16_test.cpp xe_gemv_bf16.cpp)
+  rad_l0_sycl(xe_gemv_bf16_test)
+  target_include_directories(xe_gemv_bf16_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/libr4d)
+  target_compile_options(xe_gemv_bf16_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_gemv_bf16_test PRIVATE rad_abi)
+  set_target_properties(xe_gemv_bf16_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_gemv_bf16_cpu COMMAND xe_gemv_bf16_test)
+  set_tests_properties(xe_gemv_bf16_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
   # The MTP draft head's w2a8 GEMV, through its layout hooks, against libref's gemm_zp order.
   add_executable(xe_gemv_w2a8_test test/gemv_w2a8_test.cpp xe_gemv_w2a8.cpp)
   rad_l0_sycl(xe_gemv_w2a8_test)
