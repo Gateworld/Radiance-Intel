@@ -191,13 +191,17 @@ template <bool W16>
 __device__ __forceinline__ long hc_codes_bytes(long K) { return W16 ? 2 * K : K; }
 
 /* Sixteen codes at element e of row wr (the 16-byte E4M3 load, or two 16-byte FP16 loads). */
+/* The E4M3 form holds one 16-byte load, the FP16 form two: separate types, so the E4M3 dots keep their register
+ * footprint (a shared two-load struct cost the E4M3 path ~1.5 ms a step on the card, M35 against M34). */
 template <bool W16>
-struct HcCodes16 { uint4 a, b; };
+struct HcCodes16 { uint4 a; };
+template <>
+struct HcCodes16<true> { uint4 a, b; };
 template <bool W16>
 __device__ __forceinline__ HcCodes16<W16> hc_load16(const unsigned char* __restrict__ wr, long e) {
     HcCodes16<W16> c;
     if constexpr (W16) { c.a = *(const uint4*)(wr + 2 * e); c.b = *(const uint4*)(wr + 2 * e + 16); }
-    else { c.a = *(const uint4*)(wr + e); c.b = c.a; }
+    else { c.a = *(const uint4*)(wr + e); }
     return c;
 }
 template <bool W16>
