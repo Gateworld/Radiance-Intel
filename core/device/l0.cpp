@@ -1355,6 +1355,58 @@ int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
     return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, bytes); });
 }
 
+/* RADIANCE_L0_HOST_PREBIND=1 (the Intel port, owner note 84, run 88): rad_host_prebind. Run 87 found
+ * the two-card first step stuck in the mover's first copy on card1: NEO binding the copy's host
+ * buffer, which the shared context imported from card0, and xe answering VM_BIND with EBUSY forever.
+ * This makes the same kind of copy (64 bytes from each host allocation, on the caller's stream, so
+ * the same engine) at startup, one allocation at a time, logged before each: a bind that still
+ * fails names its allocation, and the step loop's copies find their buffers bound. Off by default. */
+int z_host_prebind(RadStream s, const char* tag) {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_L0_HOST_PREBIND");
+        return e && e[0] == '1';
+    }();
+    if (!on) return RAD_OK;
+    RAD_TRY(check_stream(s, "rad_host_prebind"));
+    L0Stream& st = S(s);
+    RAD_TRY(enter(st));
+    std::vector<std::pair<uintptr_t, AllocRec>> host;
+    {
+        std::lock_guard<std::mutex> lk(alloc_mutex());
+        for (const auto& kv : alloc_table())
+            if (kv.second.kind == RAD_MEM_HOST_PINNED || kv.second.kind == RAD_MEM_HOST_MAPPED) host.push_back(kv);
+    }
+    const Dev& D = devs()[st.dev];
+    void* scratch = nullptr;
+    RAD_TRY(guarded("rad_host_prebind", [&] { scratch = sycl::malloc_device(kAlign, D.d, D.ctx); }));
+    if (!scratch) {
+        device_set_error("rad_host_prebind: no %lld-byte scratch on card %d", (long long)kAlign, st.dev);
+        return RAD_E_NOMEM;
+    }
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    int64_t total = 0;
+    int rc = RAD_OK;
+    for (size_t i = 0; i < host.size(); ++i) {
+        const AllocRec& r = host[i].second;
+        RAD_INFO("l0 prebind %s (card %d): host allocation %zu of %zu at 0x%llx, %.2f MiB, kind %d, allocated with card %d current",
+                 tag, st.dev, i + 1, host.size(), (unsigned long long)host[i].first, r.bytes / 1048576.0, r.kind, r.device);
+        const auto t = clk::now();
+        rc = guarded("rad_host_prebind", [&] {
+            st.q.memcpy(scratch, (const void*)host[i].first, (size_t)std::min<int64_t>(r.bytes, 64)).wait();
+        });
+        if (rc < 0) break;
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t).count();
+        if (ms > 50) RAD_WARN("l0 prebind %s (card %d): allocation %zu took %.1f ms", tag, st.dev, i + 1, ms);
+        total += r.bytes;
+    }
+    (void)guarded("rad_host_prebind", [&] { sycl::free(scratch, D.ctx); });
+    if (rc >= 0)
+        RAD_INFO("l0 prebind %s (card %d): %zu host allocation(s), %.2f GiB, touched in %.1f ms", tag, st.dev, host.size(),
+                 total / 1073741824.0, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    return rc;
+}
+
 void seg_open() {
     Tape& t = *t_rec.t;
     if (t_rec.native) {
@@ -2646,6 +2698,7 @@ DeviceBackend make_backend() {
     b.stream_gate = z_stream_gate;
     b.gate_open = z_gate_open;
     b.gate_room = z_gate_room;
+    b.host_prebind = z_host_prebind;
     b.tape_begin = z_tape_begin;
     b.tape_mark = z_tape_mark;
     b.tape_pause = z_tape_pause;

@@ -163,6 +163,11 @@ if(RAD_BUILD_TESTS)
   rad_l0_sycl(xe_list_pool_probe)
   target_link_libraries(xe_list_pool_probe PRIVATE ${RAD_ZE_LOADER} ${CMAKE_DL_LIBS})
   set_target_properties(xe_list_pool_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Milestone 3, run 88 (owner note 84): the two-card first step's stuck bind without the model -- host memory of a
+  # context over both cards, touched by one card's copy queue. A two-card probe only; no CPU test.
+  add_executable(xe_hostbind_probe test/hostbind_probe.cpp)
+  rad_l0_sycl(xe_hostbind_probe)
+  set_target_properties(xe_hostbind_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
   # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
   add_executable(xe_mtp_couple_test test/mtp_couple_test.cpp)

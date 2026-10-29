@@ -616,6 +616,10 @@ void* rad_link_gate(RadStream s) {
     if (const auto f = dev()->link_gate) return f(s);
     return nullptr;
 }
+int rad_host_prebind(RadStream s, const char* tag) {
+    if (const auto f = dev()->host_prebind) return f(s, tag);
+    return RAD_OK;
+}
 int rad_xp_supported(int device) {
     const auto* d = dev();
     return d->xp_supported && d->xp_stream_create && d->ride && d->ride_wait && d->ride_release && d->xp_list &&

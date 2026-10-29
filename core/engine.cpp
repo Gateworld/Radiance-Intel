@@ -1640,6 +1640,21 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     loop_status_.store(RAD_OK, std::memory_order_release);
     done_.reserve((size_t)cfg_.max_seqs);
 
+    /* Every host allocation touched once from each rank's mover and compute streams, one rank at a
+     * time, before any step: a backend that maps host memory per card and engine on first use maps
+     * it here, logged. A no-op unless the backend's switch is on (rad_host_prebind; the Intel port's
+     * two-card first step, run 88). */
+    for (auto& r : ranks_) {
+        if (rad_dev_set(r->device) < 0) continue;
+        const RadStream mv = r->mover.transfer_stream();
+        const std::string tm = fmt("rank %d mover", r->index), tc = fmt("rank %d compute", r->index);
+        int st = mv ? rad_host_prebind(mv, tm.c_str()) : RAD_OK;
+        if (st >= 0) st = rad_host_prebind(r->ctx.stream(), tc.c_str());
+        if (st < 0) RAD_WARN("rank %d: touching the host allocations before the first step: %s", r->index,
+                             rad_strerror(st));
+    }
+    (void)rad_dev_set(ranks_[0]->device);
+
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });

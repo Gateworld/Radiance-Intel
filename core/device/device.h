@@ -97,6 +97,14 @@ extern "C" int rad_link_hold(RadStream s, int on);
  * with rad_link_hold(s, 2). Null where the backend holds nothing. */
 extern "C" void* rad_link_gate(RadStream s);
 
+/* Touch every live host allocation once from stream `s`, so the driver maps each one for the
+ * stream's card and engine now rather than at its first use in a step. Each allocation is logged
+ * before its copy, with `tag` naming the caller's stream. A no-op (RAD_OK) where the backend has
+ * nothing to do or the backend's switch is off (Level Zero: RADIANCE_L0_HOST_PREBIND=1; the
+ * Intel port, run 88: a two-card first step stuck binding host memory imported from the other
+ * card). */
+extern "C" int rad_host_prebind(RadStream s, const char* tag);
+
 /* Device half of the expert prefetch (core/runtime/xprefetch.cpp). A backend that cannot have a
  * dispatch complete a signal, or has no spare DMA engine, leaves these out; rad_xp_supported is
  * then 0 and the prefetch is off.
@@ -325,6 +333,9 @@ struct DeviceBackend {
     int     (*stream_gate)(RadStream s, void** gate);
     int     (*gate_open)(void* gate);
     int64_t (*gate_room)(RadStream s);
+
+    /* ---- see rad_host_prebind. Null on a backend that maps host memory at allocation. */
+    int     (*host_prebind)(RadStream s, const char* tag);
 };
 
 
