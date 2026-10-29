@@ -131,6 +131,9 @@ int main(int argc, char** argv) {
             }
             std::printf("  init ok; launching\n");
             double worst = 0; bool ok = true; double us_sum = 0; int timed = 0;
+            /* run 87 (owner notes 81-82): where a launch pair's time goes, per rank -- the thread's start after
+             * t0, the launch call, the queue wait; summed over the timed iterations */
+            double ph_start[2] = {0, 0}, ph_launch[2] = {0, 0}, ph_wait[2] = {0, 0};
             for (int it = 0; it < iters && ok; ++it) {
                 for (int r = 0; r < 2; ++r) {
                     for (int64_t i = 0; i < c.numel; ++i) {
@@ -143,9 +146,12 @@ int main(int argc, char** argv) {
                 }
                 /* both ranks launch, each on its own thread and queue */
                 int lrc[2] = { 0, 0 };
+                double ts[2][3] = {};
                 auto t0 = std::chrono::steady_clock::now();
                 std::thread th[2];
                 for (int r = 0; r < 2; ++r) th[r] = std::thread([&, r] {
+                    auto us = [&] { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); };
+                    ts[r][0] = us();
                     RadTensor t[2]{};
                     t[0].data = x[r]; t[0].dtype = c.dt == 2 ? RAD_F32 : RAD_BF16; t[0].rank = 1; t[0].shape[0] = c.numel; t[0].stride[0] = 1;
                     t[1] = t[0]; t[1].data = yb[r] + kCanary;
@@ -157,11 +163,16 @@ int main(int argc, char** argv) {
                     RadArgs a{};
                     a.t = t; a.n_t = c.inplace ? 1 : 2; a.p = p; a.n_p = 4; a.instance = inst[r]; a.rank = r; a.world_size = 2;
                     lrc[r] = launch[form](&a, (RadStream)&q[r]);
+                    ts[r][1] = us();
                     q[r].wait();
+                    ts[r][2] = us();
                 });
                 th[0].join(); th[1].join();
                 auto t1 = std::chrono::steady_clock::now();
-                if (it > 0) { us_sum += std::chrono::duration<double, std::micro>(t1 - t0).count(); ++timed; }
+                if (it > 0) {
+                    us_sum += std::chrono::duration<double, std::micro>(t1 - t0).count(); ++timed;
+                    for (int r = 0; r < 2; ++r) { ph_start[r] += ts[r][0]; ph_launch[r] += ts[r][1] - ts[r][0]; ph_wait[r] += ts[r][2] - ts[r][1]; }
+                }
                 if (lrc[0] != RAD_OK || lrc[1] != RAD_OK) { std::printf("  launch rc %d / %d at iter %d\n", lrc[0], lrc[1], it); ok = false; break; }
                 for (int r = 0; r < 2; ++r) if (stalled(inst[r], (RadStream)&q[r])) { std::printf("  rank %d stalled at iter %d\n", r, it); ok = false; }
                 /* check both ranks against the host sum */
@@ -196,6 +207,10 @@ int main(int argc, char** argv) {
             std::printf("RESULT allreduce %-4s dt%d numel %7lld %-8s: %s, %d iters, worst |diff| %g%s\n", form ? "host" : "peer", c.dt,
                         (long long)c.numel, c.inplace ? "in-place" : "into y", ok ? "PASS" : "FAIL", iters, worst,
                         (!cpu && timed) ? (std::string(", ") + std::to_string(us_sum / timed) + " us a launch pair (host wall incl. waits)").c_str() : "");
+            if (!cpu && timed)
+                for (int r = 0; r < 2; ++r)
+                    std::printf("  phases rank %d: thread start %.1f us, launch call %.1f us, queue wait %.1f us (means over %d)\n", r,
+                                ph_start[r] / timed, ph_launch[r] / timed, ph_wait[r] / timed, timed);
             all_ok &= ok;
             for (int r = 0; r < 2; ++r) { sycl::free(x[r], q[r]); sycl::free(yb[r], q[r]); fini(inst[r]); }
         }
