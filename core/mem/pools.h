@@ -73,8 +73,20 @@ public:
     /* Carve `bytes` at `align`. Returns the pointer, or null with a recorded shortfall if it does
      * not fit.
      * `off_out` receives the byte offset from base, which fixed-stride slabs use because the base
-     * may be a device pointer the host cannot dereference. */
+     * may be a device pointer the host cannot dereference. In a pool made of pieces (below) it is
+     * the offset within the reservation's piece. */
     void* reserve(std::string_view what, int64_t bytes, int64_t align, int64_t* off_out = nullptr);
+
+    /* ---- a pool in pieces -------------------------------------------------------------------
+     *
+     * A host pool can be backed by several allocations of at most `piece` bytes instead of one
+     * (RADIANCE_HOST_POOL_PIECE_MIB, read by Pools::configure; the Intel port, owner notes 87 / 90: xe cannot bind a host
+     * buffer of more than 4 GiB that a second card imports through a shared context, and the
+     * two-card first step hangs or the kernel oopses on one). A reservation never spans pieces, so
+     * a caller wanting more than largest_free() must take several. One piece (the default) is the
+     * single allocation it always was. */
+    int64_t largest_free(int64_t align) const;
+    int     pieces() const { return pieces_.empty() ? (base_ ? 1 : 0) : (int)pieces_.size(); }
 
     /* True when nothing was refused. Checked once at the end of startup so the report names every
      * failure, not only the first (spec §3.1). */
@@ -115,7 +127,8 @@ private:
     int init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a);
 
     friend class Pools;
-    int init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a);
+    /* `piece` > 0 and smaller than `bytes`: back the pool with allocations of at most `piece`. */
+    int init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a, int64_t piece = 0);
     /* release(), then name the pool and set its budget with nothing reserved. */
     void reset(std::string_view nm, int64_t bytes, int kind, MemAllocator* a);
     void release();
@@ -129,8 +142,11 @@ private:
     VMem          vm_;
     MemAllocator* alloc_ = nullptr;
     std::vector<Shortfall> shortfalls_;
-    struct Res { std::string what; int64_t off, bytes; };
+    struct Res { std::string what; int64_t off, bytes; int piece = 0; };
     std::vector<Res> res_;
+    /* Empty unless the pool is in pieces; then base_ is the first piece's and used_ the sum. */
+    struct Piece { void* base = nullptr; int64_t bytes = 0, used = 0; };
+    std::vector<Piece> pieces_;
 };
 
 /* ------------------------------------------------------------------ Pools */

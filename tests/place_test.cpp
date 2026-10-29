@@ -1567,6 +1567,68 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     rad_stream_destroy(compute);
 }
 
+/* The host pool in pieces (RADIANCE_HOST_POOL_PIECE_MIB; the Intel port, owner notes 87 / 90): the
+ * class pool comes in chunks, each inside one piece, every pooled unit still has an address, and the
+ * swaps run through it as through one pool. 2 MiB pieces against 1 MiB experts give chunks of one or
+ * two slots. */
+TEST(a_mover_over_a_host_pool_in_pieces_places_and_swaps_through_chunks) {
+    HeatFixture hf;
+    Config c = hf.cfg;
+    c.vram_kv_mib = 8;
+    setenv("RADIANCE_HOST_POOL_PIECE_MIB", "2", 1);
+    Pools pools;
+    const int s = pools.configure(c, 0, &rad_malloc_allocator(), &rad_malloc_allocator());
+    unsetenv("RADIANCE_HOST_POOL_PIECE_MIB");
+    CHECK_OK(s);
+    CHECK(pools.host_pinned().pieces() > 1);
+
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc, &pools));
+
+    for (rad_weight w = 1; (size_t)w < hf.f.prog.weights.size(); ++w) {
+        const WeightSlot* ws = m.residency()->lookup(w);
+        CHECK(ws != nullptr && ws->ptr != nullptr);
+    }
+    /* More than one chunk, none overlapping, each a whole number of slots within one 2 MiB piece. */
+    uint64_t lo[16], hi[16], st[16];
+    const int n = m.pool_ranges(lo, hi, st, 16);
+    CHECK(n > 1);
+    for (int i = 0; i < n; ++i) {
+        CHECK(hi[i] > lo[i]);
+        CHECK_EQ((hi[i] - lo[i]) % st[i], 0ull);
+        CHECK(hi[i] - lo[i] <= (2ull << 20));
+        for (int j = 0; j < i; ++j) CHECK(hi[i] <= lo[j] || hi[j] <= lo[i]);
+    }
+
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+    const int32_t ids[4] = {4, 5, 6, 7};
+    const int32_t counts[4] = {10, 10, 10, 10};
+    int d = 0;
+    for (Deadline dl; !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        work.run(compute);
+        h.observe_ids(0, ids, counts, 4);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        for (const Swap& x : sw) m.issue(x, &h);
+        if (m.stats().promotions >= 1 && m.stats().demotions >= 1) break;
+    }
+    CHECK(m.stats().promotions >= 1);
+    CHECK(m.stats().demotions >= 1);
+    for (Deadline dl; any_busy(h, hf.plan) && !dl.passed(); ++d) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        work.run(compute);
+    }
+    rad_stream_destroy(compute);
+}
+
 namespace {
 int32_t resident_count(const HeatEngine& h, const Plan& p) {
     int32_t n = 0;

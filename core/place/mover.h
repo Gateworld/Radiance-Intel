@@ -479,16 +479,19 @@ public:
     /* Whether idle ticks keep the turnover slots filled; the engine holds them through a prompt
      * and the few steps after it (Engine::tiering_dispatch). */
     void hold_turnover(bool held) { hold_turnover_ = held; }
-    /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`. */
+    /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride, one range a
+     * chunk (one a class unless the host pool is in pieces). At most `max`; past that the later
+     * chunks go unreported (the expert prefetch then skips their units). */
     int pool_ranges(uint64_t* lo, uint64_t* hi, uint64_t* stride, int max) const {
         int n = 0;
         for (const ClassPools& cp : pools_)
-            if (cp.pool_dev && cp.stride > 0 && n < max) {
-                lo[n] = (uint64_t)(uintptr_t)cp.pool_dev;
-                hi[n] = lo[n] + (uint64_t)cp.pool.size() * (uint64_t)cp.stride;
-                stride[n] = (uint64_t)cp.stride;
-                ++n;
-            }
+            for (const ClassPools::Chunk& c : cp.chunks)
+                if (c.dev && cp.stride > 0 && n < max) {
+                    lo[n] = (uint64_t)(uintptr_t)c.dev;
+                    hi[n] = lo[n] + (uint64_t)c.n * (uint64_t)cp.stride;
+                    stride[n] = (uint64_t)cp.stride;
+                    ++n;
+                }
         return n;
     }
 
@@ -594,8 +597,20 @@ private:
     struct ClassPools {
         SlotPool slab, pool;
         void*    slab_base = nullptr;
-        void*    pool_base = nullptr;
-        void*    pool_dev = nullptr;   /* the pinned pool as the device addresses it */
+        /* The pinned pool's slots in chunks of consecutive slots, each one host-pool reservation:
+         * one chunk unless the host pool is in pieces (RADIANCE_HOST_POOL_PIECE_MIB, the Intel
+         * port's xe bind limit), then as many as the pieces need. `dev` is the chunk as the device
+         * addresses it. Only pool_ptr() / pool_dptr() resolve a pool slot. */
+        struct Chunk { char* base = nullptr; char* dev = nullptr; int64_t first = 0, n = 0; };
+        std::vector<Chunk> chunks;
+        bool has_pool() const { return !chunks.empty(); }
+        const Chunk& chunk_of(int64_t s) const {
+            size_t i = 0;
+            while (i + 1 < chunks.size() && s >= chunks[i + 1].first) ++i;
+            return chunks[i];
+        }
+        char* pool_ptr(int64_t s) const  { const Chunk& c = chunk_of(s); return c.base + (s - c.first) * stride; }
+        char* pool_dptr(int64_t s) const { const Chunk& c = chunk_of(s); return c.dev + (s - c.first) * stride; }
         int64_t  stride = 0;
         int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */

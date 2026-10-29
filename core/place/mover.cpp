@@ -81,7 +81,7 @@ Mover::~Mover() {
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
             if (c.slab_base) rad_dev_free(c.slab_base, RAD_MEM_DEVICE);
-            if (c.pool_base) rad_dev_free(c.pool_base, RAD_MEM_HOST_PINNED);
+            for (const ClassPools::Chunk& k : c.chunks) if (k.base) rad_dev_free(k.base, RAD_MEM_HOST_PINNED);
         }
         if (static_vram_) rad_dev_free(static_vram_, RAD_MEM_DEVICE);
         if (stage_) rad_dev_free(stage_, RAD_MEM_HOST_PINNED);
@@ -188,25 +188,37 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         total_shadow += shadow + sc.n_stage;
 
         cp.pool.init(n_pool[c], sc.stride);
-        if (n_pool[c] > 0) {
-            cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
-            if (!cp.pool_base) {
-                RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
-                        sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str());
+        for (int64_t first = 0; first < n_pool[c];) {
+            /* One chunk: the rest of the class, or as many slots as the host pool's largest free
+             * piece holds when it is in pieces (core/mem/pools.h). One chunk otherwise. */
+            int64_t n = n_pool[c] - first;
+            if (budget_ && budget_->host_pinned().pieces() > 1) {
+                const int64_t room = budget_->host_pinned().largest_free(RAD_ALIGN_UNIT) / sc.stride;
+                n = std::min(n, room);
+            }
+            char* base = n > 0 ? (char*)reserve(sc.name.c_str(), n * sc.stride, RAD_MEM_HOST_PINNED) : nullptr;
+            if (!base) {
+                RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s (%lld placed)",
+                        sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str(), (long long)first);
                 return RAD_E_NOMEM;
             }
-            /* The pool's base as the card addresses it (equal to the host address on a unified
-             * backend). Without one there is no zero-copy tier. */
-            cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
+            /* The chunk as the card addresses it (equal to the host address on a unified backend).
+             * Without one there is no zero-copy tier. */
+            char* dev = (char*)rad_dev_device_ptr(base);
             /* Warned, not refused: a pool nothing zero-copies out of is not an error. The host
              * pointer is valid on the device only where the two coincide. A deployment's pool is
              * RAD_MEM_HOST_MAPPED (core/mem/pools.cpp), so this fires only on the test path. */
-            if (!cp.pool_dev) {
+            if (!dev) {
                 RAD_WARN("mover: the '%s' host pool has no device address; a kernel reading it "
                          "zero-copy would fault", sc.name.c_str());
-                cp.pool_dev = cp.pool_base;
+                dev = base;
             }
+            cp.chunks.push_back({base, dev, first, n});
+            first += n;
         }
+        if (cp.chunks.size() > 1)
+            RAD_INFO("mover: the '%s' pool's %lld slots of %s in %zu chunks (the host pool in pieces)",
+                     sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str(), cp.chunks.size());
         /* The pool free list starts empty: every pooled unit occupies its slot. The engine primes
          * off the shadow slots and then alternates, a promotion freeing the pool slot a demotion
          * needs.
@@ -371,8 +383,8 @@ void* Mover::unit_base(int32_t unit) const {
         return cp.slot_ptr(us.slab_slot);
     if (us.tier == Tier::VRAM && us.static_off >= 0 && static_vram_)
         return (char*)static_vram_ + us.static_off;
-    if (us.tier == Tier::HostPinned && us.pool_slot >= 0 && cp.pool_dev)
-        return (char*)cp.pool_dev + us.pool_slot * cp.stride;
+    if (us.tier == Tier::HostPinned && us.pool_slot >= 0 && cp.has_pool())
+        return cp.pool_dptr(us.pool_slot);
     if (us.tier == Tier::HostPageable && us.static_off >= 0 && pageable_)
         return (char*)pageable_ + us.static_off;
     /* An unstaged file-tier unit has no address; a kernel cannot read from disk, so a caller
@@ -497,7 +509,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
 
     const void* src = nullptr;
     if (us.tier == Tier::HostPinned && us.pool_slot >= 0)
-        src = (char*)cp.pool_base + us.pool_slot * cp.stride;
+        src = cp.pool_ptr(us.pool_slot);
     else if (us.tier == Tier::HostPageable && us.static_off >= 0)
         src = (char*)pageable_ + us.static_off;
     else if (us.tier == Tier::SSD) {
@@ -570,7 +582,7 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
         if (!stageable(u)) continue;
         const UnitState& us = unit_[(size_t)u];
         const ClassPools& cp = pools_[(size_t)us.klass];
-        const char* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
+        const char* src = cp.pool_ptr(us.pool_slot);
         stage_picks_.push_back(StagePick{src, u, us.bytes, align_up(us.bytes, RAD_ALIGN_UNIT),
                                          nullptr});
     }
@@ -820,7 +832,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
          * budget and a demotion costs about what a promotion does, the exchange rate heat.h's
          * min_gain is tuned against. */
         if (rad_event_wait(mover_, gate_) < 0) { cp.pool.add_free(g); return false; }
-        queue_move_copy((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(us.slab_slot), us.bytes,
+        queue_move_copy(cp.pool_ptr(g), cp.slot_ptr(us.slab_slot), us.bytes,
                         rec);
         Move& m = moves_[(size_t)rec];
         m.kind = Move::Kind::Demote;
@@ -1153,7 +1165,7 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     if (rec < 0) { ++stats_.no_record; return RAD_E_FULL; }
     RAD_TRY(record_gate());
     if (us.pool_slot < 0) return RAD_E_STATE;
-    const void* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
+    const void* src = cp.pool_ptr(us.pool_slot);
     Move& m = moves_[(size_t)rec];
     RAD_TRY(rad_event_wait(mover_, gate_));
     queue_move_copy(cp.slot_ptr(slot), src, us.bytes, rec);
@@ -1392,7 +1404,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
             } else if (g >= 0) {
-                RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
+                RAD_TRY(rad_memcpy_async(cp.pool_ptr(g), cp.slot_ptr(from),
                                          us.bytes, mover_));
                 us.pool_slot = g;
                 us.slab_slot = -1;

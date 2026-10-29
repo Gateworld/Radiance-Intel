@@ -223,6 +223,49 @@ TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {
     CHECK(!p.configured());
 }
 
+/* The host pool in pieces (RADIANCE_HOST_POOL_PIECE_MIB; the Intel port, owner notes 87 / 90: xe
+ * cannot bind a host buffer over 4 GiB that a second card imports). 5 MiB in pieces of 2 MiB is three
+ * allocations, 2 + 2 + 1; a reservation never spans two, and one that fits no piece is refused with
+ * the largest piece's room as what was available. */
+TEST(a_host_pool_in_pieces_never_spans_a_piece) {
+    Config c = small_config();
+    c.host_pool_mib = 5;
+    setenv("RADIANCE_HOST_POOL_PIECE_MIB", "2", 1);
+    Pools p;
+    const int s = configure_pools(p, c);
+    unsetenv("RADIANCE_HOST_POOL_PIECE_MIB");
+    CHECK_OK(s);
+    Pool& h = p.host_pinned();
+    CHECK_EQ(h.pieces(), 3);
+    CHECK_EQ(h.bytes(), 5ll << 20);
+    CHECK_EQ(h.largest_free(RAD_ALIGN_UNIT), 2ll << 20);
+
+    char* a = (char*)h.reserve("a", 3 << 19, RAD_ALIGN_UNIT);       /* 1.5 MiB: piece 1 */
+    char* b = (char*)h.reserve("b", 3 << 19, RAD_ALIGN_UNIT);       /* 1.5 MiB: not in piece 1's rest */
+    REQUIRE(a != nullptr && b != nullptr);
+    CHECK(b < a || b >= a + (2 << 20));                              /* a different piece */
+    CHECK_EQ(h.largest_free(RAD_ALIGN_UNIT), 1ll << 20);             /* piece 3, untouched */
+    CHECK(h.reserve("too big for a piece", 5 << 19, RAD_ALIGN_UNIT) == nullptr);   /* 2.5 MiB */
+    REQUIRE_EQ((long long)h.shortfalls().size(), 1ll);
+    CHECK_EQ(h.shortfalls()[0].available, 1ll << 20);
+    char* d = (char*)h.reserve("d", 1 << 19, RAD_ALIGN_UNIT);       /* 0.5 MiB: piece 1's rest */
+    CHECK(d == a + (3 << 19));
+    CHECK_EQ(h.used(), (7ll << 19));
+    CHECK(h.report().find("in 3 pieces") != std::string::npos);
+}
+
+/* Unset (the default), the host pool is one allocation, as before the pieces. */
+TEST(a_host_pool_without_the_switch_is_one_allocation) {
+    Config c = small_config();
+    c.host_pool_mib = 5;
+    unsetenv("RADIANCE_HOST_POOL_PIECE_MIB");
+    Pools p;
+    CHECK_OK(configure_pools(p, c));
+    CHECK_EQ(p.host_pinned().pieces(), 1);
+    CHECK_EQ(p.host_pinned().largest_free(RAD_ALIGN_UNIT), 5ll << 20);
+    CHECK(p.host_pinned().reserve("all of it", 5 << 20, RAD_ALIGN_UNIT) != nullptr);
+}
+
 /* ================================================================== the derived budget */
 
 TEST(a_device_with_no_capacity_sizes_its_pools_from_the_program) {

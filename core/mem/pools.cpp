@@ -1,6 +1,7 @@
 /* pools.cpp -- see pools.h. */
 #include "mem/pools.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -59,9 +60,12 @@ void Pool::release() {
     if (elastic_) {
         vm_.release();
         elastic_ = false;
+    } else if (!pieces_.empty()) {
+        for (Piece& p : pieces_) if (p.base && alloc_) alloc_->free(p.base, kind_);
     } else if (base_ && alloc_) {
         alloc_->free(base_, kind_);
     }
+    pieces_.clear();
     base_ = nullptr;
     bytes_ = used_ = 0;
 }
@@ -76,9 +80,28 @@ void Pool::reset(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) 
     res_.clear();
 }
 
-int Pool::init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
+int Pool::init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a, int64_t piece) {
     reset(nm, bytes, kind, a);
     if (bytes_ <= 0) return RAD_OK;
+
+    if (piece > 0 && piece < bytes_) {
+        /* In pieces: whole pieces of `piece` bytes and a smaller last one, each its own
+         * allocation. Refused whole if any piece fails, as a single allocation would be. */
+        for (int64_t off = 0; off < bytes_; off += piece) {
+            const int64_t n = std::min(piece, bytes_ - off);
+            void* p = a->alloc(n, kind);
+            if (!p) {
+                const char* why = a == &rad_device_allocator() ? rad_dev_last_error() : nullptr;
+                shortfalls_.push_back({name_, fmt("backing allocation, piece %zu", pieces_.size() + 1), n, 0,
+                                       why && *why ? why : "the allocator returned nothing"});
+                release();
+                return RAD_E_NOMEM;
+            }
+            pieces_.push_back({p, n, 0});
+        }
+        base_ = pieces_[0].base;
+        return RAD_OK;
+    }
 
     base_ = a->alloc(bytes_, kind);
     if (!base_) {
@@ -92,8 +115,31 @@ int Pool::init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
     return RAD_OK;
 }
 
+int64_t Pool::largest_free(int64_t align) const {
+    if (align <= 0) return 0;
+    if (pieces_.empty()) return std::max<int64_t>(bytes_ - align_up(used_, align), 0);
+    int64_t best = 0;
+    for (const Piece& p : pieces_) best = std::max(best, p.bytes - align_up(p.used, align));
+    return best;
+}
+
 void* Pool::reserve(std::string_view what, int64_t bytes, int64_t align, int64_t* off_out) {
     if (bytes < 0 || align <= 0) return nullptr;
+    if (!pieces_.empty()) {
+        /* The first piece it fits in; a reservation never spans two. */
+        for (size_t i = 0; i < pieces_.size(); ++i) {
+            Piece& p = pieces_[i];
+            const int64_t off = align_up(p.used, align);
+            if (off + bytes > p.bytes) continue;
+            used_ += off + bytes - p.used;
+            p.used = off + bytes;
+            res_.push_back({std::string(what), off, bytes, (int)i});
+            if (off_out) *off_out = off;
+            return (char*)p.base + off;
+        }
+        shortfalls_.push_back({name_, std::string(what), bytes, largest_free(align)});
+        return nullptr;
+    }
     int64_t off = align_up(used_, align);
     if (off + bytes > bytes_) {
         shortfalls_.push_back({name_, std::string(what), bytes, bytes_ - off});
@@ -151,9 +197,14 @@ std::string Pool::report() const {
     std::string s = fmt("%-14s %10s budget, %10s used, %10s free\n",
                         name_.c_str(), humanb(bytes_).c_str(), humanb(used_).c_str(),
                         humanb(avail()).c_str());
+    if (!pieces_.empty())
+        s += fmt("    in %zu pieces of at most %s (RADIANCE_HOST_POOL_PIECE_MIB)\n", pieces_.size(),
+                 humanb(pieces_[0].bytes).c_str());
     for (const auto& r : res_)
-        s += fmt("    %-24s %10s @ +%lld\n", r.what.c_str(), humanb(r.bytes).c_str(),
-                 (long long)r.off);
+        s += pieces_.empty()
+                 ? fmt("    %-24s %10s @ +%lld\n", r.what.c_str(), humanb(r.bytes).c_str(), (long long)r.off)
+                 : fmt("    %-24s %10s @ piece %d +%lld\n", r.what.c_str(), humanb(r.bytes).c_str(), r.piece + 1,
+                       (long long)r.off);
     for (const auto& f : shortfalls_) s += "    " + f.str() + "\n";
     return s;
 }
@@ -221,7 +272,15 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,
      * rad_dev_device_ptr returns null in Mover::init and Site::DeviceZeroCopy experts get an
      * unusable pointer. On the host backend all memory kinds are the same aligned pages. */
-    if ((s = host_   .init("host_pool",   hp, RAD_MEM_HOST_MAPPED, host)) < 0) st = s;
+    /* RADIANCE_HOST_POOL_PIECE_MIB=<MiB> (the Intel port, owner notes 87 / 90): the host pool as
+     * allocations of at most that size (2048 is the port's setting) instead of one. Unset or 0: one
+     * allocation, as always. */
+    int64_t piece = 0;
+    if (const char* e = std::getenv("RADIANCE_HOST_POOL_PIECE_MIB")) {
+        const long long v = std::strtoll(e, nullptr, 10);
+        if (v > 0) piece = (int64_t)v * MiB;
+    }
+    if ((s = host_   .init("host_pool",   hp, RAD_MEM_HOST_MAPPED, host, piece)) < 0) st = s;
 
     fit_report_  = weights_.report();
     fit_report_ += kv_.report();
