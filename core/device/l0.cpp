@@ -463,13 +463,14 @@ std::atomic<int64_t> g_sig_early{0}, g_bar_early{0};
 std::atomic<int64_t> g_same_tape_waits{0};   /* plays that waited for the same tape's previous play (its lists were still in flight) */   /* N4's diagnostic: the ring event / the barrier already complete right after the play's submission */
 std::atomic<int64_t> g_nstretch_composed{0}, g_nstretch_evicted{0};
 std::atomic<int64_t> g_append_retries{0};   /* owner note 58: appends retried after an out-of-memory result */
+void vtrace_list(int d, int kind, int delta);   /* RADIANCE_L0_VRAM_TRACE's list counts (below) */
 Tape::~Tape() {
     for (Seg& s : segs)
-        if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 0, -1); }
     for (auto& kv : nstretch)
-        if (kv.second) { zeCommandListDestroy(kv.second); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        if (kv.second) { zeCommandListDestroy(kv.second); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 1, -1); }
     for (NDead& d : ndead)
-        if (d.list) { zeCommandListDestroy(d.list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        if (d.list) { zeCommandListDestroy(d.list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 1, -1); }
 }
 struct Rec {
     Tape* t = nullptr;
@@ -495,6 +496,98 @@ struct Rec {
  * decode-sized passes (ctx.cpp record_pass, n_tok <= 64), and this is a safety bound. */
 constexpr size_t kTapeMaxSegs = 2048;
 thread_local Rec t_rec;
+
+/* RADIANCE_L0_VRAM_TRACE=1 (owner note 61 item 0): where the recordings' VRAM goes, from this process's own DRM
+ * client per card (/proc/self/fdinfo: drm-total-vram0 of the xe clients whose drm-pdev is the card), read at each
+ * tape's begin and end and every 256 plays, against this card's lists alive by kind (the recordings' segment lists,
+ * the composed stretches) and their peaks, and the device layer's own allocations (g_used). The driver keeps a
+ * destroyed list's memory and reuses it (X1, run 75), so the peaks are what the VRAM follows. Run 76's V1 charged
+ * growth to each list's build window instead: most of it landed outside the windows, and two fdinfo reads a segment
+ * (the driver walks every buffer object on a read) cost enough host CPU to reach the heat stop. */
+bool vram_trace() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_VRAM_TRACE"); return e && e[0] == '1'; }();
+    return v;
+}
+struct VTrace {
+    std::mutex m;
+    std::vector<std::string> paths;    /* this card's xe client fdinfo files, one a client */
+    int64_t base = -1, used_base = 0;  /* at the first reading */
+    std::atomic<int64_t> seg_alive{0}, seg_peak{0}, seg_made{0}, str_alive{0}, str_peak{0}, str_made{0};
+};
+VTrace& vtrace(int d) { static VTrace v[kMaxDevices]; return v[d]; }
+int64_t fdinfo_bytes(const char* v) {
+    while (*v == ' ' || *v == '\t') ++v;
+    const double x = std::strtod(v, nullptr);
+    if (std::strstr(v, "GiB")) return (int64_t)(x * 1073741824.0);
+    if (std::strstr(v, "MiB")) return (int64_t)(x * 1048576.0);
+    if (std::strstr(v, "KiB")) return (int64_t)(x * 1024.0);
+    return (int64_t)x;
+}
+/* Finds this card's xe clients among the process's open files (on first use and at each tape_begin). */
+void vtrace_scan(int d) {
+    VTrace& V = vtrace(d);
+    const std::string& pci = devs()[d].pci;
+    std::map<std::string, std::string> by_client;
+    for (int fd = 0; fd < 4096; ++fd) {
+        char p[64];
+        std::snprintf(p, sizeof p, "/proc/self/fdinfo/%d", fd);
+        FILE* f = std::fopen(p, "r");
+        if (!f) continue;
+        char ln[256];
+        bool xe = false, mine = false;
+        std::string id;
+        while (std::fgets(ln, sizeof ln, f)) {
+            if (!std::strncmp(ln, "drm-driver:", 11)) xe = std::strstr(ln + 11, "xe") != nullptr;
+            else if (!std::strncmp(ln, "drm-pdev:", 9)) mine = !pci.empty() && std::strstr(ln + 9, pci.c_str()) != nullptr;
+            else if (!std::strncmp(ln, "drm-client-id:", 14)) id = ln + 14;
+        }
+        std::fclose(f);
+        if (xe && mine && !id.empty() && !by_client.count(id)) by_client[id] = p;
+    }
+    std::lock_guard<std::mutex> lk(V.m);
+    V.paths.clear();
+    for (auto& kv : by_client) V.paths.push_back(kv.second);
+}
+int64_t vram_proc(int d) {
+    VTrace& V = vtrace(d);
+    if (V.paths.empty()) vtrace_scan(d);
+    std::lock_guard<std::mutex> lk(V.m);
+    int64_t sum = 0;
+    for (const std::string& p : V.paths) {
+        FILE* f = std::fopen(p.c_str(), "r");
+        if (!f) continue;
+        char ln[256];
+        while (std::fgets(ln, sizeof ln, f))
+            if (!std::strncmp(ln, "drm-total-vram0:", 16)) sum += fdinfo_bytes(ln + 16);
+        std::fclose(f);
+    }
+    if (V.base < 0) { V.base = sum; V.used_base = g_used[d].load(std::memory_order_relaxed); }
+    return sum;
+}
+/* A list of this card's made (+1) or destroyed (-1): kind 0 a recording's segment list, 1 a composed stretch. */
+void vtrace_list(int d, int kind, int delta) {
+    if (!vram_trace()) return;
+    VTrace& V = vtrace(d);
+    std::atomic<int64_t>& alive = kind ? V.str_alive : V.seg_alive;
+    std::atomic<int64_t>& peak = kind ? V.str_peak : V.seg_peak;
+    const int64_t a = alive.fetch_add(delta, std::memory_order_relaxed) + delta;
+    if (delta > 0) {
+        (kind ? V.str_made : V.seg_made).fetch_add(delta, std::memory_order_relaxed);
+        int64_t p = peak.load(std::memory_order_relaxed);
+        while (a > p && !peak.compare_exchange_weak(p, a, std::memory_order_relaxed)) {}
+    }
+}
+void vtrace_report(int d, const char* at, unsigned long long id) {
+    if (!vram_trace()) return;
+    VTrace& V = vtrace(d);
+    const int64_t now = vram_proc(d), used = g_used[d].load(std::memory_order_relaxed);
+    const double M = 1048576.0;
+    RAD_INFO("l0 vram trace dev %d %s %llu: process VRAM %.0f MiB (+%.0f since the first reading); engine allocations +%.0f; "
+             "segment lists alive %lld (peak %lld, made %lld); composed lists alive %lld (peak %lld, made %lld)",
+             d, at, id, now / M, (now - V.base) / M, (used - V.used_base) / M, (long long)V.seg_alive.load(),
+             (long long)V.seg_peak.load(), (long long)V.seg_made.load(), (long long)V.str_alive.load(),
+             (long long)V.str_peak.load(), (long long)V.str_made.load());
+}
 
 bool recording() { return t_rec.t && (t_rec.g || t_rec.nlist) && t_rec.pause == 0; }
 /* The native recorder is open on this thread: commands on its streams go into the command list. */
@@ -1075,6 +1168,7 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
     r.dep_dev = t.dev; r.dep_slot = dep_slot; r.dep_serial = dep_serial;
     const int64_t np = g_nplays.fetch_add(1, std::memory_order_relaxed) + 1;
     g_nlists_played.fetch_add(n, std::memory_order_relaxed);
+    if (vram_trace() && np % 256 == 0) vtrace_report(t.dev, "after play", (unsigned long long)np);
     if (np % 8192 == 0)   /* the pool's shape over a long run (run 23: the replays' host memory growth) */
         RAD_INFO("l0 tape: %lld plays; lists created %lld, destroyed %lld (alive %lld); stretches composed %lld, evicted %lld; kernel objects %lld",
                  (long long)np, (long long)g_nlists_created.load(), (long long)g_nlists_destroyed.load(),
@@ -1293,6 +1387,7 @@ void n_seg_close() {
         }
         sg.list = l;
         t.ncmds += sg.nodes;
+        vtrace_list(t.dev, 0, 1);
     } else {
         zeCommandListDestroy(l);
         g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
@@ -1377,6 +1472,11 @@ int z_tape_begin(void) {
         device_set_error("tape_begin: the home stream's native handle is not an immediate command list");
         return RAD_E_UNSUPPORTED;
     }
+    if (vram_trace() && native) {
+        vtrace_scan(t_device);
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 4) vtrace_report(t_device, "before tape", (unsigned long long)t->id);
+    }
     t_rec = Rec{};
     t_rec.t = t.release();
     t_rec.native = native;
@@ -1435,6 +1535,7 @@ RadTape z_tape_end(int keep) {
     }
     const bool lost = t_rec.lost;
     t_rec = Rec{};
+    if (vram_trace() && t->native) vtrace_report(t->dev, "after tape", (unsigned long long)t->id);
     /* Owner note 58 (E11): a segment whose close failed never ran, so this pass is incomplete on this rank --
      * reported with a fixed prefix the context turns into a failed step, never a silent refusal (the rest of
      * the pass ran plainly without that segment's commands and gave a different answer). */
@@ -1665,6 +1766,7 @@ ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
     if (rc != ZE_RESULT_SUCCESS) fail("zeCommandListClose", rc);
     if (prof.ts) { std::lock_guard<std::mutex> lk(nprof_mutex()); nprof_lists()[l] = std::move(prof); }
     g_nstretch_composed.fetch_add(1, std::memory_order_relaxed);
+    vtrace_list(t.dev, 1, 1);
     static std::atomic<int> told{0};
     if (told.fetch_add(1) < 4)
         RAD_INFO("l0 tape %llu: segments [%d, %d) composed into one native list of %zu command(s)", (unsigned long long)t.id, from, to, n);
@@ -1673,7 +1775,7 @@ ze_command_list_handle_t n_compose(Tape& t, int from, int to) {
 /* Destroys the evicted stretch lists whose follow-up play has completed. */
 void n_reap_stretches(Tape& t) {
     while (!t.ndead.empty() && n_slot_done(t.dev, t.ndead.front().slot, t.ndead.front().serial)) {
-        if (t.ndead.front().list) { zeCommandListDestroy(t.ndead.front().list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        if (t.ndead.front().list) { zeCommandListDestroy(t.ndead.front().list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(t.dev, 1, -1); }
         t.ndead.pop_front();
     }
 }
@@ -1690,6 +1792,7 @@ int play_now(Tape& tr, int from, int to) {
                 for (Seg& s : t->segs)
                     if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; ++n; }
                 g_nlists_destroyed.fetch_add(n, std::memory_order_relaxed);
+                vtrace_list(t->dev, 0, -(int)n);
                 t->segs_dropped = true;
                 static std::atomic<int> told{0};
                 if (told.fetch_add(1) < 4)
