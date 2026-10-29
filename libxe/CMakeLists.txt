@@ -167,6 +167,7 @@ if(RAD_BUILD_TESTS)
   # context over both cards, touched by one card's copy queue. A two-card probe only; no CPU test.
   add_executable(xe_hostbind_probe test/hostbind_probe.cpp)
   rad_l0_sycl(xe_hostbind_probe)
+  target_link_libraries(xe_hostbind_probe PRIVATE ${RAD_ZE_LOADER})
   set_target_properties(xe_hostbind_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
   # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
