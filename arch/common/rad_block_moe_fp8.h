@@ -283,6 +283,9 @@ struct MoeFP8 {
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
         rad_buf sgate   = 0;   /* [max_tok, 1]                bf16 */
+        /* Owner note 53 (RADIANCE_HOST_EXPERTS=1): the host's partial sum of the routed experts the
+         * card does not hold, in the host arena with `ids` and `ew`. Optional: 0 declares no host op. */
+        rad_buf hpart   = 0;   /* [max_tok, n_embd]           bf16, host domain */
     };
 
     /* Checkpoint names. `experts` is a prefix ("....mlp.experts") from which per-expert names are
@@ -352,6 +355,10 @@ struct MoeFP8 {
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    /* moe_host_experts (owner note 53), declared when the wire has `hpart`: a host op on lane 1, behind
+     * the router, issued after the routed GEMMs so their launches are already submitted while the host
+     * waits; lane 0 waits for it before the gather. */
+    rad_op op_host = 0;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -1305,6 +1312,17 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     if (!op_gather) return RAD_E_INVAL;
 
+    /* Owner note 53: the host's partial (see Wire::hpart). It must resolve when asked for. */
+    if (w.hpart) {
+        op_host = rw(b, RAD_OP(b, "moe_host_experts",
+                               RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                          RAD_INT("top_k", c.top_k), RAD_INT("n_expert", c.n_expert_all),
+                                          RAD_STR("dtype", g.dtype)),
+                               RAD_NOWEIGHTS),
+                     {w.ids, w.ew}, {w.hpart});
+        if (!op_host) return RAD_E_INVAL;
+    }
+
     /* ---- the shared expert. Ordinary dense linears over the same normed input. */
     if (shared) {
         /* The shared arm runs concurrently with the routed GEMMs, so its buffers are excluded from
@@ -1595,6 +1613,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
 
+    /* Owner note 53: lane 1 stands behind the routing now; the host op it carries is issued after the
+     * routed GEMMs (below), so in a recorded pass they are in the stretch already played when the host
+     * joins. */
+    if (op_host) {
+        rad_lane(c_, 1);
+        rad_lane_join(c_, 0, 1);
+        rad_lane(c_, 0);
+    }
+
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */
     const bool rot = c.expert_rot != 0;
@@ -1713,6 +1740,16 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                                      "tokens to %s%s\n", calib_rows, calib_dir(),
                              (a && bb && ce) ? "" : ", with errors");
         }
+    }
+
+    /* Owner note 53: the host's partial, on lane 1 behind the routing; lane 0 waits for it here. This
+     * first form only places the step (its partial is zero and nothing adds it yet). */
+    if (op_host) {
+        rad_lane(c_, 1);
+        RAD_ISSUE_N(c_, op_host, rows, brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brow_slice(w.hpart, r0, rows, g.n_embd));
+        rad_lane(c_, 0);
+        rad_lane_join(c_, 1, 0);
     }
 
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes

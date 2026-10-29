@@ -1903,6 +1903,18 @@ int ref_moe_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("moe_gather", operand, out);
 }
 
+int ref_moe_host_experts_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t k = gi(p, n_p, "top_k", 0), ne = gi(p, n_p, "n_expert", 0);
+    if (M <= 0 || n <= 0 || k <= 0 || ne <= 0 || k > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t((uint32_t)RAD_I32, { M, k });                /* expert_ids */
+    o.t(D, { M, k });                                /* expert_w */
+    o.t(D, { M, n });                                /* y -- the host's partial sum, token order */
+    return o.finish("moe_host_experts", operand, out);
+}
+
 int ref_row_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), R = gi(p, n_p, "R", 0);
     if (M <= 0 || N <= 0 || R <= 0) return RAD_E_UNSUPPORTED;

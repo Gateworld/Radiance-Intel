@@ -259,6 +259,7 @@ int ref_moe_cb_unrelayout  (const RadParam*, int, int, const RadEncoding*, const
                             const void*, int64_t, const RadTensor*, int);
 int ref_scale_rows         (const RadArgs*, RadStream);
 int ref_moe_gather         (const RadArgs*, RadStream);
+int ref_moe_host_experts   (const RadArgs*, RadStream);
 int ref_row_topk           (const RadArgs*, RadStream);
 int ref_row_topk_merge     (const RadArgs*, RadStream);
 int ref_pair_argmax        (const RadArgs*, RadStream);
@@ -492,6 +493,7 @@ REF_SHAPE_FN(ref_moe_gemm_q);
 REF_SHAPE_FN(ref_moe_gemm_q_mod4);
 REF_SHAPE_FN(ref_scale_rows);
 REF_SHAPE_FN(ref_moe_gather);
+REF_SHAPE_FN(ref_moe_host_experts);
 REF_SHAPE_FN(ref_row_topk);
 REF_SHAPE_FN(ref_row_topk_merge);
 REF_SHAPE_FN(ref_pair_argmax);

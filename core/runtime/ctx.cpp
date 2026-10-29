@@ -1266,6 +1266,9 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
+            /* the touch state this op's join saw when recorded: the play re-recorded the events */
+            host_touch_pending_[0] = th.pend[0];
+            host_touch_pending_[1] = th.pend[1];
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;

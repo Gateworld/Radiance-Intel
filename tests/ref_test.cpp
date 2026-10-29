@@ -992,7 +992,7 @@ TEST(op_vocabulary) {
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
-        "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
+        "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather", "moe_host_experts",
         "row_topk",
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
@@ -8470,6 +8470,7 @@ std::vector<Geo> geometries() {
                                      .i("top_k", 2).i("group", 128).s("a_order", "sorted")
                                      .s("dtype", "fp8a8")),
         G("moe_gather", "M", 3, a.i("M", R).i("n", 8).i("top_k", 2).s("dtype", "f32")),
+        G("moe_host_experts", "M", 3, a.i("M", R).i("n", 8).i("top_k", 2).i("n_expert", 4).s("dtype", "f32")),
         G("row_topk", "M", 3, a.i("M", R).i("N", 20).i("R", 4).s("dtype", "f32")),
         G("row_topk_merge", "M", 3, a.i("M", R).i("R", 4).i("world_size", 2).s("dtype", "f32")),
         G("pair_argmax", "M", 3, a.i("M", R).i("n", 4).s("dtype", "f32")),

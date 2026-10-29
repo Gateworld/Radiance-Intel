@@ -469,6 +469,11 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes' host-touch state when the op was recorded (before its join), restored before
+         * the join at every play: the play re-records the touch events but does not re-run the
+         * issues that set the flags, so without it every host op after the pass's first would skip
+         * its wait (run 79, owner note 53: one host op per routed layer). */
+        bool             pend[2] = {false, false};
     };
     struct PassTape {
         uint64_t key = 0;

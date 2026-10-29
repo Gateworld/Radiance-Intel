@@ -850,6 +850,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      *
      * The device caches host-arena memory, so rad_dev_host_wrote after the launch makes the
      * host's writes visible to later kernels. */
+    /* the lanes' touch state the join is about to consume, kept with a recorded host op (TapeHost::pend) */
+    const bool touch_pend0 = host_touch_pending_[0], touch_pend1 = host_touch_pending_[1];
     if (dom == RAD_DOMAIN_HOST) {
         /* Timed apart from the op: it is the cost of stopping the pipeline. */
         if (profiling_) {
@@ -909,6 +911,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         th.args = ip.args;
         th.n = n;
         th.drain = host_join_drains(opd, n_opd);
+        th.pend[0] = touch_pend0;
+        th.pend[1] = touch_pend1;
         for (int i = 0; i < n_opd; ++i) th.t[i] = t[i];
         TapeStep st;
         st.kind = kTapeHost;

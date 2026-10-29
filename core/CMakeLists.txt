@@ -19,6 +19,9 @@ endforeach()
 file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
+# The Intel port's xe-direct experiment (closed, owner note 64; its files kept uncommitted in the tree, note 63) is
+# not part of the engine: only its standalone tests would build it.
+list(REMOVE_ITEM RAD_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/device/xe_direct.cpp)
 
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)

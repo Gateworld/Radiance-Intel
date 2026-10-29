@@ -785,6 +785,25 @@ int ref_moe_gather(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ moe_host_experts */
+/* Owner note 53, step 1 (m3/design-host-experts.md): the host's partial sum of the routed experts the card
+ * does not hold. This form holds no expert yet, so every partial is zero: it is the per-layer host step
+ * (its join on the router, its write to the host arena) without the work. */
+int ref_moe_host_experts(const RadArgs* a, RadStream) {
+    if (a->n_t < 3) return RAD_E_INVAL;
+    const RadTensor *ids = &a->t[0], *ew = &a->t[1], *Y = &a->t[2];
+    if (!ids->data || !ew->data || !Y->data) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(Y) / n;
+    if (M <= 0) return RAD_E_SHAPE;
+    const int64_t y_rs = Y->rank >= 2 ? Y->stride[Y->rank - 2] : n;
+    const int64_t y_cs = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
+    for (int64_t t = 0; t < M; ++t)
+        for (int64_t c = 0; c < n; ++c) stt(Y, t * y_rs + c * y_cs, 0.0f);
+    return RAD_OK;
+}
+
 /* One step of a selection sort over `n` candidates: the unused one with the largest value, ties to
  * the lower id, skipping pads (id < 0). Returns its index, or -1 when none is left. */
 template <class Id, class Val>

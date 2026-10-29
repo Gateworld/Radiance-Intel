@@ -156,6 +156,7 @@ struct Model {
 
     /* the routed feed-forward's */
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
+    rad_buf b_hpart = 0;   /* owner note 53 (RADIANCE_HOST_EXPERTS=1): the host experts' partial */
     rad_buf b_egu = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
     ActFP8  a_eff{}, a_sff{};
     /* The rotated codes of the block input, for the routed arm only: `q` and `s` are used and `x`
@@ -868,8 +869,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The model's expert count, not this rank's: the router is replicated and scores every
      * expert. */
     m.b_rlogits = decl_b(b, nm.f("moe_logits"), g.act_dtype, {T, m.moecfg.n_expert_all});
-    m.b_eids    = decl_b(b, nm.f("moe_ids"),    RAD_I32,     {T, m.moecfg.top_k});
-    m.b_ew      = decl_b(b, nm.f("moe_ew"),     g.act_dtype, {T, m.moecfg.top_k});
+    /* Owner note 53 (m3/design-host-experts.md): with RADIANCE_HOST_EXPERTS=1 every routed layer has a
+     * host op behind its router (MoeFP8::op_host) that reads the routing and writes a partial sum, so
+     * the routing and the partial live in the host arena: the host op's join then waits on the router
+     * alone, not the stream. Off by default; with it off nothing here changes. */
+    static const bool host_experts = [] {
+        const char* v = std::getenv("RADIANCE_HOST_EXPERTS");
+        return v && v[0] == '1';
+    }();
+    const int route_dom = host_experts ? RAD_DOMAIN_HOST : RAD_DOMAIN_DEVICE;
+    m.b_eids    = decl_b(b, nm.f("moe_ids"),    RAD_I32,     {T, m.moecfg.top_k}, RAD_BUF_TRANSIENT, route_dom);
+    m.b_ew      = decl_b(b, nm.f("moe_ew"),     g.act_dtype, {T, m.moecfg.top_k}, RAD_BUF_TRANSIENT, route_dom);
+    if (host_experts)
+        m.b_hpart = decl_b(b, nm.f("moe_hpart"), g.act_dtype, {T, g.n_embd}, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.b_eoff    = decl_b(b, nm.f("moe_eoff"),   RAD_I32,     {m.moecfg.n_expert + 1});
     /* PERSIST, not transient. `moe_scatter` writes the per-expert histogram and no declared op
      * reads it (rad_route_report is a handoff, not an op), so as a transient liveness would let a
@@ -991,6 +1003,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
     mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
+    mw.hpart = m.b_hpart;
 
     HyperConn::Wire hw{};
     hw.h = m.b_h; hw.x = m.a_x; hw.inj = m.b_inj;
@@ -1312,6 +1325,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * they must survive the round that produced them. */
         tw.attn = aw; tw.attn.x = m.b_mtp_hw;
         tw.mlp  = mw; tw.mlp.x  = m.b_mtp_hw;
+        tw.mlp.hpart = 0;   /* owner note 53's host step: the trunk's routed layers only, for now */
         /* The QSA wire is within-step scratch and a draft round is its own step, so the head
          * shares all of it. The QSA tail is per-layer state (`kv_qsa_tail`), not in the wire, and
          * declare() binds the head's layer to it like any other. */

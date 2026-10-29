@@ -567,6 +567,14 @@ static const RadParamSpec pMoeGather[] = { P_INT("M"), P_INT("n"), P_INT("top_k"
 static const RadOperandSpec oMoeGather[] = { OPD("y_expert"), OPD("expert_w"), OPD("sorted_tok"),
                                              OPD_O("shared"), OPD_O("shared_gate"), OUT("y") };
 
+/* Owner note 53 (run 79, step 1 of m3/design-host-experts.md): the routed experts the card does not
+ * hold, computed on the host into a partial sum the layer adds. A host row only (the routing and the
+ * partial live in the host arena). This first form writes zeros: it places the per-layer host step and
+ * measures its wait; the residency view and the computation come next. */
+static const RadParamSpec pMoeHostExperts[] = { P_INT("M"), P_INT("n"), P_INT("top_k"),
+                                                P_INT("n_expert"), P_STR("dtype") };
+static const RadOperandSpec oMoeHostExperts[] = { OPD("expert_ids"), OPD("expert_w"), OUT("y") };
+
 /* `vocab_off` and `pairs` are the vocab-parallel form: `x` is one rank's slice, `idx` carries
  * global columns, and `pairs` is the [M, R, 2] (int32 id, float value) plane an all_gather moves.
  * Must match libr4d's schema, or the loader refuses ref and the model fails to load. */
@@ -1468,6 +1476,8 @@ static const RadOpSchema kSchemas[] = {
   "`w_q` class q at [N_q, K_q], expert e at entry e/4 of class e%4. The output is as wide as the "
   "widest class in `parts` stacked parts, and a narrower class fills each part's leading columns "
   "and zeros the rest." },
+{ "moe_host_experts", ARR(pMoeHostExperts), ARR(oMoeHostExperts),
+  "the routed experts the card does not hold, computed on the host into a partial sum (owner note 53)." },
 { "moe_gather", ARR(pMoeGather), ARR(oMoeGather),
   "Scatters the sorted expert output back and weights it. The sum over a token's slots runs in "
   "ASCENDING SLOT order, which is what makes it reproducible." },
@@ -2238,6 +2248,9 @@ ROW_CB("ref_moe_gemm_q", "moe_gemm_q", "moe",
 ROW_CB("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
        "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
        DT_FLOAT_CB, ref_moe_gemm_q_mod4),
+SIMPLE("ref_moe_host_experts", "moe_host_experts", "moe",
+       "the routed experts the card does not hold, on the host into a partial sum", DT_FLOAT,
+       ref_moe_host_experts),
 SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        ref_moe_gather),
 SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),
