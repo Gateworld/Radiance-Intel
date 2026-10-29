@@ -448,6 +448,10 @@ struct Tape {
     uint64_t nclock = 0;
     struct NDead { ze_command_list_handle_t list; int slot; uint64_t serial; };
     std::deque<NDead> ndead;
+    /* RADIANCE_L0_TAPE_EARLY=1 (owner note 65): segment lists released while recording, each once its own
+     * play has completed (and the recording made to wait when too many are in flight), blocks composed as
+     * they fill, the rest released at tape_end -- instead of every segment list waiting for the first play */
+    std::deque<NDead> nseg_dead;
     bool segs_dropped = false;         /* the segment lists went at the first play (the pool's phase 2) */
     bool oom_told = false;             /* owner note 58: an out-of-memory append retried, said once a tape */
     /* owner note 42: the recorded waits whose signaller is inside the tape (the event, the waiter's segment),
@@ -471,6 +475,8 @@ Tape::~Tape() {
         if (kv.second) { zeCommandListDestroy(kv.second); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 1, -1); }
     for (NDead& d : ndead)
         if (d.list) { zeCommandListDestroy(d.list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 1, -1); }
+    for (NDead& d : nseg_dead)   /* a tape is deleted idle (release_tape), so these plays have completed */
+        if (d.list) { zeCommandListDestroy(d.list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(dev, 0, -1); }
 }
 struct Rec {
     Tape* t = nullptr;
@@ -1364,6 +1370,8 @@ void seg_open() {
     for (L0Stream* s : t.qs) qs.push_back(s->q);
     t_rec.g->begin_recording(qs);
 }
+void n_early_after_seg(Tape& t, int si);   /* RADIANCE_L0_TAPE_EARLY (owner note 65), below n_compose */
+void n_early_end(Tape& t);
 /* Closes the open native segment: close the list, run it (a play of one list), keep it. */
 void n_seg_close() {
     Tape& t = *t_rec.t;
@@ -1401,6 +1409,7 @@ void n_seg_close() {
         if (kept.list) n_rerecord(t, kept.evs);
         else if (t.nslot >= 0) { n_rerecord(t, kept.evs); ++t.dangling_fixed; }   /* owner note 42: event-only after native work: a runtime-queue record would not follow the lists */
         else rerecord(t, kept.evs);
+        n_early_after_seg(t, si);
     }
 }
 /* Closes the open segment: finalize, run, keep. */
@@ -1588,6 +1597,10 @@ RadTape z_tape_end(int keep) {
         RAD_INFO("l0 tape: %zu segment(s), %zu %s, %zu event record(s), %zu stream(s) recorded%s",
                  t->segs.size(), nodes, t->native ? "command(s) in native lists" : "graph node(s)", evs, t->qs.size(),
                  t->fence ? "" : ", played unfenced");
+    if (t->native) {
+        const int rc = guarded("tape_end", [t] { n_early_end(*t); });
+        if (rc != RAD_OK) { release_tape(t); return nullptr; }
+    }
     return (RadTape)t;
 }
 
@@ -1778,6 +1791,63 @@ void n_reap_stretches(Tape& t) {
         if (t.ndead.front().list) { zeCommandListDestroy(t.ndead.front().list); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); vtrace_list(t.dev, 1, -1); }
         t.ndead.pop_front();
     }
+}
+/* RADIANCE_L0_TAPE_EARLY=1 (owner note 65). The driver keeps the high-water mark of lists alive at once
+ * (X1, V2), and with segment lists waiting for their tape's first play, the recordings of new shapes stack
+ * up before any is replayed (H26: 3,636 segment lists at once, +4.9 GiB a card, where the steady state
+ * plays 542 composed lists). Here a recording releases its segment lists as it goes: each segment's list is
+ * queued with its own play's slot and destroyed once that play has completed, the recording waiting for
+ * the oldest when more than kEarlyWindow are in flight; each full block of kBlock segments is composed as it
+ * fills (from the kept descriptors, as a play would); tape_end waits for the recording's last play, releases
+ * the rest and marks the tape so every play composes (the partial ranges on demand, as today). Off: the
+ * shipped behaviour (segment lists live until the first play). */
+bool tape_early() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_TAPE_EARLY"); return e && e[0] == '1'; }();
+    return v;
+}
+constexpr size_t kEarlyWindow = 64;   /* segment lists of the current recording in flight at most */
+void n_early_drop(Tape& t, const Tape::NDead& d) {
+    if (!d.list) return;
+    t.nlast.erase(d.list);
+    zeCommandListDestroy(d.list);
+    g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
+    vtrace_list(t.dev, 0, -1);
+}
+void n_early_after_seg(Tape& t, int si) {
+    if (!tape_early() || !t.native || compose_mode() == 0) return;
+    Seg& s = t.segs[(size_t)si];
+    if (s.list) {
+        t.nseg_dead.push_back(Tape::NDead{s.list, t.nslot, t.nserial});   /* its play is the tape's latest */
+        s.list = nullptr;
+    }
+    if ((si + 1) % kBlock == 0) {
+        const std::pair<int, int> key{si + 1 - kBlock, si + 1};
+        if (!t.nstretch_used.count(key)) {
+            t.nstretch[key] = n_compose(t, key.first, key.second);   /* null when the block holds no command */
+            t.nstretch_used[key] = ++t.nclock;
+        }
+    }
+    while (!t.nseg_dead.empty() && n_slot_done(t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial)) {
+        n_early_drop(t, t.nseg_dead.front());
+        t.nseg_dead.pop_front();
+    }
+    while (t.nseg_dead.size() > kEarlyWindow) {
+        n_slot_wait(t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial, "an early segment release");
+        n_early_drop(t, t.nseg_dead.front());
+        t.nseg_dead.pop_front();
+    }
+}
+void n_early_end(Tape& t) {
+    if (!tape_early() || !t.native || compose_mode() == 0) return;
+    for (Seg& s : t.segs)   /* none expected: each segment's list was queued at its close */
+        if (s.list) { t.nseg_dead.push_back(Tape::NDead{s.list, t.nslot, t.nserial}); s.list = nullptr; }
+    if (!t.nseg_dead.empty()) {
+        /* the immediate list is in order: the last queued play complete means all of them are */
+        n_slot_wait(t.dev, t.nseg_dead.back().slot, t.nseg_dead.back().serial, "the recording's segment release");
+        for (const Tape::NDead& d : t.nseg_dead) n_early_drop(t, d);
+        t.nseg_dead.clear();
+    }
+    t.segs_dropped = true;
 }
 int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
