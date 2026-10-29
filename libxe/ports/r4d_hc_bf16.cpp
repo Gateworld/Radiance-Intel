@@ -1074,7 +1074,7 @@ __global__ __launch_bounds__(kThreads)
 void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       const unsigned short* __restrict__ dbuf,
                       const unsigned short* __restrict__ h, const float* __restrict__ w,
-                      const float* __restrict__ scalein,
+                      const float* __restrict__ scalein, const unsigned short* __restrict__ nbuf,
                       unsigned short* __restrict__ x, unsigned char* __restrict__ q,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
@@ -1130,8 +1130,9 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
         float acc = 0.0f;
         for (int c = 0; c < hc; ++c) {
             const long j = (long)c * n + i;
-            const float Nv = nbf(bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c]
-                                 * (w[j] + wadd));
+            /* hc_read V2 wrote N once (hc_v2_norm_kernel, the same bf16 value as this expression). */
+            const float Nv = nbuf ? bf2f(nbuf[r * (long)hc * n + j])
+                                  : nbf(bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c] * (w[j] + wadd));
             acc += bf2f(s_u[rl * kUpRows + c * ipb + ii]) * Nv;
         }
         acc *= inv_hc;
@@ -1225,6 +1226,7 @@ static inline int hc_up_launch(const RadTensor* up, long uld, int f8, const unsi
 static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i8,
                                    const unsigned short* dbuf,
                                    const unsigned short* h, const float* w, const float* scale,
+                                   const unsigned short* nbuf,
                                    unsigned short* x, unsigned char* q, float* qs,
                                    unsigned char* rq, float* rqs,
                                    unsigned int* ctr, long long rows, long long n, int hc,
@@ -1238,7 +1240,8 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
     const void* upp = up->data;
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
     emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds,     \
-                       upp, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, (long)rows, (long)n,  \
+                       upp, uld, dbuf, h, w, scale, nbuf, x, q, qs, rq, rqs, ctr, (long)rows,      \
+                       (long)n,                                                                   \
                        hc,                                                                        \
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
                        (long)rsrow, wadd)
@@ -1257,6 +1260,100 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
 #undef HC_UPMIX_CASE
 #undef HC_UPMIX_CASE3
     return emit_rc;
+}
+
+/* ============================================================== hc_read V2, the decode products
+ *
+ * Intel port, owner note 66 (RADIANCE_XE_HC_V2=1, the E4M3 decode path below kDecMinRows rows). Kernel A
+ * spends its time before the first weight byte: every workgroup re-sums all of `h` for the norm and stages N
+ * in LDS, and with ta = 4 columns a workgroup only four of its eight waves stream W_down. Here the norm runs
+ * once and the products read N from global memory:
+ *
+ *   hc_v2_norm  grid (hc, rows): stream c's sum of squares in kernel A's order (thread tid takes i = tid,
+ *               tid + 256, ...; the wave sums; the waves' sums in order), its scale (published for the mix as
+ *               kernel A does), and stream c of N written to `nbuf` [rows, hc * n] as bf16 by kernel A's
+ *               expression.
+ *   hc_v2_down  grid (ceil(lr / 8) + 1, rows): a wave a column of W_down, the same lane-strided dot
+ *               (hc8_dot_down) and wave sum over the same N, eight columns a workgroup so every wave
+ *               streams. The last workgroup computes the inject gains, as kernel A's does.
+ *   hc_up_mix   reads N from `nbuf` instead of recomputing it from h, the scales and w (the same bf16).
+ *
+ * Bit-identical to kernel A and hc_up_mix: the same values in the same summation order; only where N
+ * lives and which workgroup runs what change. */
+constexpr int kV2Cols = kWaves;   // columns of W_down a workgroup owns: one a wave
+
+__global__ __launch_bounds__(kThreads)
+void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                       unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
+                       long rows, long n, int hc, long hrow, float eps, float wadd) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    const int  c = blockIdx.x;
+    const long r = blockIdx.y;
+    if (r >= rows || c >= hc) return;
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const unsigned short* hp = h + r * hrow;
+    const long cb = (long)c * n;
+
+    /* kernel A's loop for one stream: the prefetch depth moves arrival times, not the order */
+    constexpr int kPreSs = 8;
+    float acc = 0.0f;
+    long  i = tid;
+    for (; i + (long)(kPreSs - 1) * kThreads < n; i += (long)kPreSs * kThreads) {
+        uint32_t hv[kPreSs];
+#pragma unroll
+        for (int p = 0; p < kPreSs; ++p) hv[p] = bfw(hp + cb + i + (long)p * kThreads);
+#pragma unroll
+        for (int p = 0; p < kPreSs; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
+    }
+    for (; i < n; i += kThreads) { const float v = bf2f(hp[cb + i]); acc += v * v; }
+    acc = wave_sum(acc);
+    if (lane == 0) s_part[wave] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int k = 0; k < kWaves; ++k) ss += s_part[k];
+        const float sc = __frsqrt_rn(ss / (float)n + eps);
+        s_sc = sc;
+        if (scaleout) scaleout[r * kHcMax + c] = sc;
+    }
+    __syncthreads();
+    const float sc = s_sc;
+    unsigned short* np = nbuf + r * (long)hc * n + cb;
+    for (long j = tid; j < n; j += kThreads) np[j] = f2bf(bf2f(hp[cb + j]) * sc * (w[cb + j] + wadd));
+}
+
+__global__ __launch_bounds__(kThreads)
+void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
+                       const unsigned short* __restrict__ injw, unsigned short* __restrict__ dout,
+                       unsigned short* __restrict__ inj, long rows, int hc, long HN, long lr, long irow) {
+    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);   /* wave_dot_lds for the inject gains */
+    const long r = blockIdx.y;
+    if (r >= rows) return;
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const unsigned short* sN = nbuf + r * HN;
+    const float inv_hc = 1.0f / (float)hc;
+    if (blockIdx.x != gridDim.x - 1) {
+        const long k = (long)blockIdx.x * kV2Cols + wave;
+        if (k >= lr) return;
+        float acc = hc8_dot_down<kDotU, false>(sN, (const unsigned char*)downv + k * dld, HN, lane);
+        acc = wave_sum(acc);
+        if (lane == 0) dout[r * lr + k] = f2bf(siluf_(acc * inv_hc));
+        return;
+    }
+    if (!injw || !inj) return;
+    for (int c = wave; c < hc; c += kWaves) {
+        const unsigned short* wr = injw + (long)c * HN;
+        float acc = wave_dot_lds<kDotU>(sN, wr, HN, lane, s_stage[wave]);
+        acc = wave_sum(acc);
+        if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+    }
+}
+
+/* Read once, in host code, at every call. */
+bool xe_hc_v2_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_V2"); return v && v[0] == '1'; }();
+    return on;
 }
 
 /* ============================================================== hc_read, kernel B2
@@ -3965,8 +4062,25 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
              (long)dld, injw ? (const unsigned short*)injw->data : nullptr, dbuf,                 \
              inj ? (unsigned short*)inj->data : nullptr, scale, (long)rows, (long)n, (int)hc,     \
              (long)lr, (long)ta, (long)hrow, (long)irow, eps, wadd)
+    /* hc_read V2 (owner note 66, RADIANCE_XE_HC_V2=1): on the E4M3 rows, the norm once and N in global memory
+     * (the `u` scratch, unused by the fused mix below), then the down product a wave a column. */
+    const bool v2 = wf == 1 && xe_hc_v2_on();
+    unsigned short* nbuf = v2 ? ubuf : nullptr;
+    if (v2) {
+        emit_rc = R4D_EMIT(s, hc_v2_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
+                           (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
+                           (long)n, (int)hc, (long)hrow, eps, wadd);
+        if (emit_rc == RAD_OK)
+            emit_rc = R4D_EMIT(s, hc_v2_down_kernel,
+                               dim3((unsigned)((lr + kV2Cols - 1) / kV2Cols) + 1u, (unsigned)rows), dim3(kThreads),
+                               0u, (const unsigned short*)nbuf, (const void*)down->data, (long)dld,
+                               injw ? (const unsigned short*)injw->data : nullptr, dbuf,
+                               inj ? (unsigned short*)inj->data : nullptr, (long)rows, (int)hc, (long)HN, (long)lr,
+                               (long)irow);
+    } else {
     /* the stored form: 0 bf16, 1 E4M3 rows, 2 the same rows expanded to FP16 at load (owner note 56) */
     emit_rc = wf == 2 ? HC_READ_A(2) : wf == 1 ? HC_READ_A(1) : HC_READ_A(0);
+    }
 #undef HC_READ_A
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
     if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
@@ -3984,7 +4098,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     if (fused)
         emit_rc = hc_up_mix_launch(up, (long)uld, wf, i8, dbuf, (const unsigned short*)h->data,
                                    (const float*)w->data,
-                                   scale, (unsigned short*)x->data,
+                                   scale, nbuf, (unsigned short*)x->data,
                                    q ? (unsigned char*)q->data : nullptr,
                                    q ? (float*)qs->data : nullptr,
                                    rq ? (unsigned char*)rq->data : nullptr,
