@@ -279,6 +279,11 @@ struct OpInfo {
      * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
      * reference-kernel gate does not count it. */
     bool                  lora_declined = false;
+    /* No weights, and every buffer it declares (rad_op_reads / rad_op_writes) is in the host domain:
+     * its data is all in the host arena, so it runs its host kernel the way an op whose weights are
+     * all on the host does (ctx.cpp; Program::device_holes). Set at finish. The Intel port's owner note
+     * 53: the host experts' step behind each router (rad_block_moe_fp8.h, moe_host_experts). */
+    bool                  host_site = false;
 };
 
 struct KVGroupInfo {

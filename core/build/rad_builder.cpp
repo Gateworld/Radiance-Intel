@@ -52,9 +52,10 @@ std::vector<const Program::Miss*> Program::device_holes(bool host_backend) const
     for (const Miss& m : misses) {
         if (m.domain == RAD_DOMAIN_HOST) continue;
         const bool host_kernel = no_host.count(std::make_pair(m.index, m.span)) == 0;
-        /* An instance with no weight has nothing the planner places, so nothing moves it. */
+        /* An instance with no weight has nothing the planner places, so nothing moves it -- unless
+         * all its data is in the host arena (OpInfo::host_site), which puts it on the host. */
         const bool weightless = m.index > 0 && (size_t)m.index < ops.size() &&
-                                ops[(size_t)m.index].weights.empty();
+                                ops[(size_t)m.index].weights.empty() && !ops[(size_t)m.index].host_site;
         if (host_kernel && (host_backend || !weightless)) continue;
         out.push_back(&m);
     }
@@ -2254,6 +2255,19 @@ int Builder::finish() {
                     break;
                 }
     finish_buffer_liveness();
+
+    /* OpInfo::host_site: weightless ops whose declared buffers are all in the host arena. */
+    for (size_t h = 1; h < prog_.ops.size(); ++h) {
+        OpInfo& oi = prog_.ops[h];
+        if (!oi.weights.empty() || h >= op_bufs_.size()) continue;
+        bool any = false, all_host = true;
+        for (const auto* v : { &op_bufs_[h].reads, &op_bufs_[h].writes })
+            for (rad_buf bh : *v) {
+                any = true;
+                if (bh >= prog_.buffers.size() || prog_.buffers[bh].decl.domain != RAD_DOMAIN_HOST) all_host = false;
+            }
+        oi.host_site = any && all_host;
+    }
 
     int s = plan_buffers(prog_, &bufrep_);
     if (s < 0 && status_ == RAD_OK) status_ = s;

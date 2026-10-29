@@ -643,6 +643,30 @@ TEST(a_device_hole_is_decided_per_instance) {
     CHECK_EQ(p.device_holes(true)[0]->index, 2);
 }
 
+/* A weightless op whose declared buffers are all in the host arena (OpInfo::host_site) runs on the host,
+ * so its device miss is no hole while its host kernel exists; without a host kernel it still is. */
+TEST(a_host_site_op_is_no_device_hole) {
+    Program p;
+    p.ops.resize(2);
+    p.ops[1].op = "moe_host_experts";
+    p.ops[1].index = 1;
+    p.ops[1].host_site = true;
+    Program::Miss m;
+    m.op = "moe_host_experts";
+    m.span = "M <= 64";
+    m.why = "no device kernel";
+    m.domain = RAD_DOMAIN_DEVICE;
+    m.index = 1;
+    p.misses.push_back(m);
+    CHECK_EQ((int)p.device_holes(false).size(), 0);
+    p.ops[1].host_site = false;                       /* the same op with device-domain buffers */
+    CHECK_EQ((int)p.device_holes(false).size(), 1);
+    p.ops[1].host_site = true;
+    m.domain = RAD_DOMAIN_HOST;                       /* and no host kernel either */
+    p.misses.push_back(m);
+    CHECK_EQ((int)p.device_holes(false).size(), 1);
+}
+
 /* ================================================================== init, after the whole graph */
 TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     NEED_PLUGIN(reg)

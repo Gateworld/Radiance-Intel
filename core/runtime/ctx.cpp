@@ -425,6 +425,15 @@ int Ctx::bind_ops() {
             }
             if (all_host) dom = RAD_DOMAIN_HOST;
         }
+        /* A weightless op whose declared buffers are all in the host arena (OpInfo::host_site) runs
+         * its host kernel too, when it has one. */
+        if (dom == RAD_DOMAIN_DEVICE && oi.weights.empty() && oi.host_site) {
+            bool any_host = false;
+            for (int b = 0; b < p.n_bands && !any_host; ++b)
+                any_host = issue_table_[(size_t)p.plan_off + (size_t)b * RAD_N_DOMAINS +
+                                        RAD_DOMAIN_HOST].launch != nullptr;
+            if (any_host) dom = RAD_DOMAIN_HOST;
+        }
         op_domain_[i].store((uint8_t)dom, std::memory_order_relaxed);
 
         if (dom == RAD_DOMAIN_HOST) {
