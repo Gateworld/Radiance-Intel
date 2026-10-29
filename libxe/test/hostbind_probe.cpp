@@ -15,7 +15,15 @@
  *           second card imports each piece from the first)
  *   import  one contiguous mmap of GIB, registered with the driver in CHUNK_MIB pieces by NEO's
  *           zexDriverImportExternalPointer (each card maps the pages itself; the range stays contiguous)
+ *   own1    as usm, but allocated through a second context over the same cards with card 1 first (run 93: does
+ *           card 1 then own them instead of importing card 0's?), and used from the first context's queues. HB4: no,
+ *           card 0 still owns them.
+ *   solo1   allocated through a context of card 1 alone, used from the first context's queue on card 1 (ORDER "1").
+ *           HB5: works, but card 0 still holds the pages: NEO places host USM on its first device whatever the context.
+ *   shared1 sycl::aligned_alloc_shared on card 1 in the shared context: a buffer card 1 creates itself (does it stay in
+ *           system memory, and does card 0 hold none of it?)
  *   xe_hostbind_probe GIB ORDER CHUNK_MIB [FILL=1] [MODE=usm]
+ * At the end, each xe DRM client's fdinfo (drm-total-system = imports not bound; drm-total-gtt) says who owns what.
  *     GIB        host memory in all, in GiB (fractions allowed)
  *     ORDER      the cards that touch it, in order: "1" (card1 only), "01" (card0 then card1, the engine's), "10"
  *     CHUNK_MIB  the piece size, at most 4096
@@ -29,6 +37,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
+#include <dirent.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -82,7 +91,15 @@ int main(int argc, char** argv) {
                              "allocation over 4 GiB on the importing card)\n", chunk_mib);
         return 2;
     }
-    if (mode != "usm" && mode != "import") { std::fprintf(stderr, "hostbind: MODE usm or import\n"); return 2; }
+    if (mode != "usm" && mode != "import" && mode != "own1" && mode != "solo1" && mode != "shared1" && mode != "pair") {
+        std::fprintf(stderr, "hostbind: MODE usm, import, own1, solo1, shared1 or pair\n");
+        return 2;
+    }
+    /* pair (run 93): two sets of GIB each in the shared context -- A, standing for the other rank's pool, never
+     * copied from or read here, then B, the set the cards in ORDER use. If a kernel's indirect host access makes
+     * every host allocation resident, a kernel on card 1 binds A too. RI_HB_RESIDENT=1 makes B resident on each card
+     * in ORDER first (zeContextMakeMemoryResident), for use with NEO's DisableIndirectAccess=1. */
+    const bool pair = mode == "pair";
 
     std::vector<sycl::device> gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (gpus.size() < 2) {
@@ -90,6 +107,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     sycl::context ctx(gpus);   /* one context over every card, as l0.cpp makes for two ranks */
+    /* own1 (run 93, owner note 91 item 3): the pieces come from a second context over the same cards with card 1
+     * first, as if card 1 owned them, and are used from `ctx`'s queues as before. Does card 1 then bind them as its
+     * own (no import), and do its kernels read them? */
+    sycl::context ctx1(std::vector<sycl::device>{gpus[1], gpus[0]});
+    /* solo1 (run 93, HB4: own1 still left card 0 the owner): the pieces from a context of card 1 alone, used from the
+     * shared context's queue on card 1 -- memory only card 1 ever maps, as a rank's private pool could be. */
+    sycl::context ctx_solo1(gpus[1]);
     std::vector<sycl::queue> qs;
     for (auto& d : gpus) qs.emplace_back(ctx, d, sycl::property::queue::in_order{});
     for (size_t i = 0; i < gpus.size(); ++i)
@@ -115,11 +139,26 @@ int main(int argc, char** argv) {
         if (m == MAP_FAILED) { std::printf("hostbind: mmap of %lld bytes failed\n", total); return 1; }
         range = (char*)m;
     }
+    std::vector<std::pair<char*, long long>> other;   /* pair: set A */
+    if (pair)
+        for (long long off = 0; off < total; off += piece) {
+            const long long n = std::min(piece, total - off);
+            char* p = sycl::aligned_alloc_host<char>(4096, (size_t)n, ctx);
+            if (!p) { std::printf("hostbind: set A allocation failed\n"); return 1; }
+            if (fill) for (long long b = 0; b < n; b += 4096) p[b] = 1;
+            other.emplace_back(p, n);
+        }
     for (long long off = 0; off < total; off += piece) {
         const long long n = std::min(piece, total - off);
         char* p = nullptr;
-        if (mode == "usm") {
+        if (mode == "usm" || pair) {
             p = sycl::aligned_alloc_host<char>(4096, (size_t)n, ctx);
+        } else if (mode == "own1") {
+            p = sycl::aligned_alloc_host<char>(4096, (size_t)n, ctx1);
+        } else if (mode == "solo1") {
+            p = sycl::aligned_alloc_host<char>(4096, (size_t)n, ctx_solo1);
+        } else if (mode == "shared1") {
+            p = sycl::aligned_alloc_shared<char>(4096, (size_t)n, gpus[1], ctx);
         } else {
             p = range + off;
             const ze_result_t r = import_fn(drv, p, (size_t)n);
@@ -146,13 +185,39 @@ int main(int argc, char** argv) {
     std::vector<char*> scratch;
     std::vector<long long*> sums;
     std::vector<char**> ptrs;
+    /* Only the cards in ORDER are touched at all (HB3, run 92: a setup copy on card0 queued behind its stuck copy job
+     * though only card1 was asked for). */
     for (size_t i = 0; i < gpus.size(); ++i) {
-        scratch.push_back(sycl::malloc_device<char>(4096, gpus[i], ctx));
-        sums.push_back(sycl::malloc_device<long long>(1, gpus[i], ctx));
-        ptrs.push_back(sycl::malloc_device<char*>(allocs.size(), gpus[i], ctx));
+        scratch.push_back(nullptr);
+        sums.push_back(nullptr);
+        ptrs.push_back(nullptr);
+        if (order.find((char)('0' + i)) == std::string::npos) continue;
+        scratch[i] = sycl::malloc_device<char>(4096, gpus[i], ctx);
+        sums[i] = sycl::malloc_device<long long>(1, gpus[i], ctx);
+        ptrs[i] = sycl::malloc_device<char*>(allocs.size(), gpus[i], ctx);
         std::vector<char*> hp;
         for (auto& a : allocs) hp.push_back(a.first);
         qs[i].memcpy(ptrs[i], hp.data(), hp.size() * sizeof(char*)).wait();
+    }
+
+    if (pair) {
+        std::printf("hostbind: pair: set A %zu piece(s), %.2f GiB, never used here; set B is the pieces above\n",
+                    other.size(), total / 1073741824.0);
+        const char* res = std::getenv("RI_HB_RESIDENT");
+        if (res && res[0] == '1') {
+            ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+            for (char c : order) {
+                const int d = c - '0';
+                ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(gpus[(size_t)d]);
+                for (size_t i = 0; i < allocs.size(); ++i) {
+                    const auto t = now_ns();
+                    const ze_result_t r = zeContextMakeMemoryResident(zc, zd, allocs[i].first, (size_t)allocs[i].second);
+                    std::printf("hostbind: resident on card %d: piece %zu = 0x%x in %.1f ms\n", d, i + 1, (unsigned)r,
+                                (now_ns() - t) * 1e-6);
+                }
+            }
+        }
+        std::fflush(stdout);
     }
 
     std::thread watch([&] {
@@ -198,14 +263,44 @@ int main(int argc, char** argv) {
         if (got != want) ++bad;
     }
     std::printf(bad ? "hostbind: every step completed, %d sum(s) WRONG\n" : "hostbind: every touch completed\n", bad);
+    /* Who owns the pieces: each DRM client's memory as the driver counts it. A card imports what shows in its
+     * "system" placement (not resident until bound); a card's own host buffers are its GTT. */
+    if (DIR* dd = opendir("/proc/self/fdinfo")) {
+        while (dirent* e = readdir(dd)) {
+            if (e->d_name[0] == '.') continue;
+            std::string fp = std::string("/proc/self/fdinfo/") + e->d_name;
+            FILE* f = std::fopen(fp.c_str(), "r");
+            if (!f) continue;
+            char ln[256];
+            std::string out;
+            bool xe = false;
+            while (std::fgets(ln, sizeof ln, f)) {
+                if (!std::strncmp(ln, "drm-driver:", 11) && std::strstr(ln, "xe")) xe = true;
+                if (!std::strncmp(ln, "drm-pdev:", 9) || !std::strncmp(ln, "drm-total-system:", 17) ||
+                    !std::strncmp(ln, "drm-resident-system:", 20) || !std::strncmp(ln, "drm-total-gtt:", 14) ||
+                    !std::strncmp(ln, "drm-total-vram0:", 16)) {
+                    ln[std::strcspn(ln, "\n")] = 0;
+                    out += std::string("  ") + ln;
+                }
+            }
+            std::fclose(f);
+            if (xe) std::printf("hostbind: fd %s:%s\n", e->d_name, out.c_str());
+        }
+        closedir(dd);
+    }
     std::fflush(stdout);
     for (size_t i = 0; i < gpus.size(); ++i) {
-        sycl::free(scratch[i], ctx);
-        sycl::free(sums[i], ctx);
-        sycl::free(ptrs[i], ctx);
+        if (scratch[i]) sycl::free(scratch[i], ctx);
+        if (sums[i]) sycl::free(sums[i], ctx);
+        if (ptrs[i]) sycl::free(ptrs[i], ctx);
     }
-    if (mode == "usm") {
+    if (mode == "usm" || mode == "shared1" || pair) {
         for (auto& a : allocs) sycl::free(a.first, ctx);
+        for (auto& a : other) sycl::free(a.first, ctx);
+    } else if (mode == "own1") {
+        for (auto& a : allocs) sycl::free(a.first, ctx1);
+    } else if (mode == "solo1") {
+        for (auto& a : allocs) sycl::free(a.first, ctx_solo1);
     } else {
         for (auto& a : allocs) release_fn(drv, a.first);
         munmap(range, (size_t)total);

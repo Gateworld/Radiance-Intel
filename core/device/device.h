@@ -100,7 +100,8 @@ extern "C" void* rad_link_gate(RadStream s);
 /* Touch every live host allocation once from stream `s`, so the driver maps each one for the
  * stream's card and engine now rather than at its first use in a step. Each allocation is logged
  * before its copy, with `tag` naming the caller's stream. A no-op (RAD_OK) where the backend has
- * nothing to do or the backend's switch is off (Level Zero: RADIANCE_L0_HOST_PREBIND=1; the
+ * nothing to do or the backend's switch is off (Level Zero: RADIANCE_L0_HOST_PREBIND=1, or =own for only
+ * the allocations made with the stream's card current; the
  * Intel port, run 88: a two-card first step stuck binding host memory imported from the other
  * card). */
 extern "C" int rad_host_prebind(RadStream s, const char* tag);

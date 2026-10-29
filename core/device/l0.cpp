@@ -269,6 +269,47 @@ int z_peer_access(int self, int peer) {
 }
 
 /* ------------------------------------------------------------------ memory */
+/* RADIANCE_L0_EXPLICIT_RESIDENCY=1 (the Intel port, run 93), for use with NEO's DisableIndirectAccess=1.
+ * SYCL launches kernels with indirect access to USM, for which the driver makes every allocation of the
+ * context resident on the launching card: on two B70s a kernel on card1 binds both ranks' host pools and
+ * card0's device memory as imports, and some of those binds never return (xe answers VM_BIND with EBUSY,
+ * runs 87-93; the probe's `pair`, HB7). With indirect access off, a kernel makes only its argument
+ * allocations resident, so everything a kernel reaches through a pointer table -- the weights, the expert
+ * pools -- is made resident here, at allocation: on its own card always, and on every card when it is at
+ * most kResidentEverywhere (mailboxes, staging, small shared buffers). The other rank's large host pieces
+ * and the other card's large device pools are not bound on a card that never reads them. */
+bool explicit_residency() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_EXPLICIT_RESIDENCY"); return e && e[0] == '1'; }();
+    return v;
+}
+constexpr int64_t kResidentEverywhere = 1ll << 30;
+void make_resident_where_needed(void* p, int64_t bytes, int kind, int dev) {
+    if (!explicit_residency() || kind == RAD_MEM_HOST || !p) return;
+    static std::once_flag said;
+    std::call_once(said, [] {
+        const char* k = std::getenv("DisableIndirectAccess");
+        const char* r = std::getenv("NEOReadDebugKeys");
+        const bool on = k && k[0] == '1' && r && r[0] == '1';
+        RAD_INFO("l0 residency: each allocation made resident at allocation on its own card, and on every card up "
+                 "to %lld MiB (RADIANCE_L0_EXPLICIT_RESIDENCY); NEO's DisableIndirectAccess %s",
+                 (long long)(kResidentEverywhere >> 20),
+                 on ? "is set" : "is NOT set: kernels still make every allocation resident on their card");
+    });
+    for (int d = 0; d < (int)devs().size(); ++d) {
+        const Dev& D = devs()[d];
+        if (D.cpu || (d != dev && bytes > kResidentEverywhere)) continue;
+        ze_result_t r = ZE_RESULT_ERROR_UNKNOWN;
+        try {
+            ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.ctx);
+            ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(D.d);
+            r = zeContextMakeMemoryResident(zc, zd, p, (size_t)bytes);
+        } catch (const sycl::exception&) {}
+        if (r != ZE_RESULT_SUCCESS)
+            RAD_WARN("l0 residency: %.2f MiB at %p (kind %d, card %d's) not made resident on card %d: 0x%x",
+                     bytes / 1048576.0, p, kind, dev, d, (unsigned)r);
+    }
+}
+
 void* z_alloc(int64_t bytes, int kind) {
     if (bytes <= 0) {
         device_set_error("rad_dev_alloc(%lld): size must be positive", (long long)bytes);
@@ -314,6 +355,7 @@ void* z_alloc(int64_t bytes, int kind) {
         alloc_table()[(uintptr_t)p] = AllocRec{bytes, kind, dev};
     }
     if (kind == RAD_MEM_DEVICE) g_used[dev].fetch_add(bytes, std::memory_order_relaxed);
+    make_resident_where_needed(p, (int64_t)n, kind, dev);
     return p;
 }
 
@@ -1387,11 +1429,15 @@ int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
  * the same engine) at startup, one allocation at a time, logged before each: a bind that still
  * fails names its allocation, and the step loop's copies find their buffers bound. Off by default. */
 int z_host_prebind(RadStream s, const char* tag) {
-    static const bool on = [] {
+    /* 1: every host allocation; own (run 93, owner note 91 item 4): only those made with the stream's card current,
+     * what that card's rank uses -- R19 showed `1` making card1 bind both ranks' pools and stop at ~26 GiB. */
+    static const int mode = [] {
         const char* e = std::getenv("RADIANCE_L0_HOST_PREBIND");
-        return e && e[0] == '1';
+        if (!e) return 0;
+        if (!std::strcmp(e, "own")) return 2;
+        return e[0] == '1' ? 1 : 0;
     }();
-    if (!on) return RAD_OK;
+    if (!mode) return RAD_OK;
     RAD_TRY(check_stream(s, "rad_host_prebind"));
     L0Stream& st = S(s);
     RAD_TRY(enter(st));
@@ -1399,7 +1445,9 @@ int z_host_prebind(RadStream s, const char* tag) {
     {
         std::lock_guard<std::mutex> lk(alloc_mutex());
         for (const auto& kv : alloc_table())
-            if (kv.second.kind == RAD_MEM_HOST_PINNED || kv.second.kind == RAD_MEM_HOST_MAPPED) host.push_back(kv);
+            if ((kv.second.kind == RAD_MEM_HOST_PINNED || kv.second.kind == RAD_MEM_HOST_MAPPED) &&
+                (mode == 1 || kv.second.device == st.dev))
+                host.push_back(kv);
     }
     const Dev& D = devs()[st.dev];
     void* scratch = nullptr;
