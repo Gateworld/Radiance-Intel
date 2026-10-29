@@ -907,6 +907,31 @@ bool ze_ready(int d) {
         probe = n_list_create(Z, false);
         if (!probe) { Z.why = "zeCommandListCreate failed"; return false; }
     }
+    {   /* Owner note 68 item 4: what the driver takes for a command list here, read from this process's own
+         * VRAM (fdinfo) across eight empty lists, so the log says whether NEO's OverrideCmdListCmdBufferSizeInKb
+         * (a debug key: run 80's X9 measured 0.25 MiB a list with 64 against 1.19 MiB by default, NEO 1.14.37020)
+         * took effect. The driver reuses this memory for the recordings' lists, so it costs nothing. */
+        const char* ovr = std::getenv("OverrideCmdListCmdBufferSizeInKb");
+        const char* rdk = std::getenv("NEOReadDebugKeys");
+        const int64_t v0 = vram_proc(d);
+        ze_command_list_handle_t ls[8] = {};
+        int made = 0;
+        for (int i = 0; i < 8; ++i) {
+            ls[i] = n_list_create(Z, Z.inorder);
+            if (!ls[i]) break;
+            zeCommandListClose(ls[i]);
+            ++made;
+        }
+        const int64_t v1 = vram_proc(d);
+        for (int i = 0; i < made; ++i) { zeCommandListDestroy(ls[i]); g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed); }
+        if (made == 8 && v0 > 0) {
+            const double per = (double)(v1 - v0) / 8.0 / 1048576.0;
+            const bool asked = ovr && rdk && rdk[0] == '1';
+            RAD_INFO("l0 tape: the driver takes %.2f MiB a command list on device %d (NEO OverrideCmdListCmdBufferSizeInKb %s%s%s)",
+                     per, d, asked ? "set to " : "not set", asked ? ovr : "",
+                     asked ? (per < 0.6 ? ": in effect" : ": NOT in effect -- the recordings cost the default size; the floor still guards the card") : "");
+        }
+    }
     zeCommandListDestroy(probe);
     g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
     Z.ok = true;
@@ -1852,7 +1877,10 @@ void n_reap_stretches(Tape& t) {
  * the oldest when more than kEarlyWindow are in flight; each full block of kBlock segments is composed as it
  * fills (from the kept descriptors, as a play would); tape_end waits for the recording's last play, releases
  * the rest and marks the tape so every play composes (the partial ranges on demand, as today). Off: the
- * shipped behaviour (segment lists live until the first play). */
+ * shipped behaviour (segment lists live until the first play). Kept opt-in after owner note 68's M-pair (run
+ * 90): text identical both ways, but the MTP-on single prompt 48.9 tok/s against 51.5 (M54 / M56 against M55 /
+ * M57), the plays' composing costing host time; NEO's 64 KB command buffer per list (the service's setting,
+ * m3/service/run.sh) takes most of the recordings' VRAM back without it (H56: +1.9 GiB against +4.9). */
 bool tape_early() {
     static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_TAPE_EARLY"); return e && e[0] == '1'; }();
     return v;
