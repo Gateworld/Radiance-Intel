@@ -269,6 +269,7 @@ int z_peer_access(int self, int peer) {
 }
 
 /* ------------------------------------------------------------------ memory */
+void vtrace_alloc(int d, int64_t bytes, int kind, bool freed);   /* RADIANCE_L0_VRAM_TRACE's ledger (below) */
 /* RADIANCE_L0_EXPLICIT_RESIDENCY=1 (the Intel port, run 93), for use with NEO's DisableIndirectAccess=1.
  * SYCL launches kernels with indirect access to USM, for which the driver makes every allocation of the
  * context resident on the launching card: on two B70s a kernel on card1 binds both ranks' host pools and
@@ -356,6 +357,7 @@ void* z_alloc(int64_t bytes, int kind) {
     }
     if (kind == RAD_MEM_DEVICE) g_used[dev].fetch_add(bytes, std::memory_order_relaxed);
     make_resident_where_needed(p, (int64_t)n, kind, dev);
+    vtrace_alloc(dev, (int64_t)n, kind, false);
     return p;
 }
 
@@ -378,6 +380,7 @@ void z_free(void* p, int kind) {
     if (r.kind == RAD_MEM_DEVICE) g_used[r.device].fetch_sub(r.bytes, std::memory_order_relaxed);
     try { sycl::free(p, devs()[r.device].ctx); }
     catch (const sycl::exception& e) { RAD_WARN("rad_dev_free(%p): %s", p, e.what()); }
+    vtrace_alloc(r.device, r.bytes, r.kind, true);
 }
 
 /* The allocation holding `p`, interior pointers included. */
@@ -625,16 +628,37 @@ void vtrace_list(int d, int kind, int delta) {
         while (a > p && !peak.compare_exchange_weak(p, a, std::memory_order_relaxed)) {}
     }
 }
+/* The driver's free VRAM on card d (what the floor and the planner read), -1 when it cannot say. */
+int64_t driver_free(int d) {
+    const Dev& D = devs()[d];
+    try {
+        if (!D.cpu && D.d.has(sycl::aspect::ext_intel_free_memory))
+            return (int64_t)D.d.get_info<sycl::ext::intel::info::device::free_memory>();
+    } catch (const sycl::exception&) {}
+    return -1;
+}
 void vtrace_report(int d, const char* at, unsigned long long id) {
     if (!vram_trace()) return;
     VTrace& V = vtrace(d);
     const int64_t now = vram_proc(d), used = g_used[d].load(std::memory_order_relaxed);
     const double M = 1048576.0;
-    RAD_INFO("l0 vram trace dev %d %s %llu: process VRAM %.0f MiB (+%.0f since the first reading); engine allocations +%.0f; "
+    RAD_INFO("l0 vram trace dev %d %s %llu: process VRAM %.0f MiB (+%.0f since the first reading); driver free %.0f MiB; "
+             "engine allocations %.0f MiB (+%.0f); "
              "segment lists alive %lld (peak %lld, made %lld); composed lists alive %lld (peak %lld, made %lld)",
-             d, at, id, now / M, (now - V.base) / M, (used - V.used_base) / M, (long long)V.seg_alive.load(),
+             d, at, id, now / M, (now - V.base) / M, driver_free(d) / M, used / M, (used - V.used_base) / M,
+             (long long)V.seg_alive.load(),
              (long long)V.seg_peak.load(), (long long)V.seg_made.load(), (long long)V.str_alive.load(),
              (long long)V.str_peak.load(), (long long)V.str_made.load());
+}
+/* Run 96 (owner note 95 item 1): the ledger -- each device or host-mapped allocation (and free) of at least 16 MiB,
+ * with the card's process VRAM and the driver's free VRAM right after it. The engine logs what it allocated just
+ * after (its arena, KV, pools), so the log's order names each line's owner. */
+void vtrace_alloc(int d, int64_t bytes, int kind, bool freed) {
+    if (!vram_trace() || bytes < (16ll << 20) || kind == RAD_MEM_HOST || devs()[d].cpu) return;
+    const double M = 1048576.0;
+    RAD_INFO("l0 vram ledger dev %d %s %.1f MiB %s: process VRAM %.0f MiB; driver free %.0f MiB; engine allocations %.0f MiB",
+             d, freed ? "free" : "alloc", bytes / M, kind == RAD_MEM_DEVICE ? "device" : "host-mapped",
+             vram_proc(d) / M, driver_free(d) / M, g_used[d].load(std::memory_order_relaxed) / M);
 }
 
 bool recording() { return t_rec.t && (t_rec.g || t_rec.nlist) && t_rec.pause == 0; }
