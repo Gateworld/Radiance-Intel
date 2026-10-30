@@ -73,6 +73,7 @@
 #include "r4d_fwht.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_q8.h"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the prefill products on the matrix units (owner note 102) */
 
 namespace {
 
@@ -1464,6 +1465,164 @@ int xe_hc_v2_level() {
     return lv;
 }
 bool xe_hc_v2_on() { return xe_hc_v2_level() >= 1; }
+
+/* ============================================================== hc_read on the matrix units (owner note 102)
+ *
+ * Intel port, run 99 (RADIANCE_XE_HC_PF_DPAS=1; E4M3 rows, hc 4, from kPfMinRows rows). The prefill's per-row kernels
+ * read all of W_down (3.3 MB) once a row: hc_read_a was 6.5 s of a rank's 7K first token. Here both products are
+ * batched over the chunk's rows on the matrix units, modelled on xe_gemv_bf16.cpp's gemm_bf16_dpas_kernel: sub-group
+ * 16, eight sub-groups, 64 rows by 64 columns a work-group; per 64-k group the rows are staged as bf16 and the
+ * weight rows in the packed B layout (word (k2, n) = b[n][2 k2] | b[n][2 k2 + 1] << 16), then four 8 x 16 x 16
+ * joint_matrix_mad steps a sub-group into f32 tiles that persist over K. Each 64-code piece of an E4M3 row is decoded
+ * once a tile into LDS, as the bf16 of code x group scale (the rounding upstream's tiled forms make, e4m3x8_bf16;
+ * decoded by e4m3x4_s8 with the scale times 2^8, the same bits).
+ *
+ *   hc_v2_norm   N to `nbuf` [rows, HN] and the scales, as V2 (the same bits).
+ *   kMode 0      N against W_down's lr rows, the hc inject rows (bf16) as hc more columns (the AMD tiled forms'
+ *                fold): silu(acc / hc) to `d`, 2 sigmoid(acc / hc) to the gains.
+ *   kMode 1      `d` [rows, lr] against the 64 rows of W_up a work-group owns: 16 channels in each of the 4 streams
+ *                (row t is stream t / 16 of channel i0 + t % 16, as hc_up_mix's), so the mix completes in the
+ *                work-group: bf16(sigmoid) of the tile into LDS, then x = mean_c(u N) in hc_up_mix's order. The
+ *                codes by hc_quant_rows after it (V2 level 4's split).
+ *
+ * Not bit-identical to the per-row kernels: f32 sums in the matrix unit's order over bf16 weights rounded after the
+ * scale, a tolerance check (as upstream's prefill forms against its decode ones). K is a multiple of 64. */
+namespace hcpf {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kSG = 16, kWv = 8, kThr = kSG * kWv;   /* 128 */
+constexpr int kRT = 8 * kWv;                         /* 64 rows a work-group */
+constexpr int kNT = 64;                              /* 64 columns: four 16-column tiles */
+constexpr int kAP = 64 + 8;                          /* the A stage's row pitch in bf16 */
+}  // namespace hcpf
+constexpr long kPfMinRows = hcpf::kRT;
+
+template <int kMode>
+void hc_pf_dpas_kernel(const unsigned short* __restrict__ A, long K,                 /* [rows, K] bf16, pitch K */
+                       const unsigned char* __restrict__ W, long wld, long grp,      /* E4M3 rows, scales after K */
+                       long nw, const unsigned short* __restrict__ injw,             /* kMode 0: hc bf16 rows of K */
+                       int hc, long rows, long n,
+                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj, long irow,
+                       const unsigned short* __restrict__ nbuf, unsigned short* __restrict__ x, long xrow) {
+    using namespace hcpf;
+    XE_SHARED(uint16_t, sA, kRT * kAP);       /* 64 rows x 64 k bf16, pitch 72 */
+    XE_SHARED(uint32_t, sB, 4 * 4 * 128);     /* [k step 4][n tile 4][packed 8 x 16 words] */
+    XE_SHARED(float, sC, kWv * 8 * 16);       /* one 8 x 16 f32 tile a sub-group */
+    XE_SHARED(uint16_t, sU, kMode == 1 ? kRT * kNT : 1);   /* kMode 1: bf16(sigmoid(u)), [64 rows][64 columns] */
+    const int  tid = (int)threadIdx.x, wave = tid / kSG, lane = tid % kSG;
+    const long m0 = (long)blockIdx.y * kRT;
+    const int  ipb = kNT / hc;                                /* kMode 1: channels a work-group owns */
+    const long i0  = (long)blockIdx.x * ipb;
+    const long n0  = (long)blockIdx.x * kNT;
+    /* the weight row behind a column of the tile: kMode 0 column n0 + c (E4M3 below nw, inject rows to nw + hc,
+     * else none), kMode 1 hc_up_mix's (stream c / ipb, channel i0 + c % ipb) */
+    auto wrow = [&](int c) -> long {
+        if constexpr (kMode == 1) return (long)(c / ipb) * n + i0 + c % ipb;
+        else return n0 + c;
+    };
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::a, 8, 16, jm::layout::row_major> Am;
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm;
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+#pragma unroll
+    for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+    for (long k0 = 0; k0 < K; k0 += 64) {
+        xe::syncthreads();                                    /* the previous group's stages are consumed */
+        /* the rows: 64 x 64 k, eight bf16 a thread a load (zeros past `rows`) */
+        for (int idx = tid; idx < kRT * 8; idx += kThr) {
+            const int  r = idx / 8, kc = (idx % 8) * 8;
+            const long m = m0 + r;
+            uint4 v = {0u, 0u, 0u, 0u};
+            if (m < rows) v = *(const uint4*)(A + m * K + k0 + kc);
+            *(uint4*)(sA + r * kAP + kc) = v;
+        }
+        /* the weight rows: 64 columns x 64 k, eight codes a thread a load, packed */
+        for (int idx = tid; idx < kNT * 8; idx += kThr) {
+            const int  c = idx / 8, kc = (idx % 8) * 8;
+            const long j = wrow(c), kk = k0 + kc;
+            uint32_t wv[4] = {0u, 0u, 0u, 0u};
+            if (j < nw) {
+                const unsigned char* wr = W + j * wld;
+                const uint2 cd = *(const uint2*)(wr + kk);
+                const float sc = ((const float*)(wr + K))[kk / grp] * kS8Scale;
+                float f[8];
+                e4m3x4_s8(cd.x, f);
+                e4m3x4_s8(cd.y, f + 4);
+#pragma unroll
+                for (int p = 0; p < 4; ++p)
+                    wv[p] = (uint32_t)f2bf(f[2 * p] * sc) | ((uint32_t)f2bf(f[2 * p + 1] * sc) << 16);
+            } else if (kMode == 0 && injw && j < nw + hc) {
+                const uint4 v = *(const uint4*)(injw + (j - nw) * K + kk);
+                wv[0] = v.x; wv[1] = v.y; wv[2] = v.z; wv[3] = v.w;
+            }
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const int k2 = kc / 2 + p, step = k2 / 8, kw = k2 % 8;
+                sB[((step * 4 + c / 16) * 8 + kw) * 16 + (c % 16)] = wv[p];
+            }
+        }
+        xe::syncthreads();
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            jm::joint_matrix_load(sg, Am, lptr((sycl::ext::oneapi::bfloat16*)(sA + wave * 8 * kAP + step * 16)), (size_t)kAP);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bm, lptr((sycl::ext::oneapi::bfloat16*)(sB + (step * 4 + t) * 128)), 32);
+                jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+            }
+        }
+    }
+    /* the tiles out: lane = column, 8 rows a lane */
+    const float inv_hc = 1.0f / (float)hc;
+    float* sCw = sC + wave * 128;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        jm::joint_matrix_store(sg, Cm[t], lptr(sCw), 16, jm::layout::row_major);
+        xe::wave_barrier();
+        const int c = t * 16 + lane;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int  rl = wave * 8 + e;
+            const long m  = m0 + rl;
+            const float v = sCw[e * 16 + lane];
+            if constexpr (kMode == 1) {
+                sU[rl * kNT + c] = f2bf(sigmoidf_(v));
+            } else if (m < rows) {
+                const long j = n0 + c;
+                if (j < nw) dout[m * nw + j] = f2bf(siluf_(v * inv_hc));
+                else if (inj && j < nw + hc) inj[m * irow + (j - nw)] = f2bf(2.0f * sigmoidf_(v * inv_hc));
+            }
+        }
+        xe::wave_barrier();
+    }
+    if constexpr (kMode == 1) {
+        xe::syncthreads();
+        for (int idx = tid; idx < kRT * ipb; idx += kThr) {
+            const int  rl = idx / ipb, ii = idx - rl * ipb;
+            const long m  = m0 + rl;
+            if (m >= rows) continue;
+            const long i = i0 + ii;
+            float acc = 0.0f;
+            for (int c = 0; c < hc; ++c)
+                acc += bf2f(sU[rl * kNT + c * ipb + ii]) * bf2f(nbuf[m * (long)hc * n + (long)c * n + i]);
+            acc *= inv_hc;
+            x[m * xrow + i] = f2bf(acc);
+        }
+    }
+}
+
+/* RADIANCE_XE_HC_PF_DPAS=1 (owner note 102): prefill rows take the matrix-unit products above. Read once. */
+bool xe_hc_pf_dpas_on(hipStream_t q) {
+    static const bool want = [] {
+        const char* v = std::getenv("RADIANCE_XE_HC_PF_DPAS");
+        const bool on = v && v[0] == '1';
+        if (on) std::fprintf(stderr, "[xe] hc_read prefill on the matrix units (RADIANCE_XE_HC_PF_DPAS=1)\n");
+        return on;
+    }();
+    return want && q->get_device().is_gpu();
+}
 
 /* ============================================================== hc_read, kernel B2
  *
@@ -4154,6 +4313,41 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                (long)rows, (long)HN, (long)lr, s);
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     } else {
+    /* owner note 102: prefill chunks (kPfMinRows rows on) take both products on the matrix units, hc_pf_dpas_kernel;
+     * a shape it does not take keeps the per-row kernels below */
+    if (wf == 1 && rows >= kPfMinRows && hc == 4 && xe_hc_pf_dpas_on((hipStream_t)s)) {
+        const bool fold = injw && inj;
+        const bool fits = (HN % 64) == 0 && (lr % 64) == 0 && (n % (hcpf::kNT / hc)) == 0 && (dld % 8) == 0
+                          && (uld % 8) == 0 && ((((uintptr_t)down->data | (uintptr_t)up->data) & 7u) == 0u)
+                          && ((((uintptr_t)dbuf | (uintptr_t)ubuf | (fold ? (uintptr_t)injw->data : 0u)) & 15u) == 0u);
+        if (fits) {
+            unsigned short* nbuf = ubuf;
+            const unsigned gy = (unsigned)((rows + hcpf::kRT - 1) / hcpf::kRT);
+            const long ncol = lr + (fold ? hc : 0);
+            emit_rc = R4D_EMIT(s, hc_v2_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
+                               (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
+                               (long)n, (int)hc, (long)hrow, eps, wadd);
+            (void)XE_LAUNCH_SG(hcpf::kSG, (hipStream_t)s, (hc_pf_dpas_kernel<0>),
+                               dim3((unsigned)((ncol + hcpf::kNT - 1) / hcpf::kNT), gy), dim3(hcpf::kThr), 0,
+                               (const unsigned short*)nbuf, (long)HN, (const unsigned char*)down->data, (long)dld,
+                               (long)r4d_hc8::kDownGroup, (long)lr,
+                               fold ? (const unsigned short*)injw->data : (const unsigned short*)nullptr, (int)hc,
+                               (long)rows, (long)n, dbuf, fold ? (unsigned short*)inj->data : (unsigned short*)nullptr,
+                               (long)irow, (const unsigned short*)nullptr, (unsigned short*)nullptr, (long)0);
+            (void)XE_LAUNCH_SG(hcpf::kSG, (hipStream_t)s, (hc_pf_dpas_kernel<1>),
+                               dim3((unsigned)(n / (hcpf::kNT / hc)), gy), dim3(hcpf::kThr), 0,
+                               (const unsigned short*)dbuf, (long)lr, (const unsigned char*)up->data, (long)uld,
+                               (long)r4d_hc8::up_group(lr), (long)HN, (const unsigned short*)nullptr, (int)hc,
+                               (long)rows, (long)n, (unsigned short*)nullptr, (unsigned short*)nullptr, (long)0,
+                               (const unsigned short*)nbuf, (unsigned short*)x->data, (long)xrow);
+            hc_quant_rows_launch(i8, (const unsigned short*)x->data, q ? (unsigned char*)q->data : nullptr,
+                                 q ? (float*)qs->data : nullptr, rq ? (unsigned char*)rq->data : nullptr,
+                                 rq ? (float*)rqs->data : nullptr, (long)rows, (long)n, (long)xrow, (long)qrow,
+                                 (long)srow, (long)rqrow, (long)rsrow, s);
+            if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
+            return (int)hipGetLastError();
+        }
+    }
     long long ta = kDownTAMax;
     /* Target two workgroups per WGP, i.e. one per CU, since want_wg() returns WGPs (see its note).
      * A one-WGP target would accept 44 blocks at a depth-3 verify (four rows, ta = 32); the one-CU
