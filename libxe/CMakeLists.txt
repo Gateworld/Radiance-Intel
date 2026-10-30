@@ -27,6 +27,16 @@ target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CM
 target_compile_options(libxe PRIVATE -ffp-contract=off -Wno-unused-function)
 # milestone 2: the all-reduce rows allocate at init through rad_l0k (rad_l0k_device)
 target_link_libraries(libxe PRIVATE rad_l0k)
+# Run 102 (owner note 111): the lane layer's xor patterns as permute_group_by_xor (xe_lanes.h, XE_NATIVE_XOR). The same
+# partner lanes, so the same values; off unless the owner turns it on (note 96).
+# A plain variable, not a cached option, so the default here takes effect at every configure; -DRAD_XE_NATIVE_XOR=ON
+# still overrides it. (Run 102's image :120 was built with it ON for its gates: E34 / KA4 / M124 / M125.)
+if(NOT DEFINED RAD_XE_NATIVE_XOR)
+  set(RAD_XE_NATIVE_XOR OFF)
+endif()
+if(RAD_XE_NATIVE_XOR)
+  target_compile_definitions(libxe PRIVATE XE_NATIVE_XOR=1)
+endif()
 
 if(RAD_BUILD_TESTS)
   # This directory is added before the top level's enable_testing(), so enable it here.
@@ -42,6 +52,10 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_lane_test PRIVATE rad_abi)
   target_link_options(xe_lane_test PRIVATE ${RAD_SYCL_FLAGS})
   set_target_properties(xe_lane_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # the shim is tested in the form libxe is built with (run 102: XE_NATIVE_XOR)
+  if(RAD_XE_NATIVE_XOR)
+    target_compile_definitions(xe_lane_test PRIVATE XE_NATIVE_XOR=1)
+  endif()
   # The trunk W8A8 GEMV against libref's quant_dot order (host re-computation), canaries on y.
   add_executable(xe_gemv_i8_test test/gemv_i8_test.cpp xe_gemv_i8.cpp)
   rad_l0_sycl(xe_gemv_i8_test)
@@ -207,6 +221,12 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_gdn_decode_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_gdn_decode_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_gdn_decode_bench libxe)
+  # Run 102 (owner note 111): the lane layer's emulated xor butterfly against permute_group_by_xor. Not a ctest.
+  add_executable(xe_lane_xor_bench test/lane_xor_bench.cpp)
+  rad_l0_sycl(xe_lane_xor_bench)
+  target_include_directories(xe_lane_xor_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_lane_xor_bench PRIVATE rad_abi)
+  set_target_properties(xe_lane_xor_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Owner note 1's per-launch figure: N tiny kernels launched plainly and replayed from a tape.
   add_executable(xe_tape_bench test/tape_bench.cpp)
   rad_l0_sycl(xe_tape_bench)

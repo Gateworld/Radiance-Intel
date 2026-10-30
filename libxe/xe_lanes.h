@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <algorithm>   /* the launch profiler (RADIANCE_XE_LAUNCH_PROFILE): its table */
 #include <atomic>
@@ -66,9 +67,19 @@ inline Idx3 block_dim()  { auto i = item(); return {(unsigned)i.get_local_range(
 inline Idx3 grid_dim()   { auto i = item(); return {(unsigned)i.get_group_range(2), (unsigned)i.get_group_range(1), (unsigned)i.get_group_range(0)}; }
 
 /* ------------------------------------------------------------------ cross-lane */
+/* XE_NATIVE_XOR=1 (run 102, owner note 111; the CMake option RAD_XE_NATIVE_XOR, off by default): the xor patterns
+ * below -- DPP row_xmask, permlanex16 with the identity selectors (lane ^ 16), HIP's __shfl_xor within its width --
+ * as SYCL's permute_group_by_xor instead of select_from_group over a lane index computed a lane. Every lane reads
+ * the same partner, so the same values; LB1 timed a 32-lane sum butterfly at 18.7 ms emulated against 3.65 ms. */
+#ifndef XE_NATIVE_XOR
+#define XE_NATIVE_XOR 0
+#endif
+
 /* DPP16 row_shl / row_shr / row_xmask with every row and bank enabled (all libr4d uses); a source
  * outside the 16-lane row reads 0 under bound_ctrl, else keeps `old`. Other controls read `old`. */
 inline int update_dpp(int old, int src, int ctrl, int /*row_mask*/, int /*bank_mask*/, bool bc) {
+    /* row_xmask: (l & 16) | ((l & 15) ^ k) is l ^ k for k < 16, always inside the row */
+    if (XE_NATIVE_XOR && ctrl >= 0x160 && ctrl < 0x170) return sycl::permute_group_by_xor(sg(), src, ctrl & 15);
     const int l = lane(), r = l & 15, k = ctrl & 15;
     int from;
     if (ctrl > 0x100 && ctrl < 0x110)       from = r + k < 16 ? l + k : -1;   /* row_shl */
@@ -80,6 +91,8 @@ inline int update_dpp(int old, int src, int ctrl, int /*row_mask*/, int /*bank_m
 }
 /* v_permlanex16_b32: lane L reads, from the other row of sixteen, the lane L's selector nibble names */
 inline int permlanex16(int /*old*/, int src, unsigned sel_lo, unsigned sel_hi, bool, bool) {
+    /* the identity selectors (r4d_xor_lane<16>): lane L reads lane L ^ 16 */
+    if (XE_NATIVE_XOR && sel_lo == 0x76543210u && sel_hi == 0xFEDCBA98u) return sycl::permute_group_by_xor(sg(), src, 16);
     const int l = lane(), r = l & 15;
     const unsigned sel = (r < 8 ? sel_lo >> (4 * r) : sel_hi >> (4 * (r - 8))) & 15u;
     return sycl::select_from_group(sg(), src, (16 - (l & 16)) | (int)sel);
@@ -97,6 +110,9 @@ inline unsigned ballot(bool p) {
 /* HIP's shuffles within groups of `width` lanes */
 template <class T> inline T shfl_from(T v, int src) { return sycl::select_from_group(sg(), v, src); }
 template <class T> inline T shfl_xor(T v, int mask, int width = 32) {
+    /* a mask inside the width: (l & ~(width - 1)) | ((l ^ mask) & (width - 1)) is l ^ mask */
+    if constexpr (XE_NATIVE_XOR && std::is_arithmetic_v<T>)
+        if (mask >= 0 && mask < width) return sycl::permute_group_by_xor(sg(), v, mask);
     const int l = lane();
     return shfl_from(v, (l & ~(width - 1)) | ((l ^ mask) & (width - 1)));
 }
