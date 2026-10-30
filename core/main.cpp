@@ -3,7 +3,12 @@
  */
 #include "engine.h"
 #include "hf_model.h"
+#include "rad_internal.h"
 #include "util/stallwatch.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <thread>
 
 int main(int argc, char** argv) {
     rad::Config cfg;
@@ -19,6 +24,18 @@ int main(int argc, char** argv) {
      * comfortably covers the slowest normal step, such as a container read from a slow disk. The
      * watch goes on into serve() and ends when the server listens. */
     auto watch = std::make_unique<rad::StallWatch>("startup", 120000);
+    /* RADIANCE_STALL_EXIT_S=N (owner note 112, opt-in): a startup quiet for N s inside a driver call
+     * exits (code 75) instead of waiting -- a stuck bind killed later, with the loader's copies queued
+     * behind it, has reset a card. RADIANCE_STALL_EXIT_ANY=1 counts any wait (the gate's injected
+     * one, RADIANCE_DEBUG_STARTUP_WAIT_S: a sleep before start()). */
+    if (const char* e = std::getenv("RADIANCE_STALL_EXIT_S"); e && std::atoi(e) > 0) {
+        const char* any = std::getenv("RADIANCE_STALL_EXIT_ANY");
+        watch->exit_after((uint64_t)std::atoi(e) * 1000, any && any[0] == '1');
+    }
+    if (const char* e = std::getenv("RADIANCE_DEBUG_STARTUP_WAIT_S"); e && std::atoi(e) > 0) {
+        RAD_WARN("startup: debug wait of %d s (RADIANCE_DEBUG_STARTUP_WAIT_S)", std::atoi(e));
+        std::this_thread::sleep_for(std::chrono::seconds(std::atoi(e)));
+    }
     s = engine.start();
     if (s < 0 || engine.config().debug_graph) watch.reset();
     if (s < 0) {

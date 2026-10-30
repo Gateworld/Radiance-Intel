@@ -215,6 +215,8 @@ struct StallWatch::Impl {
     std::string             phase;
     uint64_t                quiet_ns = 0;
     uint64_t                poll_ns = 0;
+    uint64_t                exit_ns = 0;    /* exit_after(): 0 = never */
+    bool                    exit_any = false;
     pid_t                   holder = 0;
     std::mutex              mu;
     std::condition_variable cv;
@@ -245,6 +247,28 @@ struct StallWatch::Impl {
                  stall_describe_thread(holder, true).c_str(), others.c_str(), phase.c_str());
     }
 
+    /* Whether the holder, or any other thread of the process, is inside a driver call (an ioctl,
+     * or an uninterruptible wait in the kernel). */
+    bool in_driver() const {
+        const pid_t me = (pid_t)syscall(SYS_gettid);
+        bool found = false;
+        if (DIR* d = opendir("/proc/self/task")) {
+            while (dirent* e = readdir(d)) {
+                const pid_t t = (pid_t)std::atoi(e->d_name);
+                if (t <= 0 || t == me) continue;
+                const std::string dir = fmt("/proc/self/task/%d/", (int)t);
+                long nr = -1;
+                std::sscanf(read_first_line(dir + "syscall").c_str(), "%ld", &nr);
+                const std::string stat = read_first_line(dir + "stat");
+                const size_t rp = stat.rfind(')');
+                const char state = rp != std::string::npos && rp + 2 < stat.size() ? stat[rp + 2] : '?';
+                if (is_ioctl(nr) || (t == holder && state == 'D')) { found = true; break; }
+            }
+            closedir(d);
+        }
+        return found;
+    }
+
     void run() {
         uint64_t since = rad_mono_ns();       /* the start of the current silence */
         uint64_t own = 0;                     /* the time of this watch's own last report */
@@ -254,6 +278,18 @@ struct StallWatch::Impl {
             const uint64_t last = log_last_line_ns();
             if (last > since && last != own) { since = last; next = quiet_ns; }
             const uint64_t now = rad_mono_ns();
+            if (exit_ns && now - since >= exit_ns && (exit_any || in_driver())) {
+                lk.unlock();
+                report(now - since);
+                RAD_ERR("%s: stopped after %.0f s with nothing logged and %s, before more work queues "
+                        "behind it (exit %d; RADIANCE_STALL_EXIT_S). A reboot or a retry decides the next "
+                        "step, not a longer wait.",
+                        phase.c_str(), (double)(now - since) / 1e9,
+                        exit_any ? "a wait of any kind (the test setting)" : "a driver call outstanding",
+                        StallWatch::kStallExitCode);
+                std::fflush(nullptr);
+                std::_Exit(StallWatch::kStallExitCode);
+            }
             if (now - since < next) continue;
             lk.unlock();
             report(now - since);
@@ -273,6 +309,14 @@ StallWatch::StallWatch(const char* phase, uint64_t quiet_ms) : p_(std::make_uniq
     p_->holder = (pid_t)syscall(SYS_gettid);
     install_stack_handler();
     p_->th = std::thread([this] { p_->run(); });
+}
+
+void StallWatch::exit_after(uint64_t after_ms, bool any_wait) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    p_->exit_ns = after_ms * 1000000ull;
+    p_->exit_any = any_wait;
+    /* poll often enough that the exit is at most a quarter of its interval late */
+    if (p_->exit_ns) p_->poll_ns = std::max<uint64_t>(1000000ull, std::min(p_->poll_ns, p_->exit_ns / 4));
 }
 
 StallWatch::~StallWatch() {

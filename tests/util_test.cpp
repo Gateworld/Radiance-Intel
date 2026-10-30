@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mutex>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <string>
 #include <thread>
@@ -519,6 +520,35 @@ TEST(a_phase_that_logs_is_never_reported) {
     });
     CHECK(out.find("nothing has been logged") == std::string::npos);
     CHECK(out.find("probe: step 59") != std::string::npos);
+}
+
+/* The exit status of a child that holds a watch with exit_after(50 ms, any_wait) across `sleep_ms`
+ * of silence, then ends normally with 0. */
+static int stall_child_status(bool any_wait, int sleep_ms) {
+    const pid_t pid = fork();
+    if (pid == 0) {
+        {
+            StallWatch w("probe", 60000);
+            w.exit_after(50, any_wait);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        }
+        _exit(0);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return -1;
+    return WEXITSTATUS(st);
+}
+
+/* Owner note 112: a quiet phase past exit_after() ends the process with kStallExitCode, so a stuck
+ * bring-up never waits for an outside kill; a test's sleep stands in for the stuck driver call. */
+TEST(a_quiet_phase_past_exit_after_ends_the_process) {
+    CHECK_EQ(stall_child_status(true, 5000), StallWatch::kStallExitCode);
+}
+
+/* Without a driver call outstanding the same silence is only reported, never an exit: a slow
+ * but healthy step (a disk read, a compile) is not a stall. */
+TEST(a_quiet_phase_outside_the_driver_does_not_exit) {
+    CHECK_EQ(stall_child_status(false, 400), 0);
 }
 
 RAD_TEST_MAIN()

@@ -36,6 +36,14 @@ public:
     StallWatch(const StallWatch&) = delete;
     StallWatch& operator=(const StallWatch&) = delete;
 
+    /* Fail fast (owner note 112): once nothing has been logged for `after_ms` while the thread
+     * doing the phase, or another of the process's threads, is inside a driver call, report as
+     * above and end the process with kStallExitCode instead of waiting -- a stall killed late, with
+     * copies queued behind it, has reset a card. `any_wait` also counts a wait outside the driver
+     * (a test's injected sleep). 0 turns it off (the default). */
+    void exit_after(uint64_t after_ms, bool any_wait = false);
+    static constexpr int kStallExitCode = 75;
+
     struct Impl;
 
 private:
