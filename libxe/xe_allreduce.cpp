@@ -63,6 +63,12 @@ using uc_u32 = syclex::annotated_ptr<uint32_t, decltype(syclex::properties(
     intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>))>;
 inline void uc_st(uint32_t* p, uint32_t v) { uc_u32 a(p); a[0] = v; }
 inline uint32_t uc_ld(const uint32_t* p) { uc_u32 a((uint32_t*)p); return a[0]; }
+/* the same for 8-byte words (run 102's LL form: a payload word and its sequence number in one aligned store) */
+using uc_u64 = syclex::annotated_ptr<uint64_t, decltype(syclex::properties(
+    intelex::write_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>,
+    intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>))>;
+inline void uc_st64(uint64_t* p, uint64_t v) { uc_u64 a(p); a[0] = v; }
+inline uint64_t uc_ld64(const uint64_t* p) { uc_u64 a((uint64_t*)p); return a[0]; }
 #ifdef __SYCL_DEVICE_ONLY__
 #define XE_AR_CONSTANT __attribute__((opencl_constant))
 #else
@@ -126,9 +132,20 @@ template <class T> T* alloc(const Inst& in, size_t n) {
     return sycl::aligned_alloc_device<T>(4096, n, *in.dev, *in.ctx);
 }
 
+/* RADIANCE_XE_AR_PROTO=4 (run 102, owner note 109 item 1): the LL form (see ar_kernel); unset or 0: as shipped. (Forms
+ * 1-3, the shipped handshake with lighter fences, were measured in AB1 -- no gain, and the same large-message
+ * divergence -- and removed.) */
+int ar_proto() {
+    static const int v = [] { const char* e = std::getenv("RADIANCE_XE_AR_PROTO"); return e && e[0] == '4' ? 4 : 0; }();
+    return v;
+}
+
 int build(Inst* in) {
     const int64_t eb = elem_bytes(in->dtype);
     in->slot_bytes = ((in->numel * eb + 4095) / 4096) * 4096;
+    /* the LL form carries a sequence number with every payload word: twice the bytes, so every message up to the
+     * bound takes it (the shipped form's large-message divergence is what it removes) */
+    if (ar_proto() == 4) in->slot_bytes *= 2;
     in->my_scratch = alloc<uint8_t>(*in, (size_t)(2 * in->slot_bytes));
     in->my_flags = alloc<uint32_t>(*in, 2 * kMaxBlocks);
     in->my_seq = sycl::aligned_alloc_device<uint32_t>(4096, 1024, *in->dev, *in->ctx);
@@ -220,11 +237,24 @@ template <> inline uint32_t from_f<0>(float f) { const uint32_t u = __float_as_u
 template <> inline uint32_t from_f<1>(float f) { return (uint32_t)sycl::bit_cast<uint16_t>((sycl::half)f); }
 template <> inline uint32_t from_f<2>(float f) { return __float_as_uint(f); }
 
+/* Run 99 (owner note 105 item 4, RADIANCE_XE_AR_HC_FUSE=1): ar_hc_write's residual write inside the bf16 all-reduce,
+ * as libr4d's ar_hc_write does it -- h[r][c][i] += inj[r][c] * y[r][i] on the two elements of each reduced word, with
+ * hc_write_kernel's arithmetic (bf16 operands to f32, one product and one add, narrowed by libr4d's f2bf: round half
+ * away, u + 0x8000), so the same bytes as the all-reduce then hc_write, one launch fewer. A word never straddles a
+ * row (n is even). */
+struct HcW {
+    const uint16_t* inj = nullptr;   /* [M][irow] bf16 gains; null: no write */
+    uint16_t* h = nullptr;           /* [M][hrow] bf16 streams, hc runs of n */
+    uint32_t n = 0, hc = 0, irow = 0, hrow = 0;
+};
+inline float hcw_bf2f(uint32_t b16) { return __uint_as_float(b16 << 16); }
+inline uint16_t hcw_f2bf(float f) { return (uint16_t)((__float_as_uint(f) + 0x8000u) >> 16); }
+
 /* One all-reduce: words of 32 bits (two bf16/fp16 or one f32); `n32` words in the message. */
-template <int DT>
+template <int DT, bool HW = false, int PR = 0>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
-               uint32_t rank, uint32_t nblk, uint32_t spin) {
+               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
@@ -233,6 +263,54 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     const uint32_t* in = my_slots + par * slot_words;
     const uint32_t per = (n32 + nblk - 1) / nblk;
     const uint32_t w0 = b * per, w1 = (w0 + per < n32) ? w0 + per : n32;
+    /* the sum of one word, rank 0's first, into y (and, with HW, hc_write's update of the streams) */
+    auto emit = [&](uint32_t k, uint32_t mine, uint32_t theirs) {
+        const uint32_t r0 = rank == 0 ? mine : theirs, r1 = rank == 0 ? theirs : mine;
+        uint32_t o;
+        if constexpr (DT == 2) o = from_f<2>(to_f<2>(r0) + to_f<2>(r1));
+        else {
+            const uint32_t lo = from_f<DT>(to_f<DT>(r0 & 0xffffu) + to_f<DT>(r1 & 0xffffu));
+            const uint32_t hi = from_f<DT>(to_f<DT>(r0 >> 16) + to_f<DT>(r1 >> 16));
+            o = lo | (hi << 16);
+        }
+        y[k] = o;
+        if constexpr (HW && DT == 0) {
+            const uint32_t j0 = 2u * k, r = j0 / hw.n, i = j0 - r * hw.n;
+            const float v0 = hcw_bf2f(o & 0xffffu), v1 = hcw_bf2f(o >> 16);
+            const uint16_t* gr = hw.inj + (size_t)r * hw.irow;
+            uint16_t* hp = hw.h + (size_t)r * hw.hrow + i;
+            for (uint32_t c = 0; c < hw.hc; ++c) {
+                const float g = hcw_bf2f(gr[c]);
+                uint16_t* p = hp + (size_t)c * hw.n;
+                p[0] = hcw_f2bf(hcw_bf2f(p[0]) + g * v0);
+                p[1] = hcw_f2bf(hcw_bf2f(p[1]) + g * v1);
+            }
+        }
+    };
+    if constexpr (PR == 4) {
+        /* RADIANCE_XE_AR_PROTO=4 (run 102): the LL form (NCCL's low-latency protocol). Each payload word goes to the
+         * peer with this launch's sequence number in the same aligned 8-byte store, and the reader polls each word
+         * until its number matches -- no flag word, no system-scope fence, nothing assumed about the order in which
+         * the peer's stores land (the shipped form's flag can arrive before its payload: the large-message rank
+         * divergence of X11-X16 and AB1-AB2). Twice the slot bytes; the launch takes this form only when 2 x n32
+         * words fit a parity's slot. Stale words carry s - 2 (the other parity) or 0 (never written): s >= 1. */
+        uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
+        const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
+        for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
+        uint32_t ok = 1;
+        for (uint32_t k = w0 + t; k < w1 && ok; k += kWG) {
+            uint32_t budget = spin;
+            uint64_t v;
+            for (;;) {
+                v = uc_ld64(in64 + k);
+                if ((uint32_t)(v >> 32) == s) break;
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                if (--budget == 0) { ok = 0; break; }
+            }
+            if (ok) emit(k, x[k], (uint32_t)v);
+        }
+        if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
+    } else {
     for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st(out + k, x[k]);
     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
     __syncthreads();
@@ -253,18 +331,8 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
     else {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-        for (uint32_t k = w0 + t; k < w1; k += kWG) {
-            const uint32_t mine = x[k], theirs = uc_ld(in + k);
-            const uint32_t r0 = rank == 0 ? mine : theirs, r1 = rank == 0 ? theirs : mine;
-            uint32_t o;
-            if constexpr (DT == 2) o = from_f<2>(to_f<2>(r0) + to_f<2>(r1));
-            else {
-                const uint32_t lo = from_f<DT>(to_f<DT>(r0 & 0xffffu) + to_f<DT>(r1 & 0xffffu));
-                const uint32_t hi = from_f<DT>(to_f<DT>(r0 >> 16) + to_f<DT>(r1 >> 16));
-                o = lo | (hi << 16);
-            }
-            y[k] = o;
-        }
+        for (uint32_t k = w0 + t; k < w1; k += kWG) emit(k, x[k], uc_ld(in + k));
+    }
     }
     /* the counter advances once per launch, after every block has read it: the last block to
      * finish does it (an atomic arrival count in seq_ctr[2]); a block that gave up arrives too, so
@@ -283,7 +351,7 @@ uint32_t spin_budget() {
     return v;
 }
 
-int launch(const RadArgs* a, RadStream s, int host_form) {
+int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr) {
     Inst* in = (Inst*)a->instance;
     if (!in || in->host != host_form) return R4D_NO(RAD_E_STATE);
     const RadTensor* x = r4d_opt(a, 0);
@@ -313,11 +381,19 @@ int launch(const RadArgs* a, RadStream s, int host_form) {
     try {
         sycl::queue* q = (sycl::queue*)s;
         const dim3 grid(nblk), block(kWG);
-#define XE_AR(DT) XE_LAUNCH(q, ar_kernel<DT>, grid, block, 0, (const uint32_t*)x->data, (uint32_t*)y->data,              \
-                            (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, in->my_flags,       \
-                            in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk, spin_budget())
-        switch (in->dtype) { case 0: XE_AR(0); break; case 1: XE_AR(1); break; default: XE_AR(2); break; }
+#define XE_ARP(DT, HW_, PR_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_>), grid, block, 0, (const uint32_t*)x->data,       \
+                            (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
+                            in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
+                            spin_budget(), hw ? *hw : HcW{})
+        /* RADIANCE_XE_AR_PROTO=4 (run 102): the LL form (a sequence number in every payload word), taken when the
+         * message's 8-byte words fit a parity's slot -- build() doubles the slots under it, so always */
+        const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
+        const bool ll = ar_proto() == 4 && 2ull * n32 <= slot_words;
+#define XE_AR(DT, HW_) do { if (ll) XE_ARP(DT, HW_, 4); else XE_ARP(DT, HW_, 0); } while (0)
+        if (hw && in->dtype == 0) XE_AR(0, true);
+        else switch (in->dtype) { case 0: XE_AR(0, false); break; case 1: XE_AR(1, false); break; default: XE_AR(2, false); break; }
 #undef XE_AR
+#undef XE_ARP
     } catch (const sycl::exception&) {
         return RAD_E_DEVICE;
     }
@@ -430,6 +506,19 @@ int ar_hc_write_launch(const RadArgs* a, RadStream s, int host_form) {
     p[2].key = "dtype"; p[2].kind = RAD_P_STR; p[2].sval = r4d_gets(a, "dtype");
     RadArgs ar{};
     ar.t = &xt; ar.n_t = 1; ar.p = p; ar.n_p = 3; ar.instance = in; ar.rank = a->rank; ar.world_size = a->world_size;
+    /* RADIANCE_XE_AR_HC_FUSE=1 (owner note 105 item 4): the residual write inside the bf16 all-reduce (ar_kernel's
+     * HW form); any shape it does not take keeps the two launches */
+    static const bool fuse = [] { const char* v = std::getenv("RADIANCE_XE_AR_HC_FUSE"); return v && v[0] == '1'; }();
+    if (fuse && in->dtype == 0 && n % 2 == 0 && inj->dtype == RAD_BF16 && h->dtype == RAD_BF16 && inj->data && h->data) {
+        long long irows = 0, hrows = 0;
+        const long long irow = r4d_rows_pitch(inj, hc, &irows), hrow = r4d_rows_pitch(h, hc * n, &hrows);
+        if (irow >= 0 && hrow >= 0 && irows >= M && hrows >= M) {
+            HcW hw;
+            hw.inj = (const uint16_t*)inj->data; hw.h = (uint16_t*)h->data;
+            hw.n = (uint32_t)n; hw.hc = (uint32_t)hc; hw.irow = (uint32_t)irow; hw.hrow = (uint32_t)hrow;
+            return launch(&ar, s, host_form, &hw);
+        }
+    }
     const int rc = launch(&ar, s, host_form);
     if (rc != RAD_OK) return rc;
     RadTensor t3[3] = { *y, *inj, *h };

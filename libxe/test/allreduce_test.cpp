@@ -95,6 +95,67 @@ int main(int argc, char** argv) {
     std::printf("device 0: %s\ndevice 1: %s\n", g_dev[0].get_info<sycl::info::device::name>().c_str(),
                 g_dev[1].get_info<sycl::info::device::name>().c_str());
 
+    /* AR_BENCH=N (run 102, owner note 109 item 1): the decode exchange's device time. Both ranks submit N bf16
+     * all-reduces of 2560 x AR_ROWS (default 1) values back to back, bracketed by a one-item marker kernel each side on
+     * a profiling queue; the time a launch is (start of the closing marker - end of the opening one) / N, so the
+     * ranks' host submission skew washes out over N. Environment for the forms (RADIANCE_XE_AR_*) passes through. */
+    const int64_t bound_x = std::getenv("AR_BOUND_X") ? std::atoll(std::getenv("AR_BOUND_X")) : 1;
+    if (const char* eb = std::getenv("AR_BENCH"); eb && !cpu) {
+        const int nb = std::atoi(eb);
+        const int rows = std::getenv("AR_ROWS") ? std::atoi(std::getenv("AR_ROWS")) : 1;
+        const int64_t numel = 2560LL * rows, bytes = numel * 2;
+        sycl::queue pq[2] = { sycl::queue(g_ctx, g_dev[0], { sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() }),
+                              sycl::queue(g_ctx, g_dev[1], { sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() }) };
+        void* inst[2] = { nullptr, nullptr };
+        int irc[2] = { 0, 0 };
+        RadParam p[4]{};
+        p[0].key = "world_size"; p[0].kind = RAD_P_INT; p[0].ival = 2;
+        p[1].key = "numel"; p[1].kind = RAD_P_INT; p[1].ival = numel * bound_x;
+        p[2].key = "dtype"; p[2].kind = RAD_P_STR; p[2].sval = "bf16";
+        p[3].key = "exact"; p[3].kind = RAD_P_INT; p[3].ival = 1;
+        {
+            std::thread t0([&] { irc[0] = init[0](p, 4, 0, 2, &inst[0]); });
+            std::thread t1([&] { irc[1] = init[0](p, 4, 1, 2, &inst[1]); });
+            t0.join(); t1.join();
+        }
+        if (irc[0] != RAD_OK || irc[1] != RAD_OK) { std::printf("RESULT ar_bench: init failed %d / %d\n", irc[0], irc[1]); return 1; }
+        uint8_t* x[2];
+        for (int r = 0; r < 2; ++r) { x[r] = sycl::malloc_device<uint8_t>(bytes, pq[r]); pq[r].memset(x[r], 0, bytes).wait(); }
+        for (int rep = 0; rep < 3; ++rep) {
+            double per[2] = {0, 0}, sub[2] = {0, 0};
+            std::thread th[2];
+            for (int r = 0; r < 2; ++r) th[r] = std::thread([&, r] {
+                RadTensor t{};
+                t.data = x[r]; t.dtype = RAD_BF16; t.rank = 1; t.shape[0] = numel; t.stride[0] = 1;
+                RadArgs a{};
+                a.t = &t; a.n_t = 1; a.p = p; a.n_p = 4; a.instance = inst[r]; a.rank = r; a.world_size = 2;
+                /* the launches recorded once into a SYCL graph and replayed, as the engine's tapes replay a pass:
+                 * a host-submitted loop is submission-bound (~23 us a launch, AB1), not the exchange */
+                namespace sxg = sycl::ext::oneapi::experimental;
+                sxg::command_graph g{pq[r].get_context(), pq[r].get_device()};
+                const auto h0 = std::chrono::steady_clock::now();
+                g.begin_recording(pq[r]);
+                for (int i = 0; i < nb; ++i) launch[0](&a, (RadStream)&pq[r]);
+                g.end_recording(pq[r]);
+                auto ge = g.finalize();
+                sub[r] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count() / nb;
+                sycl::event e0 = pq[r].single_task([] {});
+                pq[r].ext_oneapi_graph(ge);
+                sycl::event e1 = pq[r].single_task([] {});
+                e1.wait();
+                const auto a0 = e0.get_profiling_info<sycl::info::event_profiling::command_end>();
+                const auto a1 = e1.get_profiling_info<sycl::info::event_profiling::command_start>();
+                per[r] = (double)(a1 - a0) * 1e-3 / nb;
+            });
+            th[0].join(); th[1].join();
+            const bool st = stalled(inst[0], (RadStream)&pq[0]) || stalled(inst[1], (RadStream)&pq[1]);
+            std::printf("RESULT ar_bench rows %d, %d launches (a graph): device %.2f / %.2f us a launch (rank 0 / 1), recording "
+                        "%.2f / %.2f us a launch%s\n", rows, nb, per[0], per[1], sub[0], sub[1], st ? ", STALLED" : "");
+        }
+        for (int r = 0; r < 2; ++r) { sycl::free(x[r], pq[r]); fini(inst[r]); }
+        return 0;
+    }
+
     const Case cases[] = { { 0, 2560, true }, { 0, 2560, false }, { 2, 2560, true }, { 0, 4104, false },
                            { 0, 1 << 18, true }, { 2, 1 << 16, false } };
     bool all_ok = true;
@@ -110,7 +171,9 @@ int main(int argc, char** argv) {
             {
                 RadParam p[4]{};
                 p[0].key = "world_size"; p[0].kind = RAD_P_INT; p[0].ival = 2;
-                p[1].key = "numel"; p[1].kind = RAD_P_INT; p[1].ival = c.numel;
+                /* AR_BOUND_X=k (run 102): the instance's bound k x the message, as the engine's band bound exceeds a
+                 * decode message (the LL form, RADIANCE_XE_AR_PROTO=4, needs twice the message in a slot) */
+                p[1].key = "numel"; p[1].kind = RAD_P_INT; p[1].ival = c.numel * bound_x;
                 p[2].key = "dtype"; p[2].kind = RAD_P_STR; p[2].sval = c.dt == 2 ? "fp32" : "bf16";
                 p[3].key = "exact"; p[3].kind = RAD_P_INT; p[3].ival = 1;
                 std::thread t0([&] { irc[0] = init[form](p, 4, 0, 2, &inst[0]); });
