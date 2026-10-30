@@ -735,6 +735,14 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 // every candidate writes its own slot, matching vLLM's Triton path. A radiance caller declares the
 // form as the op's `state_form` (ru_state_form); the raw C entry, which vLLM's radiance_gdn.py
 // calls, has no op parameters and reads RADIANCE_GDN_ANCHOR, as that caller does.
+/* RADIANCE_XE_GDN_NT=0|1 (run 101, owner note 108 item 1): the state's non-temporal hint forced off or on instead of
+ * chosen by the flood size (RU_NT_MB). The hint changes no result. GB3 found the per-token state store holding the
+ * decode chain (~60 us a token of ~97); the hint's lowering on Xe is the first suspect. -1: the shipped choice. */
+static int ru_nt_force() {
+  static const int v = [] { const char* e = getenv("RADIANCE_XE_GDN_NT"); return e && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1; }();
+  return v;
+}
+
 static bool ru_anchor() {
   static const bool v = [] {
     const char* e = getenv("RADIANCE_GDN_ANCHOR");
@@ -815,7 +823,7 @@ static int ru_update_launch(
   // without it.
   const long slots_written = anc ? 1 : (long)indices_stride;
   const long flood = (long)N * slots_written * state_slot_stride * (sdt ? 2 : 4);
-  const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
+  const bool nt = ru_nt_force() >= 0 ? ru_nt_force() == 1 : flood <= (long)RU_NT_MB * 1024 * 1024;
   // Anchor bounds: six columns are addressed (three anchor, three factor), and the factor block
   // (indices_stride tokens of RU_FSTR) must fit in one head's slice of a slot. Keep these before
   // the staged path, which returns early and is the shipped anchor path.
@@ -906,7 +914,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const int sdt = state_fp16 ? 1 : 0;
   const long slots_written = anc ? 1 : sidx_stride;
   const long flood = (long)N * slots_written * st_slot * (sdt ? 2 : 4);
-  const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
+  const bool nt = ru_nt_force() >= 0 ? ru_nt_force() == 1 : flood <= (long)RU_NT_MB * 1024 * 1024;
   /* KT = 4 threads a v row (milestone 3, kernel 4): 32 state + 32 key + 32 query floats a lane fit
    * the large register file; the shipped two-thread layout spilled 32 KB a thread on Xe */
   /* 8 on the card (run 26: 16 state + 16 key + 16 query floats a lane; KT = 4 still spilled 7.5 KB at SIMD32); the
