@@ -36,7 +36,20 @@ namespace {
 constexpr int kRowsPerWG = 8;
 constexpr int kMaxM = 4;   /* activation rows a weight pass serves; more rows loop the launch */
 
-template <bool WS_BF16, int MB>
+/* NX (RADIANCE_XE_GEMV_NX=1, run 102, owner note 109 item 2): the five cross-lane steps (the group's three int32
+ * steps, the row's two float steps) as permute_group_by_xor instead of the emulated ds_bpermute / __shfl_xor (a
+ * select_from_group over a lane computed a lane: ~5x the time of the xor form in LB1). The same partner lanes in the
+ * same order, so the same bits. */
+template <int MSK>
+inline int gv_xor_i(int s) {
+    return sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), s, MSK);
+}
+template <int MSK>
+inline float gv_xor_f(float v) {
+    return sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, MSK);
+}
+
+template <bool WS_BF16, int MB, bool NX = false>
 void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
                       const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                       uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
@@ -69,17 +82,20 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
                     s = sycl::ext::oneapi::dot_acc((int32_t)wv[u], (int32_t)xv[u], s);
             }
             /* the group's exact int32 sum over its 8 lanes */
-            s += __builtin_amdgcn_ds_bpermute((lane ^ 1) << 2, s);
-            s += __builtin_amdgcn_ds_bpermute((lane ^ 2) << 2, s);
-            s += __builtin_amdgcn_ds_bpermute((lane ^ 4) << 2, s);
+            if constexpr (NX) { s += gv_xor_i<1>(s); s += gv_xor_i<2>(s); s += gv_xor_i<4>(s); }
+            else {
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 1) << 2, s);
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 2) << 2, s);
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 4) << 2, s);
+            }
             if (gl && m < M && chunk == 0) acc[m] += ((float)s * as[(size_t)m * as_ld + g]) * sb;
         }
     }
 #pragma unroll
     for (int m = 0; m < MB; ++m) {
         float v = acc[m];
-        v += __shfl_xor(v, 8);
-        v += __shfl_xor(v, 16);
+        if constexpr (NX) { v += gv_xor_f<8>(v); v += gv_xor_f<16>(v); }
+        else { v += __shfl_xor(v, 8); v += __shfl_xor(v, 16); }
         if (live && lane == 0 && m < M) {
             const uint32_t u = __float_as_uint(v);   /* round to nearest even, NaN kept quiet */
             y[(size_t)m * y_ld + n] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
@@ -204,10 +220,12 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         const int8_t* am = a + (size_t)m0 * a_ld;
         const float* asm_ = as + (size_t)m0 * as_ld;
         uint16_t* ym = y + (size_t)m0 * y_ld;
-        if (mb == 1)
-            XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, 1>), grid, block, 0, am, a_ld, asm_, as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb);
-        else
-            XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, kMaxM>), grid, block, 0, am, a_ld, asm_, as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb);
+        static const bool nx = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_NX"); return e && e[0] == '1'; }();
+#define XE_GV(MB_, NX_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_>), grid, block, 0, am, a_ld, asm_, as_ld, b, b_ld, \
+                                  bs, bs_ld, ym, y_ld, N, K, mb)
+        if (mb == 1) { if (nx) XE_GV(1, true); else XE_GV(1, false); }
+        else { if (nx) XE_GV(kMaxM, true); else XE_GV(kMaxM, false); }
+#undef XE_GV
     }
 }
 
