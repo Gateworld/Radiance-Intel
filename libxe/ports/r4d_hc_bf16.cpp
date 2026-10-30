@@ -204,16 +204,32 @@ __device__ __forceinline__ HcCodes16<W16> hc_load16(const unsigned char* __restr
     else { c.a = *(const uint4*)(wr + e); }
     return c;
 }
-template <bool W16>
+/* Intel port, run 98 (owner notes 66 / 99, RADIANCE_XE_HC_V2=5): four E4M3 codes as their values times 2^-8, by
+ * the hardware's FP16 conversion. A code's low seven bits shifted left by seven are an FP16 bit pattern whose value
+ * is the code's times 2^-8 -- normals and subnormals alike, since FP16's exponent bias exceeds E4M3's by 8 and its
+ * subnormals cover E4M3's -- and the sign goes to bit 15. About four operations a code against e4m3_to_f32's ~13
+ * (xe_lanes.h emulates v_cvt_pk_f32_fp8). The caller multiplies the group scale by 2^8 instead: every product and
+ * partial sum is then the original times an exact power of two, so the scaled dot gives the same bits. The NaN code
+ * (S1111111) reads as +-480 here, not NaN; quantised weights never hold it. */
+__device__ __forceinline__ void e4m3x4_s8(uint32_t w, float* f) {
+    const uint32_t a = w & 0x00ff00ffu, b = (w >> 8) & 0x00ff00ffu;     /* bytes 0 / 2 and 1 / 3, one a half */
+    const uint32_t ha = ((a & 0x007f007fu) << 7) | ((a & 0x00800080u) << 8);
+    const uint32_t hb = ((b & 0x007f007fu) << 7) | ((b & 0x00800080u) << 8);
+    f[0] = hc_h2f(ha); f[1] = hc_h2f(hb); f[2] = hc_h2f(ha >> 16); f[3] = hc_h2f(hb >> 16);
+}
+constexpr float kS8Scale = 256.0f;   /* the factor the S8 form leaves to the group scale */
+
+template <bool W16, bool S8 = false>
 __device__ __forceinline__ void hc_codes16_f32(const HcCodes16<W16>& c, float* wf) {
     if constexpr (W16) { f16x8(c.a, wf); f16x8(c.b, wf + 8); }
+    else if constexpr (S8) { e4m3x4_s8(c.a.x, wf); e4m3x4_s8(c.a.y, wf + 4); e4m3x4_s8(c.a.z, wf + 8); e4m3x4_s8(c.a.w, wf + 12); }
     else { e4m3x8(c.a.x, c.a.y, wf); e4m3x8(c.a.z, c.a.w, wf + 8); }
 }
 
-template <bool W16 = false>
+template <bool W16 = false, bool S8 = false>
 __device__ __forceinline__ float hc8_dot16(const unsigned short* __restrict__ sv, const HcCodes16<W16>& c) {
     float wf[16], nf[16];
-    hc_codes16_f32<W16>(c, wf);
+    hc_codes16_f32<W16, S8>(c, wf);
     bf16x8(*(const uint4*)sv, nf);
     bf16x8(*(const uint4*)(sv + 8), nf + 8);
     float p = 0.0f;
@@ -222,11 +238,12 @@ __device__ __forceinline__ float hc8_dot16(const unsigned short* __restrict__ sv
     return p;
 }
 
-template <int kU, bool W16 = false>
+template <int kU, bool W16 = false, bool S8 = false>
 __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__ sv,
                                               const unsigned char* __restrict__ wr, long K,
                                               int lane) {
     const float* __restrict__ sr = (const float*)(wr + hc_codes_bytes<W16>(K));
+    constexpr float ks = S8 ? kS8Scale : 1.0f;   /* exact: a power of two */
     float acc = 0.0f;
     long  j = 0;
     for (; j + kHc8Step * kU <= K; j += kHc8Step * kU) {
@@ -236,17 +253,17 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
         for (int u = 0; u < kU; ++u) {
             const long e = j + (long)u * kHc8Step + lane * 16;
             c[u] = hc_load16<W16>(wr, e);
-            s[u] = sr[e / r4d_hc8::kDownGroup];
+            s[u] = sr[e / r4d_hc8::kDownGroup] * ks;
         }
 #pragma unroll
         for (int u = 0; u < kU; ++u) {
             const long e = j + (long)u * kHc8Step + lane * 16;
-            acc = fmaf(hc8_dot16<W16>(sv + e, c[u]), s[u], acc);
+            acc = fmaf(hc8_dot16<W16, S8>(sv + e, c[u]), s[u], acc);
         }
     }
     for (; j < K; j += kHc8Step) {
         const long e = j + lane * 16;
-        acc = fmaf(hc8_dot16<W16>(sv + e, hc_load16<W16>(wr, e)), sr[e / r4d_hc8::kDownGroup], acc);
+        acc = fmaf(hc8_dot16<W16, S8>(sv + e, hc_load16<W16>(wr, e)), sr[e / r4d_hc8::kDownGroup] * ks, acc);
     }
     return acc;
 }
@@ -256,7 +273,7 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
  * threads' sums make the row. All of a quarter's sixteen-code loads issue before the first is used
  * (five at lowrank 320); kUpMaxQ bounds lowrank at 512. */
 constexpr int kUpMaxQ = 8;
-template <int RG, bool W16 = false>
+template <int RG, bool W16 = false, bool S8 = false>
 __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr,
                                            const unsigned char* __restrict__ wr, int q4,
                                            float* acc) {
@@ -272,7 +289,7 @@ __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr
     for (int i = 0; i < kUpMaxQ; ++i) {
         if (i >= nq) break;
         float wf[16];
-        hc_codes16_f32<W16>(c[i], wf);
+        hc_codes16_f32<W16, S8>(c[i], wf);
 #pragma unroll
         for (int r = 0; r < RG; ++r) {
             const float* dr = sd + (long)r * lr + k0 + 16 * i;
@@ -280,7 +297,7 @@ __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr
             for (int t = 0; t < 16; ++t) acc[r] = fmaf(wf[t], dr[t], acc[r]);
         }
     }
-    const float sc = ((const float*)(wr + hc_codes_bytes<W16>(lr)))[q4];
+    const float sc = ((const float*)(wr + hc_codes_bytes<W16>(lr)))[q4] * (S8 ? kS8Scale : 1.0f);
 #pragma unroll
     for (int r = 0; r < RG; ++r) {
         float a = acc[r] * sc;
@@ -398,9 +415,11 @@ __device__ __forceinline__ float sv_at(const float* p, long i) { return p[i]; }
 template <int kU, typename SV>
 __device__ __forceinline__ float wave_dot_lds(const SV* __restrict__ sv,
                                               const unsigned short* __restrict__ wr, long HN,
-                                              int lane, unsigned short* stage) {
+                                              int lane, unsigned short* stage, float acc0 = 0.0f) {
     constexpr long kPer = kWave * 8;
-    float acc = 0.0f;
+    /* acc0 (the Intel port, run 98): a running sum to continue -- a dot taken in two calls over consecutive halves
+     * whose length is a multiple of kPer * kU is then the one call's chain, in the same order. */
+    float acc = acc0;
     long  j = 0;
     if (((uintptr_t)wr & 15u) == 0u) {
         if (kU > 1) {
@@ -1077,7 +1096,8 @@ __host__ __device__ inline long hc_up_st_off(long rg, long lr) { return (rg * lr
  * first (hc runs of ipb consecutive rows, each run contiguous, so a wave reads 512 consecutive bytes a load),
  * issued before `d`'s and behind the same barrier. A thread's quarter row then comes from LDS: the same codes
  * and scale in the same order. */
-template <int RG, int F8, bool I8 = false, bool ST = false>   /* F8: 0 bf16, 1 E4M3 rows, 2 FP16 rows */
+template <int RG, int F8, bool I8 = false, bool ST = false, bool S8 = false>   /* F8: 0 bf16, 1 E4M3 rows, 2 FP16 rows;
+                                                                               S8: e4m3x4_s8 (V2 level 5) */
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       const unsigned short* __restrict__ dbuf,
@@ -1121,7 +1141,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
         const int  t = tid >> 2, q4 = tid & 3;
         const long j = (long)(t / ipb) * n + i0 + t % ipb;
         float acc[RG];
-        hc8_dot_up<RG, F8 == 2>(sd, lr, ST ? s_w + (long)t * uld : (const unsigned char*)upv + j * uld, q4, acc);
+        hc8_dot_up<RG, F8 == 2, S8>(sd, lr, ST ? s_w + (long)t * uld : (const unsigned char*)upv + j * uld, q4, acc);
 #pragma unroll
         for (int r = 0; r < RG; ++r)
             if (q4 == 0) s_u[r * kUpRows + t] = f2bf(sigmoidf_(acc[r]));
@@ -1250,25 +1270,27 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
                                    unsigned int* ctr, long long rows, long long n, int hc,
                                    long long lr, long long hrow, long long xrow, long long qrow,
                                    long long srow, long long rqrow, long long rsrow, float wadd,
-                                   bool st, RadStream stream) {
+                                   bool st, RadStream stream, bool s8 = false) {
     int emit_rc = RAD_OK;
     const long rg = hc_up_rg(rows, lr);
     const dim3 grid((unsigned)(n / (kUpRows / hc)), (unsigned)((rows + rg - 1) / rg));
     /* The staged form (owner note 66): E4M3 rows of whole 16-byte units that fit beside `d`. */
     st = st && f8 == 1 && uld % 16 == 0 && hc_up_st_off(rg, lr) + kUpRows * uld <= 60 * 1024;
+    s8 = s8 && st;   /* the S8 decode only with the staged E4M3 form */
     const unsigned lds = (unsigned)(st ? hc_up_st_off(rg, lr) + kUpRows * uld : rg * lr * sizeof(float));
     const void* upp = up->data;
-#define HC_UPMIX_CASE4(RG_, F8_, I8_, ST_)                                                       \
-    emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_, ST_>), grid, dim3(kThreads), lds, \
+#define HC_UPMIX_CASE4(RG_, F8_, I8_, ST_, S8_)                                                  \
+    emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_, ST_, S8_>), grid, dim3(kThreads), lds, \
                        upp, uld, dbuf, h, w, scale, nbuf, x, q, qs, rq, rqs, ctr, (long)rows,      \
                        (long)n,                                                                   \
                        hc,                                                                        \
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
                        (long)rsrow, wadd)
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
-    do { /* st only with f8 == 1: no staged instantiation of the other forms */               \
-        if (st) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1));                                       \
-        else HC_UPMIX_CASE4(RG_, F8_, I8_, false);                                               \
+    do { /* st / s8 only with f8 == 1: no staged instantiation of the other forms */          \
+        if (s8) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1), (F8_ == 1));                           \
+        else if (st) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1), false);                           \
+        else HC_UPMIX_CASE4(RG_, F8_, I8_, false, false);                                        \
     } while (0)
 #define HC_UPMIX_CASE(RG_, F8_)                                                                  \
     do { if (i8) HC_UPMIX_CASE3(RG_, F8_, true); else HC_UPMIX_CASE3(RG_, F8_, false); } while (0)
@@ -1352,8 +1374,14 @@ void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __rest
 /* kPart (RADIANCE_XE_HC_V2=3, a timing split): 0 the columns and, in the last workgroup, the inject gains; 1 the
  * columns only (grid ceil(lr / 8)); 2 the gains only (grid 1). The same work either way (P31: 17.2 us for the
  * columns, 18.6 for the gains, 22.2 together). N stays in global memory: an LDS copy, as kernel A's, made the
- * launch slower (P32: 26.5 us). */
-template <int kPart = 0>
+ * launch slower (P32: 26.5 us).
+ *
+ * kS8 (RADIANCE_XE_HC_V2=5): the columns decode their codes by e4m3x4_s8 (P34: 12.6 us against 17.2), and each
+ * inject gain gets a workgroup of its own (the first hc of the grid; all of it for kPart 2): its eight waves copy N
+ * and the gain's weight row into 2 x HN bytes of dynamic LDS, half of each at a time, and wave 0 runs the same
+ * wave_dot_lds over LDS, its sum carried across the halves. One wave walking the row from global memory took 18.6 us
+ * (P31), 37.3 with eight loads in flight (P34). The same values in the same order. */
+template <int kPart = 0, bool kS8 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
                        const unsigned short* __restrict__ injw, unsigned short* __restrict__ dout,
@@ -1364,6 +1392,45 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const unsigned short* sN = nbuf + r * HN;
     const float inv_hc = 1.0f / (float)hc;
+    if constexpr (kS8) {
+        /* The gain workgroups come first in the grid (so they start at once), one a gain, and only when there are
+         * gains; the columns follow. */
+        const long ninj = kPart == 1 || !injw || !inj ? 0 : (kPart == 2 ? (long)gridDim.x : hc);
+        if (kPart == 1 || (long)blockIdx.x >= ninj) {
+            const long k = ((long)blockIdx.x - ninj) * kV2Cols + wave;
+            if (k >= lr) return;
+            float acc = hc8_dot_down<kDotU, false, true>(sN, (const unsigned char*)downv + k * dld, HN, lane);
+            acc = wave_sum(acc);
+            if (lane == 0) dout[r * lr + k] = f2bf(siluf_(acc * inv_hc));
+            return;
+        }
+        if (!injw || !inj) return;
+        const int c = (int)blockIdx.x;
+        /* N and the gain's row, in two halves of HN / 2 each (2 x HN bytes of LDS: the launch checks that the half
+         * is a whole number of wave_dot_lds steps). Both in LDS at once (40 KB, P37's 9.6 us alone) left one
+         * workgroup an Xe core and the launch in two rounds (P36: 24.1 us against the columns' 12.6); the row alone
+         * in LDS with N from global was slower still (P38: 37.1). Wave 0 carries its sum from the first half into
+         * the second: the one-pass chain. */
+        XE_DYN_LDS(unsigned short, s_nw);
+        const unsigned short* wg = injw + (long)c * HN;
+        const long half = HN / 2;
+        float acc = 0.0f;
+        for (int p = 0; p < 2; ++p) {
+            if (p) __syncthreads();   /* wave 0 is done reading the first half */
+            for (long o = (long)tid * 8; o < half; o += (long)kThreads * 8) {
+                *(uint4*)(s_nw + o)        = *(const uint4*)(sN + p * half + o);
+                *(uint4*)(s_nw + half + o) = *(const uint4*)(wg + p * half + o);
+            }
+            __syncthreads();
+            if (wave == 0)
+                acc = wave_dot_lds<kDotU>((const unsigned short*)s_nw, (const unsigned short*)(s_nw + half), half,
+                                          lane, s_stage[0], acc);
+        }
+        if (wave != 0) return;
+        acc = wave_sum(acc);
+        if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+        return;
+    }
     if (kPart == 1 || (kPart == 0 && blockIdx.x != gridDim.x - 1)) {
         const long k = (long)blockIdx.x * kV2Cols + wave;
         if (k >= lr) return;
@@ -1384,11 +1451,13 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
 /* Read once, in host code, at every call. RADIANCE_XE_HC_V2: 1 the norm and down product above, 2 also
  * hc_up_mix's staged W_up rows, 3 as 2 with the inject gains in a launch of their own (to time the two), 4 as 2
  * with the mix's codes made by hc_quant_rows after it instead of by its last workgroups behind a counter and
- * fences (P32: 28.7 + 3.6 us against 33.7). */
+ * fences (P32: 28.7 + 3.6 us against 33.7), 5 as 4 with the E4M3 codes decoded by e4m3x4_s8 in hc_v2_down and
+ * hc_up_mix, and each inject gain in a workgroup of its own over LDS; 6 as 5 with the down product's columns and gains in
+ * launches of their own, to time the two. */
 int xe_hc_v2_level() {
     static const int lv = [] {
         const char* v = std::getenv("RADIANCE_XE_HC_V2");
-        const int l = v && v[0] >= '1' && v[0] <= '4' ? v[0] - '0' : 0;
+        const int l = v && v[0] >= '1' && v[0] <= '6' ? v[0] - '0' : 0;
         if (l) std::fprintf(stderr, "[xe] hc_read V2 level %d (E4M3 decode rows)\n", l);
         return l;
     }();
@@ -4111,16 +4180,26 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
                            (long)n, (int)hc, (long)hrow, eps, wadd);
         const unsigned dcols = (unsigned)((lr + kV2Cols - 1) / kV2Cols);
-#define HC_V2_DOWN(P_, GX_)                                                                                     \
-        R4D_EMIT(s, (hc_v2_down_kernel<P_>), dim3((GX_), (unsigned)rows), dim3(kThreads), 0u,                     \
+        /* levels 5 / 6: the S8 form, its gains first in the grid, a workgroup each with the row in 2 x HN bytes of LDS */
+        /* the gains stage N and their row in halves of a whole number of wave_dot_lds steps (kWave * 8 * kDotU) */
+        const bool s8d = xe_hc_v2_level() >= 5 && HN % (2L * kWave * 8 * kDotU) == 0 && HN * 2 <= 56 * 1024;
+        const unsigned glds = s8d ? (unsigned)(HN * 2) : 0u;
+#define HC_V2_DOWN(P_, S8_, GX_, LDS_)                                                                          \
+        R4D_EMIT(s, (hc_v2_down_kernel<P_, S8_>), dim3((GX_), (unsigned)rows), dim3(kThreads), (LDS_),            \
                  (const unsigned short*)nbuf, (const void*)down->data, (long)dld,                                 \
                  injw ? (const unsigned short*)injw->data : nullptr, dbuf, inj ? (unsigned short*)inj->data : nullptr, \
                  (long)rows, (int)hc, (long)HN, (long)lr, (long)irow)
         if (emit_rc == RAD_OK && xe_hc_v2_level() == 3) {
-            emit_rc = HC_V2_DOWN(1, dcols);
-            if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, 1u);
+            emit_rc = HC_V2_DOWN(1, false, dcols, 0u);
+            if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, false, 1u, 0u);
+        } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 6) {
+            /* level 6: level 5's columns and gains in launches of their own (a timing split, as level 3) */
+            emit_rc = HC_V2_DOWN(1, true, dcols, 0u);
+            if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, true, (unsigned)hc, glds);
+        } else if (emit_rc == RAD_OK && s8d) {
+            emit_rc = HC_V2_DOWN(0, true, dcols + (unsigned)((injw && inj) ? hc : 0), glds);
         } else if (emit_rc == RAD_OK) {
-            emit_rc = HC_V2_DOWN(0, dcols + 1u);
+            emit_rc = HC_V2_DOWN(0, false, dcols + 1u, 0u);
         }
 #undef HC_V2_DOWN
     } else {
@@ -4148,7 +4227,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         emit_rc = hc_up_mix_launch(up, (long)uld, wf, i8, dbuf, (const unsigned short*)h->data,
                                    (const float*)w->data, scale, nbuf, (unsigned short*)x->data,
                                    nullptr, nullptr, nullptr, nullptr, nullptr, rows, n, (int)hc, lr,
-                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, true, s);
+                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, true, s,
+                                   xe_hc_v2_level() >= 5);
         if (emit_rc == RAD_OK)
             hc_quant_rows_launch(i8, (const unsigned short*)x->data, q ? (unsigned char*)q->data : nullptr,
                                  q ? (float*)qs->data : nullptr, rq ? (unsigned char*)rq->data : nullptr,
@@ -4162,7 +4242,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                    q ? (float*)qs->data : nullptr,
                                    rq ? (unsigned char*)rq->data : nullptr,
                                    rq ? (float*)rqs->data : nullptr, mctr, rows, n, (int)hc, lr,
-                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, v2 && xe_hc_v2_level() >= 2, s);
+                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, v2 && xe_hc_v2_level() >= 2, s,
+                                   v2 && xe_hc_v2_level() >= 5);
     else
         emit_rc = hc_up_launch(up, (long)uld, wf, dbuf, ubuf, rows, HN, lr, s);
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
