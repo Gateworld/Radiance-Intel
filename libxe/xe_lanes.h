@@ -165,14 +165,30 @@ inline float e4m3_to_f32(unsigned b) {
     if ((b & 0x7fu) == 0x7fu) u = ((b & 0x80u) << 24) | 0x7fc00000u;
     return sycl::bit_cast<float>(u);
 }
+/* Intel port, run 98 (owner note 66): two E4M3 bytes (bits 0-7 and 16-23 of x) to floats through the hardware's
+ * FP16 conversion. A byte's low seven bits shifted left by seven are an FP16 pattern of its value times 2^-8 --
+ * normals and subnormals alike, as FP16's exponent bias exceeds E4M3's by 8 and its subnormals cover E4M3's -- and
+ * the sign goes to bit 15; times 2^8 is then exact. About half e4m3_to_f32's operations. S1111111 keeps its
+ * signed quiet NaN, so every one of the 256 codes gives e4m3_to_f32's bits (lane_cases.h case 6). */
+inline void e4m3x2_f16(unsigned x, float& a, float& b) {
+    const unsigned h = ((x & 0x007f007fu) << 7) | ((x & 0x00800080u) << 8);
+    a = (float)sycl::bit_cast<sycl::half>((uint16_t)(h & 0xffffu)) * 256.0f;
+    b = (float)sycl::bit_cast<sycl::half>((uint16_t)(h >> 16)) * 256.0f;
+    if ((x & 0x7fu) == 0x7fu) a = sycl::bit_cast<float>(((x & 0x80u) << 24) | 0x7fc00000u);
+    if ((x & 0x7f0000u) == 0x7f0000u) b = sycl::bit_cast<float>(((x & 0x800000u) << 8) | 0x7fc00000u);
+}
 /* v_cvt_pk_f32_fp8: bytes 0,1 (hi false) or 2,3 of v to two floats; exact */
 inline v2f cvt_pk_f32_fp8(int v, bool hi) {
     const unsigned u = (unsigned)v >> (hi ? 16 : 0);
-    return v2f{e4m3_to_f32(u & 0xffu), e4m3_to_f32((u >> 8) & 0xffu)};
+    float a, b;
+    e4m3x2_f16((u & 0xffu) | ((u & 0xff00u) << 8), a, b);
+    return v2f{a, b};
 }
 /* v_cvt_f32_fp8: byte `sel` of v to a float; exact */
 inline float cvt_f32_fp8(int v, int sel) {
-    return e4m3_to_f32(((unsigned)v >> (8 * (sel & 3))) & 0xffu);
+    float a, b;
+    e4m3x2_f16(((unsigned)v >> (8 * (sel & 3))) & 0xffu, a, b);
+    return a;
 }
 /* f32 -> f16 rounding toward zero (v_cvt_pkrtz_f16_f32): no rounding up, overflow to the largest
  * finite, NaN kept quiet */
