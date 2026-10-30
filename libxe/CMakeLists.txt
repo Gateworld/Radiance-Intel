@@ -199,6 +199,14 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_moe_planes_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_moe_planes_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_moe_planes_bench libxe)
+  # Run 101 (owner note 108 item 1): device timing of the decode GDN update at one rank's shape. Not a ctest.
+  add_executable(xe_gdn_decode_bench test/gdn_decode_bench.cpp)
+  rad_l0_sycl(xe_gdn_decode_bench)
+  target_include_directories(xe_gdn_decode_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
+                             ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_link_libraries(xe_gdn_decode_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_gdn_decode_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_gdn_decode_bench libxe)
   # Owner note 1's per-launch figure: N tiny kernels launched plainly and replayed from a tape.
   add_executable(xe_tape_bench test/tape_bench.cpp)
   rad_l0_sycl(xe_tape_bench)
