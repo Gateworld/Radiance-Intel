@@ -512,6 +512,10 @@ std::atomic<int64_t> g_sig_early{0}, g_bar_early{0};
 std::atomic<int64_t> g_same_tape_waits{0};   /* plays that waited for the same tape's previous play (its lists were still in flight) */   /* N4's diagnostic: the ring event / the barrier already complete right after the play's submission */
 std::atomic<int64_t> g_nstretch_composed{0}, g_nstretch_evicted{0};
 std::atomic<int64_t> g_append_retries{0};   /* owner note 58: appends retried after an out-of-memory result */
+/* Run 99 (owner note 103): the host's waits for the device that the segment-list release adds, by where: 0 the early
+ * release's in-flight window, 1 its wait at tape_end, 2 the first play's release (the shipped form). Counted only when
+ * the play had not completed; on the VRAM trace line. */
+std::atomic<int64_t> g_twait_n[3] = {}, g_twait_us[3] = {};
 void vtrace_list(int d, int kind, int delta);   /* RADIANCE_L0_VRAM_TRACE's list counts (below) */
 Tape::~Tape() {
     for (Seg& s : segs)
@@ -644,11 +648,14 @@ void vtrace_report(int d, const char* at, unsigned long long id) {
     const double M = 1048576.0;
     RAD_INFO("l0 vram trace dev %d %s %llu: process VRAM %.0f MiB (+%.0f since the first reading); driver free %.0f MiB; "
              "engine allocations %.0f MiB (+%.0f); "
-             "segment lists alive %lld (peak %lld, made %lld); composed lists alive %lld (peak %lld, made %lld)",
+             "segment lists alive %lld (peak %lld, made %lld); composed lists alive %lld (peak %lld, made %lld); "
+             "release waits: early window %lld (%.1f ms), early end %lld (%.1f ms), first play %lld (%.1f ms)",
              d, at, id, now / M, (now - V.base) / M, driver_free(d) / M, used / M, (used - V.used_base) / M,
              (long long)V.seg_alive.load(),
              (long long)V.seg_peak.load(), (long long)V.seg_made.load(), (long long)V.str_alive.load(),
-             (long long)V.str_peak.load(), (long long)V.str_made.load());
+             (long long)V.str_peak.load(), (long long)V.str_made.load(),
+             (long long)g_twait_n[0].load(), g_twait_us[0].load() / 1e3, (long long)g_twait_n[1].load(),
+             g_twait_us[1].load() / 1e3, (long long)g_twait_n[2].load(), g_twait_us[2].load() / 1e3);
 }
 /* Run 96 (owner note 95 item 1): the ledger -- each device or host-mapped allocation (and free) of at least 16 MiB,
  * with the card's process VRAM and the driver's free VRAM right after it. The engine logs what it allocated just
@@ -1095,6 +1102,15 @@ void n_slot_wait(int dev, int slot, uint64_t serial, const char* who) {
                      t_device, dev, slot, (unsigned long long)serial, who, (long long)g_nplays.load(), slot_story(dev, slot, serial).c_str());
         }
     }
+}
+/* n_slot_wait for the segment-list release, counted by where (g_twait_*) when the play had not completed. */
+void n_release_wait(int where, int dev, int slot, uint64_t serial, const char* who) {
+    if (n_slot_done(dev, slot, serial)) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    n_slot_wait(dev, slot, serial, who);
+    g_twait_n[where].fetch_add(1, std::memory_order_relaxed);
+    g_twait_us[where].fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                std::memory_order_relaxed);
 }
 /* The stream's next submission to the runtime follows its pending native play: the host waits here. */
 void settle(L0Stream& s) {
@@ -1957,13 +1973,30 @@ bool tape_early() {
     static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_TAPE_EARLY"); return e && e[0] == '1'; }();
     return v;
 }
-constexpr size_t kEarlyWindow = 64;   /* segment lists of the current recording in flight at most */
+/* Segment lists of the current recording in flight at most (RADIANCE_L0_TAPE_EARLY_WINDOW, default 64). */
+size_t early_window() {
+    static const size_t n = [] { const char* v = std::getenv("RADIANCE_L0_TAPE_EARLY_WINDOW"); long x = v ? std::atol(v) : 0; return x > 0 ? (size_t)x : (size_t)64; }();
+    return n;
+}
+/* Run 99 (owner note 103), RADIANCE_L0_TAPE_EARLY_LAZY=1: tape_end does not wait for the recording's last play; the
+ * lists still in flight stay queued and go once done, reaped at the tape's plays and its next segment closes. */
+bool early_lazy() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_TAPE_EARLY_LAZY"); return e && e[0] == '1'; }();
+    return v;
+}
 void n_early_drop(Tape& t, const Tape::NDead& d) {
     if (!d.list) return;
     t.nlast.erase(d.list);
     zeCommandListDestroy(d.list);
     g_nlists_destroyed.fetch_add(1, std::memory_order_relaxed);
     vtrace_list(t.dev, 0, -1);
+}
+/* The queued segment lists whose plays have completed, oldest first (the immediate list is in order). */
+void n_early_reap(Tape& t) {
+    while (!t.nseg_dead.empty() && n_slot_done(t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial)) {
+        n_early_drop(t, t.nseg_dead.front());
+        t.nseg_dead.pop_front();
+    }
 }
 void n_early_after_seg(Tape& t, int si) {
     if (!tape_early() || !t.native || compose_mode() == 0) return;
@@ -1979,12 +2012,9 @@ void n_early_after_seg(Tape& t, int si) {
             t.nstretch_used[key] = ++t.nclock;
         }
     }
-    while (!t.nseg_dead.empty() && n_slot_done(t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial)) {
-        n_early_drop(t, t.nseg_dead.front());
-        t.nseg_dead.pop_front();
-    }
-    while (t.nseg_dead.size() > kEarlyWindow) {
-        n_slot_wait(t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial, "an early segment release");
+    n_early_reap(t);
+    while (t.nseg_dead.size() > early_window()) {
+        n_release_wait(0, t.dev, t.nseg_dead.front().slot, t.nseg_dead.front().serial, "an early segment release");
         n_early_drop(t, t.nseg_dead.front());
         t.nseg_dead.pop_front();
     }
@@ -1993,9 +2023,11 @@ void n_early_end(Tape& t) {
     if (!tape_early() || !t.native || compose_mode() == 0) return;
     for (Seg& s : t.segs)   /* none expected: each segment's list was queued at its close */
         if (s.list) { t.nseg_dead.push_back(Tape::NDead{s.list, t.nslot, t.nserial}); s.list = nullptr; }
-    if (!t.nseg_dead.empty()) {
+    if (early_lazy()) {
+        n_early_reap(t);   /* the rest go once done (n_early_reap at the tape's plays); no wait here */
+    } else if (!t.nseg_dead.empty()) {
         /* the immediate list is in order: the last queued play complete means all of them are */
-        n_slot_wait(t.dev, t.nseg_dead.back().slot, t.nseg_dead.back().serial, "the recording's segment release");
+        n_release_wait(1, t.dev, t.nseg_dead.back().slot, t.nseg_dead.back().serial, "the recording's segment release");
         for (const Tape::NDead& d : t.nseg_dead) n_early_drop(t, d);
         t.nseg_dead.clear();
     }
@@ -2006,10 +2038,11 @@ int play_now(Tape& tr, int from, int to) {
     if (t->native) {
         return guarded("tape_play", [&] {
             std::vector<ze_command_list_handle_t> lists;
+            if (!t->nseg_dead.empty()) n_early_reap(*t);   /* RADIANCE_L0_TAPE_EARLY_LAZY: the recording's lists, once done */
             /* phase 2 of the pool: from the first play on, every range is a composed list; the segment
              * lists (one a segment, 1,036 a decode pass) go once the recording's own plays have completed */
             if (compose_mode() != 0 && !t->segs_dropped) {
-                if (t->submitted && !n_slot_done(t->dev, t->nslot, t->nserial)) n_slot_wait(t->dev, t->nslot, t->nserial, "the segment lists' release");
+                if (t->submitted) n_release_wait(2, t->dev, t->nslot, t->nserial, "the segment lists' release");
                 int64_t n = 0;
                 for (Seg& s : t->segs)
                     if (s.list) { zeCommandListDestroy(s.list); s.list = nullptr; ++n; }
