@@ -7,13 +7,15 @@ namespace rad {
 
 HostArena::~HostArena() { close(); }
 
-int HostArena::open(int64_t slot_bytes, int64_t cap_bytes) {
+int HostArena::open(int64_t slot_bytes, int64_t cap_bytes, bool pageable) {
     close();
     if (slot_bytes <= 0 || cap_bytes < slot_bytes) return RAD_E_INVAL;
     const int64_t n = cap_bytes / slot_bytes;
     /* Pinned or nothing: an async copy to pageable memory serialises against the stream, so a
-     * pageable fallback would run the store at a fraction of its budgeted rate. */
-    base_ = rad_dev_alloc(n * slot_bytes, RAD_MEM_HOST_PINNED);
+     * pageable fallback would run the store at a fraction of its budgeted rate. `pageable` is asked
+     * for, not a fallback (the Intel port's RADIANCE_CKPT_PAGEABLE, hostarena.h). */
+    kind_ = pageable ? RAD_MEM_HOST : RAD_MEM_HOST_PINNED;
+    base_ = rad_dev_alloc(n * slot_bytes, kind_);
     if (!base_) return RAD_E_NOMEM;
     slot_bytes_ = slot_bytes;
     used_ = 0;
@@ -24,7 +26,7 @@ int HostArena::open(int64_t slot_bytes, int64_t cap_bytes) {
 }
 
 void HostArena::close() {
-    if (base_) rad_dev_free(base_, RAD_MEM_HOST_PINNED);
+    if (base_) rad_dev_free(base_, kind_);
     base_ = nullptr;
     slot_bytes_ = 0;
     used_ = 0;

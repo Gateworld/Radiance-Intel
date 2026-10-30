@@ -23,7 +23,12 @@ namespace rad {
 class HostArena {
 public:
     ~HostArena();
-    int  open(int64_t slot_bytes, int64_t cap_bytes);
+    /* `pageable` (Intel port, run 97, owner note 95 item 3): plain host memory, which no card binds.
+     * On two B70s the 1.54 GiB pinned snapshot store is an import on card1 (the runtime owns host memory
+     * on card0); with MTP on and the expert slab ~0.9 GiB larger its bind never returns (xe VM_BIND EBUSY,
+     * H63 / H64 / H67 / M76), before or after the load. Its copies then serialise against the stream
+     * (B34: +0.4-0.5 s on 7K / 16K first tokens). */
+    int  open(int64_t slot_bytes, int64_t cap_bytes, bool pageable = false);
     void close();
     bool enabled() const { return base_ != nullptr; }
 
@@ -49,6 +54,7 @@ public:
 private:
     bool    is_used(int64_t s) const { return (bits_[(size_t)(s >> 6)] >> (s & 63)) & 1ull; }
     void*   base_ = nullptr;
+    int     kind_ = RAD_MEM_HOST_PINNED;
     int64_t slot_bytes_ = 0;
     int64_t used_ = 0;
     int64_t cap_slots_ = 0;

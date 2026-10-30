@@ -3110,8 +3110,15 @@ int Engine::configure_kv() {
             std::string why;
             if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
                 return refuse("does not fit: " + why);
-            if (ck_store_.open(slot, slot * n) != RAD_OK)
+            /* Intel port, run 97 (owner note 95 item 3): RADIANCE_CKPT_PAGEABLE=1 keeps the store in plain host
+             * memory, which no card binds (hostarena.h). */
+            const char* pg = std::getenv("RADIANCE_CKPT_PAGEABLE");
+            const bool pageable = pg && pg[0] == '1';
+            if (ck_store_.open(slot, slot * n, pageable) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
+            if (pageable)
+                RAD_INFO("checkpoint slots: the store is pageable host memory (RADIANCE_CKPT_PAGEABLE): no card "
+                         "binds it, and its copies wait for their stream");
             if (!sized_auto)
                 RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
                          "none of it on the card", (long long)n, what, humanb(slot).c_str(),
