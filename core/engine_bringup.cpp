@@ -1505,6 +1505,23 @@ int Engine::plan() {
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* Intel port, run 97 (owner note 95 item 3, RADIANCE_VRAM_CAP_FROM_FREE=1): the runtime's free reading
+             * is capped at the reported capacity (SYCL's global_mem_size, 30.30 GiB on a B70, of a 32,616 MiB card),
+             * so a reading at the cap says only "at least that". A 2 GiB probe brings the reading under the cap; the
+             * reading plus the probe is the card's free memory, which vram_budget's resolve then takes as the card. */
+            if (const char* cf = std::getenv("RADIANCE_VRAM_CAP_FROM_FREE");
+                cf && cf[0] == '1' && props.vram_bytes > 0 && props.vram_free >= props.vram_bytes - (1ll << 20)) {
+                const int64_t probe = 2048ll << 20;
+                if (void* p = rad_dev_alloc(probe, RAD_MEM_DEVICE)) {
+                    RadDeviceProps q{};
+                    if (rad_dev_props(r->device, &q) >= 0 && q.vram_free < q.vram_bytes - (1ll << 20))
+                        f.free = q.vram_free + probe;
+                    rad_dev_free(p, RAD_MEM_DEVICE);
+                    RAD_INFO("VRAM budget: card %d reports %s with its free reading capped there; a 2 GiB probe puts "
+                             "the free memory at %s (RADIANCE_VRAM_CAP_FROM_FREE)", r->device,
+                             humanb(props.vram_bytes).c_str(), humanb(f.free).c_str());
+                }
+            }
             /* On integrated graphics an eighth of host memory stays the host's, on top of the free
              * figure's own bound (core/device/hip.cpp), so the OS is not driven to reclaim and
              * kill. */

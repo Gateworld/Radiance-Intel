@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace rad {
 
@@ -99,6 +100,18 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * see (core/cvec.h's direction table), which the headroom already covers. */
     int64_t held_out = 0;
     for (const VramFacts& f : per_rank) held_out = std::max(held_out, f.held_out);
+    /* Intel port, run 97 (owner note 95 item 3): on a B70 the device's reported capacity (SYCL's
+     * global_mem_size, 30.30 GiB) is below what is free at this reading (~31.6 GiB of the card's
+     * 32,616 MiB), so `already_held` clamps to 0 and ~1.3 GiB is never split. RADIANCE_VRAM_CAP_FROM_FREE=1
+     * takes the free reading as the card when it is the larger: what the driver holds is then outside the
+     * split already, and everything allocated after it -- the runtime's first-use surfaces, the recordings
+     * -- is the headroom's to cover, by measurement (briefs/2026-10-30-vram-by-owner.md). */
+    if (const char* cf = std::getenv("RADIANCE_VRAM_CAP_FROM_FREE"); cf && cf[0] == '1' && freeb > b.capacity) {
+        if (log)
+            RAD_INFO("VRAM budget: the card reports %s but %s is free; the split takes the free reading as the card "
+                     "(RADIANCE_VRAM_CAP_FROM_FREE)", humanb(b.capacity).c_str(), humanb(freeb).c_str());
+        b.capacity = freeb;
+    }
     b.already_held = std::max<int64_t>(b.capacity - freeb - held_out, 0);
 
     /* What is left after the fixed terms. */
