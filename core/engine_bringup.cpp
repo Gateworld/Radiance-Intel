@@ -1436,6 +1436,13 @@ void Engine::probe_arena_levels() {
  * plus one ring a sequence (the ring in the fixed costs), never capped at the declare-time
  * window, never snapshotted. Every plan (each sizing probe and the real manager) goes through
  * here, so they all plan the same bytes. */
+/* RADIANCE_HOST_FIRST's reserve of the load's pinned buffers (defined with the loader below) */
+static bool host_first();
+static void reserve_fill(int64_t bytes, int n);
+static void reserve_release_all();
+static int load_workers();
+extern const int64_t kLoadBounceBytes, kLoadWindowBytes;
+
 static int declare_ring_windows(KVManager& kv, const Program& prog) {
     for (size_t g = 1; g < prog.kv_groups.size(); ++g) {
         const RadKVGroupDecl& d = prog.kv_groups[g].decl;
@@ -1739,6 +1746,17 @@ int Engine::plan() {
         }
     }
 
+    /* RADIANCE_HOST_FIRST (run 101, owner notes 98 item 1 / 107): the load's pinned buffers before any VRAM pool, so
+     * every card binds them while nearly empty (the host pools follow in Pools::configure, first on each card). */
+    if (host_first() && !device_is_host()) {
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+        const int w = load_workers();
+        reserve_fill(kLoadBounceBytes, w);
+        reserve_fill(kLoadWindowBytes + 2 * DirectFile::alignment(), 6);
+        RAD_INFO("RADIANCE_HOST_FIRST: the load's %d bounce rings (%s each) and 6 windows reserved, and each card's "
+                 "host pool allocated before its VRAM pools", w, humanb(kLoadBounceBytes).c_str());
+    }
+
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
         /* This rank's own split: cfg_ field for field unless the block above re-split it. */
@@ -1848,6 +1866,54 @@ struct LoadRun {
  * The pool holds a bounded amount, since staged inputs are host copies and a model exceeds host
  * memory. A new input waits for room only while finished work will free some (an incomplete
  * weight cannot be relaid, so waiting on it would deadlock); otherwise it is taken anyway. */
+/* RADIANCE_HOST_FIRST=1 (the Intel port, run 101, owner notes 98 item 1 / 107): the load's pinned buffers -- the
+ * workers' bounce rings and the sweep's windows -- are allocated before the VRAM pools, while the cards are nearly
+ * empty. Each is made resident on every card at allocation (l0's explicit residency, up to 1 GiB), and on a boot
+ * whose second card stops binding imports once it is full (M102: the bounces after the pools) those binds must
+ * come first. The load takes them by size; what it leaves is freed after it. */
+static bool host_first() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_HOST_FIRST"); return e && e[0] == '1'; }();
+    return v;
+}
+struct HostReserve {
+    std::mutex mu;
+    std::vector<std::pair<int64_t, void*>> free;
+};
+static HostReserve& host_reserve() { static HostReserve r; return r; }
+/* A pinned buffer of `bytes`: one of the reserve's when it holds that size, else a fresh allocation. */
+static void* reserve_alloc(int64_t bytes) {
+    if (host_first()) {
+        HostReserve& r = host_reserve();
+        std::lock_guard<std::mutex> lk(r.mu);
+        for (size_t i = 0; i < r.free.size(); ++i)
+            if (r.free[i].first == bytes) {
+                void* p = r.free[i].second;
+                r.free.erase(r.free.begin() + (long)i);
+                return p;
+            }
+    }
+    return rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
+}
+static void reserve_fill(int64_t bytes, int n) {
+    HostReserve& r = host_reserve();
+    std::lock_guard<std::mutex> lk(r.mu);
+    for (int i = 0; i < n; ++i)
+        if (void* p = rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED)) r.free.emplace_back(bytes, p);
+}
+static void reserve_release_all() {
+    HostReserve& r = host_reserve();
+    std::lock_guard<std::mutex> lk(r.mu);
+    for (auto& f : r.free) rad_dev_free(f.second, RAD_MEM_HOST_PINNED);
+    r.free.clear();
+}
+/* The loader's worker count and buffer sizes, shared by the sweep and the reserve above. */
+static int load_workers() {
+    const unsigned hw = std::thread::hardware_concurrency();
+    return (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+}
+extern const int64_t kLoadBounceBytes = 8 * (4ll << 20);   /* Bounce: kSlots x kSlot */
+extern const int64_t kLoadWindowBytes = 64ll << 20;        /* the sweep's default window */
+
 struct StagedWeight {
     const Program* prog = nullptr;
     size_t   wi = 0;
@@ -2018,7 +2084,8 @@ private:
         /* The next slot, once the copy made out of it last time round has run. */
         int acquire(uint8_t** p) {
             if (!buf) {
-                buf = rad_dev_alloc(kSlots * kSlot, RAD_MEM_HOST_PINNED);
+                static_assert(kSlots * kSlot == kLoadBounceBytes, "the reserve's bounce size");
+                buf = reserve_alloc(kSlots * kSlot);
                 if (!buf) return RAD_E_NOMEM;
             }
             Slot& s = slot[next];
@@ -2292,7 +2359,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         }
     }
 
-    int64_t window = 64 << 20;
+    int64_t window = kLoadWindowBytes;
     /* Widen the window to hold the widest strided piece. Slicing is correct at any width (a cut
      * piece is copied in two halves), but a narrower window doubles the copies. In practice no
      * piece approaches 64 MiB. */
@@ -2334,7 +2401,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. */
         RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
         for (int b = 0; b < kWin; ++b) {
-            buf[b] = rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED);
+            buf[b] = reserve_alloc(window + 2 * kBlk);
             if (!buf[b]) {
                 RAD_ERR("load: no %s pinned staging window (the load needs %d); free host memory",
                         humanb(window).c_str(), kWin);
@@ -2907,9 +2974,8 @@ int Engine::load_weights() {
     int64_t staged_bytes = 0;
     for (const StagedWeight& sw : staged) staged_bytes += sw.in_bytes;
     RelayoutPool pool(staged);
-    const unsigned hw = std::thread::hardware_concurrency();
     /* Started even with nothing staged: the same workers fill host pool slots. */
-    const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+    const int workers = load_workers();
     pool.start(workers, 4ll << 30);
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
@@ -2925,6 +2991,7 @@ int Engine::load_weights() {
         }
     }
     const int pool_st = pool.finish();
+    reserve_release_all();   /* RADIANCE_HOST_FIRST: what the load did not take */
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
     if (!staged.empty() && file_)

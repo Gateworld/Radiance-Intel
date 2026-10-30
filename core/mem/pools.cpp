@@ -258,6 +258,20 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
 
     int st = RAD_OK;
     int s;
+    /* RADIANCE_HOST_POOL_PIECE_MIB=<MiB> (the Intel port, owner notes 87 / 90): the host pool as
+     * allocations of at most that size (2048 is the port's setting) instead of one. Unset or 0: one
+     * allocation, as always. */
+    int64_t piece = 0;
+    if (const char* e = std::getenv("RADIANCE_HOST_POOL_PIECE_MIB")) {
+        const long long v = std::strtoll(e, nullptr, 10);
+        if (v > 0) piece = (int64_t)v * MiB;
+    }
+    /* RADIANCE_HOST_FIRST=1 (the Intel port, run 101, owner notes 98 item 1 / 107): the host pool -- the imports a
+     * second card binds -- is allocated (and, under RADIANCE_L0_EXPLICIT_RESIDENCY, made resident) before this
+     * card's VRAM pools, while the card is still nearly empty, as production's ROCm path maps host memory at
+     * allocation. The bring-up's other imports follow the same rule (engine_bringup.cpp). */
+    const bool host_first = [] { const char* e = std::getenv("RADIANCE_HOST_FIRST"); return e && e[0] == '1'; }();
+    if (host_first && (s = host_.init("host_pool", hp, RAD_MEM_HOST_MAPPED, host, piece)) < 0) st = s;
     /* Order matters only for diagnostics: the two big pools go first so a failure names the one
      * that could not be served. */
     if ((s = weights_.init("vram_weights", w,  RAD_MEM_DEVICE, device)) < 0) st = s;
@@ -272,15 +286,7 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,
      * rad_dev_device_ptr returns null in Mover::init and Site::DeviceZeroCopy experts get an
      * unusable pointer. On the host backend all memory kinds are the same aligned pages. */
-    /* RADIANCE_HOST_POOL_PIECE_MIB=<MiB> (the Intel port, owner notes 87 / 90): the host pool as
-     * allocations of at most that size (2048 is the port's setting) instead of one. Unset or 0: one
-     * allocation, as always. */
-    int64_t piece = 0;
-    if (const char* e = std::getenv("RADIANCE_HOST_POOL_PIECE_MIB")) {
-        const long long v = std::strtoll(e, nullptr, 10);
-        if (v > 0) piece = (int64_t)v * MiB;
-    }
-    if ((s = host_   .init("host_pool",   hp, RAD_MEM_HOST_MAPPED, host, piece)) < 0) st = s;
+    if (!host_first && (s = host_.init("host_pool", hp, RAD_MEM_HOST_MAPPED, host, piece)) < 0) st = s;
 
     fit_report_  = weights_.report();
     fit_report_ += kv_.report();
