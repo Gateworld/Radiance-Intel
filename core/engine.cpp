@@ -806,20 +806,30 @@ int Engine::step_loop() {
         sched_.publish(/*idle=*/false);
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
-         * shows up in `collect`, the step's only host synchronisation. */
+         * shows up in `collect`, the step's only host synchronisation. RADIANCE_STEP_TRACE=1 (Intel
+         * port, milestone 3 run 110, owner note 129 item 1): a line for every step that is not a
+         * decode step (a prefill's two or three chunks never reach 128), at INFO, with its rows. */
         if (t_on) {
             phase_mark(PH_DRAFT);
-            if (++phase_n_ == 128) {
+            static const bool each = [] { const char* e = std::getenv("RADIANCE_STEP_TRACE"); return e && *e == '1'; }();
+            const bool now_each = each && b->phase != RAD_PHASE_DECODE;
+            if (++phase_n_ == 128 || now_each) {
+                const double n = (double)phase_n_ * 1000.0;
                 double tot = 0;
                 for (int i = 0; i < PH_N; ++i) tot += phase_us_[i];
-                RAD_DEBUG("step %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f "
-                          "ranks %.2f save %.2f collect %.2f commit %.2f draft %.2f (mean/128)",
-                          b->phase == RAD_PHASE_DECODE ? "decode" : "other", tot / 128000.0,
-                          phase_us_[PH_PLAN] / 128000.0,  phase_us_[PH_BEGIN] / 128000.0,
-                          phase_us_[PH_BUILD] / 128000.0, phase_us_[PH_PRE] / 128000.0,
-                          phase_us_[PH_RANKS] / 128000.0, phase_us_[PH_SAVE] / 128000.0,
-                          phase_us_[PH_COLLECT] / 128000.0, phase_us_[PH_COMMIT] / 128000.0,
-                          phase_us_[PH_DRAFT] / 128000.0);
+                const char* fmt = "step %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f "
+                                  "ranks %.2f save %.2f collect %.2f commit %.2f draft %.2f (mean/%d, %d rows)";
+                const char* kind = b->phase == RAD_PHASE_DECODE ? "decode" : "other";
+                if (now_each)
+                    RAD_INFO(fmt, kind, tot / n, phase_us_[PH_PLAN] / n, phase_us_[PH_BEGIN] / n,
+                             phase_us_[PH_BUILD] / n, phase_us_[PH_PRE] / n, phase_us_[PH_RANKS] / n,
+                             phase_us_[PH_SAVE] / n, phase_us_[PH_COLLECT] / n, phase_us_[PH_COMMIT] / n,
+                             phase_us_[PH_DRAFT] / n, phase_n_, (int)b->n_tok);
+                else
+                    RAD_DEBUG(fmt, kind, tot / n, phase_us_[PH_PLAN] / n, phase_us_[PH_BEGIN] / n,
+                              phase_us_[PH_BUILD] / n, phase_us_[PH_PRE] / n, phase_us_[PH_RANKS] / n,
+                              phase_us_[PH_SAVE] / n, phase_us_[PH_COLLECT] / n, phase_us_[PH_COMMIT] / n,
+                              phase_us_[PH_DRAFT] / n, phase_n_, (int)b->n_tok);
                 for (int i = 0; i < PH_N; ++i) phase_us_[i] = 0;
                 phase_n_ = 0;
             }
