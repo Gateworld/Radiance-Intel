@@ -351,6 +351,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["miss_hist"] = { s.experts.miss_hist[0], s.experts.miss_hist[1], s.experts.miss_hist[2],
                                s.experts.miss_hist[3], s.experts.miss_hist[4], s.experts.miss_hist[5],
                                s.experts.miss_hist[6] };
+            e["small_dispatches"] = s.experts.small_dispatches;
+            e["small_routed"] = s.experts.small_routed;
+            e["small_rows"]   = s.experts.small_rows;
+            e["small_shared"] = { s.experts.small_shared[0], s.experts.small_shared[1], s.experts.small_shared[2],
+                                  s.experts.small_shared[3] };
             e["layer_routed"] = s.experts.layer_routed;
             e["layer_missed"] = s.experts.layer_missed;
             e["routed"]      = s.experts.routed;

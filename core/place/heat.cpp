@@ -232,8 +232,11 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     int32_t n_cold = ends ? end_n_cold_[l] : 0;
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
+    const bool small = total <= 64;
+    uint64_t shared[4] = { 0, 0, 0, 0 };
     auto credit = [&](int32_t j) {
         const int32_t c = counts[j];
+        if (small) ++shared[c >= 4 ? 3 : c - 1];
         const size_t q = (size_t)(lo + j);
         const float was = h[j];
         const float x = was + (float)c * w;
@@ -267,6 +270,12 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
     ++stats_.dispatches;
+    if (small) {
+        ++stats_.small_dispatches;
+        stats_.small_routed += (uint64_t)routed;
+        stats_.small_rows += (uint64_t)total;
+        for (int i = 0; i < 4; ++i) stats_.small_shared[i] += shared[i];
+    }
     {
         const int32_t m = routed - resident;
         if (l < layer_routed_.size()) {

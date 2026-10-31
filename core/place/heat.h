@@ -128,6 +128,12 @@ struct HeatStats {
      * units a host hand-off for that layer would take. Dispatches by their misses: 0, 1, 2, 3-4, 5-8, 9-16,
      * 17 or more (unweighted: one count a dispatch). The per-layer sums are layer_counts(). */
     uint64_t miss_hist[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    /* Owner note 109 item 6 (Intel port, milestone 3, run 108): the dispatches of at most 64 routed rows (decode
+     * and the MTP verify), their routed experts, their rows (the histogram's sum), and their routed experts by
+     * the rows routed to each (1, 2, 3, 4 or more) -- how often an expert's matrix tile would share rows there.
+     * Unweighted: one count a dispatch. */
+    uint64_t small_dispatches = 0, small_routed = 0, small_rows = 0;
+    uint64_t small_shared[4] = { 0, 0, 0, 0 };
 };
 
 class HeatEngine {
