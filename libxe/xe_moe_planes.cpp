@@ -489,6 +489,7 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
     XE_SHARED(int32_t, s_tok, kMxRows);               /* stage (bit 4): each row's activation row, -1 dead */
     XE_SHARED(uint32_t, s_wrow, kMxCols);             /* stage: each column's weight-row offset, ~0 none */
     const bool stage = (compact & 4u) != 0;           /* RADIANCE_XE_MOE_MX_STAGE=1 (run 108) */
+    const bool vec = stage && (compact & 8u) != 0;    /* RADIANCE_XE_MOE_MX_VEC=1 (run 110) */
     compact &= 3u;
     const int tid = (int)threadIdx.x, wave = tid / kMxSG, lane = tid % kMxSG;
     const uint32_t nb = blockIdx.x;
@@ -634,6 +635,35 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
         for (uint32_t g = 0; g < K / 64u; ++g) {
             const uint32_t k0 = g * 64u;
             xe::syncthreads();                                  /* the previous group's stages are consumed */
+            if (vec) {
+                /* RADIANCE_XE_MOE_MX_VEC=1: four activation bytes a load (1024 loads: 8 a thread), two pairs stored;
+                 * four code bytes a load (512: 4 a thread), four packed words; the same values in the same places */
+                for (int idx = tid; idx < kMxRows * 16; idx += kMxThreads) {
+                    const int r = idx / 16, kq = (idx % 16) * 4;
+                    const int32_t t = s_tok[r];
+                    uint32_t w0 = 0, w1 = 0;
+                    if (t >= 0) {
+                        const uint32_t v4 = *(const uint32_t*)(A + (size_t)t * a_ld + k0 + (uint32_t)kq);
+                        w0 = f2h(s_e4[v4 & 255u]) | (f2h(s_e4[(v4 >> 8) & 255u]) << 16);
+                        w1 = f2h(s_e4[(v4 >> 16) & 255u]) | (f2h(s_e4[v4 >> 24]) << 16);
+                    }
+                    *(uint32_t*)(s_a + r * kMxAP + kq) = w0;
+                    *(uint32_t*)(s_a + r * kMxAP + kq + 2) = w1;
+                }
+                for (int idx = tid; idx < kMxCols * 8; idx += kMxThreads) {
+                    const int n = idx / 8, b4 = (idx % 8) * 4;
+                    const int step = b4 / 8, k2 = b4 % 8;
+                    const uint32_t wo = s_wrow[n];
+                    const bool okw = wo != 0xFFFFFFFFu;
+                    const uint32_t v4 = okw ? *(const uint32_t*)(wrow0 + (size_t)wo + k0 / 2u + (uint32_t)b4) : 0u;
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const uint32_t code = (v4 >> (8 * u)) & 255u;
+                        s_b[((step * 4 + n / 16) * 8 + k2 + u) * 16 + (n % 16)] =
+                            okw ? ((uint32_t)s_lv[code & 15u] | ((uint32_t)s_lv[code >> 4] << 16)) : 0u;
+                    }
+                }
+            } else {
             for (int idx = tid; idx < kMxRows * 32; idx += kMxThreads) {   /* 2048 pairs: 16 a thread */
                 const int r = idx / 32, kp = (idx % 32) * 2;
                 const int32_t t = s_tok[r];
@@ -644,11 +674,13 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
                 }
                 *(uint32_t*)(s_a + r * kMxAP + kp) = w;
             }
+            }
             if ((k0 & 127u) == 0u)
                 for (int r = tid; r < kMxRows; r += kMxThreads) {
                     const int32_t t = s_tok[r];
                     s_as[r] = t >= 0 ? As[(size_t)t * as_ld + k0 / 128u] : 0.0f;
                 }
+            if (!vec)
             for (int idx = tid; idx < kMxCols * 32; idx += kMxThreads) {   /* 2048 words: 16 a thread */
                 const int n = idx / 32, byte = idx % 32;
                 const int step = byte / 8, k2 = byte % 8;
@@ -775,10 +807,13 @@ uint32_t mx_compact() {   /* moe_planes_mx_kernel's `compact` (run 108): 1, the 
                            * runs plus the rows past them (zeroed) -- the default since owner note 126; BOUND=1 (and
                            * COMPACT not 1) -> 2, the per-row grid bounded at off[n_expert]; COMPACT=0 -> 0, the old
                            * per-row grid (its wrong-expert blocks past the runs; for comparisons only).
-                           * RADIANCE_XE_MOE_MX_STAGE=1 adds 4: the staging's per-row / per-column work once */
+                           * RADIANCE_XE_MOE_MX_STAGE=1 adds 4: the staging's per-row / per-column work once;
+                           * RADIANCE_XE_MOE_MX_VEC=1 (with STAGE; run 110, owner note 129 item 5) adds 8: its loads
+                           * four bytes at a time */
     static const uint32_t v = [] {
         const char* st = std::getenv("RADIANCE_XE_MOE_MX_STAGE");
-        const uint32_t stage = st && *st == '1' ? 4u : 0u;
+        const char* vc = std::getenv("RADIANCE_XE_MOE_MX_VEC");
+        const uint32_t stage = st && *st == '1' ? (vc && *vc == '1' ? 12u : 4u) : 0u;
         const char* s = std::getenv("RADIANCE_XE_MOE_MX_COMPACT");
         const char* b = std::getenv("RADIANCE_XE_MOE_MX_BOUND");
         if (s && *s == '1') return 1u | stage;
