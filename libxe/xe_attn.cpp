@@ -229,8 +229,9 @@ long long part_bytes(long long head_dim, long long gqa) {
 template <int E, bool KV8, bool OF>
 void launch(sycl::queue* q, const AttnP& p, int total_q) {
     const dim3 grid((unsigned)p.splits, (unsigned)p.kv_heads, (unsigned)total_q), block(32 * p.gqa);
-    /* RADIANCE_XE_ATTN_VX=1 (run 110): an E4M3 cache at E 8 whose every row offset is a multiple of 8 bytes */
-    static const bool vx_on = [] { const char* e = std::getenv("RADIANCE_XE_ATTN_VX"); return e && e[0] == '1'; }();
+    /* VX (run 110): an E4M3 cache at E 8 whose every row offset is a multiple of 8 bytes. The default since owner note
+     * 135 (exact: KA5's md5; the M-pair's texts); RADIANCE_XE_ATTN_VX=0 opts out */
+    static const bool vx_on = [] { const char* e = std::getenv("RADIANCE_XE_ATTN_VX"); return !(e && e[0] == '0'); }();
     const bool vx = vx_on && KV8 && E == 8 && ((uintptr_t)p.kv | (uintptr_t)p.kv_bs | (uintptr_t)p.kv_hs | (uintptr_t)p.kv_row) % 8 == 0;
     if (vx) {
         if (p.splits == 1) XE_LAUNCH(q, (attn_split_kernel<E, KV8, true, OF, true>), grid, block, 0, p);
