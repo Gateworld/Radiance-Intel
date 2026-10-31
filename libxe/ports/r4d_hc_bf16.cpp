@@ -269,6 +269,52 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
     return acc;
 }
 
+/* Intel port, run 103 (owner note 119, RADIANCE_XE_HC_V2=8): hc8_dot_down<kU, false, true> for up to R rows of N
+ * (`nr` of them, `svs` apart) against one E4M3 row of W_down: each sixteen codes are loaded and decoded once and
+ * serve every row. Each row's chain is hc8_dot_down's -- hc8_dot16's sixteen fmaf from 0, the same group scale, the
+ * same fmaf order over the row -- so every row gets level 5's bits. The rows are walked one at a time inside each
+ * block, their N loaded there, so only one row's sixteen values are live (run 99's form held four and spilled). */
+template <int kU, int R>
+__device__ __forceinline__ void hc8_dot_down_rows_s8(const unsigned short* __restrict__ sv, long svs, int nr,
+                                                     const unsigned char* __restrict__ wr, long K, int lane,
+                                                     float* acc) {
+    const float* __restrict__ sr = (const float*)(wr + hc_codes_bytes<false>(K));
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    auto block = [&](const HcCodes16<false>& c, float s, long e) {
+        float wf[16];
+        hc_codes16_f32<false, true>(c, wf);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= nr) break;
+            float nf[16];
+            bf16x8(*(const uint4*)(sv + r * svs + e), nf);
+            bf16x8(*(const uint4*)(sv + r * svs + e + 8), nf + 8);
+            float p = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) p = fmaf(wf[t], nf[t], p);
+            acc[r] = fmaf(p, s, acc[r]);
+        }
+    };
+    long j = 0;
+    for (; j + kHc8Step * kU <= K; j += kHc8Step * kU) {
+        HcCodes16<false> c[kU];
+        float s[kU];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const long e = j + (long)u * kHc8Step + lane * 16;
+            c[u] = hc_load16<false>(wr, e);
+            s[u] = sr[e / r4d_hc8::kDownGroup] * kS8Scale;
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) block(c[u], s[u], j + (long)u * kHc8Step + lane * 16);
+    }
+    for (; j < K; j += kHc8Step) {
+        const long e = j + lane * 16;
+        block(hc_load16<false>(wr, e), sr[e / r4d_hc8::kDownGroup] * kS8Scale, e);
+    }
+}
+
 /* One thread's quarter of an E4M3 row of mix_up against RG rows of `d` in LDS. The quarter is the
  * row's scale group (r4d_hc8::up_group), so its partial sums are complete before scaling, and four
  * threads' sums make the row. All of a quarter's sixteen-code loads issue before the first is used
@@ -1449,16 +1495,44 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
     }
 }
 
+/* RADIANCE_XE_HC_V2=8 (run 103, owner note 119): the down product's columns for a verify's rows, four rows a wave
+ * and two columns a workgroup (64 threads), over ceil(lr / 2) column slices x ceil(rows / 4) row groups. Level 7
+ * kept a row a token in the grid, so three of four column workgroups returned at once and the read-latency-bound
+ * kernel lost most of its workgroups in flight (P46: 55.2 us against level 5's 45.7). Here every workgroup works,
+ * small ones, as many as level 5's grid holds over 4. Each row's sum is hc8_dot_down<.., S8>'s: level 5's bits. The
+ * inject gains keep level 6's launch of their own. */
+constexpr int kV2RowCols = 2;   /* columns (waves) a workgroup */
+template <int kRG>
+__global__ __launch_bounds__(kWave * kV2RowCols)
+void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
+                            unsigned short* __restrict__ dout, long rows, int hc, long HN, long lr) {
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * kRG;
+    const long k = (long)blockIdx.x * kV2RowCols + wave;
+    if (k >= lr || r0 >= rows) return;
+    const int nr = (int)(rows - r0 < kRG ? rows - r0 : kRG);
+    const float inv_hc = 1.0f / (float)hc;
+    float acc[kRG];
+    hc8_dot_down_rows_s8<2, kRG>(nbuf + r0 * HN, HN, nr, (const unsigned char*)downv + k * dld, HN, lane, acc);
+#pragma unroll
+    for (int i = 0; i < kRG; ++i) {
+        if (i >= nr) break;
+        const float a = wave_sum(acc[i]);
+        if (lane == 0) dout[(r0 + i) * lr + k] = f2bf(siluf_(a * inv_hc));
+    }
+}
+
 /* Read once, in host code, at every call. RADIANCE_XE_HC_V2: 1 the norm and down product above, 2 also
  * hc_up_mix's staged W_up rows, 3 as 2 with the inject gains in a launch of their own (to time the two), 4 as 2
  * with the mix's codes made by hc_quant_rows after it instead of by its last workgroups behind a counter and
  * fences (P32: 28.7 + 3.6 us against 33.7), 5 as 4 with the E4M3 codes decoded by e4m3x4_s8 in hc_v2_down and
  * hc_up_mix, and each inject gain in a workgroup of its own over LDS; 6 as 5 with the down product's columns and gains in
- * launches of their own, to time the two. */
+ * launches of their own, to time the two; 8 (run 103, owner note 119) as 6 with a verify's columns four rows a wave
+ * (hc_v2_down_rows_kernel). (7, run 102's four-rows form on the per-row grid, was slower and removed.) */
 int xe_hc_v2_level() {
     static const int lv = [] {
         const char* v = std::getenv("RADIANCE_XE_HC_V2");
-        const int l = v && v[0] >= '1' && v[0] <= '6' ? v[0] - '0' : 0;
+        const int l = v && ((v[0] >= '1' && v[0] <= '6') || v[0] == '8') ? v[0] - '0' : 0;
         if (l) std::fprintf(stderr, "[xe] hc_read V2 level %d (E4M3 decode rows)\n", l);
         return l;
     }();
@@ -4389,6 +4463,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 6) {
             /* level 6: level 5's columns and gains in launches of their own (a timing split, as level 3) */
             emit_rc = HC_V2_DOWN(1, true, dcols, 0u);
+            if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, true, (unsigned)hc, glds);
+        } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 8 && rows > 1) {
+            /* level 8: a verify's columns four rows a wave, two columns a workgroup; the gains in their own launch */
+            emit_rc = R4D_EMIT(s, hc_v2_down_rows_kernel<4>,
+                               dim3((unsigned)((lr + kV2RowCols - 1) / kV2RowCols), (unsigned)((rows + 3) / 4)),
+                               dim3(kWave * kV2RowCols), 0u, (const unsigned short*)nbuf, (const void*)down->data,
+                               (long)dld, dbuf, (long)rows, (int)hc, (long)HN, (long)lr);
             if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, true, (unsigned)hc, glds);
         } else if (emit_rc == RAD_OK && s8d) {
             emit_rc = HC_V2_DOWN(0, true, dcols + (unsigned)((injw && inj) ? hc : 0), glds);
