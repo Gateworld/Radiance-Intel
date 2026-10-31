@@ -807,13 +807,14 @@ uint32_t mx_compact() {   /* moe_planes_mx_kernel's `compact` (run 108): 1, the 
                            * runs plus the rows past them (zeroed) -- the default since owner note 126; BOUND=1 (and
                            * COMPACT not 1) -> 2, the per-row grid bounded at off[n_expert]; COMPACT=0 -> 0, the old
                            * per-row grid (its wrong-expert blocks past the runs; for comparisons only).
-                           * RADIANCE_XE_MOE_MX_STAGE=1 adds 4: the staging's per-row / per-column work once;
-                           * RADIANCE_XE_MOE_MX_VEC=1 (with STAGE; run 110, owner note 129 item 5) adds 8: its loads
-                           * four bytes at a time */
+                           * STAGE adds 4: the staging's per-row / per-column work once; VEC (with STAGE; run 110,
+                           * owner note 129 item 5) adds 8: its loads four bytes at a time. Both are the defaults
+                           * since owner note 134 (exact: KX7 / B72); RADIANCE_XE_MOE_MX_STAGE=0 / _VEC=0 opt out */
     static const uint32_t v = [] {
         const char* st = std::getenv("RADIANCE_XE_MOE_MX_STAGE");
         const char* vc = std::getenv("RADIANCE_XE_MOE_MX_VEC");
-        const uint32_t stage = st && *st == '1' ? (vc && *vc == '1' ? 12u : 4u) : 0u;
+        const bool st_off = st && *st == '0', vc_off = vc && *vc == '0';
+        const uint32_t stage = st_off ? 0u : (vc_off ? 4u : 12u);
         const char* s = std::getenv("RADIANCE_XE_MOE_MX_COMPACT");
         const char* b = std::getenv("RADIANCE_XE_MOE_MX_BOUND");
         if (s && *s == '1') return 1u | stage;
