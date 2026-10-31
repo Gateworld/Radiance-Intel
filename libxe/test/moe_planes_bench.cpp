@@ -120,7 +120,9 @@ int check_main(LaunchFn fn, sycl::queue& q, int variant) {
     std::printf("check: variant %d (%s classes), RADIANCE_XE_MOE_MX=%s RADIANCE_XE_MOE_MULTI=%s, T %d rows "
                 "(runs 70/64/50/8 of experts 2/5/8/11, 4 padding rows), top_k %d\n",
                 variant, variant == 2 ? "unequal" : "equal", mxs ? mxs : "(unset)", mus ? mus : "(unset)", T, top_k);
-    const Proj projs[2] = { { "gate_up", 1280, 2560, 2, false }, { "down", 2560, 640, 1, true } };
+    /* BENCH_TP2=1 (run 100): one rank's shapes, as the timing's */
+    const bool tp2 = std::getenv("BENCH_TP2") && *std::getenv("BENCH_TP2") == '1';
+    const Proj projs[2] = { { "gate_up", tp2 ? 512 : 1280, 2560, 2, false }, { "down", 2560, tp2 ? 256 : 640, 1, true } };
     /* the routing: rows sorted by expert; a_order=token rows carry a shuffled flat index (token = flat / top_k) */
     std::vector<int32_t> h_sorted_tok(T, -1), h_sorted_srt(T, -1), h_off(n_expert + 1, 0);
     std::vector<int> row_e(T, -1), row_r(T, -1);
@@ -324,8 +326,11 @@ int main(int argc, char** argv) {
                                0.25f, 0.875f, 1.5f, 2.25f, 3.f, 4.f, 5.5f, 8.f };   /* E4M3-exact */
     /* BENCH_SMALL=1: the tiny model's shapes (K 512 / 128: the UPL=1 instantiation the CPU JIT compiles) */
     const bool small = std::getenv("BENCH_SMALL") && *std::getenv("BENCH_SMALL") == '1';
-    const Proj projs[2] = { { "gate_up", small ? 256 : 1280, small ? 512 : 2560, 2, false },
-                            { "down", small ? 512 : 2560, small ? 128 : 640, 1, true } };
+    /* BENCH_TP2=1 (run 100, owner note 104): one rank's shapes at tp 2 -- an expert width of 256 a rank (the engine's
+     * 992 KiB expert unit), so gate_up 512 x 2560 and down 2560 x 256 */
+    const bool tp2 = std::getenv("BENCH_TP2") && *std::getenv("BENCH_TP2") == '1';
+    const Proj projs[2] = { { "gate_up", small ? 256 : (tp2 ? 512 : 1280), small ? 512 : 2560, 2, false },
+                            { "down", small ? 512 : 2560, small ? 128 : (tp2 ? 256 : 640), 1, true } };
     bool all_ok = true;
     for (const Proj& P : projs) {
         const Form F = form_of(P.N, P.K);
