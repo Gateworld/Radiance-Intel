@@ -74,6 +74,7 @@ using r4d_moesort::kScatterSmall;
 using r4d_moesort::ScatterLds;
 using r4d_moesort::wave_incl_scan_i32;
 using r4d_moesort::scatter_small_place;
+using r4d_moesort::scatter_direct_place;
 using r4d_moesort::kScatWaves;
 using r4d_moesort::scatter_small_kernel;
 using r4d_moegather::kGatherSlots;
@@ -312,7 +313,9 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
 /* Two different expert counts: the selection runs over the whole (replicated) router, `n_expert`,
  * while the sort runs over this rank's slice, `n_local`, dropping the rest (512 against 254 at two
  * ranks here). Passing one count to both would let the sort index its histogram out of range. */
-template <uint32_t MAXOWN, uint32_t NW>
+/* DIRECT (the Intel port, RADIANCE_XE_SORT_DIRECT=1 at T <= kSortDirectMax): the sort's outputs counted straight
+ * from the slot list (r4d_moe_sort.h's scatter_direct_place), the same bytes. */
+template <uint32_t MAXOWN, uint32_t NW, bool DIRECT = false>
 __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
@@ -320,12 +323,14 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     int32_t base, Protect prot) {
     XE_SHARED_VAR(ScatterLds<NW>, sl);
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
-    for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
+    if constexpr (!DIRECT)
+        for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
     const SlotSink snk{sl.e, base, n_local, prot};
     for (uint32_t m = wave; m < M; m += NW)
         router_topk_row<MAXOWN>(lg, ids, w, m, n_expert, top_k, lg_ld, norm, lane, snk);
     lds_barrier();
-    scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
+    if constexpr (DIRECT) scatter_direct_place(sorted, off, cnt, M * top_k, n_local, sl.e);
+    else scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
 }
 
 /* The general form, in three passes so it stays stable without an atomic deciding order. `bcnt` is
@@ -2264,8 +2269,8 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
 
-#define R4D_RTS_L(OWN, NWV)                                                                     \
-    emit_rc = R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV>), dim3(1),                 \
+#define R4D_RTS_L(OWN, NWV, ...)                                                                \
+    emit_rc = R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1),  \
                        dim3((NWV) * kWave), 0,                                                  \
                        (const uint16_t*)lg->data, (int32_t*)ids->data,                          \
                        (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,         \
@@ -2279,7 +2284,13 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
      * against 5.4 at 32 waves), while extra waves cost ~0.4 us at four rows. Above 32 rows the
      * waves wrap. */
     const int nw = M <= 8 ? 8 : M <= 16 ? 16 : 32;
-    if (n_expert <= (long long)(8 * kWave)) {
+    /* the Intel port (owner note 129 item 4): the direct sort at a decode or verify step's few slots */
+    static const bool direct_on = [] { const char* e = std::getenv("RADIANCE_XE_SORT_DIRECT"); return e && e[0] == '1'; }();
+    const bool direct = direct_on && nw == 8 && T <= (long long)r4d_moesort::kSortDirectMax;
+    if (direct) {
+        if (n_expert <= (long long)(8 * kWave)) R4D_RTS_L(8, 8, true);
+        else                                    R4D_RTS_L(16, 8, true);
+    } else if (n_expert <= (long long)(8 * kWave)) {
         if      (nw == 8)  R4D_RTS_L(8, 8);
         else if (nw == 16) R4D_RTS_L(8, 16);
         else               R4D_RTS_L(8, 32);

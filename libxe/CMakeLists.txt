@@ -234,6 +234,15 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_i4i8_probe PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_i4i8_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_i4i8_probe libxe)
+  # Run 110 (owner note 129 item 4): router_topk_scatter's time a launch, against the selection alone and an empty
+  # launch. Not a ctest.
+  add_executable(xe_router_bench test/router_bench.cpp)
+  rad_l0_sycl(xe_router_bench)
+  target_include_directories(xe_router_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
+                             ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_link_libraries(xe_router_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_router_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_router_bench libxe)
   # Run 101 (owner note 108 item 1): device timing of the decode GDN update at one rank's shape. Not a ctest.
   add_executable(xe_gdn_decode_bench test/gdn_decode_bench.cpp)
   rad_l0_sycl(xe_gdn_decode_bench)

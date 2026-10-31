@@ -181,6 +181,47 @@ __device__ __forceinline__ void scatter_small_place(
     }
 }
 
+/* The direct form (RADIANCE_XE_SORT_DIRECT=1, the Intel port, owner note 129 item 4, run 110), for a decode or
+ * verify step's few slots (T <= kSortDirectMax): every output counted straight from the slot list, with no barrier
+ * after the one that filled it. Slot i's place is the number of live slots j with a lower place, or the same and
+ * j < i; expert e's offset the live slots placed below it, its count those placed at it; the sorted rows past the
+ * live count -1. The same integers as scatter_small_place (a stable counting sort by place, then slot): the same
+ * bytes. On Xe the small sort's three barriers, atomics and emulated row scans cost ~8 us a launch (RB1); the direct
+ * form wins at one row (T 10: 11.6-12.1 us against 14.3 a fused launch, RB2 / RB3) and loses from four rows on (T 40:
+ * 14.7 against 12.7; T 80: 21.2 against 13.1), so it is held to one row's slots. */
+constexpr uint32_t kSortDirectMax = 16;
+
+__device__ __forceinline__ void scatter_direct_place(int32_t* __restrict__ sorted, int32_t* __restrict__ off,
+                                                     int32_t* __restrict__ cnt, uint32_t T, uint32_t n_expert,
+                                                     const int32_t* __restrict__ se) {
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t x = tid; x < n_expert + 1u || x < T; x += blockDim.x) {
+        const int32_t ei = x < T ? se[x] : -1;
+        int32_t live = 0, below_e = 0, at_e = 0, pos = 0;
+        /* four slots a load (the list is 16-byte aligned at the head of the LDS struct); past T masked */
+        for (uint32_t j0 = 0; j0 < T; j0 += 4) {
+            const int4 q4 = *(const int4*)(se + j0);
+            const int32_t qv[4] = { q4.x, q4.y, q4.z, q4.w };
+#pragma unroll
+            for (uint32_t u = 0; u < 4; ++u) {
+                const uint32_t j = j0 + u;
+                const int32_t ej = j < T ? qv[u] : -1;
+                const bool lj = ej >= 0;
+                live += lj;
+                below_e += lj && ej < (int32_t)x;
+                at_e += ej == (int32_t)x;
+                pos += lj && (ej < ei || (ej == ei && j < x));
+            }
+        }
+        if (x < n_expert) { off[x] = below_e; cnt[x] = at_e; }
+        if (x == n_expert) off[x] = live;
+        if (x < T) {
+            if (ei >= 0) sorted[pos] = (int32_t)x;
+            if ((int32_t)x >= live) sorted[x] = -1;
+        }
+    }
+}
+
 /* moe_scatter's small form: the slot list from `ids`, then the sort. A template only so a unit that
  * includes this header and does not launch it compiles no kernel. */
 constexpr uint32_t kScatWaves = 8;          /* 256 threads */
