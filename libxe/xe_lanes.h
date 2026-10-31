@@ -637,7 +637,14 @@ typedef short xe_v8s __attribute__((ext_vector_type(8)));
  * B(k, N) element k & 7 of lane N + 16 * (k >> 3); the result lane l is column N = l & 15, rows
  * 8 * (l >> 4) + e. Each product is added to c in ascending k, as the emulator does. The operands
  * move a 32-bit word at a time (two bf16/f16 or four E4M3 elements). Correct, not fast: 16 + 64
- * shuffles a bf16 tile (8 + 32 for E4M3). */
+ * shuffles a bf16 tile (8 + 32 for E4M3).
+ * XE_WMMA_BCAST=1 (run 105, owner note 109 item 5; the CMake variable RAD_XE_WMMA_BCAST, off by default): the same
+ * values moved by cheaper forms -- B's column as the lane's own word or its lane ^ 16 partner, A's rows as two
+ * uniform broadcasts and a select -- instead of select_from_group over a lane computed a lane. The same elements in
+ * the same order, so the same bits. The prefill GDN chunk scan (42.5 % of the 7K first token, P43) runs on these. */
+#ifndef XE_WMMA_BCAST
+#define XE_WMMA_BCAST 0
+#endif
 namespace xe {
 inline float wmma_e4m3(uint32_t b) {
     const uint32_t e = (b >> 3) & 15u, m = b & 7u;
@@ -666,14 +673,31 @@ template <int KIND, class V, class C> inline C wmma(const V& a, const V& b, cons
     float bcol[16];
     for (int kh = 0; kh < 2; ++kh) {
         uint32_t w[NW];
+#if XE_WMMA_BCAST
+        /* lane N + 16 kh: the lane itself in half kh, else its partner across the halves (lane ^ 16) */
+        for (int i = 0; i < NW; ++i) {
+            const uint32_t other = sycl::permute_group_by_xor(sg(), wb[i], 16);
+            w[i] = h == kh ? wb[i] : other;
+        }
+#else
         for (int i = 0; i < NW; ++i) w[i] = shfl_from(wb[i], N + 16 * kh);
+#endif
         for (int j = 0; j < 8; ++j) bcol[8 * kh + j] = wmma_elem<KIND>(w, j);
     }
     for (int e = 0; e < 8; ++e) {
         float acc = d[e];
         for (int kh = 0; kh < 2; ++kh) {
             uint32_t w[NW];
+#if XE_WMMA_BCAST
+            /* lane 8 h + e + 16 kh: one of two lanes, each the same for a whole half -- two broadcasts */
+            for (int i = 0; i < NW; ++i) {
+                const uint32_t v0 = sycl::group_broadcast(sg(), wa[i], e + 16 * kh);
+                const uint32_t v1 = sycl::group_broadcast(sg(), wa[i], 8 + e + 16 * kh);
+                w[i] = h ? v1 : v0;
+            }
+#else
             for (int i = 0; i < NW; ++i) w[i] = shfl_from(wa[i], 8 * h + e + 16 * kh);
+#endif
             for (int j = 0; j < 8; ++j) acc += wmma_elem<KIND>(w, j) * bcol[8 * kh + j];
         }
         d[e] = acc;

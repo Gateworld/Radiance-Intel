@@ -37,6 +37,15 @@ endif()
 if(RAD_XE_NATIVE_XOR)
   target_compile_definitions(libxe PRIVATE XE_NATIVE_XOR=1)
 endif()
+# Run 105 (owner note 109 item 5): the emulated WMMA's operand moves as broadcasts and lane ^ 16 (xe_lanes.h,
+# XE_WMMA_BCAST): the same elements in the same order. A plain variable as RAD_XE_NATIVE_XOR; off in the tree (image
+# :127 was built with it ON for its gates: xe_lane_cpu, KC1 / KC2, B41).
+if(NOT DEFINED RAD_XE_WMMA_BCAST)
+  set(RAD_XE_WMMA_BCAST OFF)
+endif()
+if(RAD_XE_WMMA_BCAST)
+  target_compile_definitions(libxe PRIVATE XE_WMMA_BCAST=1)
+endif()
 
 if(RAD_BUILD_TESTS)
   # This directory is added before the top level's enable_testing(), so enable it here.
@@ -55,6 +64,9 @@ if(RAD_BUILD_TESTS)
   # the shim is tested in the form libxe is built with (run 102: XE_NATIVE_XOR)
   if(RAD_XE_NATIVE_XOR)
     target_compile_definitions(xe_lane_test PRIVATE XE_NATIVE_XOR=1)
+  endif()
+  if(RAD_XE_WMMA_BCAST)
+    target_compile_definitions(xe_lane_test PRIVATE XE_WMMA_BCAST=1)
   endif()
   # The trunk W8A8 GEMV against libref's quant_dot order (host re-computation), canaries on y.
   add_executable(xe_gemv_i8_test test/gemv_i8_test.cpp xe_gemv_i8.cpp)
