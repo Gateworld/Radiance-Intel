@@ -461,19 +461,65 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
                           uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
                           uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, uint32_t parts,
-                          uint32_t a_rows) {
+                          uint32_t a_rows, uint32_t compact) {
     XE_SHARED(uint16_t, s_a, kMxRows * kMxAP);        /* the block's activation rows, 64 k a group, f16 */
     XE_SHARED(uint32_t, s_b, 4 * 4 * 128);            /* [k step 4][n tile 4][packed 8 x 16 words]: 64 k x 64 n */
     XE_SHARED(float, s_c, kMxWaves * 8 * 16);         /* one 8 x 16 f32 tile a sub-group */
     XE_SHARED(float, s_as, kMxRows);                  /* the rows' a_scale of the current 128-K group */
     XE_SHARED(uint16_t, s_lv, 16);                    /* the expert's levels as f16 (v2m's rounding) */
     XE_SHARED(float, s_e4, 256);                      /* byte -> E4M3 value */
+    /* Last, so the matrix tiles' buffers above keep their places (s_a at offset 0). */
+    XE_SHARED(int32_t, s_blk, 2);                     /* compact: this work-group's expert and first row */
     const int tid = (int)threadIdx.x, wave = tid / kMxSG, lane = tid % kMxSG;
-    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    const uint32_t nb = blockIdx.x;
+    int32_t e = -1;
+    uint32_t r0 = 0, rn = 1;
+    if (compact == 1) {
+        /* RADIANCE_XE_MOE_MX_COMPACT=1 (run 108): the grid is the 64-row blocks themselves -- every expert's run in
+         * blocks, in expert order, then the rows past the runs (off[n_expert] .. T, written as zeros) -- instead of
+         * one work-group a sorted row of which only a block's first does any work. Each work-group finds its block
+         * from a group scan of the experts' block counts; the blocks, and so every product and store, are the
+         * leader rule's. */
+        const uint32_t b = blockIdx.y;
+        const uint32_t per = (n_expert + (uint32_t)kMxThreads - 1) / (uint32_t)kMxThreads;
+        const uint32_t e0 = sycl::min(n_expert, (uint32_t)tid * per), e1 = sycl::min(n_expert, e0 + per);
+        uint32_t mine = 0;
+        for (uint32_t x = e0; x < e1; ++x) mine += ((uint32_t)(off[x + 1] - off[x]) + kMxRows - 1) / kMxRows;
+        const uint32_t before = sycl::exclusive_scan_over_group(xe::wg(), mine, sycl::plus<uint32_t>());
+        const uint32_t total = sycl::reduce_over_group(xe::wg(), mine, sycl::plus<uint32_t>());
+        if (tid == 0) s_blk[0] = -1;
+        xe::syncthreads();
+        if (b >= before && b < before + mine) {
+            uint32_t k = b - before, x = e0;
+            for (;; ++x) {
+                const uint32_t nbx = ((uint32_t)(off[x + 1] - off[x]) + kMxRows - 1) / kMxRows;
+                if (k < nbx) break;
+                k -= nbx;
+            }
+            s_blk[0] = (int32_t)x;
+            s_blk[1] = off[x] + (int32_t)(k * kMxRows);
+        }
+        xe::syncthreads();
+        e = s_blk[0];
+        if (e >= 0) {
+            r0 = (uint32_t)s_blk[1];
+            const uint32_t last = (uint32_t)off[e + 1];
+            rn = (last - r0) < (uint32_t)kMxRows ? (last - r0) : (uint32_t)kMxRows;
+        } else {
+            r0 = (uint32_t)off[n_expert] + (b - total) * kMxRows;
+            if (b < total || r0 >= T) return;
+            rn = (T - r0) < (uint32_t)kMxRows ? (T - r0) : (uint32_t)kMxRows;
+        }
+    } else {
+    const uint32_t i = blockIdx.y;
     if (i >= T) return;
     const int32_t flat = sorted[i];
-    int32_t e = -1;
-    if (flat >= 0) {
+    /* compact == 2 (RADIANCE_XE_MOE_MX_BOUND=1, run 108): a row at or past off[n_expert] is not this GEMM's. The
+     * protected experts sort last and their rows are live (sorted >= 0); unbounded, such a row whose distance from
+     * off[n_expert - 1] is a multiple of 64 becomes a "leader" of expert n_expert - 1, rn = off[n_expert] - i
+     * wraps to 64, and the block computes 64 rows with the wrong expert -- in a full pass up to 63 of them past
+     * Y's last row. Bounded, those rows are zeroed one by one, as v2m zeroes rows past its live count. */
+    if (flat >= 0 && !(compact == 2 && i >= (uint32_t)off[n_expert])) {
         uint32_t lo = 0, hi = n_expert;
         while (lo + 1 < hi) {
             const uint32_t mid = (lo + hi) / 2;
@@ -481,11 +527,12 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
         }
         e = (int32_t)lo;
     }
-    uint32_t r0 = i, rn = 1;
+    r0 = i;
     if (e >= 0) {
         const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
         if ((i - first) % (uint32_t)kMxRows != 0) return;
         rn = (last - i) < (uint32_t)kMxRows ? (last - i) : (uint32_t)kMxRows;
+    }
     }
     const PCls& c = (e >= 0 && (e & 1)) ? c1 : c0;
     const uint32_t fy = N / parts;
@@ -631,6 +678,18 @@ bool mx_on(sycl::queue* q) {   /* the matrix-unit form for prefill rows is the d
     static const bool want = [] { const char* s = std::getenv("RADIANCE_XE_MOE_MX"); return !(s && *s == '0'); }();
     static const bool gpu = q->get_device().is_gpu();
     return want && gpu;
+}
+
+uint32_t mx_compact() {   /* run 108, opt-in (moe_planes_mx_kernel's `compact`): RADIANCE_XE_MOE_MX_COMPACT=1 -> 1, the
+                           * grid is the 64-row blocks of the regular runs plus the rows past them (zeroed);
+                           * else RADIANCE_XE_MOE_MX_BOUND=1 -> 2, the per-row grid bounded at off[n_expert]; 0 */
+    static const uint32_t v = [] {
+        const char* s = std::getenv("RADIANCE_XE_MOE_MX_COMPACT");
+        if (s && *s == '1') return 1u;
+        const char* b = std::getenv("RADIANCE_XE_MOE_MX_BOUND");
+        return b && *b == '1' ? 2u : 0u;
+    }();
+    return v;
 }
 
 bool multi_on() {   /* RADIANCE_XE_MOE_MULTI=0: one work-group a routed row (v2) */
@@ -800,11 +859,13 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
 #define XE_MOE_V2(U) do { if (rpt == 1) XE_MOE_V2R(U, 1); else XE_MOE_V2R(U, 2); } while (0)
 #define XE_MOE_V2R(U, R)                                                                                    \
     if (mx)                                                                                                 \
-    XE_LAUNCH_SG(kMxSG, qq, moe_planes_mx_kernel, dim3((unsigned)((N + kMxCols - 1) / kMxCols), (unsigned)T),  \
+    XE_LAUNCH_SG(kMxSG, qq, moe_planes_mx_kernel,                                                           \
+                 dim3((unsigned)((N + kMxCols - 1) / kMxCols),                                              \
+                      mx_compact() == 1 ? (unsigned)(T / kMxRows + n_expert + 2) : (unsigned)T),            \
                  dim3(kMxThreads), 0, (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1],       \
                  (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T,  \
                  (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,          \
-                 (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);                          \
+                 (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, mx_compact());            \
     else if (multi)                                                                                         \
     XE_LAUNCH_SG(16, qq, (moe_planes_v2m_kernel<U, kV2MT, R>), grid, block, 0, (const uint8_t*)Aq->data,    \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
