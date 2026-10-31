@@ -85,6 +85,73 @@ void gemv_bf16_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __r
     }
 }
 
+/* RADIANCE_XE_ROUTER_PAIR=1 (run 102, owner note 109 item 3): the router's GEMV and the shared expert's gate column
+ * (same activation, same K) in one launch -- rows [0, N) of b into y, rows [N, N + N2) of b2 into y2 -- instead of
+ * two (48 launches a decode step fewer). Each row is gemv_bf16_kernel's row, the same arithmetic in the same order,
+ * so the same bits. The pointers ride in a struct of 8-byte fields (no padding: the tape audit compares bytes). */
+struct GvPair {
+    const uint16_t* b2 = nullptr;
+    void* y2 = nullptr;
+    long b2_ld = 0, y2_ld = 0, n2 = 0;
+};
+template <bool A_F32, bool Y_F32, int MB>
+void gemv_bf16_pair_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
+                           void* __restrict__ y, long y_ld, int N, int K, int M, GvPair p) {
+    const int lane = (int)threadIdx.x & 31;
+    const int nn = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);
+    const bool second = nn >= N;
+    const int n = second ? nn - N : nn;
+    const bool live = second ? n < (int)p.n2 : true;
+    const uint16_t* brow = (second ? p.b2 + (size_t)(live ? n : 0) * p.b2_ld : b + (size_t)n * b_ld);
+    void* yy = second ? p.y2 : y;
+    const long yld = second ? p.y2_ld : y_ld;
+    float acc[MB];
+#pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+    const int nchunk = K / 8;
+    for (int c = lane; c < nchunk && live; c += 32) {
+        const uint4 w = *(const uint4*)(brow + (size_t)c * 8);
+        const unsigned wv[4] = {w.x, w.y, w.z, w.w};
+        float wf[8];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            wf[2 * u] = __uint_as_float(wv[u] << 16);
+            wf[2 * u + 1] = __uint_as_float(wv[u] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            float s = 0.0f;
+            if constexpr (A_F32) {
+                const float* ar = (const float*)a + (size_t)m * a_ld + (size_t)c * 8;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) s += ar[e] * wf[e];
+            } else {
+                const uint16_t* ar = (const uint16_t*)a + (size_t)m * a_ld + (size_t)c * 8;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) s += ld_bf16(ar, e) * wf[e];
+            }
+            acc[m] += s;
+        }
+    }
+    for (int k = nchunk * 8 + lane; k < K && live; k += 32)
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            const float av = A_F32 ? ((const float*)a)[(size_t)m * a_ld + k] : ld_bf16((const uint16_t*)a, (long)((size_t)m * a_ld + k));
+            acc[m] += av * ld_bf16(brow, k);
+        }
+#pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float v = acc[m];
+        for (int x = 16; x >= 1; x >>= 1) v += __shfl_xor(v, x);
+        if (live && lane == 0 && m < M) {
+            if constexpr (Y_F32) ((float*)yy)[(size_t)m * yld + n] = v;
+            else ((uint16_t*)yy)[(size_t)m * yld + n] = to_bf16(v);
+        }
+    }
+}
+
 /* ---- the matrix-unit form for prefill rows (milestone 3, stage B, run 58) ----
  *
  * The 7K prefill's profile (B10) showed gemm_nt's GEMV launched once a token a layer -- 204,546 launches of 19 us
@@ -244,6 +311,50 @@ int gemv(const RadTensor* A, const RadTensor* B, const RadTensor* Y, long long N
     return RAD_OK;
 }
 
+bool router_pair_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_PAIR"); return e && e[0] == '1'; }();
+    return v;
+}
+
+/* y = a @ b^T and y2 = a @ b2^T in one launch (gemv_bf16_pair_kernel): the decode / verify rows only (M <= kMaxM),
+ * both outputs of one dtype. RAD_E_UNSUPPORTED for anything else, and the caller launches the two GEMVs. */
+int gemv_pair(const RadTensor* A, const RadTensor* B, const RadTensor* Y, long long N, const RadTensor* B2,
+              const RadTensor* Y2, long long N2, long long K, RadStream s) {
+    if (!A || !B || !Y || !B2 || !Y2 || !A->data || !B->data || !Y->data || !B2->data || !Y2->data) return RAD_E_UNSUPPORTED;
+    if (B->dtype != RAD_BF16 || B2->dtype != RAD_BF16 || (A->dtype != RAD_BF16 && A->dtype != RAD_F32) ||
+        (Y->dtype != RAD_BF16 && Y->dtype != RAD_F32) || Y2->dtype != Y->dtype)
+        return RAD_E_UNSUPPORTED;
+    if (N <= 0 || N2 <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    long long M = 0, Ma = 0, Nb = 0, M2 = 0, Nb2 = 0;
+    const long long y_ld = r4d_rows_pitch(Y, N, &M), y2_ld = r4d_rows_pitch(Y2, N2, &M2);
+    const long long a_ld = r4d_rows_pitch(A, K, &Ma);
+    const long long b_ld = r4d_rows_pitch(B, K, &Nb), b2_ld = r4d_rows_pitch(B2, K, &Nb2);
+    if (y_ld < 0 || y2_ld < 0 || a_ld < 0 || b_ld < 0 || b2_ld < 0) return RAD_E_UNSUPPORTED;
+    if (M <= 0 || M > kMaxM || M2 != M || Ma < M || Nb < N || Nb2 < N2) return RAD_E_UNSUPPORTED;
+    if (((uintptr_t)B->data | (uintptr_t)B2->data | (uintptr_t)A->data) % 16 || b_ld % 8 || b2_ld % 8 || a_ld % 8)
+        return RAD_E_UNSUPPORTED;
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        GvPair p;
+        p.b2 = (const uint16_t*)B2->data; p.y2 = Y2->data; p.b2_ld = (long)b2_ld; p.y2_ld = (long)y2_ld; p.n2 = (long)N2;
+        const dim3 grid((unsigned)((N + N2 + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+        const bool af = A->dtype == RAD_F32, yf = Y->dtype == RAD_F32;
+        const uint16_t* b = (const uint16_t*)B->data;
+#define XE_GVP(AF, YF, MB_) XE_LAUNCH(q, (gemv_bf16_pair_kernel<AF, YF, MB_>), grid, block, 0, A->data, (long)a_ld, b, \
+                                      (long)b_ld, Y->data, (long)y_ld, (int)N, (int)K, (int)M, p)
+#define XE_GVP2(AF, YF) do { if (M == 1) XE_GVP(AF, YF, 1); else XE_GVP(AF, YF, kMaxM); } while (0)
+        if (af && yf) XE_GVP2(true, true);
+        else if (af) XE_GVP2(true, false);
+        else if (yf) XE_GVP2(false, true);
+        else XE_GVP2(false, false);
+#undef XE_GVP2
+#undef XE_GVP
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
+
 /* The int8 lm_head (libr4d's logits_gemm_i8 stored row, r4d_fp8_layout.cpp): each row is K i8 codes,
  * then its K/128 bf16 scales, padded to w_ld bytes. y[m, n] = sum_g scale[n, g] * sum_{k in g}
  * x[m, k] * code[n, k], f32 out. Lane l reads 16-code chunks l, l + 32, ...; a chunk's partial sum
@@ -346,9 +457,14 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
     if ((GB && GB->data) != (G && G->data)) return R4D_NO(RAD_E_INVAL);   /* together or not at all */
     const long long K = r4d_geti_or(args, "K", r4d_dim(B, (int)B->rank - 1));
     const long long E = r4d_geti_or(args, "n_expert", r4d_dim(B, (int)B->rank - 2));
-    int rc = gemv(A, B, r4d_opt(args, 3), E, K, s);
-    if (rc != RAD_OK) return rc;
-    if (GB && GB->data && (rc = gemv(A, GB, G, 1, K, s)) != RAD_OK) return rc;
+    int rc;
+    if (GB && GB->data && router_pair_on()) rc = gemv_pair(A, B, r4d_opt(args, 3), E, GB, G, 1, K, s);
+    else rc = RAD_E_UNSUPPORTED;
+    if (rc == RAD_E_UNSUPPORTED) {   /* the two launches (the pair form off, or a shape it does not take) */
+        rc = gemv(A, B, r4d_opt(args, 3), E, K, s);
+        if (rc != RAD_OK) return rc;
+        if (GB && GB->data && (rc = gemv(A, GB, G, 1, K, s)) != RAD_OK) return rc;
+    } else if (rc != RAD_OK) return rc;
     RadArgs sub = *args;
     sub.t = args->t + 3;
     sub.n_t = 6;
