@@ -77,6 +77,10 @@ static const RadConstraint cXeCouplePropose[] = {
 static const RadConstraint cXeCoupleVerify[] = {
     C_GE("M", 1), C_GE("n_cand", 1), C_GE("n_vocab", 1),
 };
+/* Run 111 (owner note 135 item 3): GPTQ's calibration Gram on the card -- libr4d's gram_accum unit ported
+ * (ports/r4d_gram_accum_fp8.cpp, hipport.py), its row written here by hand with libr4d's constraints */
+extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s);
+static const RadConstraint cXeGramAccum[] = { C_DIV("n", 4), C_EQ("group", 128), C_IN("dtype", "fp8a8") };
 extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
 /* block_size is derived on attn_paged: no EQ here, so the page size is the model's declared one */
@@ -176,6 +180,14 @@ static const RadKernelInfo kKernels[] = {
   ROW(cXeArGHcW2Host), NOTUNE,
   xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_gather_hc_write_2rank_host, xe_ar_gather_hc_write_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
 #include "ports/all_rows.inc"
+{ "xe_gram_accum", "gram_accum", "quant",
+  "h += x^T x over an E4M3 activation, in f32 -- the Gram matrix a GPTQ packer needs (libr4d's unit, ported)",
+  "n a multiple of 4 and group 128 (a 64-wide output tile lies inside one scale group); any M; the accumulator "
+  "is READ as well as written",
+  "E4M3 plus an f32 scale per (row, 128 columns) in; an f32 [n][n] accumulator in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGramAccum), NOTUNE,
+  nullptr, nullptr, r4d_rad_gram_accum, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 { "xe_gemm_i8a8_gemv", "gemm_nt_q", "gemm",
   "the trunk's W8A8 product as a sub-group GEMV: exact int32 group sums, scaled per (row, 128 K)",
   "any M (4 activation rows a weight pass), any N; K a multiple of 128; the stored layout",
