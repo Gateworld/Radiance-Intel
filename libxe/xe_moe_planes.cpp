@@ -804,6 +804,15 @@ bool moe8m_on() {   /* RADIANCE_XE_MOE8M=1 (run 110, owner note 129 item 2): moe
     return v;
 }
 
+int moe8m_rows() {   /* RADIANCE_XE_MOE8M_R=8 (run 110): MOE8M's rows a team at K <= 512 (4 by default): more output
+                      * columns a work-group, so its setup (the run search, the tables, the activation stage) is shared
+                      * by more weight bytes. M164: the down projection 128 -> 96 us a call. The same at gate / up (K
+                      * 2560, 4 rows) was slower, 149 against 128 us (M165: spills, fewer work-groups), so it stays at
+                      * K <= 512 */
+    static const int v = [] { const char* s = std::getenv("RADIANCE_XE_MOE8M_R"); return s && *s == '8' ? 8 : 4; }();
+    return v;
+}
+
 bool h2_on() {   /* RADIANCE_XE_MOE_H2=1 (run 100, owner note 104 item 2): the f16x2 product pairs (bit for bit) */
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_H2"); return s && *s == '1'; }();
     return v;
@@ -977,7 +986,7 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
             /* rows a team (owner note 54 item 2, run 79): 2 = 64 rows a work-group (shipped); 1 = 32, twice the
              * work-groups, so a decode grid of 80-120 work-groups on 64 resident slots leaves a finer tail.
              * Per output the arithmetic and its order are unchanged: bit for bit. */
-            const int rpt = (m8 && K <= 512) ? 4 : v2_rows(K);
+            const int rpt = (m8 && K <= 512) ? moe8m_rows() : v2_rows(K);
             const int rpw = (kV2WG / lpr) * rpt;
             const dim3 grid((unsigned)((N + rpw - 1) / rpw), (unsigned)T), block(kV2WG);
             /* prefill-sized routing (64 rows or more) under RADIANCE_XE_MOE_MX=1: the matrix-unit form, 64-row
