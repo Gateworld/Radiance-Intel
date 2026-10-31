@@ -755,17 +755,20 @@ bool mx_on(sycl::queue* q) {   /* the matrix-unit form for prefill rows is the d
     return want && gpu;
 }
 
-uint32_t mx_compact() {   /* run 108, opt-in (moe_planes_mx_kernel's `compact`): RADIANCE_XE_MOE_MX_COMPACT=1 -> 1, the
-                           * grid is the 64-row blocks of the regular runs plus the rows past them (zeroed);
-                           * else RADIANCE_XE_MOE_MX_BOUND=1 -> 2, the per-row grid bounded at off[n_expert]; 0.
+uint32_t mx_compact() {   /* moe_planes_mx_kernel's `compact` (run 108): 1, the grid is the 64-row blocks of the regular
+                           * runs plus the rows past them (zeroed) -- the default since owner note 126; BOUND=1 (and
+                           * COMPACT not 1) -> 2, the per-row grid bounded at off[n_expert]; COMPACT=0 -> 0, the old
+                           * per-row grid (its wrong-expert blocks past the runs; for comparisons only).
                            * RADIANCE_XE_MOE_MX_STAGE=1 adds 4: the staging's per-row / per-column work once */
     static const uint32_t v = [] {
         const char* st = std::getenv("RADIANCE_XE_MOE_MX_STAGE");
         const uint32_t stage = st && *st == '1' ? 4u : 0u;
         const char* s = std::getenv("RADIANCE_XE_MOE_MX_COMPACT");
-        if (s && *s == '1') return 1u | stage;
         const char* b = std::getenv("RADIANCE_XE_MOE_MX_BOUND");
-        return (b && *b == '1' ? 2u : 0u) | stage;
+        if (s && *s == '1') return 1u | stage;
+        if (b && *b == '1') return 2u | stage;
+        if (s && *s == '0') return 0u | stage;
+        return 1u | stage;
     }();
     return v;
 }

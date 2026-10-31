@@ -469,7 +469,7 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
   }
 }
 
-#include "r4d_gdn_chunk_scan_jm.inc"   // the matrix-unit form (RADIANCE_XE_GDN_CS_JM, opt-in)
+#include "r4d_gdn_chunk_scan_jm.inc"   // the matrix-unit form (the default; RADIANCE_XE_GDN_CS_JM=0 opts out)
 
 // Slot-indexed form (the one radiance calls). `sidx` names each batch row's state slot; without
 // it the cache is indexed by row. `st_slot` and `st_head` are the cache strides in elements, which

@@ -5,8 +5,8 @@
  * The GDN chunk scan on the matrix units (joint_matrix at sub-group 16), included by
  * r4d_gdn_chunk_scan_k128_v128_c64_bf16.cpp after its emulated-WMMA kernel; the same algebra, the
  * same operands and the same bf16 roundings (W, sA, V', the state's bf16 copy, gs*K), so only the
- * order of the fp32 sums inside a 16-deep product differs. Opt-in (owner note 96):
- * RADIANCE_XE_GDN_CS_JM=64 | 32 | 16 picks the v block (the emulated form otherwise). GPU only.
+ * order of the fp32 sums inside a 16-deep product differs. The default since owner note 126 at v block
+ * 64; RADIANCE_XE_GDN_CS_JM=32 | 16 picks another block, =0 the emulated form. GPU only.
  *
  * Work-group: 8 sub-groups of 16, one 8-token row tile each (BT = 64), and a block of BVJ value
  * columns (grid V/BVJ x H x N, so 16 and 32 trade repeated U / P products for more work-groups).
@@ -332,12 +332,13 @@ void kernel(const unsigned short* __restrict__ q, const unsigned short* __restri
 
 template <int BVJ> size_t lds_need() { return sizeof(Smem<BVJ>); }
 
-// The v block RADIANCE_XE_GDN_CS_JM asks for (64, 32 or 16), or 0: unset, another value, not a GPU,
-// or a work-group's LDS too small for the block (said once on stderr).
+// The v block: 64 by default (owner note 126), or what RADIANCE_XE_GDN_CS_JM asks for (64, 32 or 16);
+// 0 (=0 or another value, the emulated form's opt-out), not a GPU, or a work-group's LDS too small for
+// the block (said once on stderr).
 inline int pick(sycl::queue* qq) {
   static const int bvj = [qq] {
     const char* e = std::getenv("RADIANCE_XE_GDN_CS_JM");
-    const int want = e ? std::atoi(e) : 0;
+    const int want = e ? std::atoi(e) : 64;
     if (want != 64 && want != 32 && want != 16) return 0;
     const sycl::device d = qq->get_device();
     if (!d.is_gpu()) return 0;
