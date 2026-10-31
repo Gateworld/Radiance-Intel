@@ -469,6 +469,8 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
   }
 }
 
+#include "r4d_gdn_chunk_scan_jm.inc"   // the matrix-unit form (RADIANCE_XE_GDN_CS_JM, opt-in)
+
 // Slot-indexed form (the one radiance calls). `sidx` names each batch row's state slot; without
 // it the cache is indexed by row. `st_slot` and `st_head` are the cache strides in elements, which
 // may exceed H*V*K when a caller pads its slots (vLLM pads to the attention page size). Pass
@@ -486,6 +488,11 @@ extern "C" int r4d_gdn_chunk_scan_k128_v128_c64_bf16_sidx(
   if (Hg <= 0 || H % Hg) return -2;
   const long st_head = state_head_stride > 0 ? state_head_stride : (long)VD * KD;
   const long st_slot = state_slot_stride > 0 ? state_slot_stride : (long)H * VD * KD;
+  if (const int bvj = cs_jm::pick((hipStream_t)stream)) {
+    cs_jm::run(bvj, *(hipStream_t)stream, q, k, v, A, g, beta, h0, o, ht, cu, ssm_state_indices,
+               indices_stride > 0 ? indices_stride : 1, st_slot, st_head, N, H, Hg, scale, state_fp16);
+    return 0;
+  }
   dim3 grid(V / BV, H, N), blk(NTHR);
 #define CS_LAUNCH(SDTC, H0C, HTC)                                                          \
   hipLaunchKernelGGL((r4d_gdn_chunk_scan_kernel<SDTC, H0C, HTC>), grid, blk, 0,            \
