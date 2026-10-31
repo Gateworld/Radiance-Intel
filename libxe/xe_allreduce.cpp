@@ -132,11 +132,12 @@ template <class T> T* alloc(const Inst& in, size_t n) {
     return sycl::aligned_alloc_device<T>(4096, n, *in.dev, *in.ctx);
 }
 
-/* RADIANCE_XE_AR_PROTO=4 (run 102, owner note 109 item 1): the LL form (see ar_kernel); unset or 0: as shipped. (Forms
- * 1-3, the shipped handshake with lighter fences, were measured in AB1 -- no gain, and the same large-message
- * divergence -- and removed.) */
+/* The LL form (see ar_kernel) is the default since run 105 (owner note 121, a correctness fix: the flag-and-payload
+ * form's large messages raced, and served answers changed from load to load); RADIANCE_XE_AR_PROTO=0 keeps the old
+ * form as an opt-out. (Forms 1-3, the old handshake with lighter fences, were measured in AB1 -- no gain, and the
+ * same large-message divergence -- and removed.) */
 int ar_proto() {
-    static const int v = [] { const char* e = std::getenv("RADIANCE_XE_AR_PROTO"); return e && e[0] == '4' ? 4 : 0; }();
+    static const int v = [] { const char* e = std::getenv("RADIANCE_XE_AR_PROTO"); return e && e[0] == '0' ? 0 : 4; }();
     return v;
 }
 
@@ -385,8 +386,8 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
                             (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
                             in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
                             spin_budget(), hw ? *hw : HcW{})
-        /* RADIANCE_XE_AR_PROTO=4 (run 102): the LL form (a sequence number in every payload word), taken when the
-         * message's 8-byte words fit a parity's slot -- build() doubles the slots under it, so always */
+        /* the LL form (a sequence number in every payload word; the default since run 105, RADIANCE_XE_AR_PROTO=0 the
+         * old form), taken when the message's 8-byte words fit a parity's slot -- build() doubles the slots, so always */
         const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
         const bool ll = ar_proto() == 4 && 2ull * n32 <= slot_words;
 #define XE_AR(DT, HW_) do { if (ll) XE_ARP(DT, HW_, 4); else XE_ARP(DT, HW_, 0); } while (0)
