@@ -50,10 +50,16 @@ inline float e4m3(uint32_t b) {
     return (b & 0x80u) ? -v : v;
 }
 
-/* E elements of a cache row at element offset o (bytes for E4M3, bf16 elements otherwise) */
-template <int E, bool KV8>
+/* E elements of a cache row at element offset o (bytes for E4M3, bf16 elements otherwise). VX (RADIANCE_XE_ATTN_VX=1,
+ * run 110, owner note 129 item 5): an E4M3 lane's 8 bytes as one 8-byte load (the launcher checks the alignment), the
+ * same bytes decoded alike. */
+template <int E, bool KV8, bool VX = false>
 inline void ld_kv(const uint8_t* kv, long o, float* x) {
-    if constexpr (KV8) {
+    if constexpr (KV8 && VX && E == 8) {
+        const uint2 v = *(const uint2*)(kv + o);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { x[e] = e4m3((v.x >> (8 * e)) & 255u); x[4 + e] = e4m3((v.y >> (8 * e)) & 255u); }
+    } else if constexpr (KV8) {
         const uint8_t* p = kv + o;
 #pragma unroll
         for (int e = 0; e < E; ++e) x[e] = e4m3(p[e]);
@@ -78,7 +84,9 @@ inline void seq_of(const AttnP& p, int tok, int* s, int* i, int* qlen) {
     }
 }
 
-template <int E, bool KV8, bool DIRECT, bool OUT_F32>
+/* VX: the K / V loads as ld_kv's VX, and the dot product's five butterfly steps as permute_group_by_xor -- the same
+ * partner lanes in the same order (run 102's native xor), so the same values. */
+template <int E, bool KV8, bool DIRECT, bool OUT_F32, bool VX = false>
 void attn_split_kernel(AttnP p) {
     constexpr int HD = 32 * E;
     const int lane = (int)threadIdx.x & 31, g = (int)threadIdx.x >> 5;
@@ -121,10 +129,14 @@ void attn_split_kernel(AttnP p) {
             float d = 0.0f;
             if (slot[u] >= 0) {
                 float kf[E];
-                ld_kv<E, KV8>(p.kv, slot[u] + lane * E, kf);
+                ld_kv<E, KV8, VX>(p.kv, slot[u] + lane * E, kf);
 #pragma unroll
                 for (int e = 0; e < E; ++e) d += qf[e] * (kf[e] * kds);
             }
+            if constexpr (VX) {
+                const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+                for (int x = 16; x >= 1; x >>= 1) d += sycl::permute_group_by_xor(sg, d, x);
+            } else
             for (int x = 16; x >= 1; x >>= 1) d += __shfl_xor(d, x);
             sc[u] = slot[u] >= 0 ? d * p.scale : -INFINITY;
             if (sc[u] > mt) mt = sc[u];
@@ -141,7 +153,7 @@ void attn_split_kernel(AttnP p) {
             const float w = sycl::exp(sc[u] - mn);
             l += w;
             float vf[E];
-            ld_kv<E, KV8>(p.kv, slot[u] + HD + lane * E, vf);
+            ld_kv<E, KV8, VX>(p.kv, slot[u] + HD + lane * E, vf);
 #pragma unroll
             for (int e = 0; e < E; ++e) acc[e] += w * (vf[e] * vds);
         }
@@ -217,7 +229,15 @@ long long part_bytes(long long head_dim, long long gqa) {
 template <int E, bool KV8, bool OF>
 void launch(sycl::queue* q, const AttnP& p, int total_q) {
     const dim3 grid((unsigned)p.splits, (unsigned)p.kv_heads, (unsigned)total_q), block(32 * p.gqa);
-    if (p.splits == 1) {
+    /* RADIANCE_XE_ATTN_VX=1 (run 110): an E4M3 cache at E 8 whose every row offset is a multiple of 8 bytes */
+    static const bool vx_on = [] { const char* e = std::getenv("RADIANCE_XE_ATTN_VX"); return e && e[0] == '1'; }();
+    const bool vx = vx_on && KV8 && E == 8 && ((uintptr_t)p.kv | (uintptr_t)p.kv_bs | (uintptr_t)p.kv_hs | (uintptr_t)p.kv_row) % 8 == 0;
+    if (vx) {
+        if (p.splits == 1) XE_LAUNCH(q, (attn_split_kernel<E, KV8, true, OF, true>), grid, block, 0, p);
+        else XE_LAUNCH(q, (attn_split_kernel<E, KV8, false, OF, true>), grid, block, 0, p);
+        if (p.splits > 1)
+            XE_LAUNCH(q, (attn_merge_kernel<E, OF>), dim3((unsigned)((long long)total_q * p.q_heads)), dim3(32), 0, p);
+    } else if (p.splits == 1) {
         XE_LAUNCH(q, (attn_split_kernel<E, KV8, true, OF>), grid, block, 0, p);
     } else {
         XE_LAUNCH(q, (attn_split_kernel<E, KV8, false, OF>), grid, block, 0, p);
