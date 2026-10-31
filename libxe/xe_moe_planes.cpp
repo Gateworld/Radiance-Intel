@@ -470,6 +470,10 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
     XE_SHARED(float, s_e4, 256);                      /* byte -> E4M3 value */
     /* Last, so the matrix tiles' buffers above keep their places (s_a at offset 0). */
     XE_SHARED(int32_t, s_blk, 2);                     /* compact: this work-group's expert and first row */
+    XE_SHARED(int32_t, s_tok, kMxRows);               /* stage (bit 4): each row's activation row, -1 dead */
+    XE_SHARED(uint32_t, s_wrow, kMxCols);             /* stage: each column's weight-row offset, ~0 none */
+    const bool stage = (compact & 4u) != 0;           /* RADIANCE_XE_MOE_MX_STAGE=1 (run 108) */
+    compact &= 3u;
     const int tid = (int)threadIdx.x, wave = tid / kMxSG, lane = tid % kMxSG;
     const uint32_t nb = blockIdx.x;
     int32_t e = -1;
@@ -591,7 +595,78 @@ void moe_planes_mx_kernel(const uint8_t* __restrict__ A, const float* __restrict
     const uint8_t* wrow0 = e >= 0 ? we + c.c_off : nullptr;
     const uint8_t* srow0 = e >= 0 ? se + c.s_off : nullptr;
     const uint32_t rb = K / 2u, sb = K / 64u;
-    if (e >= 0) {
+    if (e >= 0 && stage) {
+        /* RADIANCE_XE_MOE_MX_STAGE=1: the rows' activation rows and the columns' weight-row offsets once a
+         * work-group, not once a pair / word a group (a load, an integer division and the decode each); the
+         * same values staged, so the same bits. Published by the first group's barrier. */
+        for (int r = tid; r < kMxRows; r += kMxThreads) {
+            int32_t t = -1;
+            if ((uint32_t)r < rn) {
+                const int32_t fq = sorted[r0 + (uint32_t)r];
+                const uint32_t tk = a_sorted ? r0 + (uint32_t)r : (uint32_t)fq / top_k;
+                if (fq >= 0 && tk < a_rows) t = (int32_t)tk;
+            }
+            s_tok[r] = t;
+        }
+        for (int n = tid; n < kMxCols; n += kMxThreads) {
+            const uint32_t nn = n0 + (uint32_t)n;
+            const uint32_t pp = fy ? nn / fy : 0u, j = nn - pp * fy;
+            s_wrow[n] = nn < N && j < fc ? (pp * fc + j) * rb : 0xFFFFFFFFu;
+        }
+    }
+    if (e >= 0 && stage) {
+        for (uint32_t g = 0; g < K / 64u; ++g) {
+            const uint32_t k0 = g * 64u;
+            xe::syncthreads();                                  /* the previous group's stages are consumed */
+            for (int idx = tid; idx < kMxRows * 32; idx += kMxThreads) {   /* 2048 pairs: 16 a thread */
+                const int r = idx / 32, kp = (idx % 32) * 2;
+                const int32_t t = s_tok[r];
+                uint32_t w = 0;
+                if (t >= 0) {
+                    const uint8_t* ar = A + (size_t)t * a_ld + k0 + (uint32_t)kp;
+                    w = f2h(s_e4[ar[0]]) | (f2h(s_e4[ar[1]]) << 16);
+                }
+                *(uint32_t*)(s_a + r * kMxAP + kp) = w;
+            }
+            if ((k0 & 127u) == 0u)
+                for (int r = tid; r < kMxRows; r += kMxThreads) {
+                    const int32_t t = s_tok[r];
+                    s_as[r] = t >= 0 ? As[(size_t)t * as_ld + k0 / 128u] : 0.0f;
+                }
+            for (int idx = tid; idx < kMxCols * 32; idx += kMxThreads) {   /* 2048 words: 16 a thread */
+                const int n = idx / 32, byte = idx % 32;
+                const int step = byte / 8, k2 = byte % 8;
+                const uint32_t wo = s_wrow[n];
+                uint32_t w = 0;
+                if (wo != 0xFFFFFFFFu) {
+                    const uint8_t code = wrow0[(size_t)wo + k0 / 2u + (uint32_t)byte];
+                    w = (uint32_t)s_lv[code & 15u] | ((uint32_t)s_lv[code >> 4] << 16);
+                }
+                s_b[((step * 4 + n / 16) * 8 + k2) * 16 + (n % 16)] = w;
+            }
+            xe::syncthreads();
+#pragma unroll
+            for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                jm::joint_matrix_load(sg, Am, lptr((sycl::half*)(s_a + wave * 8 * kMxAP + step * 16)), (size_t)kMxAP);
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    jm::joint_matrix_load(sg, Bm, lptr((sycl::half*)(s_b + (step * 4 + t) * 128)), 32);
+                    jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_store(sg, Cm[t], lptr(s_cw), 16, jm::layout::row_major);
+                xe::wave_barrier();
+                const float sbv = rowok[t] ? s_e4[srow0[(size_t)rowr[t] * sb + g]] : 0.0f;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) acc[t][q] += (s_cw[q * 16 + lane] * s_as[wave * 8 + q]) * sbv;
+                xe::wave_barrier();
+            }
+        }
+    } else if (e >= 0) {
         for (uint32_t g = 0; g < K / 64u; ++g) {
             const uint32_t k0 = g * 64u;
             xe::syncthreads();                                  /* the previous group's stages are consumed */
@@ -682,12 +757,15 @@ bool mx_on(sycl::queue* q) {   /* the matrix-unit form for prefill rows is the d
 
 uint32_t mx_compact() {   /* run 108, opt-in (moe_planes_mx_kernel's `compact`): RADIANCE_XE_MOE_MX_COMPACT=1 -> 1, the
                            * grid is the 64-row blocks of the regular runs plus the rows past them (zeroed);
-                           * else RADIANCE_XE_MOE_MX_BOUND=1 -> 2, the per-row grid bounded at off[n_expert]; 0 */
+                           * else RADIANCE_XE_MOE_MX_BOUND=1 -> 2, the per-row grid bounded at off[n_expert]; 0.
+                           * RADIANCE_XE_MOE_MX_STAGE=1 adds 4: the staging's per-row / per-column work once */
     static const uint32_t v = [] {
+        const char* st = std::getenv("RADIANCE_XE_MOE_MX_STAGE");
+        const uint32_t stage = st && *st == '1' ? 4u : 0u;
         const char* s = std::getenv("RADIANCE_XE_MOE_MX_COMPACT");
-        if (s && *s == '1') return 1u;
+        if (s && *s == '1') return 1u | stage;
         const char* b = std::getenv("RADIANCE_XE_MOE_MX_BOUND");
-        return b && *b == '1' ? 2u : 0u;
+        return (b && *b == '1' ? 2u : 0u) | stage;
     }();
     return v;
 }
@@ -861,7 +939,7 @@ extern "C" int xe_rad_moe_gemm_w4p(const RadArgs* a, RadStream s) {
     if (mx)                                                                                                 \
     XE_LAUNCH_SG(kMxSG, qq, moe_planes_mx_kernel,                                                           \
                  dim3((unsigned)((N + kMxCols - 1) / kMxCols),                                              \
-                      mx_compact() == 1 ? (unsigned)(T / kMxRows + n_expert + 2) : (unsigned)T),            \
+                      (mx_compact() & 3u) == 1 ? (unsigned)(T / kMxRows + n_expert + 2) : (unsigned)T),     \
                  dim3(kMxThreads), 0, (const uint8_t*)Aq->data, (const float*)As->data, cl[0], cl[1],       \
                  (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T,  \
                  (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,          \
