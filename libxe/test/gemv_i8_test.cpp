@@ -97,10 +97,16 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
     double worst = 0;
     bool ok = canary;
     const int rows_checked = N < 512 ? N : 512;
+    /* run 110 (owner note 129 item 3): the GEMV's own order -- four group lanes, lane j summing groups j, j + 4, ...,
+     * then (acc0 + acc1) + (acc2 + acc3) -- emulated; y elements whose bits differ from it are counted, and a hash
+     * of all of y is printed so two runs (RADIANCE_XE_GEMV_G4 unset / set) can be compared */
+    long long emu_diff = 0;
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < ybytes; ++i) hash = (hash ^ hy[kCanary + i]) * 1099511628211ull;
     for (int m = 0; m < M; ++m)
         for (int j = 0; j < rows_checked; ++j) {
             const int n = (int)((uint64_t)j * N / rows_checked);
-            float acc = 0.0f;
+            float acc = 0.0f, lane[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
             double mag = 0.0;
             for (int g = 0; g < G; ++g) {
                 float sub = 0.0f;
@@ -108,18 +114,21 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
                     sub += (float)a[(size_t)m * K + k] * (float)b[(size_t)n * K + k];
                 const float term = (sub * as[(size_t)m * G + g]) * bf(bs[(size_t)n * G + g]);
                 acc += term;
+                lane[g % 4] += term;
                 mag += std::fabs((double)term);
             }
             uint16_t got;
             std::memcpy(&got, &hy[kCanary + ((size_t)m * N + n) * 2], 2);
+            emu_diff += got != to_bf((lane[0] + lane[1]) + (lane[2] + lane[3]));
             const double err = std::fabs((double)bf(got) - (double)bf(to_bf(acc)));
             /* one bf16 ulp of the result plus the reordered f32 sum's bound */
             const double tol = std::fabs((double)bf(to_bf(acc))) * 0x1p-7 + mag * G * 0x1p-23 + 1e-30;
             worst = std::max(worst, err / tol);
             ok &= err <= tol;
         }
-    std::printf("  M %d N %5d K %5d: %s, worst %.3f of tolerance, canaries %s%s\n", M, N, K, ok ? "PASS" : "FAIL",
-                worst, canary ? "ok" : "BROKEN", reps ? "" : "");
+    std::printf("  M %d N %5d K %5d: %s, worst %.3f of tolerance, canaries %s%s; %lld of %d checked differ from the "
+                "GEMV's order; y hash %016llx\n", M, N, K, ok ? "PASS" : "FAIL", worst, canary ? "ok" : "BROKEN",
+                reps ? "" : "", emu_diff, M * rows_checked, (unsigned long long)hash);
     if (reps) std::printf("    %.4f ms, %.1f GB/s of weight\n", ms, (double)N * K * (1 + 2.0 / 128) / (ms * 1e6));
     sycl::free(da, q); sycl::free(db, q); sycl::free(das, q); sycl::free(dbs, q); sycl::free(dyb, q);
     return {ok, worst, ms};
