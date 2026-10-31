@@ -227,6 +227,8 @@ void launch(sycl::queue* q, const AttnP& p, int total_q) {
 
 }  // namespace
 
+#include "xe_attn_jm.inc"   /* the matrix-unit form for a single-sequence prefill (RADIANCE_XE_ATTN_JM=1, opt-in) */
+
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a) {
     const long long hd = r4d_geti_or(a, "head_dim", 0), gqa = r4d_geti_or(a, "gqa", 0);
     if (hd <= 0 || gqa <= 0) return R4D_NO(RAD_E_INVAL);
@@ -279,7 +281,9 @@ extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s) {
     p.q_heads = (int)qh; p.kv_heads = (int)kvh; p.gqa = (int)gqa; p.block_size = (int)bs;
     p.causal = (int)r4d_geti_or(a, "causal", 1); p.window = (int)r4d_geti_or(a, "window", 0);
     p.scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
-    p.splits = splits_for(total_q, kvh);
+    /* run 109: one sequence of 64 rows or more takes the matrix-unit form under RADIANCE_XE_ATTN_JM=1 */
+    const bool jm = n_seq == 1 && total_q >= attn_jm::BQ && attn_jm::on((sycl::queue*)s);
+    p.splits = jm ? 1 : splits_for(total_q, kvh);
     if (p.splits > 1) {
         const long long need = total_q * qh * p.splits * (hd + 2) * (long long)sizeof(float);
         if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
@@ -289,7 +293,26 @@ extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s) {
         sycl::queue* qq = (sycl::queue*)s;
         const bool of = o->dtype == RAD_F32;
         const int tq = (int)total_q;
-        if (hd == 256) {
+        /* run 109: the per-row matrix form (RADIANCE_XE_ATTN_MX=1) for calls of 64 rows or more -- a prefill's;
+         * decode and verify keep the split kernel (on few rows the form's stages cost more, and it moved M97''s
+         * text at a near-tie, M155) */
+        if (!jm && total_q >= 64 && gqa <= 8 * attn_mx::kMaxRT && attn_mx::on(qq)) {
+            if (hd == 256) {
+                if (kv8) { if (of) attn_mx::launch<8, true, true>(qq, p, tq); else attn_mx::launch<8, true, false>(qq, p, tq); }
+                else     { if (of) attn_mx::launch<8, false, true>(qq, p, tq); else attn_mx::launch<8, false, false>(qq, p, tq); }
+            } else {
+                if (kv8) { if (of) attn_mx::launch<4, true, true>(qq, p, tq); else attn_mx::launch<4, true, false>(qq, p, tq); }
+                else     { if (of) attn_mx::launch<4, false, true>(qq, p, tq); else attn_mx::launch<4, false, false>(qq, p, tq); }
+            }
+        } else if (jm) {
+            if (hd == 256) {
+                if (kv8) { if (of) attn_jm::launch<8, true, true>(qq, p, tq); else attn_jm::launch<8, true, false>(qq, p, tq); }
+                else     { if (of) attn_jm::launch<8, false, true>(qq, p, tq); else attn_jm::launch<8, false, false>(qq, p, tq); }
+            } else {
+                if (kv8) { if (of) attn_jm::launch<4, true, true>(qq, p, tq); else attn_jm::launch<4, true, false>(qq, p, tq); }
+                else     { if (of) attn_jm::launch<4, false, true>(qq, p, tq); else attn_jm::launch<4, false, false>(qq, p, tq); }
+            }
+        } else if (hd == 256) {
             if (kv8) { if (of) launch<8, true, true>(qq, p, tq); else launch<8, true, false>(qq, p, tq); }
             else     { if (of) launch<8, false, true>(qq, p, tq); else launch<8, false, false>(qq, p, tq); }
         } else {
