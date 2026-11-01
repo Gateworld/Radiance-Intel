@@ -310,6 +310,8 @@ int time_main(const char* lib, int launches, int runs) {
     if (!h) { std::printf("i4i8_probe: dlopen %s: %s\n", lib, dlerror()); return 2; }
     LaunchFn fn = (LaunchFn)dlsym(h, "xe_rad_moe_gemm_w4p");
     if (!fn) { std::printf("i4i8_probe: no xe_rad_moe_gemm_w4p\n"); return 2; }
+    /* run 114: format B's engine row (xe_moe_i4i8.cpp), timed beside today's and the probe's forms when present */
+    LaunchFn fnb = (LaunchFn)dlsym(h, "xe_rad_moe_gemm_i4i8");
     sycl::queue q(sycl::device(sycl::gpu_selector_v), { sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() });
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
@@ -355,6 +357,16 @@ int time_main(const char* lib, int launches, int runs) {
             tabs[c] = sycl::malloc_device<const void*>(cnt, q);
             q.memcpy(tabc[c], pc[c].data(), cnt * sizeof(void*)).wait();
             q.memcpy(tabs[c], ps[c].data(), cnt * sizeof(void*)).wait();
+        }
+        /* format B's row reads its classes as pointer tables over the same i4 planes and bf16 scales */
+        const void** tabbi[2]; const void** tabbs[2];
+        for (int c = 0; c < 2; ++c) {
+            std::vector<const void*> vi, vs;
+            for (int e = c; e < kNExpert; e += 2) { vi.push_back(wt[e]); vs.push_back(st[e]); }
+            tabbi[c] = sycl::malloc_device<const void*>(cnt, q);
+            tabbs[c] = sycl::malloc_device<const void*>(cnt, q);
+            q.memcpy(tabbi[c], vi.data(), cnt * sizeof(void*)).wait();
+            q.memcpy(tabbs[c], vs.data(), cnt * sizeof(void*)).wait();
         }
         const uint8_t** d_wt = sycl::malloc_device<const uint8_t*>(kNExpert, q);
         const uint16_t** d_st = sycl::malloc_device<const uint16_t*>(kNExpert, q);
@@ -462,6 +474,32 @@ int time_main(const char* lib, int launches, int runs) {
                     std::fclose(f);
                 }
             }
+            if (fnb) {
+                char dtb[] = "w4g64i8h";
+                RadParam pb[11];
+                for (int i = 0; i < 11; ++i) pb[i] = p[i];
+                pb[10].sval = dtb;
+                auto rowb = [&](int L) -> int {
+                    RadTensor t[9] = {
+                        t2(d_i, RAD_I8, a_rows, P.K), t2(d_as, RAD_F32, a_rows, P.K / 128),
+                        tbl((void*)tabbi[0], RAD_I4, cnt), tbl((void*)tabbs[0], RAD_BF16, cnt),
+                        t1(d_so[L], RAD_I32, T), t1(d_of[L], RAD_I32, kNExpert + 1),
+                        tbl((void*)tabbi[1], RAD_I4, cnt), tbl((void*)tabbs[1], RAD_BF16, cnt),
+                        t2(d_y, RAD_BF16, T, P.N) };
+                    RadArgs args{};
+                    args.t = t; args.n_t = 9; args.p = pb; args.n_p = 11;
+                    return fnb(&args, (RadStream)&q);
+                };
+                const int rb = rowb(0);
+                q.wait_and_throw();
+                if (rb != RAD_OK) {
+                    std::printf("RESULT i4i8 %s %s row w4g64i8h: refused (rc %d)\n", P.name, kModeName[mode], rb);
+                } else {
+                    const double t_r = median(wall(rowb));
+                    std::printf("RESULT i4i8 %s %s row w4g64i8h: %.1f us a launch = %.1f GB/s; %.1f %% of today's time\n",
+                                P.name, kModeName[mode], t_r, distinct * ebi / (t_r * 1e-6) / 1e9, 100.0 * t_r / t_a);
+                }
+            }
             const double t_b = median(wall(today));
             std::printf("RESULT i4i8 %s %s today again: %.1f us a launch (drift %.1f %%)\n", P.name, kModeName[mode], t_b,
                         100.0 * (t_b - t_a) / t_a);
@@ -473,6 +511,7 @@ int time_main(const char* lib, int launches, int runs) {
             for (auto* x : pc[c]) sycl::free((void*)x, q);
             for (auto* x : ps[c]) sycl::free((void*)x, q);
             sycl::free(tabc[c], q); sycl::free(tabs[c], q);
+            sycl::free(tabbi[c], q); sycl::free(tabbs[c], q);
         }
         for (int e = 0; e < kNExpert; ++e) { sycl::free((void*)wt[e], q); sycl::free((void*)st[e], q); }
         sycl::free(d_wt, q); sycl::free(d_st, q);
