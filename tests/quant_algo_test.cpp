@@ -169,6 +169,32 @@ TEST(gptq_act_order_stores_the_permutation_it_quantised_in) {
     CHECK(ea < er * 0.8);
 }
 
+/* Intel port, run 113 (owner notes 131 / 134 item 3): the int4 x int8 expert format's rule -- `gptq codes=i4
+ * group=64 scale=bf16 transform=fwht128 cd=3` -- is served by libquant as it stands: two's-complement i4 codes, one
+ * bf16 scale per 64 columns of a row, the fwht128 rotation recorded, below round-to-nearest's output error on the
+ * same grid, and the same bytes at one thread and four. */
+TEST(gptq_serves_the_int4_int8_expert_rule) {
+    NEED_LIBQUANT();
+    Opts grid;
+    grid.s("codes", "i4").i("group", 64).s("scale", "bf16").s("transform", "fwht128");
+    Opts extra;
+    extra.i("cd", 3);
+    beats_rtn("gptq", grid, extra, 0.9, nullptr);
+    Opts o = grid;
+    o.i("cd", 3).s("calib", calib_dir().c_str());
+    Quantised q = quantise(quantizer("gptq"), o, kName, kR, kC, weight());
+    REQUIRE_EQ(q.status, RAD_OK);
+    std::fprintf(stderr, "    encoding %s\n", enc_name(q.enc).c_str());
+    REQUIRE_EQ(q.enc.n_planes, 2);
+    CHECK_EQ(q.enc.plane[0].dtype, (uint32_t)RAD_I4);
+    const RadEncPlane* sc = rad_enc_plane(&q.enc, "scale");
+    REQUIRE(sc != nullptr);
+    CHECK_EQ(sc->dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(sc->block[0], (int64_t)1);
+    CHECK_EQ(sc->block[1], (int64_t)64);
+    CHECK_EQ(std::string(q.enc.transform), std::string("fwht128"));
+}
+
 /* The width-n Hadamard over each n-block of a row, unnormalised: libquant's own butterflies, in
  * its order, so a file this writes is the bytes libquant would make of the model-domain one. */
 void fwht_rows(std::vector<double>& h, int64_t k, int64_t n) {
