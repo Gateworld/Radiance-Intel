@@ -201,6 +201,9 @@ struct RuConv {
   long cs_seq, cs_dim, cs_tok;
   const int* cidx; long ci_stride;        // conv state slot per sequence; negative is padding
   unsigned int* ctr;                      // one arrival counter per (sequence, key head)
+  /* Intel port, run 112 (owner note 138, RADIANCE_XE_GDN_SPLIT): the split fold (VS > 1, no fused norm) writes
+   * each row's f32 output here, [token][H][RU_V], for ru_split_norm_kernel; null otherwise */
+  float* onf;
 };
 // Max tokens per sequence for the folded convolution (preloaded into registers, static indices).
 #define RU_CVT 8
@@ -278,7 +281,13 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   // ---- CV: issue the convolution's inputs first so they are in flight during the anchor replay.
   // Thread tid owns one q|k channel of the key head (q below RU_K, k above) and, below RU_V, one v
   // channel of the value head.
-  static_assert(!CV || (NORM && VS == 1 && STG == 0), "the folded convolution is the decode shape");
+  /* The decode shape: the fused norm at one workgroup a head, or (owner note 138) the split fold without it, VS 2
+   * or 4 so a workgroup still has a thread for each of the key head's 256 q | k channels */
+  static_assert(!CV || (STG == 0 && (NORM ? VS == 1 : (VS == 2 || VS == 4) && !ANC)),
+                "the folded convolution is the decode shape");
+  static_assert(!CV || RU_V / VS * KT >= 2 * RU_K, "a q | k channel a thread");
+  constexpr int NVC = VS > 1 ? NR : RU_V;               // this workgroup's v channels (its rows)
+  const int vrow0 = VS > 1 ? (int)blockIdx.z * NR : 0;
   static_assert(RU_K == RU_V, "one LDS row pitch serves the q, k and v taps");
   constexpr int CW = R4D_GDN_CONV_W, CS = R4D_GDN_CONV_W - 1;
   XE_SHARED(unsigned short, cvq, CV ? RU_CVT * RU_K : 1); XE_SHARED(unsigned short, cvk, CV ? RU_CVT * RU_K : 1);
@@ -311,7 +320,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       if (cslot < 0) return;
       const int off = naccept ? naccept[n] - 1 : 0;
       const int ca = tid < RU_K ? hk * RU_K + tid : (Hg + hk) * RU_K + (tid - RU_K);
-      const int cb = (2 * Hg + hv) * RU_V + tid;
+      const int cb = (2 * Hg + hv) * RU_V + vrow0 + tid;   // split: this workgroup's own v rows
       const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
       if (cvt) {
 #pragma unroll
@@ -326,7 +335,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 #pragma unroll
         for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
       }
-      if (tid < RU_V) {
+      if (tid < NVC) {
 #pragma unroll
         for (int t = 0; t < RU_CVT; ++t)
           if (t < T) cxb[t] = xr[(size_t)t * cv.xpitch + cb];
@@ -340,11 +349,13 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       if (tid < 2 * T)
         ca_b = tid < T ? ru_ab<ABF16>(av, (size_t)(bos + tid) * ab_stride + hv)
                        : ru_ab<ABF16>(bv, (size_t)(bos + tid - T) * ab_stride + hv);
+      if constexpr (NORM) {   /* the gate rows are the fused norm's; the split fold's norm reads them itself */
 #pragma unroll
       for (int i = 0; i < ZPT; ++i) {
         const int zi = tid + i * THR;
         if (zi < T * RU_V)
           czg[i] = zg[(size_t)(bos + zi / RU_V) * zg_pitch + (size_t)hv * RU_V + (zi % RU_V)];
+      }
       }
     }
   }
@@ -496,20 +507,22 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       for (int t = 0; t < RU_CVT; ++t)
         if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
     }
-    if (tid < RU_V) {
-      conv(cwb, cbb, chb, cxb, cvv + tid);
+    if (tid < NVC) {   /* a v channel has one reader, this workgroup (split: its own rows only) */
+      conv(cwb, cbb, chb, cxb, cvv + vrow0 + tid);
       ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
     }
     if (tid < 2 * T) sab[tid] = ca_b;
+    if constexpr (NORM) {
 #pragma unroll
     for (int i = 0; i < ZPT; ++i) {
       const int zi = tid + i * THR;
       if (zi < T * RU_V) szg[zi] = czg[i];
     }
+    }
     // All history is consumed (taps are in LDS), so after the barrier this workgroup no longer
-    // reads the key head's conv state and may arrive on the counter.
+    // reads the key head's conv state and may arrive on the counter. Split: G x VS readers.
     __syncthreads();
-    if (G > 1 && tid == 0)
+    if (G * VS > 1 && tid == 0)
       arrived = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
                                        __HIP_MEMORY_SCOPE_AGENT);
   }
@@ -650,6 +663,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       __syncthreads();                 // wsum is reused by the next token
     }
 
+    /* the split fold (owner note 138): the f32 row output for ru_split_norm_kernel, which norms, gates, stores and
+     * quantises it exactly as the fused path below does */
+    if constexpr (CV && !NORM) {
+      if (half == 0) cv.onf[((size_t)tok * H + hv) * RU_V + row] = on;
+    } else {
     const unsigned short ob = f2bf(on);
     if (half == 0) o[((size_t)tok * H + hv) * RU_V + row] = ob;
 
@@ -685,6 +703,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       }
       __syncthreads();               // wsum is reused by the next token
     }
+    }
 
     if (!ANC) {
       const int so = sidx[(size_t)n * sidx_stride + t];
@@ -701,10 +720,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 
   if constexpr (CV) {
     // The last arriving reader rewrites the key head's q and k channels. The count was taken
-    // before the token loop, hiding its latency.
-    if (G > 1) {
+    // before the token loop, hiding its latency. Split: G x VS readers.
+    if (G * VS > 1) {
       if (tid == 0) {
-        cvlast = arrived == (unsigned)(G - 1);
+        cvlast = arrived == (unsigned)(G * VS - 1);
         if (cvlast)
           __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
@@ -721,6 +740,71 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     for (int t = 0; t < RU_CVT; ++t)
       rx[t] = t < T ? cvh[(CS - 1 + t) * THR + tid] : (unsigned short)0;
     ru_conv_rewrite(spa, rh, rx, T, cv.cs_tok);
+  }
+}
+
+/* Intel port, run 112 (owner note 138): the split fold's norm, one workgroup a (token, value head), a thread a row.
+ * It is the fused path's arithmetic in the fused path's order at KT 8: on^2 a row; a 32-lane wave there holds four
+ * rows (lanes 0 / 8 / 16 / 24) and its xor tree gives (r0^2 + r2^2) + (r1^2 + r3^2) (the other lanes add zeros); the
+ * 32 wave sums are added in order from 0; then the gate, the bf16 store and the quantiser as there. The same bits.
+ * Tokens past cu's end and padding sequences (no conv slot) are left alone, as the fused fold leaves them. */
+constexpr int kSplitNormRowsAWave = 4;   /* RU_V rows over 1,024 threads at KT 8, 32 lanes a wave */
+template <int NQ>
+__global__ __launch_bounds__(RU_V)
+void ru_split_norm_kernel(const float* __restrict__ onf, unsigned short* __restrict__ o,
+                          unsigned char* __restrict__ oq, float* __restrict__ os, long oq_pitch, long os_ld,
+                          const unsigned short* __restrict__ zg, long zg_pitch, const float* __restrict__ nw,
+                          float neps, int nact, int H, const int* __restrict__ cu, int N,
+                          const int* __restrict__ cidx, long ci_stride) {
+  XE_SHARED(float, s2, RU_V);
+  XE_SHARED(float, ws, RU_V / kSplitNormRowsAWave);
+  XE_SHARED_VAR(float, red);
+  const int tok = blockIdx.x, hv = blockIdx.y, row = threadIdx.x;
+  if (tok >= cu[N]) return;
+  int lo = 0, hi = N;                        /* the token's sequence: the last n with cu[n] <= tok */
+  while (hi - lo > 1) { const int mid = (lo + hi) / 2; if (cu[mid] <= tok) lo = mid; else hi = mid; }
+  if (cidx[(size_t)lo * ci_stride] < 0) return;
+  float on = onf[((size_t)tok * H + hv) * RU_V + row];
+  s2[row] = on * on;
+  __syncthreads();
+  if (row < RU_V / kSplitNormRowsAWave) {
+    const int r0 = row * kSplitNormRowsAWave;
+    ws[row] = (s2[r0] + s2[r0 + 2]) + (s2[r0 + 1] + s2[r0 + 3]);
+  }
+  __syncthreads();
+  if (row == 0) {
+    float tot = 0.0f;
+    for (int i = 0; i < RU_V / kSplitNormRowsAWave; ++i) tot += ws[i];
+    red = tot;
+  }
+  __syncthreads();
+  const float sc = __frsqrt_rn(red * (1.0f / RU_V) + neps);
+  const unsigned short zr = zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row];
+  on *= sc * nw[row] * ru_act(bf2f(zr), nact);
+  const unsigned short ob = f2bf(on);
+  o[((size_t)tok * H + hv) * RU_V + row] = ob;
+  if constexpr (NQ != 0) {
+    const float ov = bf2f(ob);
+    __syncthreads();                         /* red is read above by every thread */
+    s2[row] = fabsf(ov);
+    __syncthreads();
+    if (row == 0) {
+      float amax = 0.0f;
+      for (int i = 0; i < RU_V; ++i) amax = fmaxf(amax, s2[i]);
+      red = amax;
+    }
+    __syncthreads();
+    const float amax = red;
+    const float qs = amax > 0.0f ? amax * (1.0f / q8_top<NQ == 2>()) : 1.0f;
+    if (row == 0) os[(size_t)tok * os_ld + hv] = qs;
+    unsigned char code;
+    if constexpr (NQ == 2) {
+      code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f));
+    } else {
+      const float cvq = fminf(fmaxf(ov * (1.0f / qs), -448.0f), 448.0f);
+      code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cvq, cvq, 0, false) & 0xff);
+    }
+    oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
   }
 }
 
@@ -874,6 +958,27 @@ extern "C" int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // stream sharing an output are ordered by their dependency.
 constexpr unsigned kMaxConvCtr = 4096;
 
+/* Owner note 138 (run 112): the split fold's f32 row outputs, [token][H][RU_V], for up to 64 tokens x 64 heads a
+ * launch (2 MiB): a decode or verify step's tokens; a larger launch keeps the fused form. Allocated once per
+ * (stream, output) before any recording, as the counter block below. */
+constexpr long kSplitOnfTokHeads = 64 * 64;
+static float* ru_split_onf(RadStream s, const void* out) {
+  static std::mutex m;
+  static std::map<std::pair<RadStream, const void*>, float*> blocks;
+  std::lock_guard<std::mutex> lk(m);
+  const auto key = std::make_pair(s, out);
+  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  sycl::queue& q = *(sycl::queue*)s;
+  float* p = nullptr;
+  try {
+    p = sycl::malloc_device<float>((size_t)kSplitOnfTokHeads * RU_V, q);
+  } catch (const sycl::exception&) {
+    return nullptr;
+  }
+  if (p) blocks.emplace(key, p);
+  return p;
+}
+
 static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   static std::mutex m;
   static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
@@ -908,7 +1013,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long sidx_stride, const void* nacc, const void* z,
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
-                                    RadStream stream, int oq_i8, bool anc) {
+                                    RadStream stream, int oq_i8, bool anc, int ntok = 0) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -925,6 +1030,41 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   constexpr int RC_KT = 2;
 #endif
   const dim3 grid(N, H, 1), blk(RU_V * RC_KT);
+#if defined(__SYCL_TARGET_INTEL_GPU_BMG_G31__)
+  /* Owner note 138 (run 112, RADIANCE_XE_GDN_SPLIT=2|4): a head's v rows over 2 or 4 workgroups without the fused
+   * norm, then ru_split_norm_kernel -- the same bits (see both kernels). Per-candidate state only for now (the anchor's
+   * shift marker forbids splitting a head); KT 8 only (the norm kernel mirrors that layout's order). */
+  static const int split_vs = [] {
+    const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT");
+    return e && (e[0] == '2' || e[0] == '4') ? e[0] - '0' : 0;
+  }();
+  if (split_vs && !anc && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads) {
+    const dim3 sgrid(N, H, split_vs), sblk(RU_V / split_vs * RC_KT);
+#define RC_SPLIT(VSC, NTC, SDTC)                                                              \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, 0, 0, SDTC, 1, RC_KT>), \
+                     sgrid, sblk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,     \
+                     ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
+                     (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
+                     nullptr, nullptr, 0L, 0L, (const int*)cu,                                 \
+                     (const int*)sidx, sidx_stride, (const int*)nacc,                          \
+                     (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
+                     scale, thr, cv)
+#define RC_SPLIT_NT(VSC, SDTC) do { if (nt) RC_SPLIT(VSC, 1, SDTC); else RC_SPLIT(VSC, 0, SDTC); } while (0)
+#define RC_SPLIT_VS(SDTC) do { if (split_vs == 4) RC_SPLIT_NT(4, SDTC); else RC_SPLIT_NT(2, SDTC); } while (0)
+    if (sdt) RC_SPLIT_VS(1); else RC_SPLIT_VS(0);
+#undef RC_SPLIT_VS
+#undef RC_SPLIT_NT
+#undef RC_SPLIT
+    const dim3 ngrid((unsigned)ntok, (unsigned)H), nblk(RU_V);
+#define RC_NORM(NQ) hipLaunchKernelGGL((ru_split_norm_kernel<NQ>), ngrid, nblk, 0, (hipStream_t)stream,          \
+                                       (const float*)cv.onf, (unsigned short*)o, (unsigned char*)oq, (float*)os, \
+                                       oq_pitch, os_ld, (const unsigned short*)z, z_pitch, (const float*)nw,    \
+                                       neps, nact, H, (const int*)cu, N, cv.cidx, cv.ci_stride)
+    if (!oq) RC_NORM(0); else if (oq_i8) RC_NORM(2); else RC_NORM(1);
+#undef RC_NORM
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+  }
+#endif
 #define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
   do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
   while (0)
@@ -1165,6 +1305,9 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     cv.cidx = (const int*)cidx->data; cv.ci_stride = (long)cidx->stride[0];
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
+    /* owner note 138: the split fold's scratch, only when RADIANCE_XE_GDN_SPLIT asks for it */
+    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); return e && (e[0] == '2' || e[0] == '4'); }();
+    cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
 
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
@@ -1173,5 +1316,5 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         os ? (long)r4d_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
+        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, (int)T);
 }
