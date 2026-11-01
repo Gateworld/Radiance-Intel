@@ -215,6 +215,10 @@ if(RAD_BUILD_TESTS)
   rad_l0_sycl(xe_hostbind_probe)
   target_link_libraries(xe_hostbind_probe PRIVATE ${RAD_ZE_LOADER})
   set_target_properties(xe_hostbind_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Run 114 (owner note 145 item 1): how much VRAM one card really allocates, under the runtime it runs on.
+  add_executable(xe_vram_fill_probe test/vram_fill_probe.cpp)
+  rad_l0_sycl(xe_vram_fill_probe)
+  set_target_properties(xe_vram_fill_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
   # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
   add_executable(xe_mtp_couple_test test/mtp_couple_test.cpp)

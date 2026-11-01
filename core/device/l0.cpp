@@ -2934,6 +2934,16 @@ bool discover() {
     const char* want_cpu = std::getenv("RADIANCE_L0_DEVICE");
     const char* want_pci = std::getenv("RADIANCE_L0_PCI");
     const bool cpu = want_cpu && std::strcmp(want_cpu, "cpu") == 0;
+    /* Run 114 (owner note 145 item 1): with RADIANCE_VRAM_CAP_FROM_FREE the free reading is the card, so it must be
+     * what the card allocates. NEO keeps 5 % of the card back from what it reports -- 26.05 from global_mem_size
+     * (30.30 GiB of 31.89, its free reading capped there), 26.35 from the free reading (1.6 GiB under what
+     * allocates: VF2 / VF5, 31 GiB filled past it). Its percentage key at 100 makes both runtimes report the card
+     * and the free memory as they are (VF6 26.35, VF7 26.05: 31.65 GiB free with nothing held). Set before the
+     * first platform query loads the driver; values the environment already gives are kept. */
+    if (const char* cf = std::getenv("RADIANCE_VRAM_CAP_FROM_FREE"); !cpu && cf && cf[0] == '1') {
+        setenv("NEOReadDebugKeys", "1", 0);
+        setenv("ClDeviceGlobalMemSizeAvailablePercent", "100", 0);
+    }
     for (const auto& p : sycl::platform::get_platforms()) {
         if (cpu ? p.get_backend() != sycl::backend::opencl : p.get_backend() != sycl::backend::ext_oneapi_level_zero)
             continue;

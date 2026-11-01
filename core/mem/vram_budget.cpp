@@ -105,10 +105,13 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * 32,616 MiB), so `already_held` clamps to 0 and ~1.3 GiB is never split. RADIANCE_VRAM_CAP_FROM_FREE=1
      * takes the free reading as the card when it is the larger: what the driver holds is then outside the
      * split already, and everything allocated after it -- the runtime's first-use surfaces, the recordings
-     * -- is the headroom's to cover, by measurement (briefs/2026-10-30-vram-by-owner.md). */
-    if (const char* cf = std::getenv("RADIANCE_VRAM_CAP_FROM_FREE"); cf && cf[0] == '1' && freeb > b.capacity) {
+     * -- is the headroom's to cover, by measurement (briefs/2026-10-30-vram-by-owner.md).
+     * Run 114 (owner note 145 item 1): the free reading is the card whichever is larger. With NEO's percentage key
+     * at 100 (core/device/l0.cpp's discover) the card reports its whole 31.89 GiB and the reading is under it on
+     * 26.05 and 26.35 alike; taken as the card, the split is the one 26.05's capped reading gave. */
+    if (const char* cf = std::getenv("RADIANCE_VRAM_CAP_FROM_FREE"); cf && cf[0] == '1' && freeb > 0) {
         if (log)
-            RAD_INFO("VRAM budget: the card reports %s but %s is free; the split takes the free reading as the card "
+            RAD_INFO("VRAM budget: the card reports %s and %s is free; the split takes the free reading as the card "
                      "(RADIANCE_VRAM_CAP_FROM_FREE)", humanb(b.capacity).c_str(), humanb(freeb).c_str());
         b.capacity = freeb;
     }

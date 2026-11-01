@@ -306,6 +306,45 @@ TEST(a_program_that_copies_no_weight_still_gets_a_weights_pool) {
     CHECK(c.vram_kv_mib >= 299);
 }
 
+TEST(cap_from_free_splits_the_same_card_whether_the_runtime_caps_its_size_or_not) {
+    /* Run 114 (owner note 145 item 1): under RADIANCE_VRAM_CAP_FROM_FREE the free reading is the card. NEO 26.05
+     * reports 95 % of a B70 as its size, under the free reading (which the bring-up's probe corrects); with
+     * NEO's percentage key at 100 (26.05 or 26.35) it reports the whole card and the reading is under it. The
+     * same free memory must give the same split either way, the engine's own held-out table included. */
+    auto split = [](int64_t capacity) {
+        Config c = small_config();
+        c.vram_weights_mib = 0;
+        c.vram_kv_mib      = 0;
+        c.gpu_headroom_mib = 96;
+        c.max_seqs = 8;
+        c.max_ctx  = 2048;
+        VramFacts f{};
+        f.capacity   = capacity;
+        f.free       = 31LL << 30;
+        f.held_out   = 64LL << 20;
+        f.arena      = 144LL << 20;
+        f.statics    = 2LL << 30;
+        f.experts    = 200LL << 30;
+        f.kv_ceiling = 100LL << 30;
+        f.kv_one     = 1LL << 30;
+        VramBudget b;
+        CHECK_OK(vram_budget_resolve(c, { f }, &b));
+        return std::make_pair(b, c);
+    };
+    setenv("RADIANCE_VRAM_CAP_FROM_FREE", "1", 1);
+    const auto capped = split(31023LL << 20);   /* 26.05: 30.30 GiB, the reading above it */
+    const auto whole  = split(32656LL << 20);   /* the key at 100: 31.89 GiB, the reading under it */
+    unsetenv("RADIANCE_VRAM_CAP_FROM_FREE");
+    CHECK_EQ(capped.first.capacity, 31LL << 30);
+    CHECK_EQ(whole.first.capacity, 31LL << 30);
+    CHECK_EQ(whole.first.already_held, capped.first.already_held);
+    CHECK_EQ(whole.first.claimable, capped.first.claimable);
+    CHECK_EQ(whole.first.experts, capped.first.experts);
+    CHECK_EQ(whole.first.kv, capped.first.kv);
+    CHECK_EQ(whole.second.vram_weights_mib, capped.second.vram_weights_mib);
+    CHECK_EQ(whole.second.vram_kv_mib, capped.second.vram_kv_mib);
+}
+
 TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {
     /* With no lender the experts come first; the cases below cover each side's share. */
     Config c = small_config();
