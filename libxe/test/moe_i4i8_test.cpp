@@ -334,16 +334,19 @@ bool real_case(sycl::queue& q, LaunchFn fn, LaunchFn ref, const std::string& dir
         q.memcpy(ds[x], hs[x].data(), hs[x].size());
     }
     void* htab[4][2];      /* [class * 2 + (codes, scales)][entry] */
+    /* the device tables' host sources live to the q.wait() below: a queue memcpy reads its source when it runs, and
+     * run 116's first form copied from arrays scoped to the loop body (the real check's failure) */
+    void* dsrc[4][2];
     void** dtab[4];
     for (int c = 0; c < 2; ++c) {
-        void* pc[2] = { dc[c], dc[c + 2] };
-        void* ps[2] = { ds[c], ds[c + 2] };
+        dsrc[2 * c][0] = dc[c]; dsrc[2 * c][1] = dc[c + 2];
+        dsrc[2 * c + 1][0] = ds[c]; dsrc[2 * c + 1][1] = ds[c + 2];
         htab[2 * c][0] = hc[c].data(); htab[2 * c][1] = hc[c + 2].data();
         htab[2 * c + 1][0] = hs[c].data(); htab[2 * c + 1][1] = hs[c + 2].data();
         dtab[2 * c] = sycl::malloc_device<void*>(2, q);
         dtab[2 * c + 1] = sycl::malloc_device<void*>(2, q);
-        q.memcpy(dtab[2 * c], pc, sizeof pc);
-        q.memcpy(dtab[2 * c + 1], ps, sizeof ps);
+        q.memcpy(dtab[2 * c], dsrc[2 * c], sizeof dsrc[0]);
+        q.memcpy(dtab[2 * c + 1], dsrc[2 * c + 1], sizeof dsrc[0]);
     }
     int8_t* da = sycl::malloc_device<int8_t>(a.size(), q);
     float* das = sycl::malloc_device<float>(as.size(), q);
