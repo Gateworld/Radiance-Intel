@@ -172,16 +172,23 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         for (int q = 0; q < kMT; ++q) {
             if ((uint32_t)q >= rn || !liver[q]) continue;
             const uint32_t* arow = (const uint32_t*)(A + (size_t)tokr[q] * a_ld);
-            for (uint32_t b = (uint32_t)tid; b < K / 8u; b += kWG) {
-                const uint32_t lo = arow[2 * b], hi = arow[2 * b + 1];
-                s_a[q * (kMaxK / 4) + 2 * b] = (uint32_t)a_even(lo, hi);
-                s_a[q * (kMaxK / 4) + 2 * b + 1] = (uint32_t)a_odd(lo, hi);
-            }
-            for (uint32_t g = (uint32_t)tid; g < K / 64u; g += kWG) {
-                const uint32_t* ag = arow + g * 16u;
-                int32_t sa = 0;
-                for (int d = 0; d < 16; ++d) sa = dp4((int32_t)ag[d], (int32_t)0x01010101, sa);
-                s_g[q * (kMaxK / 64) + g] = (float)sa;
+            /* Each group's activation sum in the same pass: eight lanes hold a group's 16 dwords (K % 64 == 0, so
+             * they are live together), joined by three xors. The trip count is the work-group's, so every lane
+             * reaches the shuffles. (It was a second pass over global memory, 16 dependent loads a group, in every
+             * column block's work-group: run 114.) */
+            for (uint32_t b0 = 0; b0 < K / 8u; b0 += kWG) {
+                const uint32_t b = b0 + (uint32_t)tid;
+                const bool in = b < K / 8u;
+                const uint32_t lo = in ? arow[2 * b] : 0u, hi = in ? arow[2 * b + 1] : 0u;
+                if (in) {
+                    s_a[q * (kMaxK / 4) + 2 * b] = (uint32_t)a_even(lo, hi);
+                    s_a[q * (kMaxK / 4) + 2 * b + 1] = (uint32_t)a_odd(lo, hi);
+                }
+                int32_t sa = dp4((int32_t)hi, (int32_t)0x01010101, dp4((int32_t)lo, (int32_t)0x01010101, 0));
+                sa += __shfl_xor(sa, 4);
+                sa += __shfl_xor(sa, 2);
+                sa += __shfl_xor(sa, 1);
+                if (in && (b & 7u) == 0) s_g[q * (kMaxK / 64) + b / 8u] = (float)sa;
             }
             for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kWG)
                 s_as[q * (kMaxK / 128) + g] = As[(size_t)tokr[q] * as_ld + g];
