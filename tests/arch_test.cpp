@@ -6863,6 +6863,57 @@ TEST(qwen35moe_fp8_steps_lint_clean_with_int4_experts_against_int8_activations) 
                            { { "ffn_gate_up_exps", wb }, { "ffn_down_exps", wb } });
 }
 
+/* Intel port, run 116 (owner notes 146 item 4 / 147): format C -- today's w4nl64a8h experts under
+ * RADIANCE_MOE_FORMAT_C=1 -- is served as the w4nl64i8h grouped GEMM against format B's int8 pairs: the weights as
+ * stored, the same two had_quant_act_i8g a routed layer. Without the flag the same container keeps w4nl64a8h. */
+RadEncoding w4nl64_enc() {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_copy_str(e.transform, "fwht128");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "table", RAD_F32, 1, 16);
+    return e;
+}
+TEST(qwen35moe_fp8_serves_codebook_experts_against_int8_activations_opt_in) {
+    MetaKV mk = q35moe_meta();
+    const RadEncoding wc = w4nl64_enc();
+    REQUIRE(rad_enc_valid(&wc));
+    for (int on : { 0, 1 }) {
+        if (on) setenv("RADIANCE_MOE_FORMAT_C", "1", 1); else unsetenv("RADIANCE_MOE_FORMAT_C");
+        for (int world : { 1, 2 }) {
+            RadBuilder b;
+            b.encs = { { "ffn_gate_up_exps", wc }, { "ffn_down_exps", wc } };
+            RadBuildCtx ctx = build_ctx(0, world);
+            REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+            int gemm_c = 0, gemm_nl = 0, other = 0, quant_i8 = 0;
+            for (const auto& o : b.ops) {
+                if (o.op == "had_quant_act_i8g") ++quant_i8;
+                if (o.op.rfind("moe_gemm", 0) != 0) continue;
+                const std::string dt = pstr(&o, "dtype");
+                if (dt == "w4nl64i8h") ++gemm_c; else if (dt == "w4nl64a8h") ++gemm_nl; else ++other;
+            }
+            CHECK_EQ(gemm_c, on ? 2 * 8 : 0);
+            CHECK_EQ(gemm_nl, on ? 0 : 2 * 8);
+            CHECK_EQ(other, 0);
+            CHECK_EQ(quant_i8, on ? 2 * 8 : 0);
+        }
+    }
+    unsetenv("RADIANCE_MOE_FORMAT_C");
+}
+
+/* ...and its steps lint clean at one and two ranks, the flag on. */
+TEST(qwen35moe_fp8_steps_lint_clean_with_codebook_experts_against_int8_activations) {
+    MetaKV mk = q35moe_meta();
+    setenv("RADIANCE_MOE_FORMAT_C", "1", 1);
+    const RadEncoding wc = w4nl64_enc();
+    lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 3, false, 0,
+                           { { "ffn_gate_up_exps", wc }, { "ffn_down_exps", wc } });
+    unsetenv("RADIANCE_MOE_FORMAT_C");
+}
+
 /* The routed model's engine steps, its routed MTP head included, lint clean at one and two
  * ranks. */
 TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
