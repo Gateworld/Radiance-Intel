@@ -106,6 +106,14 @@ void i4_scales(int e, const Proj& P, std::vector<uint16_t>& s) {
         s[i] = (uint16_t)(u >> 16);
     }
 }
+/* Format C (run 116, owner note 146 item 4): the same u4 codes as indices into w4nl's 16 levels rounded to int8 --
+ * code c < 8 is +kLvl8[c], c >= 8 is -kLvl8[c - 8] (the table's order: 1.125 3.25 5.5 8 11 14 18 22, then negated;
+ * x 127 / 22). The magnitudes packed in one u64 for the register lookup. */
+constexpr int kLvl8[8] = { 6, 19, 32, 46, 64, 81, 104, 127 };
+constexpr uint64_t kLvl8Packed = 6ull | 19ull << 8 | 32ull << 16 | 46ull << 24 | 64ull << 32 | 81ull << 40 | 104ull << 48 |
+                                 127ull << 56;
+inline int lvl8_of(int c) { return c < 8 ? kLvl8[c] : -kLvl8[c - 8]; }
+
 int8_t i8_act(int proj, size_t i) { return (int8_t)((int)(h32(211 + proj, i) % 255u) - 127); }
 float i8_scale(int proj, int row) { return 0.001f + (float)(h32(213 + proj, row) & 255) / 25600.0f; }
 
@@ -116,8 +124,11 @@ float i8_scale(int proj, int row) { return 0.001f + (float)(h32(213 + proj, row)
  * first. A group's two chunks sit on lanes l and l ^ 1; their int32 sums are joined by one xor before the scale.
  * GL (a group a lane): lane l owns groups l + u * LPR whole (two chunks, 32 bytes), no xor. WGS threads a work-group.
  * The activation group sums: a DP4A against ones a word, then a sub-group sum (16 words = one group).
- * DUMP writes each group's exact sum to D[row][n][g]. */
-template <int LPR, int UPL, int R, bool GL, int WGS, bool DUMP>
+ * DUMP writes each group's exact sum to D[row][n][g].
+ * LUT (run 116, format C): 0 the int4 codes themselves (format B, sum(code * a) - 8 * sum(a)); 1 each code mapped to
+ * its int8 level in registers (the eight magnitudes in one u64, a shift a code, the sign from bit 3); 2 through a
+ * 256-entry LDS table, a code byte (two codes) to its two int8 levels. Then sum(level * a), with no bias term. */
+template <int LPR, int UPL, int R, bool GL, int WGS, bool DUMP, int LUT = 0>
 sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16_t* const* stab, const int8_t* A,
                         const float* As, const int32_t* sorted, const int32_t* off, uint16_t* Y, int32_t* D, uint32_t T,
                         uint32_t N, uint32_t K, uint32_t a_sorted) {
@@ -127,6 +138,7 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> s_a(sycl::range<1>(kMT * kMaxK / 4), h);
         sycl::local_accessor<int32_t, 1> s_g(sycl::range<1>(kMT * kMaxK / 64), h);
+        sycl::local_accessor<uint32_t, 1> s_t(sycl::range<1>(LUT == 2 ? 256 : 1), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(T, gx * WGS), sycl::range<2>(1, WGS)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
             const uint32_t i = (uint32_t)it.get_group(0), nb = (uint32_t)it.get_group(1);
@@ -158,6 +170,14 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
                     const int s = sycl::reduce_over_group(sg, sycl::ext::oneapi::dot_acc((int32_t)x, (int32_t)0x01010101, 0),
                                                           sycl::plus<int>());
                     if (b < K / 4u && (b & 15u) == 0) s_g[qq * (kMaxK / 64) + b / 16u] = s;
+                }
+            }
+            if constexpr (LUT == 2) {   /* byte v (codes v & 15, v >> 4) -> its two int8 levels in the low half-word */
+                for (int v = tid; v < 256; v += WGS) {
+                    const int c0 = v & 15, c1 = v >> 4;
+                    const int l0 = c0 < 8 ? (int)((kLvl8Packed >> (8 * c0)) & 255u) : -(int)((kLvl8Packed >> (8 * (c0 - 8))) & 255u);
+                    const int l1 = c1 < 8 ? (int)((kLvl8Packed >> (8 * c1)) & 255u) : -(int)((kLvl8Packed >> (8 * (c1 - 8))) & 255u);
+                    s_t[v] = ((uint32_t)l0 & 255u) | (((uint32_t)l1 & 255u) << 8);
                 }
             }
             sycl::group_barrier(it.get_group());
@@ -214,12 +234,34 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
                             const uint32_t d[4] = { w[u][r][c].x(), w[u][r][c].y(), w[u][r][c].z(), w[u][r][c].w() };
 #pragma unroll
                             for (int x = 0; x < 4; ++x) {
-                                s = sycl::ext::oneapi::dot_acc((int32_t)(d[x] & 0x0f0f0f0fu), (int32_t)a[8 * c + x], s);
-                                s = sycl::ext::oneapi::dot_acc((int32_t)((d[x] >> 4) & 0x0f0f0f0fu), (int32_t)a[8 * c + 4 + x], s);
+                                uint32_t lo4 = d[x] & 0x0f0f0f0fu, hi4 = (d[x] >> 4) & 0x0f0f0f0fu;
+                                if constexpr (LUT == 1) {   /* each code byte to its signed int8 level */
+                                    uint32_t lo8 = 0, hi8 = 0;
+#pragma unroll
+                                    for (int bb = 0; bb < 4; ++bb) {
+                                        const uint32_t c0 = (lo4 >> (8 * bb)) & 15u, c1 = (hi4 >> (8 * bb)) & 15u;
+                                        const uint32_t m0 = (uint32_t)(kLvl8Packed >> (8 * (c0 & 7u))) & 255u;
+                                        const uint32_t m1 = (uint32_t)(kLvl8Packed >> (8 * (c1 & 7u))) & 255u;
+                                        lo8 |= ((c0 & 8u) ? (0u - m0) & 255u : m0) << (8 * bb);
+                                        hi8 |= ((c1 & 8u) ? (0u - m1) & 255u : m1) << (8 * bb);
+                                    }
+                                    lo4 = lo8; hi4 = hi8;
+                                } else if constexpr (LUT == 2) {   /* a code byte (low code, high code) to two levels */
+                                    uint32_t lo8 = 0, hi8 = 0;
+#pragma unroll
+                                    for (int bb = 0; bb < 4; ++bb) {
+                                        const uint32_t ev = s_t[(d[x] >> (8 * bb)) & 255u];
+                                        lo8 |= (ev & 255u) << (8 * bb);
+                                        hi8 |= ((ev >> 8) & 255u) << (8 * bb);
+                                    }
+                                    lo4 = lo8; hi4 = hi8;
+                                }
+                                s = sycl::ext::oneapi::dot_acc((int32_t)lo4, (int32_t)a[8 * c + x], s);
+                                s = sycl::ext::oneapi::dot_acc((int32_t)hi4, (int32_t)a[8 * c + 4 + x], s);
                             }
                         }
                         if constexpr (!GL) s += sycl::permute_group_by_xor(sg, s, 1);   /* the group's other chunk */
-                        s -= 8 * gs;
+                        if constexpr (LUT == 0) s -= 8 * gs;
                         if (GL || (l & 1) == 0) {
                             acc[qq][r] += (float)s * ws[r];
                             if constexpr (DUMP)
@@ -249,10 +291,14 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
 }
 
 /* name: L lanes a column, R columns a team, G a group a lane, W256 a 256-thread work-group (else 512) */
-struct Variant { const char* name; int id, proj; };
+/* lut: 0 format B's int4 codes; 1 / 2 format C (run 116), the u4 codes to int8 levels in registers / through LDS, at
+ * format B's best mappings (gate_up L16R1W256, down GL2R2) */
+struct Variant { const char* name; int id, proj, lut = 0; };
 const Variant kVar[] = { { "L16R1", 0, 0 }, { "L16R2", 1, 0 }, { "L16R1W256", 2, 0 }, { "GL8R1", 3, 0 }, { "GL8R2", 4, 0 },
                          { "L8R2", 10, 1 }, { "L8R8", 11, 1 }, { "L8R2W256", 12, 1 }, { "GL4R2", 13, 1 },
-                         { "GL4R4", 14, 1 }, { "GL2R2", 15, 1 }, { "GL4R2W256", 16, 1 }, { "GL2R4W256", 17, 1 } };
+                         { "GL4R4", 14, 1 }, { "GL2R2", 15, 1 }, { "GL4R2W256", 16, 1 }, { "GL2R4W256", 17, 1 },
+                         { "C-reg L16R1W256", 20, 0, 1 }, { "C-lds L16R1W256", 21, 0, 2 },
+                         { "C-reg GL2R2", 22, 1, 1 }, { "C-lds GL2R2", 23, 1, 2 } };
 
 template <bool DUMP>
 sycl::event run_var(const Variant& v, sycl::queue& q, const uint8_t* const* wt, const uint16_t* const* st, const int8_t* A,
@@ -273,9 +319,18 @@ sycl::event run_var(const Variant& v, sycl::queue& q, const uint8_t* const* wt, 
     case 14: return I4A8(4, 1, 4, true, 512);
     case 15: return I4A8(2, 2, 2, true, 512);
     case 16: return I4A8(4, 1, 2, true, 256);
-    default: return I4A8(2, 2, 4, true, 256);
+    case 17: return I4A8(2, 2, 4, true, 256);
     }
 #undef I4A8
+#define I4C8(LPR, UPL, R, GL, WGS, LUT) \
+    i4a8_launch<LPR, UPL, R, GL, WGS, DUMP, LUT>(q, wt, st, A, As, so, of, Y, D, T, P.N, P.K, as)
+    switch (v.id) {
+    case 20: return I4C8(16, 5, 1, false, 256, 1);
+    case 21: return I4C8(16, 5, 1, false, 256, 2);
+    case 22: return I4C8(2, 2, 2, true, 512, 1);
+    default: return I4C8(2, 2, 2, true, 512, 2);
+    }
+#undef I4C8
 }
 
 /* ---- today's form (w4nl64a8h planes, as moe_planes_bench builds it) ---- */
@@ -532,6 +587,7 @@ int ref_main(const char* dir) {
             const Route rt = route_of(mode, 0);
             const int T = rt.T;
             /* the exact sums and y in double */
+            for (int lut = 0; lut < 2; ++lut) {   /* format B's int4 codes, then format C's int8 levels (run 116) */
             std::vector<int32_t> rd((size_t)T * P.N * G);
             std::vector<double> ry((size_t)T * P.N), rb((size_t)T * P.N);
             std::vector<uint8_t> c;
@@ -549,7 +605,8 @@ int ref_main(const char* dir) {
                         for (uint32_t k = g * 64; k < g * 64 + 64; ++k) {
                             const uint32_t ch = k / 32, j = k % 32;   /* chunk, weight in chunk */
                             const uint8_t byte = c[(size_t)n * (P.K / 2) + ch * 16 + (j % 16)];
-                            const int w = (int)(j < 16 ? (byte & 15) : (byte >> 4)) - 8;
+                            const int code = (int)(j < 16 ? (byte & 15) : (byte >> 4));
+                            const int w = lut ? lvl8_of(code) : code - 8;
                             sum += w * (int)i8_act(pi, (size_t)tok * P.K + k);
                         }
                         rd[((size_t)i * P.N + n) * G + g] = sum;
@@ -561,7 +618,7 @@ int ref_main(const char* dir) {
                 }
             }
             for (const Variant& v : kVar) {
-                if (v.proj != pi) continue;
+                if (v.proj != pi || (v.lut != 0) != (lut != 0)) continue;
                 const std::string fnm = std::string(dir) + "/i4i8-" + P.name + "-" + kModeName[mode] + "-" + v.name + ".bin";
                 FILE* f = std::fopen(fnm.c_str(), "rb");
                 if (!f) { std::printf("REF %s: missing\n", fnm.c_str()); all_ok = false; continue; }
@@ -584,6 +641,7 @@ int ref_main(const char* dir) {
                             "worst d/bound %.3g\n", P.name, kModeName[mode], v.name, ok ? "PASS" : "FAIL", (long long)bad_d,
                             hd.size(), (long long)bad_y, hy.size(), worst);
             }
+            }   /* lut */
         }
     }
     std::printf("RESULT i4i8_ref %s\n", all_ok ? "PASS" : "FAIL");
