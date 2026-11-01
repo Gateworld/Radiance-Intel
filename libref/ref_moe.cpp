@@ -285,12 +285,17 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
 
 /* What a codebook `dtype` stores: the code width, the scale's group along K and dtype, and whether
  * the scale view carries the level above it. `bits` is 0 for any other dtype. */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; bool i8 = false; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
     if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    /* Intel port, run 116 (owner notes 146 item 4 / 147): format C -- w4nl64a8h's planes served against int8
+     * activations (had_quant_act_i8g's), the 16 levels rounded to int8 at their own amax: level i is
+     * nearbyint(t_i * 127 / amax), and amax / 127 joins the weight's scale (scale.1 * (amax / 127), then times the
+     * E4M3 scale) -- the kernel's integer group sums, exactly. */
+    if (s && !std::strcmp(s, "w4nl64i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
     return CbForm{ 0, 0, 0, false };
@@ -533,6 +538,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     std::vector<CbTensor>  cbt;
     std::vector<CbScale>   cbs;
     bool codebook = false;
+    const bool cb_i8 = cb_form(a->p, a->n_p).i8;
     for (int64_t e = 0; e < n_expert; ++e) {
         const int q = (int)(e % nc);
         const RadTensor* tw = Wq[q];
@@ -563,6 +569,16 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
                 cbt[(size_t)e] = ct;
                 const int js = cb_scale(ts ? &wse[(size_t)e] : nullptr, n, k, &cbs[(size_t)e]);
                 if (js < 0) return js;
+                if (cb_i8) {   /* format C: the levels as int8 integers, amax / 127 into the scale */
+                    CbTensor& c = cbt[(size_t)e];
+                    const int nl = 1 << c.bits;
+                    float amax = 0.0f;
+                    for (int t = 0; t < nl; ++t) amax = std::max(amax, std::fabs(c.tab[t]));
+                    if (amax > 0.0f) {
+                        for (int t = 0; t < nl; ++t) c.tab[t] = std::nearbyint(c.tab[t] * 127.0f / amax);
+                        cbs[(size_t)e].mul = cbs[(size_t)e].mul * (amax / 127.0f);
+                    }
+                }
                 continue;
             }
             /* A joined scale is read only beside joined codes. */

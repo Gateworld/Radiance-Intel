@@ -18,6 +18,7 @@
 #include "rad_sample.h"
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
+#include "rad_planes.h"    /* format C's joined planes (run 116) */
 
 #include <algorithm>
 #include <cmath>
@@ -4111,6 +4112,106 @@ TEST(op_moe_gemm_q_int4_experts_against_int8_activations) {
     CHECK_EQ(out.at(1), 3.0f);
 }
 
+/* Intel port, run 116 (owner notes 146 item 4 / 147): format C (w4nl64i8h) -- today's w4nl64a8h experts (joined
+ * `codes,table` and `scale,scale.1` planes, through pointer tables as the engine passes them) against int8
+ * activations: each expert's 16 levels rounded to int8 at their own amax (w4nl: 1.125 .. 22 -> 6 .. 127), amax / 127
+ * into the weight's scale. One activation group (scale 0.5) over two weight groups; s1 0.25; mul = 0.25 * 22 / 127.
+ *   row 0: code 7 (22 -> 127) x 2 at E4M3 1.0, code 8 (-1.125 -> -6) x 3 at E4M3 2.0
+ *   row 1: code 2 (5.5 -> 32) x 2 at E4M3 1.0, and code 0 (1.125 -> 6) x 3 at E4M3 1.0 (codes 0 elsewhere: +6)
+ * The odd class: codes 0, scales 0, so its rows add nothing. */
+TEST(op_moe_gemm_q_codebook_experts_against_int8_activations) {
+    const float tab[16] = { 1.125f, 3.25f, 5.5f, 8.f, 11.f, 14.f, 18.f, 22.f,
+                            -1.125f, -3.25f, -5.5f, -8.f, -11.f, -14.f, -18.f, -22.f };
+    const int64_t N = 2, K = 128;
+    RadEncoding enc{};
+    std::strcpy(enc.scheme, "affine");
+    std::strcpy(enc.transform, "fwht128");
+    enc.n_planes = 4;
+    auto plane = [&](int i, const char* role, uint32_t dt, uint32_t kind, int64_t b0, int64_t b1) {
+        std::strcpy(enc.plane[i].role, role);
+        enc.plane[i].dtype = dt;
+        enc.plane[i].kind = kind;
+        if (kind == RAD_PLANE_TABLE) { enc.plane[i].extent[0] = b0; enc.plane[i].extent[1] = b1; }
+        else { enc.plane[i].block[0] = b0; enc.plane[i].block[1] = b1; }
+    };
+    plane(0, "codes", RAD_U4, RAD_PLANE_TILED, 1, 1);
+    plane(1, "table", RAD_F32, RAD_PLANE_TABLE, 1, 16);
+    plane(2, "scale", RAD_F8E4M3, RAD_PLANE_TILED, 1, 64);
+    plane(3, "scale.1", RAD_F32, RAD_PLANE_TILED, 0, 0);
+    /* one expert's joined forms from its planes */
+    auto joined = [&](const std::vector<uint8_t>& codes, const std::vector<uint8_t>& sc, float s1,
+                      std::vector<uint8_t>* jc, std::vector<uint8_t>* js) {
+        RadTensor cp[2]{}, sp[2]{};
+        cp[0].dtype = RAD_U4; cp[0].rank = 2; cp[0].shape[0] = N; cp[0].shape[1] = K; cp[0].data = (void*)codes.data();
+        cp[1].dtype = RAD_F32; cp[1].rank = 2; cp[1].shape[0] = 1; cp[1].shape[1] = 16; cp[1].data = (void*)tab;
+        sp[0].dtype = RAD_F8E4M3; sp[0].rank = 2; sp[0].shape[0] = N; sp[0].shape[1] = K / 64; sp[0].data = (void*)sc.data();
+        sp[1].dtype = RAD_F32; sp[1].rank = 2; sp[1].shape[0] = 1; sp[1].shape[1] = 1; sp[1].data = &s1;
+        const int sc_sel[2] = { 0, 1 }, ss_sel[2] = { 2, 3 };
+        RadPlanesEntry e[4];
+        jc->assign((size_t)rad_planes_plan(&enc, sc_sel, cp, 2, e), 0);
+        js->assign((size_t)rad_planes_plan(&enc, ss_sel, sp, 2, e), 0);
+        return rad_planes_relayout(&enc, sc_sel, cp, 2, jc->data(), (int64_t)jc->size()) == RAD_OK &&
+               rad_planes_relayout(&enc, ss_sel, sp, 2, js->data(), (int64_t)js->size()) == RAD_OK;
+    };
+    std::vector<uint8_t> ce((size_t)(N * K / 2), 0), co((size_t)(N * K / 2), 0);
+    ce[0] = 0x07;          /* row 0, k 0: code 7 */
+    ce[32] = 0x08;         /* row 0, k 64: code 8 */
+    ce[64] = 0x02;         /* row 1, k 0: code 2 */
+    std::vector<uint8_t> jce, jse, jco, jso;
+    REQUIRE(joined(ce, { 0x38, 0x40, 0x38, 0x38 }, 0.25f, &jce, &jse));
+    REQUIRE(joined(co, { 0, 0, 0, 0 }, 0.25f, &jco, &jso));
+    /* pointer tables of one entry each, [1, N, K] */
+    void* pce[1] = { jce.data() };
+    void* pse[1] = { jse.data() };
+    void* pco[1] = { jco.data() };
+    void* pso[1] = { jso.data() };
+    /* a scale table's logical shape must hold a joined header for libref to read it as joined (cb_joined); the
+     * engine's ([cnt, 768, 40]) always does, this test's [1, 2, 2] would not -- so 64 x 64 here */
+    auto table = [&](uint32_t dt, int64_t cols, void** p) {
+        T t(dt, { 1, dt == RAD_U4 ? N : 64, dt == RAD_U4 ? cols : 64 });
+        t.t.data = p;
+        t.t.stride[0] = 0;
+        return t;
+    };
+    std::vector<int64_t> av(128, 0);
+    av[0] = 2; av[64] = 3;
+    T a8(RAD_I8, { 1, 128 }); a8.n(av);
+    T as(RAD_F32, { 1, 1 });  as.f({ 0.5f });
+    T sorted(RAD_I32, { 1 });  sorted.n({ 0 });
+    T offsets(RAD_I32, { 3 }); offsets.n({ 0, 1, 1 });
+    T out(RAD_F32, { 1, N });
+    A a;
+    a.t(a8).t(as).t(table(RAD_U4, K, pce)).t(table(RAD_F8E4M3, K / 64, pse)).t(sorted).t(offsets)
+        .t(table(RAD_U4, K, pco)).t(table(RAD_F8E4M3, K / 64, pso)).t(out)
+        .i("M", 1).i("N", N).i("K", K).i("n_expert", 2).i("top_k", 1).i("group", 128)
+        .s("a_order", "token").s("dtype", "w4nl64i8h");
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    const float mul = 0.25f * (22.0f / 127.0f);
+    const float y0 = ((254.0f * 0.5f) * (1.0f * mul)) + ((-18.0f * 0.5f) * (2.0f * mul));
+    const float y1 = ((64.0f * 0.5f) * (1.0f * mul)) + ((18.0f * 0.5f) * (1.0f * mul));   /* k 64: code 0 = +6 */
+    CHECK_NEAR(out.at(0), y0, 1e-6 * std::fabs(y0));
+    CHECK_NEAR(out.at(1), y1, 1e-6 * std::fabs(y1));
+    std::fprintf(stderr, "    format C: y %.6f %.6f (want %.6f %.6f)\n", out.at(0), out.at(1), y0, y1);
+    /* the control: today's w4nl64a8h on the same planes reads the exact levels against E4M3 activations of the same
+     * values (2 = 0x40, 3 = 0x44) -- the planes themselves, checked */
+    std::vector<int64_t> ev(128, 0);
+    ev[0] = 0x40; ev[64] = 0x44;
+    T ae(RAD_F8E4M3, { 1, 128 });
+    for (int64_t i = 0; i < 128; ++i) ae.mem[(size_t)i] = (uint8_t)ev[(size_t)i];
+    T out2(RAD_F32, { 1, N });
+    A b;
+    b.t(ae).t(as).t(table(RAD_U4, K, pce)).t(table(RAD_F8E4M3, K / 64, pse)).t(sorted).t(offsets)
+        .t(table(RAD_U4, K, pco)).t(table(RAD_F8E4M3, K / 64, pso)).t(out2)
+        .i("M", 1).i("N", N).i("K", K).i("n_expert", 2).i("top_k", 1).i("group", 128)
+        .s("a_order", "token").s("dtype", "w4nl64a8h");
+    REQUIRE_EQ(run("moe_gemm_q", b), RAD_OK);
+    const float x0 = ((22.0f * 2.0f * 0.5f) * (1.0f * 0.25f)) + ((-1.125f * 3.0f * 0.5f) * (2.0f * 0.25f));
+    const float x1 = ((5.5f * 2.0f * 0.5f) * (1.0f * 0.25f)) + ((1.125f * 3.0f * 0.5f) * (1.0f * 0.25f));
+    std::fprintf(stderr, "    w4nl64a8h control: y %.6f %.6f (want %.6f %.6f)\n", out2.at(0), out2.at(1), x0, x1);
+    CHECK_NEAR(out2.at(0), x0, 1e-5 * std::fabs(x0));
+    CHECK_NEAR(out2.at(1), x1, 1e-5 * std::fabs(x1));
+}
+
 /* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
  * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
  * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
@@ -4121,7 +4222,8 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
     const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
                            { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 }, { "w4g64i8h", 256, 8 } };
+                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 }, { "w4g64i8h", 256, 8 },
+                           { "w4nl64i8h", 256, 8 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
