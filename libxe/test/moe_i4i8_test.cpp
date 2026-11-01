@@ -490,6 +490,9 @@ format_c:
     fails += !run_case(q, fc, false, 4, 10, 16, 768, 512, 2560, 2, true, 12, true);
     fails += !run_case(q, fc, true, 4, 10, 16, 512, 512, 384, 1, true, 13, true);
     fails += !run_case(q, fc, true, 1, 10, 16, 512, 512, 256, 1, false, 14, true);
+    /* the real-weight check's routing and shapes on synthetic entries (run 116): 4 experts, top_k 2 / 4 */
+    fails += !run_case(q, fc, false, 4, 2, 4, 1280, 1280, 2560, 2, true, 15, true);
+    fails += !run_case(q, fc, true, 1, 4, 4, 2560, 2560, 640, 1, true, 16, true);
     /* the real-weight check (note 147), when formatc_study_test's entries and a libref are named */
     const char* jd = std::getenv("RI_FORMATC_JOINED");
     const char* lr = std::getenv("RI_LIBREF");
