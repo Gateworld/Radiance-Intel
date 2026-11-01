@@ -104,6 +104,59 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
     }
 }
 
+/* GL (RADIANCE_XE_GEMV_GL=1, the multi-row launches; owner note 141 item 1, run 114): a group a lane. Four lanes own
+ * a column, lane j the groups j, j + 4, ... ascending -- the GEMV's group lane j -- and each sums its whole 128-byte
+ * group alone (the exact int32 group sum: no cross-lane step a group), scales and accumulates it exactly as the
+ * GEMV's chunk-0 lane does; the four meet by xor 1 then xor 2, the GEMV's xor 8 then 16: (a0 + a1) + (a2 + a3). So
+ * the same bits. A sub-group of 16 holds four columns, whose lanes read the same activation chunks together, so a
+ * row's activation is read once a sub-group instead of once a column. Sub-group 16, 256 threads: 64 columns. */
+constexpr int kGlCols = 64;
+template <bool WS_BF16, int MB>
+void gemv_i8a8_gl_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
+                         const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
+                         uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
+    const int gsub = (int)threadIdx.x & 3;
+    const int n = (int)blockIdx.x * kGlCols + ((int)threadIdx.x >> 2);
+    const int G = K / 128;
+    float acc[MB];
+#pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+    const bool live = n < N;
+    const int8_t* brow = b + (size_t)(live ? n : 0) * b_ld;
+    /* no cross-lane step inside: a lane's own trip count */
+    for (int g = gsub; live && g < G; g += 4) {
+        uint4 w[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) w[c] = *(const uint4*)(brow + (size_t)g * 128 + c * 16);
+        const float sb = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)bs)[(size_t)n * bs_ld + g] << 16)
+                                 : ((const float*)bs)[(size_t)n * bs_ld + g];
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            int s = 0;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const uint4 x = *(const uint4*)(a + (size_t)m * a_ld + (size_t)g * 128 + c * 16);
+                const unsigned wv[4] = {w[c].x, w[c].y, w[c].z, w[c].w}, xv[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (int u = 0; u < 4; ++u) s = sycl::ext::oneapi::dot_acc((int32_t)wv[u], (int32_t)xv[u], s);
+            }
+            acc[m] += ((float)s * as[(size_t)m * as_ld + g]) * sb;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float v = acc[m];
+        v += gv_xor_f<1>(v);
+        v += gv_xor_f<2>(v);
+        if (live && gsub == 0 && m < M) {
+            const uint32_t u = __float_as_uint(v);   /* round to nearest even, NaN kept quiet */
+            y[(size_t)m * y_ld + n] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
+                                                                                 : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+        }
+    }
+}
+
 /* ---- the matrix-unit form for the prefill shapes (milestone 3, stage B): M >= 64 on the GPU ----
  *
  * A work-group of kDpasWaves sub-groups (sub-group 16: the DPAS width, B1's query) owns kDpasRT activation rows
@@ -220,6 +273,19 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         const int8_t* am = a + (size_t)m0 * a_ld;
         const float* asm_ = as + (size_t)m0 * as_ld;
         uint16_t* ym = y + (size_t)m0 * y_ld;
+        /* owner note 141 item 1: a group a lane, the same bits; 1 = the multi-row launches, 2 = every launch */
+        static const int glf = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_GL"); return e ? std::atoi(e) : 0; }();
+        if (glf == 2 || (glf == 1 && mb > 1)) {
+            const dim3 ggrid((unsigned)((N + kGlCols - 1) / kGlCols)), gblock(4 * kGlCols);
+            if (mb == 1) {
+                XE_LAUNCH_SG(16, q, (gemv_i8a8_gl_kernel<WS_BF16, 1>), ggrid, gblock, 0, am, a_ld, asm_, as_ld, b, b_ld,
+                             bs, bs_ld, ym, y_ld, N, K, mb);
+            } else {
+                XE_LAUNCH_SG(16, q, (gemv_i8a8_gl_kernel<WS_BF16, kMaxM>), ggrid, gblock, 0, am, a_ld, asm_, as_ld, b,
+                             b_ld, bs, bs_ld, ym, y_ld, N, K, mb);
+            }
+            continue;
+        }
         static const bool nx = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_NX"); return e && e[0] == '1'; }();
 #define XE_GV(MB_, NX_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_>), grid, block, 0, am, a_ld, asm_, as_ld, b, b_ld, \
                                   bs, bs_ld, ym, y_ld, N, K, mb)
