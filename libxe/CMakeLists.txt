@@ -189,6 +189,17 @@ if(RAD_BUILD_TESTS)
   rad_l0_sycl(xe_list_pool_probe)
   target_link_libraries(xe_list_pool_probe PRIVATE ${RAD_ZE_LOADER} ${CMAKE_DL_LIBS})
   set_target_properties(xe_list_pool_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Run 111 (owner note 137 step 1): each card's command-queue groups and whether a second copy queue can be had.
+  # A card probe; no CPU test.
+  add_executable(xe_queue_groups_probe test/queue_groups_probe.cpp)
+  rad_l0_sycl(xe_queue_groups_probe)
+  target_link_libraries(xe_queue_groups_probe PRIVATE ${RAD_ZE_LOADER})
+  set_target_properties(xe_queue_groups_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Run 112 (owner note 137): a second copy path measured -- bcs, a compute-group list, both; and their cost to compute.
+  add_executable(xe_copy_paths_probe test/copy_paths_probe.cpp)
+  rad_l0_sycl(xe_copy_paths_probe)
+  target_link_libraries(xe_copy_paths_probe PRIVATE ${RAD_ZE_LOADER})
+  set_target_properties(xe_copy_paths_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # Milestone 3, run 88 (owner note 84): the two-card first step's stuck bind without the model -- host memory of a
   # context over both cards, touched by one card's copy queue. A two-card probe only; no CPU test.
   add_executable(xe_hostbind_probe test/hostbind_probe.cpp)
