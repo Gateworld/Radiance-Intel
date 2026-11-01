@@ -228,6 +228,12 @@ struct MoeFP8 {
          * layer's; the 64-group codebook forms may differ by layer and projection, and declare()
          * resolves each layer's (MoeFP8::fmt). */
         int     expert_w5    = 0;
+        /* Intel port, run 114 (owner notes 131 / 134 item 3, "format B"): two's-complement int4 codes with
+         * a bf16 scale per (row, 64 of K), rotated (fwht128), against INT8 activations -- the rotated
+         * input's codes and an f32 scale per (row, 128 of K), had_quant_act_i8g's -- for the card's int8
+         * path (dtype `w4g64i8h`). With `expert_w4` and `expert_rot`. The block quantises both GEMMs'
+         * inputs itself: the gate_up input from `h.x`, the down input from the bf16 silu product. */
+        int     expert_i8    = 0;
         /* Plain bf16 experts (no quantising recipe). Both GEMMs are `moe_gemm` over one table of
          * whole experts with `silu_mul` between, and the shared arm follows the trunk
          * (Geom::w_bf16). Not sliced by parity: each expert is served whole on its rank, which
@@ -351,6 +357,9 @@ struct MoeFP8 {
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
+    /* Format B (Config::expert_i8): the down input's rotation and int8 quantiser over the bf16 silu
+     * product; op_hq is then the gate_up input's, into the int8 pair. */
+    rad_op op_eq8 = 0;
     /* The caller's read writes the rotated pair (HyperConn::Config::rotate), so this block declares
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
@@ -434,11 +443,13 @@ struct MoeFP8 {
     static int probe(RadBuilder* b, Names& nm, int l, const Src& src, Config* cfg);
     /* The format `e` names: 0 block fp8, 1 four-bit, 2 four-bit rotated, 3 plain bf16, 4 the
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
-     * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales; RAD_E_DTYPE otherwise. */
+     * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 four-bit rotated at bf16 scales
+     * per 64 of K against int8 activations (w4g64i8h); RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings. */
-    static constexpr const char* kServed[10] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
-                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32" };
+    static constexpr const char* kServed[11] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
+                                                "w4g64i8h" };
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -502,6 +513,10 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
         return RAD_E_DTYPE;
     }
     if (e.n_planes != 2) return RAD_E_DTYPE;
+    /* Format B (Config::expert_i8): libquant's `codes=i4 group=64 scale=bf16 transform=fwht128`. */
+    if (e.plane[0].dtype == RAD_I4 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK / 2 &&
+        std::strcmp(e.transform, "fwht128") == 0)
+        return 10;
     if (e.plane[0].dtype == RAD_F8E4M3 && !e.transform[0] && sc->block[0] == RAD_FP8_BLOCK &&
         sc->block[1] == RAD_FP8_BLOCK)
         return 0;
@@ -580,14 +595,16 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
                             "/fwht128; or u4 codes into a 16-entry f32 table, /fwht128) or plain "
                             "bf16; or the codebook at E4M3 scales a 64 or 32 of K under a fixed "
                             "f32, or its 32-entry five-bit form at a 64, or OCP MXFP4 "
-                            "(fp4_e2m1*e8m0[1x32]). "
+                            "(fp4_e2m1*e8m0[1x32]), or four-bit at bf16 a 64 of K, /fwht128 "
+                            "(i4*bf16[1x64]/fwht128, served against int8 activations). "
                             "Convert it with a recipe that makes one of them.\n", guw, en);
             return RAD_E_DTYPE;
         }
         if (f != 3) break;
     }
-    cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
-    cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
+    cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
+    cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
+    cfg->expert_i8   = f == 10 ? 1 : 0;
     cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
     cfg->expert_g64  = (f == 5 || f == 7) ? 2 : f == 6 ? 4 : 0;
     cfg->expert_w5   = f == 7 ? 1 : 0;
@@ -645,7 +662,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     prot.clear();
     {
-        const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
+        const int want = c.expert_i8 ? 10 : c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
@@ -891,6 +908,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      *
      * Rotation exists only for the 4-bit plane (the fp8 layout hook has no rotated form), and the
      * codebook only with rotation; other combinations are refused. */
+    if (c.expert_i8 && !(c.expert_w4 && c.expert_rot && !c.expert_nl && !c.expert_g64)) {
+        fprintf(stderr, "radiance: int8-activation experts (expert_i8) are the rotated plain four-bit form "
+                        "(i4*bf16[1x64]/fwht128); this configuration mixes in another\n");
+        return RAD_E_INVAL;
+    }
     if ((c.expert_rot && !c.expert_w4) || (c.expert_nl && !c.expert_rot)) {
         fprintf(stderr, "radiance: rotated experts (expert_rot) require the 4-bit expert format, "
                         "and a codebook (expert_nl) the rotated one; there is no rotated E4M3 "
@@ -916,7 +938,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const uint32_t sdt    = c.expert_f32_scale ? (uint32_t)RAD_F32
                           : c.expert_mx        ? (uint32_t)RAD_E8M0
                           : c.expert_g64       ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
-    const int64_t  sgk    = c.expert_mx ? RAD_MX_GROUP : c.expert_g64 ? 1 : RAD_FP8_BLOCK;
+    const int64_t  sgk    = c.expert_mx ? RAD_MX_GROUP : c.expert_g64 ? 1
+                          : c.expert_i8 ? RAD_FP8_BLOCK / 2 : RAD_FP8_BLOCK;   /* format B: bf16 a 64 of K */
     const char*    escale = c.expert_g64 ? "scale,scale.1" : "scale";
     /* This class's slice of each expert: gate and up rows [lo, hi), down columns [lo, hi), scale
      * planes the same in their own units. */
@@ -1044,7 +1067,31 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* The routed arm's rotated copy of the input. Not in place: the shared expert also reads
      * `w.h.q` with an unrotated weight (see Config::expert_rot). Declared just before its one
      * consumer so graph and issue order agree. */
-    if (rot) {
+    if (c.expert_i8) {
+        /* Format B: int8 pairs for both GEMM inputs, the block's own where the architecture declared
+         * none (transient, so the arena shares them across layers). The gate_up input is quantised here
+         * from `h.x` whatever the connection writes into the E4M3 pair (`hr_in`). */
+        const int64_t er = c.rows * c.top_k;
+        if (!w.hr.q8) {
+            w.hr.q8 = decl_b(b, nm.f("blk.%d.moe_hr8.q", l), RAD_I8,  { g.max_tok, g.n_embd });
+            w.hr.s8 = decl_b(b, nm.f("blk.%d.moe_hr8.s", l), RAD_F32, { g.max_tok, fp8_blocks(g.n_embd) });
+        }
+        if (!w.eff.q8) {
+            w.eff.q8 = decl_b(b, nm.f("blk.%d.moe_eff8.q", l), RAD_I8,  { er, c.n_ff_exp });
+            w.eff.s8 = decl_b(b, nm.f("blk.%d.moe_eff8.s", l), RAD_F32, { er, fp8_blocks(c.n_ff_exp) });
+        }
+        if (!w.hr.q8 || !w.hr.s8 || !w.eff.q8 || !w.eff.s8 || !w.eff.x || !w.h.x) {
+            fprintf(stderr, "radiance: int8-activation experts need the block input's and the gated "
+                            "product's bf16 planes (`h.x`, `eff.x`) on the wire\n");
+            return RAD_E_INVAL;
+        }
+        op_hq = rw(b, RAD_OP(b, "had_quant_act_i8g",
+                      RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                      RAD_NOWEIGHTS),
+                  {w.h.x}, {w.hr.q8, w.hr.s8});
+        if (!op_hq) return RAD_E_INVAL;
+    } else if (rot) {
         if (!w.hr.q || !w.hr.s) {
             fprintf(stderr, "radiance: rotated experts need the `hr` (q, scale) pair on the wire; "
                             "the architecture declares the buffers\n");
@@ -1092,14 +1139,30 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   RAD_INT("N_odd", 2 * wq[1]), RAD_INT("K_odd", g.n_embd),
                                   RAD_INT("parts", 2)),
                        tab.data(), (int)tab.size());
-        op_gu = rw(b, h, {rot ? w.hr.q : w.h.q, rot ? w.hr.s : w.h.s, w.sorted, w.eoff}, {w.egu});
+        op_gu = rw(b, h, {c.expert_i8 ? w.hr.q8 : rot ? w.hr.q : w.h.q,
+                          c.expert_i8 ? w.hr.s8 : rot ? w.hr.s : w.h.s, w.sorted, w.eoff}, {w.egu});
     }
     /* The down projection's input can be rotated in place: `w.eff` is read only by the down GEMM,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
+    if (c.expert_i8) {
+        /* Format B: the silu product into the bf16 plane (the bf16 experts' form of the gated
+         * quantiser), then the rotation and the int8 quantiser over it. */
+        Geom gx = g;
+        gx.w_bf16 = true;
+        RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
+                                    true, false, c.swiglu_limit));
+        op_eq8 = rw(b, RAD_OP(b, "had_quant_act_i8g",
+                       RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k), RAD_INT("n", c.n_ff_exp),
+                                  RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                       RAD_NOWEIGHTS),
+                   {w.eff.x}, {w.eff.q8, w.eff.s8});
+        if (!op_eq8) return RAD_E_INVAL;
+    } else {
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
                                 false, rot, c.swiglu_limit));
+    }
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         rad_op h = ncls == 4
@@ -1121,7 +1184,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   RAD_INT("N_odd", g.n_embd), RAD_INT("K_odd", wq[1]),
                                   RAD_INT("parts", 1)),
                        tab.data(), (int)tab.size());
-        op_dn = rw(b, h, {w.eff.q, w.eff.s, w.sorted, w.eoff}, {w.edn});
+        op_dn = rw(b, h, {c.expert_i8 ? w.eff.q8 : w.eff.q, c.expert_i8 ? w.eff.s8 : w.eff.s, w.sorted, w.eoff},
+                   {w.edn});
     }
     /* ---- The protected experts' own GEMM pair. Their weights belong to the layer group, not to
      * expert slots: each container expert unit has a fixed size and these are four times larger, so
@@ -1226,6 +1290,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         if (!calib_dir()) {
             fprintf(stderr, "radiance: calibration is configured but RADIANCE_CALIB_DIR is not "
                             "set; there is nowhere to write the Hessians\n");
+            return RAD_E_INVAL;
+        }
+        /* The tap reads the E4M3 pairs, which format B does not write; its Grams come from the served
+         * container (owner note 140). */
+        if (c.expert_i8) {
+            fprintf(stderr, "radiance: calibration reads the E4M3 expert inputs, and int8-activation experts "
+                            "(w4g64i8h) write int8 ones; record the Grams from the served container\n");
             return RAD_E_INVAL;
         }
         /* Both K must be multiples of 128 (as `expert_rot` also requires). gram_accum needs only a
@@ -1623,10 +1694,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */
     const bool rot = c.expert_rot != 0;
+    /* The GEMMs' input pairs: format B's int8 ones (Config::expert_i8), else the rotated or plain
+     * E4M3 ones. */
+    const bool i8 = c.expert_i8 != 0;
+    const rad_buf gq = i8 ? w.hr.q8 : rot ? w.hr.q : w.h.q, gs = i8 ? w.hr.s8 : rot ? w.hr.s : w.h.s;
+    const rad_buf dq = i8 ? w.eff.q8 : w.eff.q, ds = i8 ? w.eff.s8 : w.eff.s;
     if (op_hq)
         RAD_ISSUE_N(c_, op_hq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                    brow_slice(w.hr.q, r0, rows, g.n_embd),
-                    brow_slice(w.hr.s, r0, rows, g.n_embd / RAD_FP8_BLOCK));
+                    brow_slice(i8 ? w.hr.q8 : w.hr.q, r0, rows, g.n_embd),
+                    brow_slice(i8 ? w.hr.s8 : w.hr.s, r0, rows, g.n_embd / RAD_FP8_BLOCK));
 
     /* The grouped GEMMs. Each table is the first handle of its run and its length; runs are
      * contiguous (see declare), so `w_gu[q] + i` is expert 2 * i + q, or 4 * i + q at four
@@ -1641,8 +1717,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     else if (ncls == 4)
         RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
-                    brow_slice(rot ? w.hr.s : w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    brow_slice(gq, r0, rows, g.n_embd),
+                    brow_slice(gs, r0, rows, g.n_embd / RAD_FP8_BLOCK),
                     RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
@@ -1651,8 +1727,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     else
         RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
-                    brow_slice(rot ? w.hr.s : w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    brow_slice(gq, r0, rows, g.n_embd),
+                    brow_slice(gs, r0, rows, g.n_embd / RAD_FP8_BLOCK),
                     RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
@@ -1660,13 +1736,16 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (op_eq8)   /* format B: the bf16 silu product rotated and quantised to int8 */
+        RAD_ISSUE_N(c_, op_eq8, rows * k, brows(w.eff.x, rows * k), brows(w.eff.q8, rows * k),
+                    brows(w.eff.s8, rows * k));
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
     else if (ncls == 4)
         RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    brows(dq, rows * k), brows(ds, rows * k),
                     RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
@@ -1675,7 +1754,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.edn, rows * k));
     else
         RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    brows(dq, rows * k), brows(ds, rows * k),
                     RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),

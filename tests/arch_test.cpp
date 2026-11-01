@@ -6122,10 +6122,12 @@ bool each_gemm_nt_once(const RadBuilder& b, const RadCtx& c) {
  * prefill, a mixed step, and a verify followed by the drafter's passes. */
 template <class Fn>
 void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, int max_spec,
-                            bool block_drafter, int64_t block) {
+                            bool block_drafter, int64_t block,
+                            const decltype(RadBuilder::encs)& encs = {}) {
     for (int world : { 1, 2 })
         for (int rank = 0; rank < world; ++rank) {
             RadBuilder b;
+            b.encs = encs;   /* the experts' stored format, when a test names one */
             RadBuildCtx ctx = spec_ctx(rank, world, max_spec);
             REQUIRE_EQ(declare(&b, meta, &ctx), RAD_OK);
             const auto dec = kit(b, { 1, 1, 1, 1 }, {});
@@ -6818,6 +6820,47 @@ TEST(qwen35moe_fp8_serves_the_experts_in_their_stored_format) {
         CHECK_EQ(stderr_of_rc([&] { return qwen35moe_fp8::declare(&b, mk.meta(), &ctx); }),
                  RAD_E_UNSUPPORTED);
     }
+}
+
+/* Intel port, run 114 (owner notes 131 / 134 item 3): format B -- rotated int4 experts at a bf16 scale per 64 of K
+ * -- is served as the w4g64i8h grouped GEMM against int8 activations: each routed layer quantises its gate_up input
+ * (h.x) and its silu product (eff.x) with had_quant_act_i8g into int8 pairs of its own, and both GEMMs read them. */
+TEST(qwen35moe_fp8_serves_int4_experts_against_int8_activations) {
+    MetaKV mk = q35moe_meta();
+    RadEncoding wb = rad_enc_affine(RAD_I4, RAD_BF16, 1, 64);
+    rad_enc_copy_str(wb.transform, "fwht128");
+    REQUIRE(rad_enc_valid(&wb));
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", wb }, { "ffn_down_exps", wb } };
+        RadBuildCtx ctx = build_ctx(0, world);
+        REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int gemm_b = 0, other = 0, quant_i8 = 0, reads_i8 = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "had_quant_act_i8g") ++quant_i8;
+            if (o.op.rfind("moe_gemm", 0) != 0) continue;
+            if (pstr(&o, "dtype") == "w4g64i8h") ++gemm_b; else ++other;
+            for (const auto r : o.reads)
+                if (r >= 1 && (size_t)r <= b.bufs.size() && b.bufs[(size_t)r - 1].d.dtype == RAD_I8) {
+                    ++reads_i8;
+                    break;
+                }
+        }
+        CHECK_EQ(gemm_b, 2 * 8);
+        CHECK_EQ(other, 0);
+        CHECK_EQ(quant_i8, 2 * 8);
+        CHECK_EQ(reads_i8, 2 * 8);
+    }
+}
+
+/* ...and its steps (decode, prefill, mixed, the verify and the MTP head's passes) lint clean at one and two ranks:
+ * every issue of the int8 quantisers and the w4g64i8h GEMMs matches its declaration. */
+TEST(qwen35moe_fp8_steps_lint_clean_with_int4_experts_against_int8_activations) {
+    MetaKV mk = q35moe_meta();
+    RadEncoding wb = rad_enc_affine(RAD_I4, RAD_BF16, 1, 64);
+    rad_enc_copy_str(wb.transform, "fwht128");
+    lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 3, false, 0,
+                           { { "ffn_gate_up_exps", wb }, { "ffn_down_exps", wb } });
 }
 
 /* The routed model's engine steps, its routed MTP head included, lint clean at one and two
