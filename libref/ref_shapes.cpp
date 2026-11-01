@@ -1796,6 +1796,9 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     if (is("mxfp4a8")) return { 1, 32 };
     if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
     if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
+    /* Intel port, run 114 (owner notes 131 / 134 item 3): format B, i4 codes at a bf16 scale per 64 of K
+     * against int8 activations (had_quant_act_i8g's, row-major, an f32 scale per 128 of K). */
+    if (is("w4g64i8h")) return { 1, g / 2 };
     if (is("w4nl32a8h")) return { 1, g / 4 };
     return { 0, 0 };
 }
@@ -1825,17 +1828,19 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
-    const auto SD = kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
-    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
+    const bool fb = kind && !std::strcmp(kind, "w4g64i8h");   /* format B: int8 a, i4 w, bf16 w_scale */
+    const auto SD = kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : fb ? (uint32_t)RAD_BF16 : D;
+    const uint32_t WD = mx ? (uint32_t)RAD_FP4E2M1 : fb ? (uint32_t)RAD_I4 : (uint32_t)RAD_F8E4M3;
+    o.t(fb ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { AR, K });   /* a -- E4M3 (int8) codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
     /* w -- the even experts; mxfp4a8 carries e2m1 codes with an E8M0 byte per (row, 32 of K) */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne0, N0, K0 });
+    o.t(WD, { ne0, N0, K0 });
     if (mx) o.t_idx_dt(RAD_U8, { ne0, N0, (K0 + 31) / 32 }, 0, 127, 0);    /* w_scale */
     else    o.t(SD, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
     /* w_odd -- the odd experts */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne1, N1, K1 });
+    o.t(WD, { ne1, N1, K1 });
     if (mx) o.t_idx_dt(RAD_U8, { ne1, N1, (K1 + 31) / 32 }, 0, 127, 0);    /* w_odd_scale */
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
@@ -1867,13 +1872,14 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
+    const bool fb = kind && !std::strcmp(kind, "w4g64i8h");   /* format B: int8 a, i4 w, bf16 w_scale */
     auto cls = [&](int q) {
         const int64_t nq = (ne + 3 - q) / 4;
-        o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
+        o.t(mx ? (uint32_t)RAD_FP4E2M1 : fb ? (uint32_t)RAD_I4 : (uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
         if (mx) o.t_idx_dt(RAD_U8, {nq, Nq[q], (Kq[q] + 31) / 32}, 0, 127, 0);
-        else o.t(D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
+        else o.t(fb ? (uint32_t)RAD_BF16 : D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
     };
-    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
+    o.t(fb ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { AR, K });   /* a -- E4M3 (int8) codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
     cls(0);                                           /* w, w_scale -- class 0 */
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */

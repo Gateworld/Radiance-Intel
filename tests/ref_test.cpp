@@ -4081,6 +4081,36 @@ TEST(op_moe_gemm_q_mod4) {
     }
 }
 
+/* Intel port, run 114 (owner notes 131 / 134 item 3): format B's grouped GEMM (w4g64i8h) -- int8 activation codes
+ * row-major with an f32 scale per 128 of K (had_quant_act_i8g's), i4 weights (element 2i in the low nibble, value
+ * (code ^ 8) - 8) with a bf16 scale per (row, 64 of K). K = 128 is two weight groups under one activation group, so
+ * a grid read the wrong way changes the result. Expert 0 (the even table) gets the token; the odd table is zero.
+ *   row 0: w[0] = 1 (scale 2), w[64] = -2 (scale 4): 0.5 x (2 x 1 x 2 + 3 x -2 x 4) = -10
+ *   row 1: w[0] = 3 (scale 1), w[64] = 0  (scale 1): 0.5 x (2 x 3 x 1)             = 3 */
+TEST(op_moe_gemm_q_int4_experts_against_int8_activations) {
+    std::vector<int64_t> av(128, 0);
+    av[0] = 2; av[64] = 3;
+    T a8(RAD_I8, { 1, 128 }); a8.n(av);
+    T as(RAD_F32, { 1, 1 });  as.f({ 0.5f });
+    std::vector<uint8_t> wv(128, 0);   /* [1 expert][2 rows][64 bytes] */
+    wv[0] = 0x01; wv[32] = 0x0e;       /* row 0: element 0 = 1, element 64 = -2 */
+    wv[64] = 0x03;                     /* row 1: element 0 = 3 */
+    T even(RAD_I4, { 1, 2, 128 }); even.raw(wv);
+    T es(RAD_BF16, { 1, 2, 2 });   es.f({ 2.0f, 4.0f, 1.0f, 1.0f });
+    T odd(RAD_I4, { 1, 2, 128 });  odd.raw(std::vector<uint8_t>(128, 0));
+    T os(RAD_BF16, { 1, 2, 2 });   os.f({ 1.0f, 1.0f, 1.0f, 1.0f });
+    T sorted(RAD_I32, { 1 });      sorted.n({ 0 });
+    T offsets(RAD_I32, { 3 });     offsets.n({ 0, 1, 1 });
+    T out(RAD_F32, { 1, 2 });
+    A a;
+    a.t(a8).t(as).t(even).t(es).t(sorted).t(offsets).t(odd).t(os).t(out)
+        .i("M", 1).i("N", 2).i("K", 128).i("n_expert", 2).i("top_k", 1).i("group", 128)
+        .s("a_order", "token").s("dtype", "w4g64i8h");
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    CHECK_EQ(out.at(0), -10.0f);
+    CHECK_EQ(out.at(1), 3.0f);
+}
+
 /* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
  * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
  * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
@@ -4091,7 +4121,7 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
     const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
                            { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
+                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 }, { "w4g64i8h", 256, 8 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
