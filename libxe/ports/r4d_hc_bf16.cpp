@@ -1522,6 +1522,49 @@ void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void*
     }
 }
 
+/* RADIANCE_XE_HC_V2_RG=1 (run 115, owner note 142 item 2: fewer launches, exact): level 8's columns and its inject
+ * gains in one launch, so the gains run beside the columns instead of after them (P49: hc_v2_down_rows<4> 25.5 us,
+ * then hc_v2_down<2, S8> 9.9 us, ~96 of each a step). The first `ngw` workgroups hold the gains, a wave a (row, gain)
+ * of the row group: wave_dot_lds over the whole row from global memory, through the wave's own 256-entry stage --
+ * one call over HN is the two LDS halves' chain (wave_dot_lds's acc0 comment), so level 8's bits. The rest are
+ * hc_v2_down_rows_kernel's column workgroups, unchanged. No barrier: every return is a whole wave's. */
+template <int kRG>
+__global__ __launch_bounds__(kWave * kV2RowCols)
+void hc_v2_down_rows_g_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
+                              const unsigned short* __restrict__ injw, unsigned short* __restrict__ dout,
+                              unsigned short* __restrict__ inj, long rows, int hc, long HN, long lr, long irow,
+                              long ngw) {
+    XE_SHARED2(unsigned short, s_stage, kV2RowCols, kWave * 8);
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * kRG;
+    const float inv_hc = 1.0f / (float)hc;
+    if ((long)blockIdx.x < ngw) {
+        const long item = (long)blockIdx.x * kV2RowCols + wave;   /* (row in the group) * hc + gain */
+        const long rr = item / hc, r = r0 + rr;
+        const int c = (int)(item % hc);
+        if (rr >= kRG || r >= rows) return;
+        float acc = wave_dot_lds<kDotU>(nbuf + r * HN, injw + (long)c * HN, HN, lane, s_stage[wave]);
+        acc = wave_sum(acc);
+        if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+        return;
+    }
+    const long k = ((long)blockIdx.x - ngw) * kV2RowCols + wave;
+    if (k >= lr || r0 >= rows) return;
+    const int nr = (int)(rows - r0 < kRG ? rows - r0 : kRG);
+    float acc[kRG];
+    hc8_dot_down_rows_s8<2, kRG>(nbuf + r0 * HN, HN, nr, (const unsigned char*)downv + k * dld, HN, lane, acc);
+#pragma unroll
+    for (int i = 0; i < kRG; ++i) {
+        if (i >= nr) break;
+        const float a = wave_sum(acc[i]);
+        if (lane == 0) dout[(r0 + i) * lr + k] = f2bf(siluf_(a * inv_hc));
+    }
+}
+bool xe_hc_v2_rg() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_V2_RG"); return v && v[0] == '1'; }();
+    return on;
+}
+
 /* Read once, in host code, at every call. RADIANCE_XE_HC_V2: 1 the norm and down product above, 2 also
  * hc_up_mix's staged W_up rows, 3 as 2 with the inject gains in a launch of their own (to time the two), 4 as 2
  * with the mix's codes made by hc_quant_rows after it instead of by its last workgroups behind a counter and
@@ -4464,6 +4507,14 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
             /* level 6: level 5's columns and gains in launches of their own (a timing split, as level 3) */
             emit_rc = HC_V2_DOWN(1, true, dcols, 0u);
             if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, true, (unsigned)hc, glds);
+        } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 8 && rows > 1 && injw && inj && xe_hc_v2_rg()) {
+            /* level 8 with RADIANCE_XE_HC_V2_RG=1: the gains' workgroups first in the columns' launch (run 115) */
+            const long ngw = (4L * hc + kV2RowCols - 1) / kV2RowCols;
+            emit_rc = R4D_EMIT(s, hc_v2_down_rows_g_kernel<4>,
+                               dim3((unsigned)(ngw + (lr + kV2RowCols - 1) / kV2RowCols), (unsigned)((rows + 3) / 4)),
+                               dim3(kWave * kV2RowCols), 0u, (const unsigned short*)nbuf, (const void*)down->data,
+                               (long)dld, (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
+                               (long)rows, (int)hc, (long)HN, (long)lr, (long)irow, ngw);
         } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 8 && rows > 1) {
             /* level 8: a verify's columns four rows a wave, two columns a workgroup; the gains in their own launch */
             emit_rc = R4D_EMIT(s, hc_v2_down_rows_kernel<4>,
