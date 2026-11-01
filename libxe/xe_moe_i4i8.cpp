@@ -194,6 +194,27 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
     }
     const ICls& c = (e >= 0 && (e & 1)) ? c1 : c0;
     const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? c.k : 0u;
+    /* A work-group whose columns all fall past this class's width, in every part they touch, writes its zeros and
+     * returns before staging (run 117; IP9, run 116: at the two-card split the smaller gate_up class's 512 of 768
+     * columns left a third of its work-groups staging K 2560 for nothing). Uniform over the work-group: no barrier
+     * is skipped by part of it. */
+    if (e >= 0) {
+        const uint32_t cpw = (uint32_t)((kWG / LPR) * R), n0 = nb * cpw, n1 = n0 + cpw < N ? n0 + cpw : N;
+        const uint32_t a = fy ? n0 % fy : 0u;
+        const bool live = n0 < N && (n1 - n0 >= fy || a < fc || n0 + (fy - a) < n1);
+        if (!live) {
+            const int team = tid / LPR, l = tid % LPR;
+            if (l == 0)
+                for (int q = 0; q < kMT; ++q) {
+                    if ((uint32_t)q >= rn) break;
+                    for (int r = 0; r < R; ++r) {
+                        const uint32_t n = n0 + (uint32_t)(team * R + r);
+                        if (n < N) Y[(size_t)(i + q) * y_ld + n] = 0;
+                    }
+                }
+            return;
+        }
+    }
     if (e >= 0) {
 #pragma unroll
         for (int q = 0; q < kMT; ++q) {
