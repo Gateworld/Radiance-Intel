@@ -1409,12 +1409,13 @@ int Ctx::run_pass(const RadBatch* b) {
     /* Non-decode keys are recorded on their second sighting, so one-off passes (prefill chunks)
      * cost no recording and do not evict useful tapes. Decode passes recur every step until a
      * bound crosses its bucket, so they are recorded on first sight. */
-    /* RADIANCE_TAPE_DEFER_AFTER_PREFILL=1 (owner notes 134 / 135 item 2a, run 111): a decode pass right behind a
-     * prefill pass -- the decode step the engine issues ahead behind a prompt's last chunk -- waits for its key's
-     * second sighting too. Recording it on first sight put a full pass's recording (~0.7 s natively, 14 s as
-     * graphs: B75 / B78 / B79) on the device behind the prompt's last chunk, inside the first token's time, for a
-     * step a max_tokens=1 request never uses. Live or played, the same bits (the audit compares them). */
-    static const bool defer_after_prefill = [] { const char* e = std::getenv("RADIANCE_TAPE_DEFER_AFTER_PREFILL"); return e && e[0] == '1'; }();
+    /* RADIANCE_TAPE_DEFER_AFTER_PREFILL (owner notes 134 / 135 item 2a, run 111; the default since owner note 143,
+     * =0 opts out): a decode pass right behind a prefill pass -- the decode step the engine issues ahead behind a
+     * prompt's last chunk -- waits for its key's second sighting too. Recording it on first sight put a full pass's
+     * recording (~0.7 s natively, 14 s as graphs: B75 / B78 / B79) on the device behind the prompt's last chunk,
+     * inside the first token's time, for a step a max_tokens=1 request never uses. Live or played, the same bits
+     * (the audit compares them). */
+    static const bool defer_after_prefill = [] { const char* e = std::getenv("RADIANCE_TAPE_DEFER_AFTER_PREFILL"); return !(e && e[0] == '0'); }();
     if ((b->phase != RAD_PHASE_DECODE || (defer_after_prefill && after_prefill)) && !tape_seen(key)) {
         bump(pc_first_);
         arch_step_(this, b);
