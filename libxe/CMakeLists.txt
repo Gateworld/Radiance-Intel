@@ -105,6 +105,15 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_bf16_wmma_cpu COMMAND xe_moe_bf16_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_bf16_wmma_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_MOE_BF16_GEMV=0" TIMEOUT 600)
+  # Run 114 (owner notes 131 / 134 item 3): format B's grouped GEMM (w4g64i8h) against a double reference.
+  add_executable(xe_moe_i4i8_test test/moe_i4i8_test.cpp)
+  rad_l0_sycl(xe_moe_i4i8_test)
+  target_link_libraries(xe_moe_i4i8_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_moe_i4i8_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_moe_i4i8_test libxe)
+  add_test(NAME xe_moe_i4i8_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_moe_i4i8_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Milestone 3 (owner note 52 item 2): the shim's branch-free E4M3 decode against the ABI's, all 256 codes.
   add_executable(xe_e4m3_decode_test test/e4m3_decode_test.cpp)
   rad_l0_sycl(xe_e4m3_decode_test)

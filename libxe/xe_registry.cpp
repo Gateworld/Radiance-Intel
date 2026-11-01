@@ -67,6 +67,12 @@ static const RadConstraint cXeMoePlanes[] = {
     C_GE("M", 1), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
     C_EQ("group", 128), C_IN("dtype", "w4nl64a8h"),
 };
+/* format B (owner notes 131 / 134 item 3, run 114): xe_moe_i4i8.cpp */
+extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s);
+static const RadConstraint cXeMoeI4I8[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
+    C_EQ("group", 128), C_IN("dtype", "w4g64i8h"),
+};
 /* the MTP coupling (owner note 47 item 2): the rows' launches in xe_mtp_couple.cpp, the shape hooks the spechub
  * plugin's (plugin/spechub/spechub.h, compiled into libxe) */
 extern "C" int xe_rad_mtp_couple_propose(const RadArgs* a, RadStream s);
@@ -264,6 +270,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cXeMoePlanes), NOTUNE,
   nullptr, nullptr, xe_rad_moe_gemm_w4p, nullptr,
   xe_moe_planes_layout, xe_moe_planes_relayout, nullptr, xe_moe_planes_unrelayout, nullptr },
+{ "xe_moe_gemm_i4i8", "moe_gemm_q", "moe",
+  "format B's experts (w4g64i8h) on the int8 path: exact int32 sums of int4 codes x int8 activations per 64 of K "
+  "by DP4A, scaled once a group, read from the canonical planes (no relayout)",
+  "any M; K a multiple of 128, group 128; two classes by parity",
+  "i8 activation with an f32 scale per 128 of K (had_quant_act_i8g's); i4 codes with a bf16 scale per row per 64 "
+  "of K, rotated at convert; bf16 out",
+  RAD_DOMAIN_DEVICE, 60,
+  ROW(cXeMoeI4I8), NOTUNE,
+  nullptr, nullptr, xe_rad_moe_gemm_i4i8, nullptr,
+  nullptr, nullptr, nullptr, nullptr, nullptr },
 { "xe_attn_paged_split", "attn_paged", "attn",
   "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "
   "head, f32 online softmax, a merge launch over the splits",
