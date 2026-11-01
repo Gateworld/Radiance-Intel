@@ -57,21 +57,29 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
     for (size_t i = 0; i < b.size(); ++i) b[i] = (int8_t)((int)(h32(seed ^ 7, i) % 255) - 127);
     for (size_t i = 0; i < as.size(); ++i) as[i] = std::ldexp(1.0f + (h32(seed ^ 9, i) >> 9) * 0x1p-23f, -9);
     for (size_t i = 0; i < bs.size(); ++i) bs[i] = to_bf(std::ldexp(1.0f + (h32(seed ^ 11, i) >> 9) * 0x1p-23f, -12));
+    /* run 115 (owner note 141 item 1): RI_BS_F32=1 gives the weights f32 scales with a full mantissa (dtype i8a8, the
+     * served trunk's), the launcher's other instance */
+    static const bool f32s = [] { const char* e = std::getenv("RI_BS_F32"); return e && e[0] == '1'; }();
+    std::vector<float> bsf((size_t)N * G);
+    for (size_t i = 0; i < bsf.size(); ++i) bsf[i] = std::ldexp(1.0f + (h32(seed ^ 11, i) >> 9) * 0x1p-23f, -12);
+    auto bsv = [&](size_t i) { return f32s ? bsf[i] : bf(bs[i]); };
 
     int8_t* da = sycl::malloc_device<int8_t>(a.size(), q);
     int8_t* db = sycl::malloc_device<int8_t>(b.size(), q);
     float* das = sycl::malloc_device<float>(as.size(), q);
-    uint16_t* dbs = sycl::malloc_device<uint16_t>(bs.size(), q);
+    void* dbs = sycl::malloc_device(f32s ? bsf.size() * 4 : bs.size() * 2, q);
     const size_t ybytes = (size_t)M * N * 2;
     uint8_t* dyb = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
     q.memcpy(da, a.data(), a.size()); q.memcpy(db, b.data(), b.size());
-    q.memcpy(das, as.data(), as.size() * 4); q.memcpy(dbs, bs.data(), bs.size() * 2);
+    q.memcpy(das, as.data(), as.size() * 4);
+    if (f32s) q.memcpy(dbs, bsf.data(), bsf.size() * 4); else q.memcpy(dbs, bs.data(), bs.size() * 2);
     q.memset(dyb, kPat, ybytes + 2 * kCanary).wait();
     uint16_t* dy = (uint16_t*)(dyb + kCanary);
 
     RadTensor t[5] = { tensor(da, RAD_I8, M, K), tensor(das, RAD_F32, M, G), tensor(db, RAD_I8, N, K),
-                       tensor(dbs, RAD_BF16, N, G), tensor(dy, RAD_BF16, M, N) };
+                       tensor(dbs, f32s ? RAD_F32 : RAD_BF16, N, G), tensor(dy, RAD_BF16, M, N) };
     char dts[] = "i8a8h";
+    if (f32s) dts[4] = 0;   /* "i8a8" */
     RadParam p[5]{};
     const char* keys[4] = { "M", "N", "K", "group" };
     const long long vals[4] = { M, N, K, 128 };
@@ -96,7 +104,9 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
     /* libref's quant_dot, element by element; the comparison allows the reordered group sum */
     double worst = 0;
     bool ok = canary;
-    const int rows_checked = N < 512 ? N : 512;
+    /* run 115: RI_CHECK_ALL=1 checks every column at M <= 8 (a reorder flips a bf16 output rarely: ~1 in 49k) */
+    static const bool all = [] { const char* e = std::getenv("RI_CHECK_ALL"); return e && e[0] == '1'; }();
+    const int rows_checked = (all && M <= 8) || N < 512 ? N : 512;
     /* run 110 (owner note 129 item 3): the GEMV's own order -- four group lanes, lane j summing groups j, j + 4, ...,
      * then (acc0 + acc1) + (acc2 + acc3) -- emulated; y elements whose bits differ from it are counted, and a hash
      * of all of y is printed so two runs (RADIANCE_XE_GEMV_G4 unset / set) can be compared */
@@ -112,7 +122,7 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
                 float sub = 0.0f;
                 for (int k = g * 128; k < g * 128 + 128; ++k)
                     sub += (float)a[(size_t)m * K + k] * (float)b[(size_t)n * K + k];
-                const float term = (sub * as[(size_t)m * G + g]) * bf(bs[(size_t)n * G + g]);
+                const float term = (sub * as[(size_t)m * G + g]) * bsv((size_t)n * G + g);
                 acc += term;
                 lane[g % 4] += term;
                 mag += std::fabs((double)term);

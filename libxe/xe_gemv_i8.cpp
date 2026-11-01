@@ -111,7 +111,13 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
  * the same bits. A sub-group of 16 holds four columns, whose lanes read the same activation chunks together, so a
  * row's activation is read once a sub-group instead of once a column. Sub-group 16, 256 threads: 64 columns. */
 constexpr int kGlCols = 64;
-template <bool WS_BF16, int MB>
+/* FM, the group term's arithmetic, probes (run 115): 0 acc + ((float)s * a) * b (the source's), 1 fma((float)s * a, b,
+ * acc) (GL=3 / 4), 2 acc + (float)s * (a * b) (GL=5), 3 fma((float)s, a * b, acc) (GL=6). On card1 none of 1-3 gives
+ * the GEMV's f32-scale bits either: IGC's ISA for both kernels has the source's term (mul, mul, add). Checked over
+ * every output against the source order emulated on the host (gemv_i8_test RI_CHECK_ALL=1), GL (FM 0) is exact at both
+ * scale types (0 of 49152 at 4 x 12288 x 2560); the GEMV strays in a few outputs a launch (2 of 49152 at f32 scales,
+ * 1 of 12288-16384 at one row) -- so the GEMV's bits are not its own order's, and no form reproduces them. */
+template <bool WS_BF16, int MB, int FM = 0>
 void gemv_i8a8_gl_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
                          const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                          uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
@@ -141,7 +147,11 @@ void gemv_i8a8_gl_kernel(const int8_t* __restrict__ a, long a_ld, const float* _
 #pragma unroll
                 for (int u = 0; u < 4; ++u) s = sycl::ext::oneapi::dot_acc((int32_t)wv[u], (int32_t)xv[u], s);
             }
-            acc[m] += ((float)s * as[(size_t)m * as_ld + g]) * sb;
+            const float sa = as[(size_t)m * as_ld + g];
+            if constexpr (FM == 1) acc[m] = sycl::fma((float)s * sa, sb, acc[m]);
+            else if constexpr (FM == 2) acc[m] += (float)s * (sa * sb);
+            else if constexpr (FM == 3) acc[m] = sycl::fma((float)s, sa * sb, acc[m]);
+            else acc[m] += ((float)s * sa) * sb;
         }
     }
 #pragma unroll
@@ -273,17 +283,20 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         const int8_t* am = a + (size_t)m0 * a_ld;
         const float* asm_ = as + (size_t)m0 * as_ld;
         uint16_t* ym = y + (size_t)m0 * y_ld;
-        /* owner note 141 item 1: a group a lane, the same bits; 1 = the multi-row launches, 2 = every launch */
+        /* owner note 141 item 1: a group a lane; 1 = the multi-row launches, 2 = every launch; 3 / 4 the same with the
+         * fused scale-accumulate (run 115) */
         static const int glf = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_GL"); return e ? std::atoi(e) : 0; }();
-        if (glf == 2 || (glf == 1 && mb > 1)) {
+        if (glf == 2 || glf == 4 || ((glf == 1 || glf == 3 || glf == 5 || glf == 6) && mb > 1)) {
             const dim3 ggrid((unsigned)((N + kGlCols - 1) / kGlCols)), gblock(4 * kGlCols);
-            if (mb == 1) {
-                XE_LAUNCH_SG(16, q, (gemv_i8a8_gl_kernel<WS_BF16, 1>), ggrid, gblock, 0, am, a_ld, asm_, as_ld, b, b_ld,
-                             bs, bs_ld, ym, y_ld, N, K, mb);
-            } else {
-                XE_LAUNCH_SG(16, q, (gemv_i8a8_gl_kernel<WS_BF16, kMaxM>), ggrid, gblock, 0, am, a_ld, asm_, as_ld, b,
-                             b_ld, bs, bs_ld, ym, y_ld, N, K, mb);
-            }
+#define XE_GL(MB_, F_) XE_LAUNCH_SG(16, q, (gemv_i8a8_gl_kernel<WS_BF16, MB_, F_>), ggrid, gblock, 0, am, a_ld, asm_, \
+                                    as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb)
+            const int fm = glf >= 5 ? glf - 3 : glf >= 3 ? 1 : 0;
+            if (mb == 1) { if (fm == 1) { XE_GL(1, 1); } else { XE_GL(1, 0); } }
+            else if (fm == 1) { XE_GL(kMaxM, 1); }
+            else if (fm == 2) { XE_GL(kMaxM, 2); }
+            else if (fm == 3) { XE_GL(kMaxM, 3); }
+            else { XE_GL(kMaxM, 0); }
+#undef XE_GL
             continue;
         }
         static const bool nx = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_NX"); return e && e[0] == '1'; }();
