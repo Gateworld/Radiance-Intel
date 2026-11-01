@@ -37,6 +37,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -88,6 +89,13 @@ inline void ar_gave_up(uint32_t* seq_ctr, uint32_t rank, uint32_t s, uint32_t b,
     }
 }
 
+/* RADIANCE_XE_AR_SKEW (run 122): block 0's failed polls for this launch into the ring, when one is set (its address in
+ * seq_ctr[4..5], the mask in [6]; 0 when off). One thread, one store a launch. */
+inline void ar_skew(uint32_t* seq_ctr, uint32_t s, uint32_t polls) {
+    const uint64_t rp = (uint64_t)uc_ld(seq_ctr + 4) | ((uint64_t)uc_ld(seq_ctr + 5) << 32);
+    if (rp) ((uint64_t*)(uintptr_t)rp)[s & uc_ld(seq_ctr + 6)] = ((uint64_t)s << 32) | polls;
+}
+
 struct Inst {
     int       rank = 0, world = 2, dtype = 0;   /* dtype: 0 bf16, 1 fp16, 2 fp32 */
     int       host = 0;
@@ -101,7 +109,20 @@ struct Inst {
     const sycl::device*  dev = nullptr;
     const sycl::context* ctx = nullptr;
     int refs = 0;
+    /* RADIANCE_XE_AR_SKEW=<dir> (owner note 151 A, run 122): the wait record -- block 0's polls before the peer's
+     * data arrived, one (sequence << 32 | polls) a launch in a device ring (its address and mask in my_seq[4..6],
+     * read by the kernel), appended to <dir>/ar-skew-r<rank>-dt<dtype>-n<numel>.bin by xe_ar2_stalls, which the
+     * engine calls once a step: records of (call count, entry), 16 bytes. */
+    uint64_t* ring = nullptr;
+    uint32_t  ring_mask = 0, last_s = 0;
+    uint64_t  calls = 0;
+    FILE*     skew_f = nullptr;
 };
+constexpr uint32_t kSkewRing = 1u << 20;
+const char* skew_dir() {
+    static const char* v = [] { const char* e = std::getenv("RADIANCE_XE_AR_SKEW"); return e && *e ? e : nullptr; }();
+    return v;
+}
 
 /* the rendezvous: one process, the rank threads publish their instance pointers and pair up */
 struct World {
@@ -156,6 +177,18 @@ int build(Inst* in) {
     if (in->host) std::memset(in->my_flags, 0, 2 * kMaxBlocks * sizeof(uint32_t));
     else q.memset(in->my_flags, 0, 2 * kMaxBlocks * sizeof(uint32_t));
     q.memset(in->my_seq, 0, 1024 * sizeof(uint32_t));
+    if (skew_dir() && !in->host) {
+        in->ring = sycl::aligned_alloc_device<uint64_t>(4096, kSkewRing, *in->dev, *in->ctx);
+        if (!in->ring) return RAD_E_NOMEM;
+        in->ring_mask = kSkewRing - 1u;
+        q.memset(in->ring, 0, kSkewRing * sizeof(uint64_t));
+        const uint64_t rp = (uint64_t)(uintptr_t)in->ring;
+        const uint32_t w[3] = { (uint32_t)rp, (uint32_t)(rp >> 32), in->ring_mask };
+        q.memcpy(in->my_seq + 4, w, sizeof w);
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/ar-skew-r%d-dt%d-n%lld.bin", skew_dir(), in->rank, in->dtype, (long long)in->numel);
+        in->skew_f = std::fopen(path, "wb");
+    }
     q.wait_and_throw();
     /* rendezvous: publish, wait for the peer, take its pointers */
     World& w = world_for(in->dtype * 2 + in->host);
@@ -224,7 +257,9 @@ void ar_fini(void* instance) {
         if (in->my_scratch) sycl::free(in->my_scratch, *in->ctx);
         if (in->my_flags) sycl::free(in->my_flags, *in->ctx);
         if (in->my_seq) sycl::free(in->my_seq, *in->ctx);
+        if (in->ring) sycl::free(in->ring, *in->ctx);
     } catch (const sycl::exception&) {}
+    if (in->skew_f) std::fclose(in->skew_f);
     delete in;
 }
 
@@ -255,8 +290,11 @@ inline uint16_t hcw_f2bf(float f) { return (uint16_t)((__float_as_uint(f) + 0x80
 template <int DT, bool HW = false, int PR = 0>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
-               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw) {
+               uint32_t rank, uint32_t nblk, uint32_t spin_arg, HcW hw) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
+    /* the poll budget; bit 31: RADIANCE_XE_AR_SKEW's record is on (so the off path loads nothing more) */
+    const uint32_t spin = spin_arg & 0x7fffffffu;
+    const bool skew = (spin_arg >> 31) != 0;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
     const uint32_t par = s & 1u;
@@ -298,7 +336,8 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
         const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
         for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
-        uint32_t ok = 1;
+        uint32_t ok = 1, polls0 = 0;
+        bool first = true;
         for (uint32_t k = w0 + t; k < w1 && ok; k += kWG) {
             uint32_t budget = spin;
             uint64_t v;
@@ -308,8 +347,10 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
                 sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                 if (--budget == 0) { ok = 0; break; }
             }
+            if (first) { polls0 = spin - budget; first = false; }
             if (ok) emit(k, x[k], (uint32_t)v);
         }
+        if (skew && b == 0 && t == 0) ar_skew(seq_ctr, s, polls0);
         if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
     } else {
     for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st(out + k, x[k]);
@@ -329,6 +370,7 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
+    if (skew && b == 0 && t == 0) ar_skew(seq_ctr, s, spin - budget);
     if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
     else {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -348,7 +390,7 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
 
 /* XE_AR_SPIN: the poll budget (default kSpin); a probe lowers it so a stalled pair fails in seconds */
 uint32_t spin_budget() {
-    static const uint32_t v = [] { const char* e = std::getenv("XE_AR_SPIN"); const long n = e ? std::strtol(e, nullptr, 10) : 0; return n > 0 ? (uint32_t)n : kSpin; }();
+    static const uint32_t v = [] { const char* e = std::getenv("XE_AR_SPIN"); const long n = e ? std::strtol(e, nullptr, 10) : 0; return n > 0 ? (uint32_t)(n < 0x7fffffffL ? n : 0x7fffffffL) : kSpin; }();
     return v;
 }
 
@@ -385,7 +427,7 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
 #define XE_ARP(DT, HW_, PR_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_>), grid, block, 0, (const uint32_t*)x->data,       \
                             (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
                             in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
-                            spin_budget(), hw ? *hw : HcW{})
+                            spin_budget() | (in->ring ? 0x80000000u : 0u), hw ? *hw : HcW{})
         /* the LL form (a sequence number in every payload word; the default since run 105, RADIANCE_XE_AR_PROTO=0 the
          * old form), taken when the message's 8-byte words fit a parity's slot -- build() doubles the slots, so always */
         const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
@@ -409,8 +451,10 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
 void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots,
                    uint32_t* my_slots, uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr,
                    uint32_t n32, uint32_t row32, uint32_t slot_words, uint32_t rank, uint32_t nblk,
-                   uint32_t spin) {
+                   uint32_t spin_arg) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
+    const uint32_t spin = spin_arg & 0x7fffffffu;   /* bit 31: the skew record (ar_kernel) */
+    const bool skew = (spin_arg >> 31) != 0;
     const uint32_t s = uc_ld(seq_ctr) + 1u;
     const uint32_t par = s & 1u;
     uint32_t* out = peer_slots + par * slot_words;
@@ -429,6 +473,7 @@ void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uin
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
+    if (skew && b == 0 && t == 0) ar_skew(seq_ctr, s, spin - budget);
     if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
     else {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -473,7 +518,8 @@ int gather_launch(const RadArgs* a, RadStream s, int host_form) {
         sycl::queue* q = (sycl::queue*)s;
         XE_LAUNCH(q, gather_kernel, dim3(nblk), dim3(kWG), 0, (const uint32_t*)x->data, (uint32_t*)y->data,
                   (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, in->my_flags, in->my_seq,
-                  n32, row32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk, spin_budget());
+                  n32, row32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,
+                  spin_budget() | (in->ring ? 0x80000000u : 0u));
     } catch (const sycl::exception&) {
         return RAD_E_DEVICE;
     }
@@ -606,6 +652,29 @@ extern "C" uint32_t xe_ar2_stalls(void* instance, RadStream s) {
     if (!in) return 0;
     uint32_t v = 0;
     ((sycl::queue*)s)->memcpy(&v, in->my_seq + 3, 4).wait();
+    /* RADIANCE_XE_AR_SKEW: the engine calls this once a step -- append the launches completed since the last call
+     * (their sequence numbers up to the counter, my_seq[0]) with the call count, the step's index for this rank */
+    if (in->skew_f && in->ring) {
+        ++in->calls;
+        uint32_t cur = 0;
+        ((sycl::queue*)s)->memcpy(&cur, in->my_seq, 4).wait();
+        uint32_t from = in->last_s + 1u;
+        if (cur - in->last_s > kSkewRing) from = cur - kSkewRing + 1u;   /* lost to the wrap: keep the newest */
+        if ((int32_t)(cur - in->last_s) > 0) {
+            const uint32_t n = cur - from + 1u;
+            std::vector<uint64_t> e(n);
+            const uint32_t i0 = from & in->ring_mask, first = n < kSkewRing - i0 ? n : kSkewRing - i0;
+            ((sycl::queue*)s)->memcpy(e.data(), in->ring + i0, (size_t)first * 8);
+            if (first < n) ((sycl::queue*)s)->memcpy(e.data() + first, in->ring, (size_t)(n - first) * 8);
+            ((sycl::queue*)s)->wait();
+            for (uint64_t x : e) {
+                const uint64_t rec[2] = { in->calls, x };
+                std::fwrite(rec, 8, 2, in->skew_f);
+            }
+            in->last_s = cur;
+        }
+        if ((in->calls & 255u) == 0) std::fflush(in->skew_f);
+    }
     return v;
 }
 /* a stalled handshake, for tests: the launch's sequence at which a block gave up, 0 if none */
