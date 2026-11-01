@@ -9,8 +9,13 @@
 #include <cstring>
 #include <immintrin.h>
 
-#if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP)
-/* A build without HIP has no kernels to launch: rad_xp_supported is 0 there, so nothing calls these. */
+#if !(defined(RAD_HAVE_L0) && RAD_HAVE_L0)
+/* The gather is the Level Zero backend's (core/device/l0_kernels.sycl); elsewhere gather mode is never on. */
+extern "C" int rad_xp_gather_launch(const rad::XpBox*, uint64_t, uint32_t*, uint32_t*, uint32_t, void*) { return -1; }
+#endif
+#if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP) && !(defined(RAD_HAVE_L0) && RAD_HAVE_L0)
+/* A build without HIP or Level Zero has no kernels to launch: rad_xp_supported is 0 there, so nothing
+ * calls these. */
 extern "C" int rad_xp_logits_launch(const uint16_t*, const uint16_t*, float*, uint32_t, uint32_t, uint32_t, void*) {
     return -1;
 }
@@ -56,8 +61,11 @@ void Ctx::xp_free(XpState& x) {
     for (void* p : {(void*)x.rec, (void*)x.nrec, (void*)x.stats, (void*)x.logits, (void*)x.maps,
                     (void*)x.places})
         if (p) rad_dev_free(p, RAD_MEM_DEVICE);
-    for (void* p : {(void*)x.box, (void*)x.done, (void*)x.stats_h})
-        if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    for (void* p : {(void*)x.box, (void*)x.done})
+        if (p) rad_dev_free(p, x.gather ? RAD_MEM_DEVICE : RAD_MEM_HOST_PINNED);
+    if (x.stats_h) rad_dev_free(x.stats_h, RAD_MEM_HOST_PINNED);
+    if (x.ctr) rad_dev_free(x.ctr, RAD_MEM_DEVICE);
+    if (x.mark_ev) rad_event_destroy(x.mark_ev);
     if (x.tail) rad_event_destroy(x.tail);
     if (x.sync) rad_event_destroy(x.sync);
     if (x.stream) rad_stream_destroy(x.stream);
@@ -93,13 +101,23 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
     x->logits = (float*)rad_dev_alloc(4 * (int64_t)kXpGroups * kXpMaxRows * kXpMaxNe, RAD_MEM_DEVICE);
     x->maps   = (void**)rad_dev_alloc(nl * kXpMaxNe * kXpParts * (int64_t)sizeof(void*), RAD_MEM_DEVICE);
     x->places = (int32_t*)rad_dev_alloc(nl * kXpMaxNe * 4, RAD_MEM_DEVICE);
-    x->box    = (XpBox*)rad_dev_alloc((int64_t)sizeof(XpBox) * kXpGroups, RAD_MEM_HOST_PINNED);
-    x->done   = (uint32_t*)rad_dev_alloc(4 * kXpGroups, RAD_MEM_HOST_PINNED);
+    /* Gather mode: the Level Zero backend has no DMA queue to spare; a kernel copies (see xp_mark_run). */
+#if defined(RAD_HAVE_L0) && RAD_HAVE_L0
+    x->gather = true;
+#endif
+    const int bk = x->gather ? RAD_MEM_DEVICE : RAD_MEM_HOST_PINNED;
+    x->box    = (XpBox*)rad_dev_alloc((int64_t)sizeof(XpBox) * kXpGroups, bk);
+    x->done   = (uint32_t*)rad_dev_alloc(4 * kXpGroups, bk);
     x->stats_h = (XpStats*)rad_dev_alloc((int64_t)sizeof(XpStats), RAD_MEM_HOST_PINNED);
+    if (x->gather) x->ctr = (uint32_t*)rad_dev_alloc(4 * kXpGroups, RAD_MEM_DEVICE);
     const bool ok = x->ring && x->rec && x->nrec && x->stats && x->logits && x->maps && x->places && x->box &&
-                    x->done && x->stats_h && rad_xp_stream_create(&x->stream) >= 0 &&
+                    x->done && x->stats_h && (!x->gather || x->ctr) && rad_xp_stream_create(&x->stream) >= 0 &&
                     rad_event_create_local(&x->tail) >= 0 && rad_event_create_local(&x->sync) >= 0 &&
+                    (!x->gather || rad_event_create_local(&x->mark_ev) >= 0) &&
                     rad_memset_async(x->nrec, 0, 4 * kXpGroups, stream_) >= 0 &&
+                    (!x->gather || (rad_memset_async(x->box, 0, (int64_t)sizeof(XpBox) * kXpGroups, stream_) >= 0 &&
+                                    rad_memset_async(x->done, 0, 4 * kXpGroups, stream_) >= 0 &&
+                                    rad_memset_async(x->ctr, 0, 4 * kXpGroups, stream_) >= 0)) &&
                     rad_memset_async(x->stats, 0, sizeof(XpStats), stream_) >= 0 && rad_stream_sync(stream_) >= 0;
     if (!ok) {
         const char* why = rad_dev_last_error();
@@ -107,13 +125,15 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
         xp_free(*x);
         return;
     }
-    std::memset((void*)x->box, 0, sizeof(XpBox) * kXpGroups);
-    std::memset(x->done, 0, 4 * kXpGroups);
+    if (!x->gather) {
+        std::memset((void*)x->box, 0, sizeof(XpBox) * kXpGroups);
+        std::memset(x->done, 0, 4 * kXpGroups);
+    }
     x->layers.resize((size_t)nl);
     XpState* xs = x.get();
-    x->thr = std::thread([this, xs] { xp_serve(*xs); });
-    RAD_INFO("rank %d: expert prefetch on: %d copies a routed layer by DMA, ring %s", rank_, kXpSlots,
-             humanb(ring).c_str());
+    if (!x->gather) x->thr = std::thread([this, xs] { xp_serve(*xs); });
+    RAD_INFO("rank %d: expert prefetch on: %d copies a routed layer by %s, ring %s, %d pool ranges", rank_, kXpSlots,
+             x->gather ? "a gather kernel on its own queue" : "DMA", humanb(ring).c_str(), x->pools.n);
     xp_ = std::move(x);
 }
 
@@ -349,7 +369,12 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
         RAD_TRY(rad_event_wait(x.stream, x.sync));
     }
     /* An earlier request still waiting for its mark is sent now, unmarked. */
-    if (x.pend.valid) {
+    if (x.pend.valid && x.gather) {
+        if (rad_xp_gather_launch(x.box + x.pend.g, x.slot, x.done + x.pend.g, x.ctr + x.pend.g, x.pend.seq,
+                                 (void*)x.stream))
+            return RAD_E_DEVICE;
+        x.pend.valid = false;
+    } else if (x.pend.valid) {
         {
             std::lock_guard<std::mutex> lk(x.mu);
             x.q.push_back(x.pend);
@@ -368,7 +393,8 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
                              (void*)x.stream) ||
         rad_xp_plan_launch(lg, (uint32_t)rows, (uint32_t)nx.n_expert, (uint32_t)nx.top_k, (void** const*)L.map,
                            L.place, cnt, x.pools, ring, x.slot, x.rec + (size_t)g * kXpSlots, x.nrec + g,
-                           (XpBox*)rad_dev_device_ptr(x.box + g), seq, x.stats, (void*)x.stream))
+                           x.gather ? x.box + g : (XpBox*)rad_dev_device_ptr(x.box + g), seq, x.stats,
+                           (void*)x.stream))
         return RAD_E_DEVICE;
     x.tail_live = true;
     if (++x.calls % kXpWindow == 0) xp_judge(x);
@@ -386,6 +412,15 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
 int Ctx::xp_mark_run() {
     XpState& x = *xp_;
     if (!x.pend.valid) return RAD_OK;
+    /* Gather mode: the copies start once the compute stream reaches this point (this layer's streamed
+     * experts are read), on the prefetch stream beside the next layer's mixer. */
+    if (x.gather) {
+        x.pend.valid = false;
+        RAD_TRY(rad_event_record(x.mark_ev, cur_stream()));
+        RAD_TRY(rad_event_wait(x.stream, x.mark_ev));
+        return rad_xp_gather_launch(x.box + x.pend.g, x.slot, x.done + x.pend.g, x.ctr + x.pend.g, x.pend.seq,
+                                    (void*)x.stream) ? RAD_E_DEVICE : RAD_OK;
+    }
     /* Refused only while another ride waits on the stream; the list then starts unmarked. */
     void* mark = nullptr;
     if (rad_ride(cur_stream(), &mark) == RAD_OK) {
@@ -410,7 +445,8 @@ int Ctx::xp_step_run(int layer) {
     const int32_t* rn = x.restore_g >= 0 ? x.nrec + x.restore_g : nullptr;
     const XpRec* prec = patch ? x.rec + (size_t)L->g * kXpSlots : nullptr;
     const int32_t* pn = patch ? x.nrec + L->g : nullptr;
-    const uint32_t* done = patch ? (const uint32_t*)rad_dev_device_ptr(x.done + L->g) : nullptr;
+    const uint32_t* done = !patch ? nullptr
+                         : x.gather ? x.done + L->g : (const uint32_t*)rad_dev_device_ptr(x.done + L->g);
     if (rad_xp_step_launch(rrec, rn, prec, pn, done, patch ? L->seq : 0, (void*)cur_stream())) return RAD_E_DEVICE;
     x.restore_g = patch ? L->g : -1;
     if (L) L->want = false;

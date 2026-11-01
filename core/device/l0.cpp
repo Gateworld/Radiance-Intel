@@ -2798,8 +2798,37 @@ int z_runtime_version(char* out, int cap) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ expert prefetch
+ * Owner note 139 stage 1, opt-in (RADIANCE_XE_EXPERT_PREFETCH=1). No DMA list and no rides here: the core's
+ * gather mode (runtime/xprefetch.cpp) copies with a kernel on the prefetch's own in-order queue -- a second
+ * immediate list on the compute group -- ordered against the compute stream by events. The ring and its
+ * side buffers are plain device memory: only kernels touch them. */
+int z_xp_supported(int) {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_XE_EXPERT_PREFETCH"); return e && e[0] == '1'; }();
+    return on ? 1 : 0;
+}
+int z_xp_stream_create(RadStream* out) { return z_stream_create(out, 0); }
+int z_ride(RadStream, void**) { return RAD_E_UNSUPPORTED; }
+int z_ride_wait(RadStream, void*) { return RAD_E_UNSUPPORTED; }
+void z_ride_release(void*, RadStream, int64_t) {}
+int z_xp_list(int, void*, int, const uint64_t*, const uint64_t*, const uint64_t*, uint32_t*, uint32_t) {
+    return RAD_E_UNSUPPORTED;
+}
+int64_t z_xp_behind(int) { return 0; }
+void* z_alloc_uncached(int64_t bytes) { return z_alloc(bytes, RAD_MEM_DEVICE); }
+void z_free_uncached(void* p) { z_free(p, RAD_MEM_DEVICE); }
+
 DeviceBackend make_backend() {
     DeviceBackend b{};
+    b.xp_supported = z_xp_supported;
+    b.xp_stream_create = z_xp_stream_create;
+    b.ride = z_ride;
+    b.ride_wait = z_ride_wait;
+    b.ride_release = z_ride_release;
+    b.xp_list = z_xp_list;
+    b.xp_behind = z_xp_behind;
+    b.alloc_uncached = z_alloc_uncached;
+    b.free_uncached = z_free_uncached;
     b.name = "l0";
     b.count = z_count;
     b.set = z_set;

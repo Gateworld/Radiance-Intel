@@ -33,7 +33,7 @@ constexpr int kXpGroups   = 3;
 constexpr int kXpMaxRows  = 16;   /* decode passes; a wider pass makes no prediction */
 constexpr int kXpMaxK     = 16;
 constexpr int kXpMaxNe    = 512;
-constexpr int kXpMaxPools = 4;
+constexpr int kXpMaxPools = 8;    /* the host pool in 2 GiB pieces is a range a piece (H88: 5) */
 constexpr int kXpParts    = 4;    /* the weights one expert's unit is made of */
 
 /* One copied unit: its table entries, what they held and what they hold while patched, and where the
@@ -88,3 +88,8 @@ extern "C" int rad_xp_plan_launch(const float* logits, uint32_t rows, uint32_t n
                                   void* stream);
 extern "C" int rad_xp_step_launch(const rad::XpRec* rrec, const int32_t* rn, const rad::XpRec* prec,
                                   const int32_t* pn, const uint32_t* done, uint32_t seq, void* stream);
+/* Gather mode (the Level Zero backend, owner note 139 stage 1: no DMA queue to spare): the plan's jobs
+ * in `box` (device memory) copied by many small work-groups on the prefetch stream, the last to finish
+ * writing `seq` to `done` after the copies (`ctr`, zero between uses, counts the arrivals). */
+extern "C" int rad_xp_gather_launch(const rad::XpBox* box, uint64_t max_bytes, uint32_t* done, uint32_t* ctr,
+                                    uint32_t seq, void* stream);

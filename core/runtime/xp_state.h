@@ -67,6 +67,11 @@ struct XpState {
     bool         have_snap = false, judge = false;
     int          restore_g  = -1;      /* the group the next step puts back */
     XpReq        pend;                 /* made at a router, waiting for its mark */
+    /* Gather mode (Level Zero, owner note 139 stage 1): `box` and `done` are device memory, no host thread;
+     * at the mark the prefetch stream waits for the compute stream (`mark_ev`) and a kernel copies. */
+    bool         gather = false;
+    uint32_t*    ctr    = nullptr;     /* [kXpGroups], device: the gather's arrivals */
+    RadEvent     mark_ev = nullptr;
 
     /* The host thread: each mailbox, once the plan has written it, to the DMA queue. */
     std::thread              thr;

@@ -16,6 +16,9 @@
 
 #include "sched/advance_impl.h"
 #include "runtime/wtab.h"
+#include "runtime/xprefetch.h"
+
+#include <cmath>
 #include "rad_l0_rec.h"
 
 /* The backend's hook that submits a held-back tape play (l0.cpp, "recorded passes"): these
@@ -120,6 +123,310 @@ int rad_l0k_fill(void* stream, void* dst, int value, int64_t bytes) {
         }
     };
     return launch_1d(stream, f, kfn, global, wg);
+}
+
+/* ---- the expert prefetch (runtime/xprefetch.h; owner note 139 stage 1): xprefetch.hip's kernels for this
+ * backend, plus the gather that stands in for the DMA queue. Logits, plan and gather run on the prefetch's
+ * own queue, which is never recorded; the step runs on the compute stream and records natively. */
+namespace {
+using u64 = unsigned long long;
+template <class T> using dev_atomic =
+    sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;
+inline float xp_bf(uint32_t x) { return sycl::bit_cast<float>(x << 16); }
+inline u64 xp_ld(void** p) { return dev_atomic<u64>(*(u64*)p).load(); }
+}  // namespace
+
+/* logits[r, e] = h[r, :] . w[e, :], bf16 in, fp32 sums: a 16-lane sub-group an expert, 16-byte loads. */
+extern "C" __attribute__((visibility("default")))
+int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* lg, uint32_t rows, uint32_t n_embd, uint32_t ne,
+                         void* stream) {
+    if (rows == 0 || rows > (uint32_t)rad::kXpMaxRows || n_embd % 256u) return -1;
+    flush_pending();
+    sycl::queue& q = *static_cast<sycl::queue*>(stream);
+    constexpr uint32_t kE = 16;   /* experts a work-group */
+    try {
+        q.parallel_for(sycl::nd_range<1>((size_t)((ne + kE - 1) / kE) * 256, 256),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const uint32_t lane = sg.get_local_linear_id();
+            const uint32_t e = (uint32_t)it.get_group(0) * kE + sg.get_group_linear_id();
+            if (e >= ne) return;
+            const uint32_t nv = n_embd / 8u;
+            const sycl::uint4* wr = (const sycl::uint4*)(w + (size_t)e * n_embd);
+            float acc[rad::kXpMaxRows];
+#pragma unroll
+            for (int r = 0; r < rad::kXpMaxRows; ++r) acc[r] = 0.f;
+            for (uint32_t c = lane; c < nv; c += 16u) {
+                const sycl::uint4 wv = wr[c];
+                float wf[8];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) { wf[2 * t] = xp_bf(wv[t] & 0xffffu); wf[2 * t + 1] = xp_bf(wv[t] >> 16); }
+#pragma unroll
+                for (int r = 0; r < rad::kXpMaxRows; ++r) {
+                    if ((uint32_t)r >= rows) break;
+                    const sycl::uint4 hv = ((const sycl::uint4*)(h + (size_t)r * n_embd))[c];
+                    float d = 0.f;
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) d += wf[2 * t] * xp_bf(hv[t] & 0xffffu) + wf[2 * t + 1] * xp_bf(hv[t] >> 16);
+                    acc[r] += d;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < rad::kXpMaxRows; ++r) {
+                if ((uint32_t)r >= rows) break;
+                const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+                if (lane == 0) lg[(size_t)r * ne + e] = v;
+            }
+        });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
+
+/* xprefetch.hip's xp_plan, one work-group of 256 at sub-group 32 (16 logits a lane cover 512 experts): count
+ * whether the step routed the group's last records, each row's top-k with softmax probabilities, the distinct
+ * experts whose entries all sit in one pinned pool slot, scored by their best probability (x1.5 if the last pass
+ * routed them here), the kXpSlots best written as jobs and records. The box is device memory here and the gather
+ * that reads it follows on the same queue, so no tags or system-scope stores. */
+extern "C" __attribute__((visibility("default")))
+int rad_xp_plan_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, void** const* map, const int32_t* place,
+                       const int32_t* cnt, rad::XpPools pools, uint64_t ring, uint64_t rs, rad::XpRec* rec,
+                       int32_t* nrec, rad::XpBox* box, uint32_t seq, rad::XpStats* stats, void* stream) {
+    (void)seq;
+    if (k == 0 || k > (uint32_t)rad::kXpMaxK || ne > (uint32_t)rad::kXpMaxNe || rows == 0 ||
+        rows > (uint32_t)rad::kXpMaxRows)
+        return -1;
+    flush_pending();
+    sycl::queue& q = *static_cast<sycl::queue*>(stream);
+    constexpr int NC = rad::kXpMaxRows * rad::kXpMaxK;
+    constexpr float kPrevBoost = 0.5f;
+    try {
+        q.submit([&](sycl::handler& cg) {
+            sycl::local_accessor<int, 1> s_e(NC, cg), s_pool(NC, cg), s_sel(rad::kXpSlots, cg), s_n(1, cg);
+            sycl::local_accessor<float, 1> s_pr(NC, cg), s_sc(NC, cg);
+            sycl::local_accessor<u64, 1> s_p(NC, cg);
+            cg.parallel_for(sycl::nd_range<1>(256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const uint32_t tid = (uint32_t)it.get_local_id(0), lane = sg.get_local_linear_id();
+                const uint32_t wave = sg.get_group_linear_id(), nw = sg.get_group_linear_range();
+                if (tid == 0) {
+                    const int nr = *nrec;
+                    for (int t = 0; t < nr; ++t) {
+                        const rad::XpRec& rc = rec[t];
+                        dev_atomic<unsigned>(stats->copied).fetch_add(1u);
+                        if (rc.cnt && rc.place >= 0 && rc.cnt[rc.place] > 0) dev_atomic<unsigned>(stats->routed).fetch_add(1u);
+                    }
+                }
+                /* Rank-major order: o = j * rows + r, every row's first choice before any second one. */
+                for (uint32_t r = wave; r < rows; r += nw) {
+                    float v[16];
+                    float m = -INFINITY;
+#pragma unroll
+                    for (uint32_t i = 0; i < 16; ++i) {
+                        const uint32_t e = lane + i * 32u;
+                        v[i] = e < ne ? lg[(size_t)r * ne + e] : -INFINITY;
+                        m = sycl::fmax(m, v[i]);
+                    }
+                    m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+                    float sum = 0.f;
+#pragma unroll
+                    for (uint32_t i = 0; i < 16; ++i) sum += v[i] > -INFINITY ? sycl::exp(v[i] - m) : 0.f;
+                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                    for (uint32_t j = 0; j < k; ++j) {
+                        float bv = -INFINITY;
+                        int bi = -1;
+#pragma unroll
+                        for (int i = 0; i < 16; ++i)
+                            if (v[i] > bv) { bv = v[i]; bi = i; }
+                        const int be = bi >= 0 ? (int)(lane + (uint32_t)bi * 32u) : 0x7fffffff;
+                        float rv = bv;
+                        int re = be;
+                        for (uint32_t o = 16; o > 0; o >>= 1) {
+                            const float ov = sycl::permute_group_by_xor(sg, rv, o);
+                            const int oe = sycl::permute_group_by_xor(sg, re, o);
+                            if (ov > rv || (ov == rv && oe < re)) { rv = ov; re = oe; }
+                        }
+                        if (lane == 0) {
+                            s_e[j * rows + r] = re;
+                            s_pr[j * rows + r] = sycl::exp(rv - m) / sum;
+                        }
+#pragma unroll
+                        for (int i = 0; i < 16; ++i)
+                            if (i == bi && re == be) v[i] = -INFINITY;
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                const uint32_t nc = rows * k;
+                for (uint32_t o = tid; o < nc; o += 256u) {
+                    const int e = s_e[o];
+                    s_pool[o] = -1;
+                    s_p[o] = 0;
+                    if (e >= 0 && (uint32_t)e < ne) {
+                        void** ent = map[(size_t)e * rad::kXpParts];
+                        if (ent) {
+                            const u64 p = xp_ld(ent);
+                            s_p[o] = p;
+                            int pi = -1;
+                            for (int i = 0; i < pools.n; ++i)
+                                if (p >= pools.lo[i] && p < pools.hi[i]) { pi = i; break; }
+                            /* All entries of the unit in one pool slot (the mover patches one at a time). */
+                            if (pi >= 0) {
+                                const u64 lo = pools.lo[pi], st = pools.stride[pi];
+                                const u64 base = lo + ((p - lo) / st) * st;
+                                for (int qq = 1; qq < rad::kXpParts && pi >= 0; ++qq) {
+                                    void** eq = map[(size_t)e * rad::kXpParts + qq];
+                                    if (!eq) continue;
+                                    const u64 vv = xp_ld(eq);
+                                    if (vv < base || vv >= base + st) pi = -1;
+                                }
+                            }
+                            s_pool[o] = pi;
+                        }
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                for (uint32_t o = tid; o < nc; o += 256u) {
+                    const int e = s_e[o];
+                    float best = s_pr[o];
+                    bool first = true;
+                    for (uint32_t u = 0; u < nc; ++u)
+                        if (s_e[u] == e) {
+                            if (u < o) first = false;
+                            best = sycl::fmax(best, s_pr[u]);
+                        }
+                    /* The counts row holds the previous pass until this layer's router runs. */
+                    if (first && cnt && place && e >= 0 && (uint32_t)e < ne) {
+                        const int pl = place[e];
+                        if (pl >= 0 && cnt[pl] > 0) best *= 1.f + kPrevBoost;
+                    }
+                    s_sc[o] = (first && s_pool[o] >= 0) ? best : -1.f;
+                }
+                if (tid == 0) s_n[0] = 0;
+                sycl::group_barrier(it.get_group());
+                for (uint32_t o = tid; o < nc; o += 256u) {
+                    const float sc = s_sc[o];
+                    if (sc < 0.f) continue;
+                    uint32_t rank = 0;
+                    for (uint32_t u = 0; u < nc; ++u) {
+                        const float su = s_sc[u];
+                        if (su > sc || (su == sc && u < o)) ++rank;
+                    }
+                    if (rank < (uint32_t)rad::kXpSlots) {
+                        s_sel[rank] = (int)o;
+                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                         sycl::access::address_space::local_space>(s_n[0]).fetch_add(1);
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                const int n = s_n[0];
+                for (int t = (int)tid; t < n * rad::kXpParts; t += 256) {
+                    const int j = t / rad::kXpParts, qq = t % rad::kXpParts, o = s_sel[j], e = s_e[o], pi = s_pool[o];
+                    const u64 lo = pools.lo[pi], st = pools.stride[pi];
+                    const u64 base = lo + ((s_p[o] - lo) / st) * st;
+                    const u64 dst = ring + (u64)j * rs;
+                    if (qq == 0) {
+                        box->jobs[j].src = base;
+                        box->jobs[j].dst = dst;
+                        box->jobs[j].bytes = st;
+                        rec[j].cnt = cnt;
+                        rec[j].place = place ? place[e] : -1;
+                    }
+                    void** ent = map[(size_t)e * rad::kXpParts + qq];
+                    rec[j].ent[qq] = ent;
+                    if (ent) {
+                        const u64 old = xp_ld(ent);
+                        rec[j].oldv[qq] = (void*)old;
+                        rec[j].newv[qq] = (void*)(dst + (old - base));
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                if (tid == 0) {
+                    *nrec = n;
+                    box->n = n;
+                    dev_atomic<unsigned>(stats->planned).fetch_add((unsigned)n);
+                }
+            });
+        });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
+
+/* The plan's jobs copied from the pinned pool into the ring: kGatherWg work-groups a job, each a contiguous
+ * share of 16-byte words; no grid barrier -- the last work-group to arrive writes `seq` to `done`, after a
+ * device-scope release, and puts the counter back to zero. A group past the job count only arrives. */
+extern "C" __attribute__((visibility("default")))
+int rad_xp_gather_launch(const rad::XpBox* box, uint64_t max_bytes, uint32_t* done, uint32_t* ctr, uint32_t seq,
+                         void* stream) {
+    if (!box || !done || !ctr || max_bytes == 0) return -1;
+    flush_pending();
+    sycl::queue& q = *static_cast<sycl::queue*>(stream);
+    constexpr uint32_t kGatherWg = 48, kWg = 256;
+    constexpr uint32_t total = kGatherWg * (uint32_t)rad::kXpSlots;
+    try {
+        q.parallel_for(sycl::nd_range<1>((size_t)total * kWg, kWg), [=](sycl::nd_item<1> it) {
+            const uint32_t g = (uint32_t)it.get_group(0), tid = (uint32_t)it.get_local_id(0);
+            const uint32_t j = g / kGatherWg, part = g % kGatherWg;
+            if ((int)j < box->n) {
+                const u64 bytes = box->jobs[j].bytes < max_bytes ? box->jobs[j].bytes : max_bytes;
+                const sycl::uint4* src = (const sycl::uint4*)(uintptr_t)box->jobs[j].src;
+                sycl::uint4* dst = (sycl::uint4*)(uintptr_t)box->jobs[j].dst;
+                const u64 words = bytes / 16u, share = (words + kGatherWg - 1) / kGatherWg;
+                const u64 w0 = (u64)part * share, w1 = w0 + share < words ? w0 + share : words;
+                for (u64 i = w0 + tid; i < w1; i += kWg) dst[i] = src[i];
+                if (part == kGatherWg - 1 && tid < (uint32_t)(bytes % 16u))
+                    ((unsigned char*)dst)[words * 16u + tid] = ((const unsigned char*)src)[words * 16u + tid];
+            }
+            sycl::group_barrier(it.get_group());
+            if (tid == 0) {
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                const uint32_t was = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                                      sycl::access::address_space::global_space>(*ctr).fetch_add(1u);
+                if (was == total - 1) {
+                    dev_atomic<uint32_t>(*ctr).store(0u);
+                    dev_atomic<uint32_t>(*done).store(seq, sycl::memory_order::release);
+                }
+            }
+        });
+    } catch (const sycl::exception&) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Compute stream, before a layer's routed GEMMs: put back the previous layer's patches, then point this
+ * layer's units at the ring where an entry still holds what the plan read and the gather has landed. */
+extern "C" __attribute__((visibility("default")))
+int rad_xp_step_launch(const rad::XpRec* rrec, const int32_t* rn, const rad::XpRec* prec, const int32_t* pn,
+                       const uint32_t* done, uint32_t seq, void* stream) {
+    flush_pending();
+    struct StepArgs { const rad::XpRec* rrec; const int32_t* rn; const rad::XpRec* prec; const int32_t* pn;
+                      const uint32_t* done; uint32_t seq; };
+    const StepArgs a{ rrec, rn, prec, pn, done, seq };
+    auto kfn = [=](sycl::nd_item<1> it) {
+        const int t = (int)it.get_local_id(0);
+        if (a.rrec && t < *a.rn * rad::kXpParts) {
+            const rad::XpRec& r = a.rrec[t / rad::kXpParts];
+            const int qq = t % rad::kXpParts;
+            if (r.ent[qq]) {
+                u64 want = (u64)r.newv[qq];
+                dev_atomic<u64>(*(u64*)r.ent[qq]).compare_exchange_strong(want, (u64)r.oldv[qq]);
+            }
+        }
+        if (!a.prec) return;
+        if (dev_atomic<uint32_t>(*(uint32_t*)a.done).load(sycl::memory_order::acquire) != a.seq)
+            return;
+        if (t >= *a.pn * rad::kXpParts) return;
+        const rad::XpRec& r = a.prec[t / rad::kXpParts];
+        const int qq = t % rad::kXpParts;
+        if (r.ent[qq]) {
+            u64 want = (u64)r.oldv[qq];
+            dev_atomic<u64>(*(u64*)r.ent[qq]).compare_exchange_strong(want, (u64)r.newv[qq]);
+        }
+    };
+    return launch_1d(stream, a, kfn, 128, 128);
 }
 
 extern "C" __attribute__((visibility("default")))
