@@ -8,7 +8,12 @@
  * call -- o, the int8 codes and scales, the recurrent state and the conv state -- and the time a call over back-to-back
  * launches. Run it once with RADIANCE_XE_GDN_SPLIT unset and once with =2 / =4: the hashes must be equal.
  *
- *   xe_gdn_split_bench LIBXE.so [launches=200]
+ *   xe_gdn_split_bench LIBXE.so [launches=200] [anchor]
+ *
+ * Run 113 (note 138's rest): `anchor` runs the MTP form instead -- state_form anchor, two accepted tokens replayed
+ * from the factor block, the six anchor / factor columns on distinct slots (1-3, 4-6) and the read copy's shift
+ * marker at 3 (shift +1), so a slice that read a marker another had already stamped would read the wrong anchor
+ * column and change the hashes.
  */
 #include <sycl/sycl.hpp>
 
@@ -54,6 +59,7 @@ uint64_t fnv(const void* p, size_t n, uint64_t h) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: xe_gdn_split_bench LIBXE.so [launches]\n"); return 2; }
     const int launches = argc > 2 ? std::atoi(argv[2]) : 200;
+    const bool anchor = argc > 3 && std::strcmp(argv[3], "anchor") == 0;
     void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::printf("dlopen %s: %s\n", argv[1], dlerror()); return 2; }
     LaunchFn fn = (LaunchFn)dlsym(h, "r4d_rad_gdn_conv_recurrent_update");
@@ -63,11 +69,13 @@ int main(int argc, char** argv) {
                    sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} } };
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char* sp = std::getenv("RADIANCE_XE_GDN_SPLIT");
-    std::printf("gdn_split_bench: %s, RADIANCE_XE_GDN_SPLIT=%s\n", q.get_device().get_info<sycl::info::device::name>().c_str(),
-                sp ? sp : "(unset)");
+    std::printf("gdn_split_bench: %s, RADIANCE_XE_GDN_SPLIT=%s, %s\n",
+                q.get_device().get_info<sycl::info::device::name>().c_str(), sp ? sp : "(unset)",
+                anchor ? "anchor" : "per_candidate");
     const int Hg = 8, H = 24, K = 128, V = 128, W = 4, CD = 2 * Hg * K + H * V, SL = 6;   /* SL = 4 tokens + W - 2 */
     for (int T : { 1, 4 }) {
-        const int N = 1, S = T + 1;
+        const int N = 1, S = anchor ? 8 : T + 1;
+        const int SW = anchor ? 8 : T;   /* the sidx row: anchor's stride is the draft window + 1 */
         auto dev = [&](size_t bytes) { return sycl::malloc_device<uint8_t>(bytes, q); };
         std::vector<uint16_t> hx((size_t)T * CD), hcw((size_t)CD * W), hcb(CD), hcs((size_t)CD * SL), ha((size_t)T * H),
             hb((size_t)T * H), hz((size_t)T * H * V);
@@ -81,19 +89,29 @@ int main(int argc, char** argv) {
         for (int i = 0; i < H; ++i) { halog[i] = uni(8, i, -1.f, 1.f); hdtb[i] = uni(9, i, -1.f, 1.f); }
         for (size_t i = 0; i < hst.size(); ++i) hst[i] = uni(10, i, -0.2f, 0.2f);
         for (int i = 0; i < V; ++i) hnw[i] = uni(11, i, 0.5f, 1.5f);
-        std::vector<int32_t> hcidx = { 0 }, hcu = { 0, T }, hsidx(T);
-        for (int t = 0; t < T; ++t) hsidx[t] = 1 + t;    /* read slot sidx[0] (no naccept), write slot t + 1 */
+        std::vector<int32_t> hcidx = { 0 }, hcu = { 0, T }, hsidx(SW), hnacc = { 2 };
+        if (anchor) {
+            for (int i = 0; i < 6; ++i) hsidx[i] = 1 + i;   /* anchor 1-3, factors 4-6 */
+            hsidx[6] = 7; hsidx[7] = 7;
+            /* the read factor copy's marker (slot 5, every head; RU_MARK_OFF = RU_TMAX 16 x RU_FSTR 648 floats into
+             * the head) at 3: m = 2, so the anchor is read at column 1 (slot 2) and written at column 2 (slot 3) */
+            const size_t head = (size_t)V * K;
+            for (int hv = 0; hv < H; ++hv) hst[(size_t)5 * H * head + (size_t)hv * head + 16 * 648] = 3.0f;
+        } else {
+            for (int t = 0; t < T; ++t) hsidx[t] = 1 + t;    /* read slot sidx[0] (no naccept), write slot t + 1 */
+        }
         uint8_t *dx = dev(hx.size() * 2), *dcw = dev(hcw.size() * 2), *dcb = dev(hcb.size() * 2), *dcs = dev(hcs.size() * 2),
                 *da = dev(ha.size() * 2), *db = dev(hb.size() * 2), *dz = dev(hz.size() * 2), *dal = dev(H * 4),
                 *ddt = dev(H * 4), *dst = dev(hst.size() * 4), *dnw = dev(V * 4), *dci = dev(4), *dcu = dev(8),
-                *dsi = dev(T * 4), *dO = dev((size_t)T * H * V * 2), *dq = dev((size_t)T * H * V), *ds = dev((size_t)T * H * 4);
+                *dsi = dev(SW * 4), *dO = dev((size_t)T * H * V * 2), *dq = dev((size_t)T * H * V), *ds = dev((size_t)T * H * 4),
+                *dna = dev(4);
         auto upload = [&] {
             q.memcpy(dx, hx.data(), hx.size() * 2); q.memcpy(dcw, hcw.data(), hcw.size() * 2);
             q.memcpy(dcb, hcb.data(), hcb.size() * 2); q.memcpy(dcs, hcs.data(), hcs.size() * 2);
             q.memcpy(da, ha.data(), ha.size() * 2); q.memcpy(db, hb.data(), hb.size() * 2);
             q.memcpy(dz, hz.data(), hz.size() * 2); q.memcpy(dal, halog.data(), H * 4); q.memcpy(ddt, hdtb.data(), H * 4);
             q.memcpy(dst, hst.data(), hst.size() * 4); q.memcpy(dnw, hnw.data(), V * 4); q.memcpy(dci, hcidx.data(), 4);
-            q.memcpy(dcu, hcu.data(), 8); q.memcpy(dsi, hsidx.data(), T * 4);
+            q.memcpy(dcu, hcu.data(), 8); q.memcpy(dsi, hsidx.data(), SW * 4); q.memcpy(dna, hnacc.data(), 4);
             q.memset(dO, 0, (size_t)T * H * V * 2); q.memset(dq, 0, (size_t)T * H * V); q.memset(ds, 0, (size_t)T * H * 4);
             q.wait();
         };
@@ -102,17 +120,19 @@ int main(int argc, char** argv) {
             ten(dx, RAD_BF16, { T, CD }), ten(dcw, RAD_BF16, { CD, W }), ten(dcb, RAD_BF16, { CD }),
             ten(dcs, RAD_BF16, { 1, CD, SL }), ten(dci, RAD_I32, { N }), ten(da, RAD_BF16, { T, H }),
             ten(db, RAD_BF16, { T, H }), ten(dal, RAD_F32, { H }), ten(ddt, RAD_F32, { H }),
-            ten(dst, RAD_F32, { S, H, V, K }), ten(dsi, RAD_I32, { N, T }), RadTensor{}, ten(dcu, RAD_I32, { N + 1 }),
+            ten(dst, RAD_F32, { S, H, V, K }), ten(dsi, RAD_I32, { N, SW }), ten(dna, RAD_I32, { N }),
+            ten(dcu, RAD_I32, { N + 1 }),
             ten(dz, RAD_BF16, { T, H * V }), ten(dnw, RAD_F32, { V }), ten(dO, RAD_BF16, { T, H, V }),
             ten(dq, RAD_I8, { T, H * V }), ten(ds, RAD_F32, { T, H }) };
-        t[11].data = nullptr;   /* no naccept */
+        if (!anchor) t[11] = RadTensor{};   /* no naccept */
         RadParam p[8]{};
         const char* ik[] = { "head_k", "head_v", "conv_width", "n_head_v" };
         const long long iv[] = { K, V, W, H };
         for (int i = 0; i < 4; ++i) { p[i].key = ik[i]; p[i].kind = RAD_P_INT; p[i].ival = iv[i]; }
         p[4].key = "scale"; p[4].kind = RAD_P_F64; p[4].dval = 1.0 / std::sqrt((double)K);
         p[5].key = "eps"; p[5].kind = RAD_P_F64; p[5].dval = 1e-6;
-        char sfv[] = "per_candidate";
+        char sfv[16];
+        std::snprintf(sfv, sizeof sfv, "%s", anchor ? "anchor" : "per_candidate");
         p[6].key = "state_form"; p[6].kind = RAD_P_STR; p[6].sval = sfv;
         RadArgs args{};
         args.t = t; args.n_t = 18; args.p = p; args.n_p = 7;
@@ -136,7 +156,7 @@ int main(int argc, char** argv) {
         q.wait_and_throw();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / launches;
         std::printf("RESULT gdn_split T %d: %.2f us a call (host wall over %d back-to-back calls)\n", T, us, launches);
-        for (uint8_t* x : { dx, dcw, dcb, dcs, da, db, dz, dal, ddt, dst, dnw, dci, dcu, dsi, dO, dq, ds }) sycl::free(x, q);
+        for (uint8_t* x : { dx, dcw, dcb, dcs, da, db, dz, dal, ddt, dst, dnw, dci, dcu, dsi, dO, dq, ds, dna }) sycl::free(x, q);
     }
     std::printf("RESULT gdn_split_bench DONE\n");
     return 0;

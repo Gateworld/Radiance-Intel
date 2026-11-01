@@ -283,7 +283,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   // channel of the value head.
   /* The decode shape: the fused norm at one workgroup a head, or (owner note 138) the split fold without it, VS 2
    * or 4 so a workgroup still has a thread for each of the key head's 256 q | k channels */
-  static_assert(!CV || (STG == 0 && (NORM ? VS == 1 : (VS == 2 || VS == 4) && !ANC)),
+  /* Run 113 (owner note 138's rest): the anchor form splits too. A slice owns whole 32-row groups at VS <= 4, so
+   * its replay reads and this step's factor writes (a group's k copy, decay / beta, its rows' v) touch only its own
+   * part of the factor block; the shift marker, which every slice of a head reads, is stamped by the last arriver
+   * on the key head's counter instead (see `stamp_group`). */
+  static_assert(!CV || (STG == 0 && (NORM ? VS == 1 : (VS == 2 || VS == 4))),
                 "the folded convolution is the decode shape");
   static_assert(!CV || RU_V / VS * KT >= 2 * RU_K, "a q | k channel a thread");
   constexpr int NVC = VS > 1 ? NR : RU_V;               // this workgroup's v channels (its rows)
@@ -470,14 +474,39 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     }
     __syncthreads();
     // Stamp after the barrier: every thread read fb's marker at the top, and stamping earlier
-    // could steer a late wave to a different column from the rest of the workgroup.
-    if (RU_ANC_MARK && tid == 0) {                      // the three copies say where they are
+    // could steer a late wave to a different column from the rest of the workgroup. Split (VS > 1):
+    // the other slices of this head may not have read it yet, so the last arriver stamps instead.
+    if (RU_ANC_MARK && VS == 1 && tid == 0) {           // the three copies say where they are
       fb0[RU_MARK_OFF] = (ST)1.0f;
       fb[RU_MARK_OFF]  = (ST)2.0f;
       fb2[RU_MARK_OFF] = (ST)3.0f;
     }
   }
-  if (empty) return;
+  /* Split anchor: every value head of the key head, in the same order as the single-workgroup stamp above (so a
+   * caller naming one slot in every column ends with the same value). Called by the last of the G x VS workgroups
+   * to arrive, after all of them read their markers. */
+  auto stamp_group = [&]() {
+    for (int g2 = 0; g2 < G; ++g2) {
+      const size_t ho = (size_t)(hk * G + g2) * st_head + RU_MARK_OFF;
+      state[(size_t)sf0 * st_slot + ho] = (ST)1.0f;
+      state[(size_t)sf  * st_slot + ho] = (ST)2.0f;
+      state[(size_t)sf2 * st_slot + ho] = (ST)3.0f;
+    }
+  };
+  if (empty) {
+    /* A fold-only step (T == 0) never reaches the convolution's arrival, so a split one arrives here. */
+    if constexpr (CV && ANC && RU_ANC_MARK && VS > 1) {
+      if (tid == 0) {
+        const unsigned int was = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
+                                                        __HIP_MEMORY_SCOPE_AGENT);
+        if (was == (unsigned)(G * VS - 1)) {
+          __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          stamp_group();
+        }
+      }
+    }
+    return;
+  }
 
   if constexpr (CV) {
     // gdn_conv_update's token body, one channel per thread, into LDS instead of q, k and v.
@@ -724,9 +753,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     if (G * VS > 1) {
       if (tid == 0) {
         cvlast = arrived == (unsigned)(G * VS - 1);
-        if (cvlast)
+        if (cvlast) {
           __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
+          if constexpr (ANC && RU_ANC_MARK && VS > 1) stamp_group();   /* every slice has read its marker */
+        }
       }
       __syncthreads();
       if (!cvlast) return;
@@ -1032,16 +1063,17 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const dim3 grid(N, H, 1), blk(RU_V * RC_KT);
 #if defined(__SYCL_TARGET_INTEL_GPU_BMG_G31__)
   /* Owner note 138 (run 112, RADIANCE_XE_GDN_SPLIT=2|4): a head's v rows over 2 or 4 workgroups without the fused
-   * norm, then ru_split_norm_kernel -- the same bits (see both kernels). Per-candidate state only for now (the anchor's
-   * shift marker forbids splitting a head); KT 8 only (the norm kernel mirrors that layout's order). */
+   * norm, then ru_split_norm_kernel -- the same bits (see both kernels). KT 8 only (the norm kernel mirrors that
+   * layout's order). Run 113: the anchor form too (MTP on), its shift marker stamped by the key head's last
+   * arriving workgroup. */
   static const int split_vs = [] {
     const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT");
     return e && (e[0] == '2' || e[0] == '4') ? e[0] - '0' : 0;
   }();
-  if (split_vs && !anc && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads) {
+  if (split_vs && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK)) {
     const dim3 sgrid(N, H, split_vs), sblk(RU_V / split_vs * RC_KT);
-#define RC_SPLIT(VSC, NTC, SDTC)                                                              \
-  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, 0, 0, SDTC, 1, RC_KT>), \
+#define RC_SPLIT_A(VSC, NTC, ANCC, SDTC)                                                      \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, ANCC, 0, SDTC, 1, RC_KT>), \
                      sgrid, sblk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,     \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
@@ -1049,12 +1081,14 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                      (const int*)sidx, sidx_stride, (const int*)nacc,                          \
                      (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
                      scale, thr, cv)
+#define RC_SPLIT(VSC, NTC, SDTC) do { if (anc) RC_SPLIT_A(VSC, NTC, 1, SDTC); else RC_SPLIT_A(VSC, NTC, 0, SDTC); } while (0)
 #define RC_SPLIT_NT(VSC, SDTC) do { if (nt) RC_SPLIT(VSC, 1, SDTC); else RC_SPLIT(VSC, 0, SDTC); } while (0)
 #define RC_SPLIT_VS(SDTC) do { if (split_vs == 4) RC_SPLIT_NT(4, SDTC); else RC_SPLIT_NT(2, SDTC); } while (0)
     if (sdt) RC_SPLIT_VS(1); else RC_SPLIT_VS(0);
 #undef RC_SPLIT_VS
 #undef RC_SPLIT_NT
 #undef RC_SPLIT
+#undef RC_SPLIT_A
     const dim3 ngrid((unsigned)ntok, (unsigned)H), nblk(RU_V);
 #define RC_NORM(NQ) hipLaunchKernelGGL((ru_split_norm_kernel<NQ>), ngrid, nblk, 0, (hipStream_t)stream,          \
                                        (const float*)cv.onf, (unsigned short*)o, (unsigned char*)oq, (float*)os, \
