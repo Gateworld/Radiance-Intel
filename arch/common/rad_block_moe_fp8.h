@@ -705,12 +705,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                             "into two equal tables by parity\n", l, prot.size(), (long long)n_reg);
             return RAD_E_INVAL;
         }
-        /* The tap's per-expert files are named by expert, but this sort numbers by place. */
-        if (c.calib) {
-            fprintf(stderr, "radiance: calibrate the bf16 container: layer %d of this one keeps "
-                            "experts plain bf16 and sorts them out of order\n", l);
-            return RAD_E_INVAL;
-        }
+        /* The tap's per-expert files are named by expert while this sort numbers by place: the
+         * per-expert pass maps each regular place back to its expert and skips the protected ones,
+         * which GPTQ does not quantise (owner note 135 item 3, the Intel port: calibrating the
+         * served container, whose recipe protects experts). */
         std::string lst;
         for (int64_t e : prot) lst += (lst.empty() ? "" : ",") + std::to_string(e);
         prot_list = nm.ckpt("%s", lst.c_str());
@@ -1797,8 +1795,18 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     if (!staging) { calib_dne_failed = true; return; }
     void* scratch = rad_buf_ptr(c_, b_gram_dne);
     rad_memset_async(scratch, 0, bytes, s);
-    for (int64_t e = 0; e < ne; ++e) {
-        const int64_t r0 = off[(size_t)e], n = off[(size_t)e + 1] - r0;
+    /* The sort's places: the regular experts in order, then the protected ones (`prot`), which
+     * are served bf16 apart and never quantised, so they get no Hessian. Without protected
+     * experts a place is its expert. */
+    std::vector<int64_t> place_expert;
+    place_expert.reserve((size_t)ne);
+    for (int64_t e = 0, j = 0; e < ne; ++e) {
+        if (j < (int64_t)prot.size() && prot[(size_t)j] == e) { ++j; continue; }
+        place_expert.push_back(e);
+    }
+    for (int64_t p = 0; p < (int64_t)place_expert.size(); ++p) {
+        const int64_t e = place_expert[(size_t)p];
+        const int64_t r0 = off[(size_t)p], n = off[(size_t)p + 1] - r0;
         if (n <= 0) continue;
         if (c.expert_bf16)
             RAD_ISSUE_N(c_, op_gram_dne, n, brow_slice(w.eff.x, r0, n, K), RAD_NONE,
