@@ -313,6 +313,29 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                 else
                     sbr[r] = rowok[r] && live ? __uint_as_float((uint32_t)se[(size_t)rowr[r] * c.s_ld + g] << 16) : 0.0f;
             }
+            /* FC: the unit's codes as their int8 levels once, for all its rows (run 117: the lookups, LDS gathers,
+             * are the cost -- IC2's wider u64 tables were slower -- and the verify had repeated them a row) */
+            uint32_t lv[FC ? R : 1][FC ? CH : 1][8];
+            if constexpr (FC) {
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int ch = 0; ch < CH; ++ch) {
+                        const uint32_t d[4] = { w[u][r][ch].x, w[u][r][ch].y, w[u][r][ch].z, w[u][r][ch].w };
+#pragma unroll
+                        for (int x = 0; x < 4; ++x) {   /* a code byte (low code, high code) to its two levels */
+                            uint32_t lo8 = 0, hi8 = 0;
+#pragma unroll
+                            for (int bb = 0; bb < 4; ++bb) {
+                                const uint32_t ev = __float_as_uint(s_g[(d[x] >> (8 * bb)) & 255u]);
+                                lo8 |= (ev & 255u) << (8 * bb);
+                                hi8 |= ((ev >> 8) & 255u) << (8 * bb);
+                            }
+                            lv[r][ch][2 * x] = lo8;
+                            lv[r][ch][2 * x + 1] = hi8;
+                        }
+                    }
+            }
 #pragma unroll
             for (int q = 0; q < kMT; ++q) {
                 if ((uint32_t)q >= rn) break;   /* uniform over the work-group */
@@ -333,16 +356,9 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                         const uint32_t d[4] = { w[u][r][ch].x, w[u][r][ch].y, w[u][r][ch].z, w[u][r][ch].w };
 #pragma unroll
                         for (int x = 0; x < 4; ++x) {
-                            if constexpr (FC) {   /* a code byte (low code, high code) to its two levels */
-                                uint32_t lo8 = 0, hi8 = 0;
-#pragma unroll
-                                for (int bb = 0; bb < 4; ++bb) {
-                                    const uint32_t ev = __float_as_uint(s_g[(d[x] >> (8 * bb)) & 255u]);
-                                    lo8 |= (ev & 255u) << (8 * bb);
-                                    hi8 |= ((ev >> 8) & 255u) << (8 * bb);
-                                }
-                                s = dp4((int32_t)lo8, (int32_t)a[8 * ch + 2 * x], s);
-                                s = dp4((int32_t)hi8, (int32_t)a[8 * ch + 2 * x + 1], s);
+                            if constexpr (FC) {
+                                s = dp4((int32_t)lv[r][ch][2 * x], (int32_t)a[8 * ch + 2 * x], s);
+                                s = dp4((int32_t)lv[r][ch][2 * x + 1], (int32_t)a[8 * ch + 2 * x + 1], s);
                             } else {
                                 const uint32_t uu = d[x] ^ 0x88888888u;
                                 s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x], s);

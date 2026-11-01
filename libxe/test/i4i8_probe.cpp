@@ -145,6 +145,7 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
         sycl::local_accessor<uint32_t, 1> s_a(sycl::range<1>(kMT * kMaxK / 4), h);
         sycl::local_accessor<int32_t, 1> s_g(sycl::range<1>(kMT * kMaxK / 64), h);
         sycl::local_accessor<uint32_t, 1> s_t(sycl::range<1>(LUT == 2 ? 256 : 1), h);
+        sycl::local_accessor<uint64_t, 1> s_t8(sycl::range<1>(LUT == 3 ? 1024 : 1), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(T, gx * WGS), sycl::range<2>(1, WGS)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
             const uint32_t i = (uint32_t)it.get_group(0), nb = (uint32_t)it.get_group(1);
@@ -184,6 +185,15 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
                     const int l0 = c0 < 8 ? (int)((kLvl8Packed >> (8 * c0)) & 255u) : -(int)((kLvl8Packed >> (8 * (c0 - 8))) & 255u);
                     const int l1 = c1 < 8 ? (int)((kLvl8Packed >> (8 * c1)) & 255u) : -(int)((kLvl8Packed >> (8 * (c1 - 8))) & 255u);
                     s_t[v] = ((uint32_t)l0 & 255u) | (((uint32_t)l1 & 255u) << 8);
+                }
+            }
+            if constexpr (LUT == 3) {   /* table bb, byte v: its two levels already in place -- the low code's level at
+                                         * byte bb of the low word, the high code's at byte bb of the high word */
+                for (int x = tid; x < 1024; x += WGS) {
+                    const int bb = x >> 8, v = x & 255, c0 = v & 15, c1 = v >> 4;
+                    const int l0 = c0 < 8 ? (int)((kLvl8Packed >> (8 * c0)) & 255u) : -(int)((kLvl8Packed >> (8 * (c0 - 8))) & 255u);
+                    const int l1 = c1 < 8 ? (int)((kLvl8Packed >> (8 * c1)) & 255u) : -(int)((kLvl8Packed >> (8 * (c1 - 8))) & 255u);
+                    s_t8[x] = ((uint64_t)((uint32_t)l0 & 255u) << (8 * bb)) | ((uint64_t)((uint32_t)l1 & 255u) << (32 + 8 * bb));
                 }
             }
             sycl::group_barrier(it.get_group());
@@ -261,6 +271,10 @@ sycl::event i4a8_launch(sycl::queue& q, const uint8_t* const* wtab, const uint16
                                         hi8 |= ((ev >> 8) & 255u) << (8 * bb);
                                     }
                                     lo4 = lo8; hi4 = hi8;
+                                } else if constexpr (LUT == 3) {   /* four lookups, OR-ed: one load and one OR a byte */
+                                    const uint64_t t = s_t8[d[x] & 255u] | s_t8[256u + ((d[x] >> 8) & 255u)] |
+                                                       s_t8[512u + ((d[x] >> 16) & 255u)] | s_t8[768u + (d[x] >> 24)];
+                                    lo4 = (uint32_t)t; hi4 = (uint32_t)(t >> 32);
                                 }
                                 s = sycl::ext::oneapi::dot_acc((int32_t)lo4, (int32_t)a[8 * c + x], s);
                                 s = sycl::ext::oneapi::dot_acc((int32_t)hi4, (int32_t)a[8 * c + 4 + x], s);
@@ -304,7 +318,11 @@ const Variant kVar[] = { { "L16R1", 0, 0 }, { "L16R2", 1, 0 }, { "L16R1W256", 2,
                          { "L8R2", 10, 1 }, { "L8R8", 11, 1 }, { "L8R2W256", 12, 1 }, { "GL4R2", 13, 1 },
                          { "GL4R4", 14, 1 }, { "GL2R2", 15, 1 }, { "GL4R2W256", 16, 1 }, { "GL2R4W256", 17, 1 },
                          { "C-reg L16R1W256", 20, 0, 1 }, { "C-lds L16R1W256", 21, 0, 2 },
-                         { "C-reg GL2R2", 22, 1, 1 }, { "C-lds GL2R2", 23, 1, 2 } };
+                         { "C-reg GL2R2", 22, 1, 1 }, { "C-lds GL2R2", 23, 1, 2 },
+                         /* run 117: LUT 3 -- four position tables of u64 (8 KiB): a byte is one load and one OR; and
+                          * the engine's 512-thread work-group for gate_up (libxe's kWG) */
+                         { "C-lds8 L16R1W256", 24, 0, 3 }, { "C-lds8 GL2R2", 25, 1, 3 },
+                         { "C-lds L16R1", 26, 0, 2 }, { "C-lds8 L16R1", 27, 0, 3 } };
 
 template <bool DUMP>
 sycl::event run_var(const Variant& v, sycl::queue& q, const uint8_t* const* wt, const uint16_t* const* st, const int8_t* A,
@@ -334,6 +352,10 @@ sycl::event run_var(const Variant& v, sycl::queue& q, const uint8_t* const* wt, 
     case 20: return I4C8(16, 5, 1, false, 256, 1);
     case 21: return I4C8(16, 5, 1, false, 256, 2);
     case 22: return I4C8(2, 2, 2, true, 512, 1);
+    case 24: return I4C8(16, 5, 1, false, 256, 3);
+    case 25: return I4C8(2, 2, 2, true, 512, 3);
+    case 26: return I4C8(16, 5, 1, false, 512, 2);
+    case 27: return I4C8(16, 5, 1, false, 512, 3);
     default: return I4C8(2, 2, 2, true, 512, 2);
     }
 #undef I4C8
