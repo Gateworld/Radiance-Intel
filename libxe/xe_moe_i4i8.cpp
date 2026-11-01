@@ -122,10 +122,11 @@ void moe_i4i8_kernel(const int8_t* __restrict__ A, const float* __restrict__ As,
  * writes its zeros. A team of LPR lanes owns R output columns; lane l loads 16-byte chunks (32 codes) l + u * LPR.
  * The activations are staged as (even, odd) dword pairs a block of eight, so a canonical code dword (byte b: element
  * 2b low, 2b + 1 high) meets its two activation dwords directly; a group's two chunks sit on lanes l and l ^ 1 and
- * their exact sums join by one xor (as floats: |sum| < 2^24) before the group's -8 sum(a) and libref's scaling. */
+ * their exact sums join by one xor (as floats: |sum| < 2^24) before the group's -8 sum(a) and libref's scaling.
+ * GL (a group a lane, the probe's GL2R2 for down): lane l owns groups l + u * LPR whole, both chunks, so no join. */
 constexpr int kMT = 4, kWG = 512;
 constexpr uint32_t kMaxK = 4096;
-template <int UPL, int LPR, int R>
+template <int UPL, int LPR, int R, bool GL>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -205,18 +206,22 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         const uint32_t entry = (uint32_t)e >> 1;
         const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry);
         const uint16_t* se = (const uint16_t*)entry_of(c.sbase, c.stab, c.sstride, entry);
-        uint4 w[UPL][R];
+        constexpr int CH = GL ? 2 : 1;   /* chunks a unit */
+        uint4 w[UPL][R][CH];
+#pragma unroll
+        for (int u = 0; u < UPL; ++u)
+#pragma unroll
+            for (int ch = 0; ch < CH; ++ch) {
+                const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) + (uint32_t)ch : (uint32_t)l + (uint32_t)u * LPR;
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
+                                                         : uint4{0, 0, 0, 0};
+            }
 #pragma unroll
         for (int u = 0; u < UPL; ++u) {
-            const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
-#pragma unroll
-            for (int r = 0; r < R; ++r)
-                w[u][r] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
-                                                 : uint4{0, 0, 0, 0};
-        }
-#pragma unroll
-        for (int u = 0; u < UPL; ++u) {
-            const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
+            /* the unit's first chunk; GL: its group's first */
+            const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) : (uint32_t)l + (uint32_t)u * LPR;
             /* No break: the join below is a sub-group shuffle every lane must reach. A chunk past the row (both of a
              * group's, CPR being even) computes on zero codes and adds nothing; its scales are not read. */
             const bool live = jc < CPR;
@@ -229,22 +234,25 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
             for (int q = 0; q < kMT; ++q) {
                 if ((uint32_t)q >= rn) break;   /* uniform over the work-group */
                 const float asc = s_as[q * (kMaxK / 128) + g / 2u], gs = s_g[q * (kMaxK / 64) + g];
-                uint32_t a[8];
+                uint32_t a[8 * CH];
 #pragma unroll
-                for (int t = 0; t < 8; ++t) a[t] = live ? s_a[q * (kMaxK / 4) + jc * 8u + (uint32_t)t] : 0u;
+                for (int t = 0; t < 8 * CH; ++t) a[t] = live ? s_a[q * (kMaxK / 4) + jc * 8u + (uint32_t)t] : 0u;
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
-                    const uint32_t d[4] = { w[u][r].x, w[u][r].y, w[u][r].z, w[u][r].w };
                     int32_t s = 0;
 #pragma unroll
-                    for (int x = 0; x < 4; ++x) {
-                        const uint32_t uu = d[x] ^ 0x88888888u;
-                        s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[2 * x], s);
-                        s = dp4((int32_t)((uu >> 4) & 0x0F0F0F0Fu), (int32_t)a[2 * x + 1], s);
+                    for (int ch = 0; ch < CH; ++ch) {
+                        const uint32_t d[4] = { w[u][r][ch].x, w[u][r][ch].y, w[u][r][ch].z, w[u][r][ch].w };
+#pragma unroll
+                        for (int x = 0; x < 4; ++x) {
+                            const uint32_t uu = d[x] ^ 0x88888888u;
+                            s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x], s);
+                            s = dp4((int32_t)((uu >> 4) & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x + 1], s);
+                        }
                     }
                     float fs = (float)s;
-                    fs += __shfl_xor(fs, 1);   /* the group's other chunk */
-                    if ((l & 1) == 0 && rowok[r] && live) acc[q][r] += ((fs - 8.0f * gs) * asc) * sbr[r];
+                    if constexpr (!GL) fs += __shfl_xor(fs, 1);   /* the group's other chunk */
+                    if ((GL || (l & 1) == 0) && rowok[r] && live) acc[q][r] += ((fs - 8.0f * gs) * asc) * sbr[r];
                 }
             }
         }
@@ -254,10 +262,10 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         if ((uint32_t)q >= rn) break;
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            float v = acc[q][r];   /* the even lanes' sums (the odd lanes hold 0) */
+            float v = acc[q][r];   /* not GL: the even lanes' sums (the odd lanes hold 0) */
             if constexpr (LPR == 16) v += __shfl_xor(v, 8);
             if constexpr (LPR >= 8) v += __shfl_xor(v, 4);
-            v += __shfl_xor(v, 2);
+            if constexpr (LPR >= 4) v += __shfl_xor(v, 2);
             v += __shfl_xor(v, 1);
             const uint32_t n = nb * ((kWG / LPR) * R) + (uint32_t)(team * R + r);
             if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] ? v : 0.0f);
@@ -343,29 +351,34 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     try {
         sycl::queue* qq = (sycl::queue*)s;
         if (!plain_forced() && K <= (long long)kMaxK) {
-            /* the run form: 8 lanes a column at K <= 512 (down, 4-8 groups a row), two columns a team; else 16
-             * (gate_up) and one column a team -- the probe's best gate_up mapping (L16R1), and at two columns
-             * IGC 2.41.5 spills ~259 bytes of <5, 16, 2> (run 114) */
-            const int lpr = K <= 512 ? 8 : 16, rpt = lpr == 8 ? 2 : 1;
-            const int upl = (int)((K / 32 + lpr - 1) / lpr);
+            /* the run form: at K <= 512 (down, 2-8 groups a row) a group a lane, 2 lanes a column and two columns a
+             * team (the probe's GL2R2: 33 us at the verify against L8R2's 42); else 16 lanes a column (gate_up) and
+             * one column a team -- the probe's best gate_up mapping (L16R1), and at two columns IGC 2.41.5 spills
+             * ~259 bytes of <5, 16, 2> (run 114) */
+            const bool gl = K <= 512;
+            const int lpr = gl ? 2 : 16, rpt = gl ? 2 : 1;
+            const int upl = gl ? (int)((K / 64 + lpr - 1) / lpr) : (int)((K / 32 + lpr - 1) / lpr);
             const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
             const dim3 grid((unsigned)((N + cpw - 1) / cpw), (unsigned)T), block(kWG);
-#define XE_I4I8_RUN(U, L, R)                                                                                 \
-    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R>), grid, block, 0, (const int8_t*)Aq->data,            \
+#define XE_I4I8_RUN(U, L, R, G)                                                                              \
+    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G>), grid, block, 0, (const int8_t*)Aq->data,         \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
                  (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M)
-            if (lpr == 8) {
-                if (upl <= 1) XE_I4I8_RUN(1, 8, 2); else XE_I4I8_RUN(2, 8, 2);
+            if (gl) switch (upl) {
+                case 1: XE_I4I8_RUN(1, 2, 2, true); break;
+                case 2: XE_I4I8_RUN(2, 2, 2, true); break;
+                case 3: XE_I4I8_RUN(3, 2, 2, true); break;
+                default: XE_I4I8_RUN(4, 2, 2, true); break;
             } else switch (upl) {
-                case 1: XE_I4I8_RUN(1, 16, 1); break;
-                case 2: XE_I4I8_RUN(2, 16, 1); break;
-                case 3: XE_I4I8_RUN(3, 16, 1); break;
-                case 4: XE_I4I8_RUN(4, 16, 1); break;
-                case 5: XE_I4I8_RUN(5, 16, 1); break;
-                case 6: XE_I4I8_RUN(6, 16, 1); break;
-                case 7: XE_I4I8_RUN(7, 16, 1); break;
-                default: XE_I4I8_RUN(8, 16, 1); break;
+                case 1: XE_I4I8_RUN(1, 16, 1, false); break;
+                case 2: XE_I4I8_RUN(2, 16, 1, false); break;
+                case 3: XE_I4I8_RUN(3, 16, 1, false); break;
+                case 4: XE_I4I8_RUN(4, 16, 1, false); break;
+                case 5: XE_I4I8_RUN(5, 16, 1, false); break;
+                case 6: XE_I4I8_RUN(6, 16, 1, false); break;
+                case 7: XE_I4I8_RUN(7, 16, 1, false); break;
+                default: XE_I4I8_RUN(8, 16, 1, false); break;
             }
 #undef XE_I4I8_RUN
             return RAD_OK;
