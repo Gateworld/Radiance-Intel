@@ -652,6 +652,26 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * whole experts bf16: those whose output dwarfs the rest, where the same relative rounding
      * error is large in absolute terms (docs/MOE-W4.md). They are sorted last and served by their
      * own bf16 GEMM pair, so they must be known before the sort is declared. */
+    /* Run 115 (owner note 146 item 3, the one-layer timing convert): a layer the architecture did not probe is
+     * served in the format its own experts hold. The probe reads this loop's first expert, so its gate_up map is
+     * made where the loop would make it and the graph is the same. A layer may differ from the probed one only
+     * within the rotated four-bit formats (w4nl's and w4g64i8h's), whose input is the same rotated read: what the
+     * architecture sized from the probed format holds, and w4g64i8h quantises its own int8 inputs. */
+    if (c.probed_layer != l) {
+        Config pc = c;
+        pc.probed_expert = c.expert_base;
+        RAD_ARCH_TRY(probe(b, nm, l, src, &pc));
+        const bool same = pc.expert_w4 == c.expert_w4 && pc.expert_rot == c.expert_rot && pc.expert_nl == c.expert_nl &&
+                          pc.expert_g64 == c.expert_g64 && pc.expert_w5 == c.expert_w5 && pc.expert_i8 == c.expert_i8 &&
+                          pc.expert_bf16 == c.expert_bf16 && pc.expert_mx == c.expert_mx &&
+                          pc.expert_f32_scale == c.expert_f32_scale;
+        if (!same && !(pc.expert_rot && c.expert_rot && pc.expert_w4 && c.expert_w4)) {
+            fprintf(stderr, "radiance: layer %d's experts are in another format than the probed layer's, and a layer "
+                            "may differ only within the rotated four-bit formats\n", l);
+            return RAD_E_DTYPE;
+        }
+        c = pc;
+    }
     const int64_t ne = c.n_expert;
     for (int64_t e = 0; e < ne; ++e) {
         const long long ge = (long long)(c.expert_base + e);   /* the checkpoint's numbering */
