@@ -18,14 +18,25 @@
  * classes by parity (entry e / 2 of class e % 2), as the declaration splits them at one or two ranks; the four-class
  * form (four ranks) is not served here. A sub-group of 32 computes one output, lanes over the weight groups -- the
  * first, plain form; the probe's faster mappings (several rows a team, a group a lane pair) come next.
+ *
+ * Format C (w4nl64i8h, owner note 147, run 116): the same run form over today's joined w4nl64a8h entries (read as
+ * xe_moe_planes.cpp lays them out, its layout hooks on the row), each code an index into its entry's 16 levels
+ * rounded to int8 -- see moe_i4i8_run_kernel's FC.
  */
 #include "xe_lanes.h"
 #include "r4d_args.h"
+#include "rad_planes.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+/* 1: this file compiled again as xe_moe_w4nl_i8.cpp, format C's own translation unit -- its own device image, so the
+ * CPU device's JIT of one form never takes the other with it (run 116: the CPU JIT crashed on the joined image) */
+#ifndef XE_I4I8_FC
+#define XE_I4I8_FC 0
+#endif
 
 namespace {
 
@@ -37,11 +48,19 @@ struct ICls {
     const void* const* stab;
     uint64_t sstride;
     uint32_t n, k;
-    uint32_t w_ld, s_ld;     /* row pitches: bytes of codes, bf16 elements of scales */
+    uint32_t w_ld, s_ld;     /* row pitches: bytes of codes, bf16 elements of scales (format C: E4M3 bytes) */
+    /* format C: the joined entries' plane offsets (codes, table; scale, scale.1); 0 at format B */
+    uint32_t c_off, t_off, s_off, s1_off;
 };
 
 inline const uint8_t* entry_of(const uint8_t* base, const void* const* tab, uint64_t stride, uint32_t e) {
     return tab ? (const uint8_t*)tab[e] : base + (uint64_t)e * stride;
+}
+inline float e4m3_to_f32(uint32_t v) {
+    const uint32_t s = (v & 0x80u) << 24, ex = (v >> 3) & 15u, m = v & 7u;
+    if (ex == 15u && m == 7u) return __uint_as_float(s | 0x7fc00000u);
+    if (ex == 0u) return __uint_as_float(s | __float_as_uint((float)m * 0.001953125f));   /* m x 2^-9 */
+    return __uint_as_float(s | ((ex + 120u) << 23) | (m << 20));
 }
 inline uint16_t to_bf16(float f) {
     const uint32_t u = __float_as_uint(f);
@@ -127,13 +146,20 @@ void moe_i4i8_kernel(const int8_t* __restrict__ A, const float* __restrict__ As,
  * GL (a group a lane, the probe's GL2R2 for down): lane l owns groups l + u * LPR whole, both chunks, so no join. */
 constexpr int kMT = 4, kWG = 512;
 constexpr uint32_t kMaxK = 4096;
-template <int UPL, int LPR, int R, bool GL>
+/* FC (format C, w4nl64i8h, owner note 147): the codes are indices into the entry's 16 f32 levels, which libref
+ * (ref_moe.cpp) rounds to int8 integers at the entry's amax, nearbyint(level * 127 / amax), moving amax / 127 into
+ * the weight scale: e4m3(scale) * (scale.1 * (amax / 127)). The work-group builds a 256-entry table, a code byte
+ * (low code, high code) to its two int8 levels (the probe's C-lds), and the sums need no -8 sum(a) term. */
+template <int UPL, int LPR, int R, bool GL, bool FC = false>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
     XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
-    XE_SHARED(float, s_g, kMT * (kMaxK / 64));     /* each group's activation sum (exact) */
+    /* each group's activation sum (exact); FC, which needs none: the 256-entry table, a byte -> two levels (bits).
+     * (A separate FC-only array, declared and unused in format B's instantiation, crashed the CPU device: run 116.) */
+    XE_SHARED(float, s_g, kMT * (kMaxK / 64));
+    static_assert(kMT * (kMaxK / 64) >= 256, "FC's table lives in s_g");
     XE_SHARED(float, s_as, kMT * (kMaxK / 128));   /* the per-128 scales */
     const int tid = (int)threadIdx.x;
     const uint32_t i = blockIdx.y, nb = blockIdx.x;
@@ -190,10 +216,23 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                 sa += __shfl_xor(sa, 4);
                 sa += __shfl_xor(sa, 2);
                 sa += __shfl_xor(sa, 1);
-                if (in && (b & 7u) == 0) s_g[q * (kMaxK / 64) + b / 8u] = (float)sa;
+                if (!FC && in && (b & 7u) == 0) s_g[q * (kMaxK / 64) + b / 8u] = (float)sa;
             }
             for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kWG)
                 s_as[q * (kMaxK / 128) + g] = As[(size_t)tokr[q] * as_ld + g];
+        }
+        if constexpr (FC) {
+            if (tid < 256) {
+                const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, (uint32_t)e >> 1) + c.t_off);
+                float amax = 0.0f;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
+                const float l0 = tab[tid & 15], l1 = tab[tid >> 4];
+                const int i0 = amax > 0.0f ? (int)sycl::rint(l0 * 127.0f / amax) : (int)l0;
+                const int i1 = amax > 0.0f ? (int)sycl::rint(l1 * 127.0f / amax) : (int)l1;
+                /* 0x40000000: a normal float's bits, so no denormal flush can touch them (reads take the low 16) */
+                s_g[tid] = __uint_as_float(0x40000000u | ((uint32_t)i0 & 255u) | (((uint32_t)i1 & 255u) << 8));
+            }
         }
     }
     __syncthreads();
@@ -213,8 +252,18 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
     if (e >= 0) {
         const uint32_t CPR = K / 32u;
         const uint32_t entry = (uint32_t)e >> 1;
-        const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry);
-        const uint16_t* se = (const uint16_t*)entry_of(c.sbase, c.stab, c.sstride, entry);
+        const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry) + c.c_off;
+        const uint8_t* se8 = entry_of(c.sbase, c.stab, c.sstride, entry) + c.s_off;
+        const uint16_t* se = (const uint16_t*)se8;
+        float smul = 1.0f;   /* FC: scale.1 x amax / 127, as libref folds it */
+        if constexpr (FC) {
+            const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, entry) + c.t_off);
+            float amax = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
+            const float s1 = *(const float*)(se8 - c.s_off + c.s1_off);
+            smul = amax > 0.0f ? s1 * (amax / 127.0f) : s1;
+        }
         constexpr int CH = GL ? 2 : 1;   /* chunks a unit */
         uint4 w[UPL][R][CH];
 #pragma unroll
@@ -237,8 +286,12 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
             const uint32_t g = live ? jc / 2u : 0u;
             float sbr[R];
 #pragma unroll
-            for (int r = 0; r < R; ++r)
-                sbr[r] = rowok[r] && live ? __uint_as_float((uint32_t)se[(size_t)rowr[r] * c.s_ld + g] << 16) : 0.0f;
+            for (int r = 0; r < R; ++r) {
+                if constexpr (FC)
+                    sbr[r] = rowok[r] && live ? e4m3_to_f32(se8[(size_t)rowr[r] * c.s_ld + g]) * smul : 0.0f;
+                else
+                    sbr[r] = rowok[r] && live ? __uint_as_float((uint32_t)se[(size_t)rowr[r] * c.s_ld + g] << 16) : 0.0f;
+            }
 #pragma unroll
             for (int q = 0; q < kMT; ++q) {
                 if ((uint32_t)q >= rn) break;   /* uniform over the work-group */
@@ -259,14 +312,27 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                         const uint32_t d[4] = { w[u][r][ch].x, w[u][r][ch].y, w[u][r][ch].z, w[u][r][ch].w };
 #pragma unroll
                         for (int x = 0; x < 4; ++x) {
-                            const uint32_t uu = d[x] ^ 0x88888888u;
-                            s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x], s);
-                            s = dp4((int32_t)((uu >> 4) & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x + 1], s);
+                            if constexpr (FC) {   /* a code byte (low code, high code) to its two levels */
+                                uint32_t lo8 = 0, hi8 = 0;
+#pragma unroll
+                                for (int bb = 0; bb < 4; ++bb) {
+                                    const uint32_t ev = __float_as_uint(s_g[(d[x] >> (8 * bb)) & 255u]);
+                                    lo8 |= (ev & 255u) << (8 * bb);
+                                    hi8 |= ((ev >> 8) & 255u) << (8 * bb);
+                                }
+                                s = dp4((int32_t)lo8, (int32_t)a[8 * ch + 2 * x], s);
+                                s = dp4((int32_t)hi8, (int32_t)a[8 * ch + 2 * x + 1], s);
+                            } else {
+                                const uint32_t uu = d[x] ^ 0x88888888u;
+                                s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x], s);
+                                s = dp4((int32_t)((uu >> 4) & 0x0F0F0F0Fu), (int32_t)a[8 * ch + 2 * x + 1], s);
+                            }
                         }
                     }
                     float fs = (float)s;
                     if constexpr (!GL) fs += __shfl_xor(fs, 1);   /* the group's other chunk */
-                    if ((GL || (l & 1) == 0) && rowok[r] && live) acc[q][r] += ((fs - 8.0f * gs) * asc) * sbr[r];
+                    if constexpr (!FC) fs -= 8.0f * gs;
+                    if ((GL || (l & 1) == 0) && rowok[r] && live) acc[q][r] += (fs * asc) * sbr[r];
                 }
             }
         }
@@ -305,10 +371,9 @@ int table_of(const RadTensor* t, long long cnt, const uint8_t** base, const void
     return RAD_OK;
 }
 
-}  // namespace
-
-/* moe_gemm_q (two classes): a, a_scale, w, w_scale, sorted, offsets, w_odd, w_scale_odd, y */
-extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
+/* moe_gemm_q (two classes): a, a_scale, w, w_scale, sorted, offsets, w_odd, w_scale_odd, y. fc: format C, the
+ * joined w4nl64a8h entries (codes,table; scale,scale.1 -- xe_moe_planes.cpp's layout) against int8 activations. */
+int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
     const RadTensor* Aq = r4d_opt(a, 0);
     const RadTensor* As = r4d_opt(a, 1);
     const RadTensor* sorted = r4d_opt(a, 4);
@@ -319,7 +384,7 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     if (!Aq || !As || !sorted || !off || !Y || !W[0] || !W[1] || !Ws[0] || !Ws[1]) return R4D_NO(RAD_E_INVAL);
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data) return R4D_NO(RAD_E_INVAL);
     const char* wdt = r4d_gets(a, "dtype");
-    if (!wdt || std::strcmp(wdt, "w4g64i8h")) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!wdt || std::strcmp(wdt, fc ? "w4nl64i8h" : "w4g64i8h")) return R4D_NO(RAD_E_UNSUPPORTED);
     long long Nc[2] = { r4d_geti_or(a, "N", 0), 0 }, Kc[2] = { r4d_geti_or(a, "K", 0), 0 };
     Nc[1] = r4d_geti_or(a, "N_odd", Nc[0]);
     Kc[1] = r4d_geti_or(a, "K_odd", Kc[0]);
@@ -347,20 +412,35 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     if (ord && !a_sorted && std::strcmp(ord, "token")) return R4D_NO(RAD_E_UNSUPPORTED);
     if (M < (a_sorted ? T : (T + top_k - 1) / top_k)) return R4D_NO(RAD_E_SHAPE);
     ICls cl[2]{};
+    if (fc != (XE_I4I8_FC != 0)) return R4D_NO(RAD_E_UNSUPPORTED);   /* each form is its own file's */
+    if (fc && (K > (long long)kMaxK || plain_forced())) return R4D_NO(RAD_E_UNSUPPORTED);   /* the run form only */
     for (int q = 0; q < 2; ++q) {
         const long long cnt = (n_expert + 1 - q) / 2;
-        if (W[q]->dtype != RAD_I4 || Ws[q]->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+        if (fc ? W[q]->dtype != RAD_U4 : (W[q]->dtype != RAD_I4 || Ws[q]->dtype != RAD_BF16))
+            return R4D_NO(RAD_E_DTYPE);
         int rc = table_of(W[q], cnt, &cl[q].base, &cl[q].tab, &cl[q].stride);
         if (rc == RAD_OK) rc = table_of(Ws[q], cnt, &cl[q].sbase, &cl[q].stab, &cl[q].sstride);
         if (rc != RAD_OK) return rc;
+        cl[q].n = (uint32_t)Nc[q];
+        cl[q].k = (uint32_t)Kc[q];
+        if (fc) {
+            /* the joined entries as xe_moe_planes_relayout writes them (rad_planes.h): the planes after a header and
+             * two entries, codes [N, K/2 bytes] then the 16 levels; E4M3 scales [N, K/64] then scale.1 */
+            const uint32_t p0 = (uint32_t)rad_planes_round((int64_t)sizeof(RadPlanesHeader) + 2 * (int64_t)sizeof(RadPlanesEntry));
+            cl[q].w_ld = (uint32_t)(Kc[q] / 2);
+            cl[q].s_ld = (uint32_t)(Kc[q] / 64);
+            cl[q].c_off = p0;
+            cl[q].t_off = (uint32_t)rad_planes_round(p0 + Nc[q] * (Kc[q] / 2));
+            cl[q].s_off = p0;
+            cl[q].s1_off = (uint32_t)rad_planes_round(p0 + Nc[q] * (Kc[q] / 64));
+            continue;
+        }
         /* the canonical planes: rows of K/2 bytes and K/64 scales (a stacked plane's own row stride if it has one) */
         const long long wr = W[q]->rank >= 3 && W[q]->stride[0] != 0 ? W[q]->stride[1] : Kc[q];
         const long long sr = Ws[q]->rank >= 3 && Ws[q]->stride[0] != 0 ? Ws[q]->stride[1] : Kc[q] / 64;
         if (wr < Kc[q] || wr % 8 || sr < Kc[q] / 64) return R4D_NO(RAD_E_STRIDE);
         cl[q].w_ld = (uint32_t)(wr / 2);
         cl[q].s_ld = (uint32_t)sr;
-        cl[q].n = (uint32_t)Nc[q];
-        cl[q].k = (uint32_t)Kc[q];
     }
     try {
         sycl::queue* qq = (sycl::queue*)s;
@@ -385,17 +465,18 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
                 for (int x = 0; x < nseen; ++x) known = known || seen[x] == key;
                 if (!known && nseen < 64) {
                     seen[nseen++] = key;
-                    std::fprintf(stderr, "[xe] w4g64i8h launch: T %lld N %lld K %lld parts %lld top_k %lld classes n %u / %u "
-                                 "k %u / %u, a %s, M %lld, grid %u x %u of %d\n", (long long)T, (long long)N, (long long)K,
+                    std::fprintf(stderr, "[xe] %s launch: T %lld N %lld K %lld parts %lld top_k %lld classes n %u / %u "
+                                 "k %u / %u, a %s, M %lld, grid %u x %u of %d\n", wdt, (long long)T, (long long)N, (long long)K,
                                  (long long)parts, (long long)top_k, cl[0].n, cl[1].n, cl[0].k, cl[1].k,
                                  a_sorted ? "sorted" : "token", (long long)M, grid.x, grid.y, kWG);
                 }
             }
-#define XE_I4I8_RUN(U, L, R, G)                                                                              \
-    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G>), grid, block, 0, (const int8_t*)Aq->data,         \
+#define XE_I4I8_RUN_F(U, L, R, G, F)                                                                         \
+    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, (const int8_t*)Aq->data,      \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
                  (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M)
+#define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
             if (gl) switch (upl) {
                 case 1: XE_I4I8_RUN(1, 2, 2, true); break;
                 case 2: XE_I4I8_RUN(2, 2, 2, true); break;
@@ -412,6 +493,7 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
                 default: XE_I4I8_RUN(8, 16, 1, false); break;
             }
 #undef XE_I4I8_RUN
+#undef XE_I4I8_RUN_F
             return RAD_OK;
         }
         XE_LAUNCH(qq, moe_i4i8_kernel, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
@@ -424,3 +506,12 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     }
     return RAD_OK;
 }
+
+}  // namespace
+
+#if XE_I4I8_FC
+/* format C (owner note 147): w4nl64i8h, the w4nl64a8h planes against int8 activations */
+extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, true); }
+#else
+extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, false); }
+#endif
