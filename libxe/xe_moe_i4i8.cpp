@@ -343,27 +343,29 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     try {
         sycl::queue* qq = (sycl::queue*)s;
         if (!plain_forced() && K <= (long long)kMaxK) {
-            /* the run form: 8 lanes a column at K <= 512 (down, 4-8 groups a row), else 16 (gate_up) */
-            const int lpr = K <= 512 ? 8 : 16;
+            /* the run form: 8 lanes a column at K <= 512 (down, 4-8 groups a row), two columns a team; else 16
+             * (gate_up) and one column a team -- the probe's best gate_up mapping (L16R1), and at two columns
+             * IGC 2.41.5 spills ~259 bytes of <5, 16, 2> (run 114) */
+            const int lpr = K <= 512 ? 8 : 16, rpt = lpr == 8 ? 2 : 1;
             const int upl = (int)((K / 32 + lpr - 1) / lpr);
-            const unsigned cpw = (unsigned)((kWG / lpr) * 2);
+            const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
             const dim3 grid((unsigned)((N + cpw - 1) / cpw), (unsigned)T), block(kWG);
-#define XE_I4I8_RUN(U, L)                                                                                    \
-    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, 2>), grid, block, 0, (const int8_t*)Aq->data,            \
+#define XE_I4I8_RUN(U, L, R)                                                                                 \
+    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R>), grid, block, 0, (const int8_t*)Aq->data,            \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
                  (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M)
             if (lpr == 8) {
-                if (upl <= 1) XE_I4I8_RUN(1, 8); else XE_I4I8_RUN(2, 8);
+                if (upl <= 1) XE_I4I8_RUN(1, 8, 2); else XE_I4I8_RUN(2, 8, 2);
             } else switch (upl) {
-                case 1: XE_I4I8_RUN(1, 16); break;
-                case 2: XE_I4I8_RUN(2, 16); break;
-                case 3: XE_I4I8_RUN(3, 16); break;
-                case 4: XE_I4I8_RUN(4, 16); break;
-                case 5: XE_I4I8_RUN(5, 16); break;
-                case 6: XE_I4I8_RUN(6, 16); break;
-                case 7: XE_I4I8_RUN(7, 16); break;
-                default: XE_I4I8_RUN(8, 16); break;
+                case 1: XE_I4I8_RUN(1, 16, 1); break;
+                case 2: XE_I4I8_RUN(2, 16, 1); break;
+                case 3: XE_I4I8_RUN(3, 16, 1); break;
+                case 4: XE_I4I8_RUN(4, 16, 1); break;
+                case 5: XE_I4I8_RUN(5, 16, 1); break;
+                case 6: XE_I4I8_RUN(6, 16, 1); break;
+                case 7: XE_I4I8_RUN(7, 16, 1); break;
+                default: XE_I4I8_RUN(8, 16, 1); break;
             }
 #undef XE_I4I8_RUN
             return RAD_OK;
