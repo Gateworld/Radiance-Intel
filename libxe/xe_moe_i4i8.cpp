@@ -23,6 +23,7 @@
 #include "r4d_args.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -373,6 +374,23 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
             const int upl = gl ? (int)((K / 64 + lpr - 1) / lpr) : (int)((K / 32 + lpr - 1) / lpr);
             const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
             const dim3 grid((unsigned)((N + cpw - 1) / cpw), (unsigned)T), block(kWG);
+            /* RADIANCE_XE_I4I8_TRACE=1 (run 116): each distinct launch geometry once, on stderr -- the engine's own
+             * shapes, against the probe's (P53: the run form slower in the engine than in i4i8_probe) */
+            static const bool trace = [] { const char* v = std::getenv("RADIANCE_XE_I4I8_TRACE"); return v && *v == '1'; }();
+            if (trace) {
+                static thread_local long long seen[64];
+                static thread_local int nseen = 0;
+                const long long key = (long long)T * 1000003LL + N * 131LL + K * 7LL + (a_sorted ? 1 : 0) + parts * 3LL;
+                bool known = false;
+                for (int x = 0; x < nseen; ++x) known = known || seen[x] == key;
+                if (!known && nseen < 64) {
+                    seen[nseen++] = key;
+                    std::fprintf(stderr, "[xe] w4g64i8h launch: T %lld N %lld K %lld parts %lld top_k %lld classes n %u / %u "
+                                 "k %u / %u, a %s, M %lld, grid %u x %u of %d\n", (long long)T, (long long)N, (long long)K,
+                                 (long long)parts, (long long)top_k, cl[0].n, cl[1].n, cl[0].k, cl[1].k,
+                                 a_sorted ? "sorted" : "token", (long long)M, grid.x, grid.y, kWG);
+                }
+            }
 #define XE_I4I8_RUN(U, L, R, G)                                                                              \
     XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G>), grid, block, 0, (const int8_t*)Aq->data,         \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
