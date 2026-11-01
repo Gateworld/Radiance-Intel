@@ -12,6 +12,15 @@
 #if !(defined(RAD_HAVE_L0) && RAD_HAVE_L0)
 /* The gather is the Level Zero backend's (core/device/l0_kernels.sycl); elsewhere gather mode is never on. */
 extern "C" int rad_xp_gather_launch(const rad::XpBox*, uint64_t, uint32_t*, uint32_t*, uint32_t, void*) { return -1; }
+extern "C" int rad_xp_plan2_launch(const float*, uint32_t, uint32_t, uint32_t, void** const*, const int32_t*,
+                                   const int32_t*, rad::XpPools, uint64_t, uint64_t, rad::XpRec*, int32_t*,
+                                   rad::XpBox*, uint32_t*, rad::XpStats*, void*) {
+    return -1;
+}
+extern "C" int rad_xp_step2_launch(const rad::XpRec*, const int32_t*, int, int, const uint32_t*, const uint32_t*,
+                                   void*) {
+    return -1;
+}
 #endif
 #if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP) && !(defined(RAD_HAVE_L0) && RAD_HAVE_L0)
 /* A build without HIP or Level Zero has no kernels to launch: rad_xp_supported is 0 there, so nothing
@@ -65,6 +74,7 @@ void Ctx::xp_free(XpState& x) {
         if (p) rad_dev_free(p, x.gather ? RAD_MEM_DEVICE : RAD_MEM_HOST_PINNED);
     if (x.stats_h) rad_dev_free(x.stats_h, RAD_MEM_HOST_PINNED);
     if (x.ctr) rad_dev_free(x.ctr, RAD_MEM_DEVICE);
+    if (x.tick) rad_dev_free(x.tick, RAD_MEM_DEVICE);
     if (x.mark_ev) rad_event_destroy(x.mark_ev);
     if (x.tail) rad_event_destroy(x.tail);
     if (x.sync) rad_event_destroy(x.sync);
@@ -101,17 +111,26 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
     x->logits = (float*)rad_dev_alloc(4 * (int64_t)kXpGroups * kXpMaxRows * kXpMaxNe, RAD_MEM_DEVICE);
     x->maps   = (void**)rad_dev_alloc(nl * kXpMaxNe * kXpParts * (int64_t)sizeof(void*), RAD_MEM_DEVICE);
     x->places = (int32_t*)rad_dev_alloc(nl * kXpMaxNe * 4, RAD_MEM_DEVICE);
-    /* Gather mode: the Level Zero backend has no DMA queue to spare; a kernel copies (see xp_mark_run). */
+    /* Level Zero (owner note 139 stage 1): RADIANCE_XE_EXPERT_PREFETCH=1 is v2 (rec2: recorded kernels on the
+     * compute stream, copies on the copy engine by the host thread); =2 the first form, gather mode (host steps a
+     * layer, a gather kernel on the prefetch queue; exact, but the tape cuts cost 22 %, M175). */
 #if defined(RAD_HAVE_L0) && RAD_HAVE_L0
-    x->gather = true;
+    {
+        const char* e = std::getenv("RADIANCE_XE_EXPERT_PREFETCH");
+        if (e && e[0] == '2') x->gather = true;
+        else x->rec2 = true;
+    }
 #endif
     const int bk = x->gather ? RAD_MEM_DEVICE : RAD_MEM_HOST_PINNED;
     x->box    = (XpBox*)rad_dev_alloc((int64_t)sizeof(XpBox) * kXpGroups, bk);
     x->done   = (uint32_t*)rad_dev_alloc(4 * kXpGroups, bk);
     x->stats_h = (XpStats*)rad_dev_alloc((int64_t)sizeof(XpStats), RAD_MEM_HOST_PINNED);
     if (x->gather) x->ctr = (uint32_t*)rad_dev_alloc(4 * kXpGroups, RAD_MEM_DEVICE);
+    if (x->rec2) x->tick = (uint32_t*)rad_dev_alloc(4 * kXpGroups, RAD_MEM_DEVICE);
     const bool ok = x->ring && x->rec && x->nrec && x->stats && x->logits && x->maps && x->places && x->box &&
-                    x->done && x->stats_h && (!x->gather || x->ctr) && rad_xp_stream_create(&x->stream) >= 0 &&
+                    x->done && x->stats_h && (!x->gather || x->ctr) && (!x->rec2 || x->tick) &&
+                    (!x->rec2 || rad_memset_async(x->tick, 0, 4 * kXpGroups, stream_) >= 0) &&
+                    rad_xp_stream_create(&x->stream) >= 0 &&
                     rad_event_create_local(&x->tail) >= 0 && rad_event_create_local(&x->sync) >= 0 &&
                     (!x->gather || rad_event_create_local(&x->mark_ev) >= 0) &&
                     rad_memset_async(x->nrec, 0, 4 * kXpGroups, stream_) >= 0 &&
@@ -131,9 +150,12 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
     }
     x->layers.resize((size_t)nl);
     XpState* xs = x.get();
-    if (!x->gather) x->thr = std::thread([this, xs] { xp_serve(*xs); });
+    if (x->rec2) x->thr = std::thread([this, xs] { xp_poll(*xs); });
+    else if (!x->gather) x->thr = std::thread([this, xs] { xp_serve(*xs); });
     RAD_INFO("rank %d: expert prefetch on: %d copies a routed layer by %s, ring %s, %d pool ranges", rank_, kXpSlots,
-             x->gather ? "a gather kernel on its own queue" : "DMA", humanb(ring).c_str(), x->pools.n);
+             x->rec2 ? "the copy engine, the plan recorded with the pass (v2)"
+                     : x->gather ? "a gather kernel on its own queue" : "DMA",
+             humanb(ring).c_str(), x->pools.n);
     xp_ = std::move(x);
 }
 
@@ -259,9 +281,11 @@ bool Ctx::xp_bind(XpLayer& L, int layer) {
     XpState& x = *xp_;
     void** map = x.maps + (size_t)layer * kXpMaxNe * kXpParts;
     int32_t* place = x.places + (size_t)layer * kXpMaxNe;
-    /* Runs once per layer at first issue, so this host wait is off the step path. */
-    if (rad_memcpy_async(map, hm.data(), (int64_t)hm.size() * (int64_t)sizeof(void*), stream_) < 0 ||
-        rad_memcpy_async(place, hp.data(), (int64_t)hp.size() * 4, stream_) < 0 || rad_stream_sync(stream_) < 0)
+    /* Runs once per layer at first issue, so this host wait is off the step path. v2 binds while a pass may be
+     * recording natively on the compute stream, so it uploads on the prefetch's own queue, which never records. */
+    const RadStream bs = x.rec2 ? x.stream : stream_;
+    if (rad_memcpy_async(map, hm.data(), (int64_t)hm.size() * (int64_t)sizeof(void*), bs) < 0 ||
+        rad_memcpy_async(place, hp.data(), (int64_t)hp.size() * 4, bs) < 0 || rad_stream_sync(bs) < 0)
         return false;
     L.map = map;
     L.place = place;
@@ -297,6 +321,9 @@ void Ctx::xp_judge(XpState& x) {
  * its stream work and rides are issued afresh, not recorded. */
 int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
     if (!xp_ && nx && rows > 0 && rows <= kXpMaxRows && xg_on()) return xg_guess(*nx, h, r0, rows, n_embd);
+    /* v2: kernels on the compute stream, recorded with the pass when it records -- never a tape step. */
+    if (xp_ && xp_->rec2)
+        return nx && rows > 0 && rows <= kXpMaxRows ? xp_predict_rec(*nx, h, r0, rows, n_embd) : RAD_OK;
     /* Too wide to predict; keep the tape free of an empty step. */
     if (!xp_ || !nx || rows <= 0 || rows > kXpMaxRows) return RAD_OK;
     if (!rec_) return xp_predict_run(*nx, h, r0, rows, n_embd);
@@ -314,7 +341,7 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
 }
 
 int Ctx::xp_mark() {
-    if (!xp_) return RAD_OK;
+    if (!xp_ || xp_->rec2) return RAD_OK;   /* v2: the host thread starts the copies as soon as it sees the plan */
     if (!rec_) return xp_mark_run();
     TapeStep st;
     st.kind = kTapeXpMark;
@@ -323,6 +350,7 @@ int Ctx::xp_mark() {
 
 int Ctx::xp_step(int layer) {
     if (!xp_ && xg_on()) xg_judge(layer);
+    if (xp_ && xp_->rec2) return xp_step_rec(layer);
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_step_run(layer);
     TapeStep st;
@@ -451,6 +479,101 @@ int Ctx::xp_step_run(int layer) {
     x.restore_g = patch ? L->g : -1;
     if (L) L->want = false;
     return RAD_OK;
+}
+
+/* ---- v2 (owner note 139 stage 1, run 113): recorded kernels and the copy engine ---- */
+
+/* At this layer's router input, on the compute stream: the next layer's logits and the plan, which numbers the
+ * request from the group's device ticket and writes the pinned mailbox. Plain launches, so a pass being recorded
+ * keeps them and every play repeats them; nothing here waits or cuts the tape. */
+int Ctx::xp_predict_rec(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
+    XpState& x = *xp_;
+    const int layer = nx.layer;
+    if (rows <= 0 || rows > kXpMaxRows || nx.top_k <= 0 || nx.top_k > kXpMaxK || nx.n_expert <= 0 ||
+        nx.n_expert > kXpMaxNe || nx.n_parts <= 0 || nx.n_parts > kXpParts || !nx.parts || n_embd % 256 ||
+        n_embd > 4096 || layer < 0 || layer >= (int)x.layers.size())
+        return RAD_OK;
+    XpLayer& L = x.layers[(size_t)layer];
+    if (!L.bound) {
+        L.next = nx;
+        if (!xp_bind(L, layer)) return RAD_OK;
+    }
+    const void* w = weight_ptr(nx.router);
+    const char* hb = (const char*)buf_ptr(h);
+    if (!w || !hb) return RAD_OK;
+    const RadStream cs = cur_stream();
+    const int g = layer % kXpGroups;
+    const uint16_t* hg = (const uint16_t*)(hb + r0 * n_embd * 2);
+    float* lg = x.logits + (size_t)g * kXpMaxRows * kXpMaxNe;
+    const int32_t* cnt = route_n_expert_ > 0 && nx.n_expert <= route_n_expert_
+                             ? route_dev_ + (int64_t)layer * route_n_expert_ : nullptr;
+    const uint64_t ring = (uint64_t)(uintptr_t)(x.ring + (size_t)g * kXpSlots * x.slot);
+    if (rad_xp_logits_launch(hg, (const uint16_t*)w, lg, (uint32_t)rows, (uint32_t)n_embd, (uint32_t)nx.n_expert,
+                             (void*)cs) ||
+        rad_xp_plan2_launch(lg, (uint32_t)rows, (uint32_t)nx.n_expert, (uint32_t)nx.top_k, (void** const*)L.map,
+                            L.place, cnt, x.pools, ring, x.slot, x.rec + (size_t)g * kXpSlots, x.nrec + g,
+                            (XpBox*)rad_dev_device_ptr(x.box + g), x.tick + g, x.stats, (void*)cs))
+        return RAD_E_DEVICE;
+    if (x.pred.size() < x.layers.size()) x.pred.assign(x.layers.size(), 0);
+    x.pred[(size_t)layer] = 1;
+    return RAD_OK;
+}
+
+/* Ahead of a layer's routed GEMMs, on the compute stream: one kernel that puts back the other groups' patches
+ * and, when this pass predicted for this layer, patches its group where the copies landed. Its arguments are fixed
+ * per layer, so the recording repeats the same decision at every play. */
+int Ctx::xp_step_rec(int layer) {
+    XpState& x = *xp_;
+    if (layer < 0 || layer >= (int)x.layers.size()) return RAD_OK;
+    const int g = layer % kXpGroups;
+    /* The prediction for this layer came at the previous layer's router input, earlier in the same pass. */
+    const bool patch = (size_t)layer < x.pred.size() && x.pred[(size_t)layer] && x.layers[(size_t)layer].bound;
+    if ((size_t)layer < x.pred.size()) x.pred[(size_t)layer] = 0;
+    const uint32_t* done = (const uint32_t*)rad_dev_device_ptr(x.done + g);
+    return rad_xp_step2_launch(x.rec, x.nrec, g, patch ? 1 : 0, done, x.tick + g, (void*)cur_stream())
+               ? RAD_E_DEVICE : RAD_OK;
+}
+
+/* The host thread: watches every group's mailbox number (the plan bumps it), and hands each new request's jobs to
+ * the copy engine with the number as the done value. Sleeps between looks: 50 us while plans keep coming, 1 ms
+ * after half a second without one. */
+void Ctx::xp_poll(XpState& x) {
+    uint32_t last[kXpGroups];
+    for (int g = 0; g < kXpGroups; ++g) last[g] = x.box[g].seq;
+    int64_t idle = 0;
+    bool warned = false;
+    while (!x.stop.load()) {
+        bool any = false;
+        for (int g = 0; g < kXpGroups; ++g) {
+            volatile XpBox* b = x.box + g;
+            const uint32_t s = b->seq;
+            if (s == last[g]) continue;
+            last[g] = s;
+            any = true;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const int n = std::min<int>((int)b->n, kXpSlots);
+            uint64_t src[kXpSlots], dst[kXpSlots], bytes[kXpSlots];
+            int m = 0;
+            for (int i = 0; i < n; ++i) {
+                if ((uint32_t)b->jobs[i].tag != s) { m = 0; break; }   /* a later plan is writing this group */
+                src[m] = b->jobs[i].src;
+                dst[m] = b->jobs[i].dst;
+                bytes[m] = b->jobs[i].bytes;
+                ++m;
+            }
+            if (m == 0) continue;
+            if (rad_xp_behind(x.device) > kXpBehind) { ++x.dropped; continue; }
+            if (rad_xp_list(x.device, nullptr, m, src, dst, bytes, x.done + g, s) == RAD_OK) {
+                ++x.lists;
+            } else if (!warned) {
+                warned = true;
+                const char* why = rad_dev_last_error();
+                RAD_WARN("rank %d: the prefetch copy queue refused a list: %s", rank_, why && *why ? why : "?");
+            }
+        }
+        idle = any ? 0 : idle + 1;
+        std::this_thread::sleep_for(std::chrono::microseconds(idle > 10000 ? 1000 : 50));
+    }
 }
 
 /* ---- Owner note 139 stage 0: the guess measured (see ctx.h: XgLayer) ---- */

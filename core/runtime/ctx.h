@@ -642,6 +642,9 @@ private:
     int  xp_predict_run(const RadPrefetchNext& next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark_run();
     int  xp_step_run(int layer);
+    int  xp_predict_rec(const RadPrefetchNext& next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
+    int  xp_step_rec(int layer);
+    void xp_poll(XpState& x);
     /* Owner note 139 stage 0 (RADIANCE_XP_GUESS=<decode passes>, xprefetch.cpp): where no prefetch runs, the
      * calls measure its guess instead, fetching nothing. Each rad_expert_prefetch of a decode pass ranks the next
      * layer's router over its rows on the host (in call order: the arch's mixer input when it asks, then the

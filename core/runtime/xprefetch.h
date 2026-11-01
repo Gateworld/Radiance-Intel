@@ -91,5 +91,16 @@ extern "C" int rad_xp_step_launch(const rad::XpRec* rrec, const int32_t* rn, con
 /* Gather mode (the Level Zero backend, owner note 139 stage 1: no DMA queue to spare): the plan's jobs
  * in `box` (device memory) copied by many small work-groups on the prefetch stream, the last to finish
  * writing `seq` to `done` after the copies (`ctr`, zero between uses, counts the arrivals). */
+/* v2 (Level Zero, owner note 139 stage 1, recorded): the plan numbers each request from the group's device ticket
+ * `tick`, and the step patches only where `done` (pinned host memory, written by the copy engine's list after the
+ * copies) holds the ticket's current value. */
+extern "C" int rad_xp_plan2_launch(const float* logits, uint32_t rows, uint32_t ne, uint32_t k, void** const* map,
+                                   const int32_t* place, const int32_t* cnt, rad::XpPools pools, uint64_t ring,
+                                   uint64_t ring_stride, rad::XpRec* rec, int32_t* nrec, rad::XpBox* box, uint32_t* tick,
+                                   rad::XpStats* stats, void* stream);
+/* v2's step, recorded once a layer: puts back every group's patches but group `g`'s (rec / nrec are all the
+ * groups' records), then with `patch` points group `g`'s units at the ring where done == *tick. */
+extern "C" int rad_xp_step2_launch(const rad::XpRec* rec, const int32_t* nrec, int g, int patch, const uint32_t* done,
+                                   const uint32_t* tick, void* stream);
 extern "C" int rad_xp_gather_launch(const rad::XpBox* box, uint64_t max_bytes, uint32_t* done, uint32_t* ctr,
                                     uint32_t seq, void* stream);

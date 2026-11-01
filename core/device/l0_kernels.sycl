@@ -19,6 +19,7 @@
 #include "runtime/xprefetch.h"
 
 #include <cmath>
+#include <cstring>
 #include "rad_l0_rec.h"
 
 /* The backend's hook that submits a held-back tape play (l0.cpp, "recorded passes"): these
@@ -136,81 +137,98 @@ inline float xp_bf(uint32_t x) { return sycl::bit_cast<float>(x << 16); }
 inline u64 xp_ld(void** p) { return dev_atomic<u64>(*(u64*)p).load(); }
 }  // namespace
 
-/* logits[r, e] = h[r, :] . w[e, :], bf16 in, fp32 sums: a 16-lane sub-group an expert, 16-byte loads. */
+/* logits[r, e] = h[r, :] . w[e, :], bf16 in, fp32 sums: a 16-lane sub-group an expert, 16-byte loads. Through
+ * launch_1d, so it records with the stream (owner note 139 stage 1 v2 runs it on the compute stream). */
 extern "C" __attribute__((visibility("default")))
 int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* lg, uint32_t rows, uint32_t n_embd, uint32_t ne,
                          void* stream) {
     if (rows == 0 || rows > (uint32_t)rad::kXpMaxRows || n_embd % 256u) return -1;
     flush_pending();
-    sycl::queue& q = *static_cast<sycl::queue*>(stream);
-    constexpr uint32_t kE = 16;   /* experts a work-group */
-    try {
-        q.parallel_for(sycl::nd_range<1>((size_t)((ne + kE - 1) / kE) * 256, 256),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const uint32_t lane = sg.get_local_linear_id();
-            const uint32_t e = (uint32_t)it.get_group(0) * kE + sg.get_group_linear_id();
-            if (e >= ne) return;
-            const uint32_t nv = n_embd / 8u;
-            const sycl::uint4* wr = (const sycl::uint4*)(w + (size_t)e * n_embd);
-            float acc[rad::kXpMaxRows];
+    /* No padding bytes: the recorder compares a recording's by-value argument byte for byte (run 113's M178 failed
+     * on 4 uninitialised tail bytes), so `pad` fills the struct and is zero. */
+    struct LogitsArgs { const uint16_t* h; const uint16_t* w; float* lg; uint32_t rows, n_embd, ne, pad; };
+    const LogitsArgs a{ h, w, lg, rows, n_embd, ne, 0u };
+    auto kfn = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const uint32_t lane = sg.get_local_linear_id();
+        const uint32_t e = (uint32_t)it.get_group(0) * 16u + sg.get_group_linear_id();   /* 16 experts a group */
+        if (e >= a.ne) return;
+        const uint32_t nv = a.n_embd / 8u;
+        const sycl::uint4* wr = (const sycl::uint4*)(a.w + (size_t)e * a.n_embd);
+        float acc[rad::kXpMaxRows];
 #pragma unroll
-            for (int r = 0; r < rad::kXpMaxRows; ++r) acc[r] = 0.f;
-            for (uint32_t c = lane; c < nv; c += 16u) {
-                const sycl::uint4 wv = wr[c];
-                float wf[8];
+        for (int r = 0; r < rad::kXpMaxRows; ++r) acc[r] = 0.f;
+        for (uint32_t c = lane; c < nv; c += 16u) {
+            const sycl::uint4 wv = wr[c];
+            float wf[8];
 #pragma unroll
-                for (int t = 0; t < 4; ++t) { wf[2 * t] = xp_bf(wv[t] & 0xffffu); wf[2 * t + 1] = xp_bf(wv[t] >> 16); }
-#pragma unroll
-                for (int r = 0; r < rad::kXpMaxRows; ++r) {
-                    if ((uint32_t)r >= rows) break;
-                    const sycl::uint4 hv = ((const sycl::uint4*)(h + (size_t)r * n_embd))[c];
-                    float d = 0.f;
-#pragma unroll
-                    for (int t = 0; t < 4; ++t) d += wf[2 * t] * xp_bf(hv[t] & 0xffffu) + wf[2 * t + 1] * xp_bf(hv[t] >> 16);
-                    acc[r] += d;
-                }
-            }
+            for (int t = 0; t < 4; ++t) { wf[2 * t] = xp_bf(wv[t] & 0xffffu); wf[2 * t + 1] = xp_bf(wv[t] >> 16); }
 #pragma unroll
             for (int r = 0; r < rad::kXpMaxRows; ++r) {
-                if ((uint32_t)r >= rows) break;
-                const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
-                if (lane == 0) lg[(size_t)r * ne + e] = v;
+                if ((uint32_t)r >= a.rows) break;
+                const sycl::uint4 hv = ((const sycl::uint4*)(a.h + (size_t)r * a.n_embd))[c];
+                float d = 0.f;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) d += wf[2 * t] * xp_bf(hv[t] & 0xffffu) + wf[2 * t + 1] * xp_bf(hv[t] >> 16);
+                acc[r] += d;
             }
-        });
-    } catch (const sycl::exception&) {
-        return -1;
-    }
-    return 0;
+        }
+#pragma unroll
+        for (int r = 0; r < rad::kXpMaxRows; ++r) {
+            if ((uint32_t)r >= a.rows) break;
+            const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+            if (lane == 0) a.lg[(size_t)r * a.ne + e] = v;
+        }
+    };
+    return launch_1d(stream, a, kfn, (size_t)((ne + 15u) / 16u) * 256, 256);
 }
 
 /* xprefetch.hip's xp_plan, one work-group of 256 at sub-group 32 (16 logits a lane cover 512 experts): count
  * whether the step routed the group's last records, each row's top-k with softmax probabilities, the distinct
  * experts whose entries all sit in one pinned pool slot, scored by their best probability (x1.5 if the last pass
- * routed them here), the kXpSlots best written as jobs and records. The box is device memory here and the gather
- * that reads it follows on the same queue, so no tags or system-scope stores. */
-extern "C" __attribute__((visibility("default")))
-int rad_xp_plan_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, void** const* map, const int32_t* place,
-                       const int32_t* cnt, rad::XpPools pools, uint64_t ring, uint64_t rs, rad::XpRec* rec,
-                       int32_t* nrec, rad::XpBox* box, uint32_t seq, rad::XpStats* stats, void* stream) {
-    (void)seq;
-    if (k == 0 || k > (uint32_t)rad::kXpMaxK || ne > (uint32_t)rad::kXpMaxNe || rows == 0 ||
-        rows > (uint32_t)rad::kXpMaxRows)
+ * routed them here), the kXpSlots best written as jobs and records. Through launch_1d (one argument struct, static
+ * local memory), so it records with the stream. With `tick` (owner note 139 stage 1 v2) the request's number is
+ * the group's device ticket, bumped here, so a recorded plan numbers every play anew; the jobs' tags and the
+ * mailbox number are then system-scope stores after a release, for the host thread that polls the pinned box.
+ * Without it (gather mode) the box is device memory, read by the gather that follows on the same queue. */
+namespace {
+struct XpPlanArgs {
+    const float* lg; uint32_t rows, ne, k; void** const* map; const int32_t* place; const int32_t* cnt;
+    rad::XpPools pools; uint64_t ring, rs; rad::XpRec* rec; int32_t* nrec; rad::XpBox* box; uint32_t seq;
+    uint32_t* tick; rad::XpStats* stats;
+};
+/* Field by field into an already zeroed struct, so XpPools' tail padding stays zero (see the launchers). */
+inline void xp_set_pools(rad::XpPools& d, const rad::XpPools& s) {
+    for (int i = 0; i < rad::kXpMaxPools; ++i) { d.lo[i] = s.lo[i]; d.hi[i] = s.hi[i]; d.stride[i] = s.stride[i]; }
+    d.n = s.n;
+}
+template <class T> using sys_atomic =
+    sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space>;
+int xp_plan_impl(const XpPlanArgs& a, void* stream) {
+    if (a.k == 0 || a.k > (uint32_t)rad::kXpMaxK || a.ne > (uint32_t)rad::kXpMaxNe || a.rows == 0 ||
+        a.rows > (uint32_t)rad::kXpMaxRows)
         return -1;
     flush_pending();
-    sycl::queue& q = *static_cast<sycl::queue*>(stream);
-    constexpr int NC = rad::kXpMaxRows * rad::kXpMaxK;
-    constexpr float kPrevBoost = 0.5f;
-    try {
-        q.submit([&](sycl::handler& cg) {
-            sycl::local_accessor<int, 1> s_e(NC, cg), s_pool(NC, cg), s_sel(rad::kXpSlots, cg), s_n(1, cg);
-            sycl::local_accessor<float, 1> s_pr(NC, cg), s_sc(NC, cg);
-            sycl::local_accessor<u64, 1> s_p(NC, cg);
-            cg.parallel_for(sycl::nd_range<1>(256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+    auto kfn = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                constexpr int NC = rad::kXpMaxRows * rad::kXpMaxK;
+                constexpr float kPrevBoost = 0.5f;
+                const float* lg = a.lg; const uint32_t rows = a.rows, ne = a.ne, k = a.k;
+                void** const* map = a.map; const int32_t* place = a.place; const int32_t* cnt = a.cnt;
+                const rad::XpPools& pools = a.pools; const uint64_t ring = a.ring, rs = a.rs;
+                rad::XpRec* rec = a.rec; int32_t* nrec = a.nrec; rad::XpBox* box = a.box; rad::XpStats* stats = a.stats;
+                const sycl::group<1> grp = it.get_group();
+                int* s_e = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[NC]>(grp);
+                int* s_pool = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[NC]>(grp);
+                int* s_sel = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[rad::kXpSlots]>(grp);
+                int* s_n = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[2]>(grp);   /* [0] n, [1] seq */
+                float* s_pr = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC]>(grp);
+                float* s_sc = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC]>(grp);
+                u64* s_p = *sycl::ext::oneapi::group_local_memory_for_overwrite<u64[NC]>(grp);
                 const sycl::sub_group sg = it.get_sub_group();
                 const uint32_t tid = (uint32_t)it.get_local_id(0), lane = sg.get_local_linear_id();
                 const uint32_t wave = sg.get_group_linear_id(), nw = sg.get_group_linear_range();
                 if (tid == 0) {
+                    s_n[1] = (int)(a.tick ? ++*a.tick : a.seq);
                     const int nr = *nrec;
                     for (int t = 0; t < nr; ++t) {
                         const rad::XpRec& rc = rec[t];
@@ -326,9 +344,9 @@ int rad_xp_plan_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, 
                     const u64 base = lo + ((s_p[o] - lo) / st) * st;
                     const u64 dst = ring + (u64)j * rs;
                     if (qq == 0) {
-                        box->jobs[j].src = base;
-                        box->jobs[j].dst = dst;
-                        box->jobs[j].bytes = st;
+                        sys_atomic<u64>(*(u64*)&box->jobs[j].src).store(base);
+                        sys_atomic<u64>(*(u64*)&box->jobs[j].dst).store(dst);
+                        sys_atomic<u64>(*(u64*)&box->jobs[j].bytes).store(st);
                         rec[j].cnt = cnt;
                         rec[j].place = place ? place[e] : -1;
                     }
@@ -339,19 +357,48 @@ int rad_xp_plan_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, 
                         rec[j].oldv[qq] = (void*)old;
                         rec[j].newv[qq] = (void*)(dst + (old - base));
                     }
+                    /* Tag after the job's stores, so a visible tag implies a complete job. */
+                    if (qq == 0) {
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                        sys_atomic<u64>(*(u64*)&box->jobs[j].tag).store((u64)(uint32_t)s_n[1]);
+                    }
                 }
                 sycl::group_barrier(it.get_group());
                 if (tid == 0) {
                     *nrec = n;
-                    box->n = n;
+                    sys_atomic<int32_t>(box->n).store(n);
                     dev_atomic<unsigned>(stats->planned).fetch_add((unsigned)n);
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    sys_atomic<uint32_t>(*(uint32_t*)&box->seq).store((uint32_t)s_n[1]);
                 }
-            });
-        });
-    } catch (const sycl::exception&) {
-        return -1;
-    }
-    return 0;
+    };
+    return launch_1d(stream, a, kfn, 256, 256);
+}
+}  // namespace
+
+extern "C" __attribute__((visibility("default")))
+int rad_xp_plan_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, void** const* map, const int32_t* place,
+                       const int32_t* cnt, rad::XpPools pools, uint64_t ring, uint64_t rs, rad::XpRec* rec,
+                       int32_t* nrec, rad::XpBox* box, uint32_t seq, rad::XpStats* stats, void* stream) {
+    XpPlanArgs a;
+    std::memset(&a, 0, sizeof a);   /* the padding too: recordings compare the argument byte for byte */
+    a.lg = lg; a.rows = rows; a.ne = ne; a.k = k; a.map = map; a.place = place; a.cnt = cnt;
+    xp_set_pools(a.pools, pools);
+    a.ring = ring; a.rs = rs; a.rec = rec; a.nrec = nrec; a.box = box; a.seq = seq; a.tick = nullptr; a.stats = stats;
+    return xp_plan_impl(a, stream);
+}
+/* v2: the request number from the group's device ticket `tick` (see xp_plan_impl). */
+extern "C" __attribute__((visibility("default")))
+int rad_xp_plan2_launch(const float* lg, uint32_t rows, uint32_t ne, uint32_t k, void** const* map, const int32_t* place,
+                        const int32_t* cnt, rad::XpPools pools, uint64_t ring, uint64_t rs, rad::XpRec* rec,
+                        int32_t* nrec, rad::XpBox* box, uint32_t* tick, rad::XpStats* stats, void* stream) {
+    if (!tick) return -1;
+    XpPlanArgs a;
+    std::memset(&a, 0, sizeof a);   /* the padding too: recordings compare the argument byte for byte */
+    a.lg = lg; a.rows = rows; a.ne = ne; a.k = k; a.map = map; a.place = place; a.cnt = cnt;
+    xp_set_pools(a.pools, pools);
+    a.ring = ring; a.rs = rs; a.rec = rec; a.nrec = nrec; a.box = box; a.seq = 0u; a.tick = tick; a.stats = stats;
+    return xp_plan_impl(a, stream);
 }
 
 /* The plan's jobs copied from the pinned pool into the ring: kGatherWg work-groups a job, each a contiguous
@@ -398,13 +445,60 @@ int rad_xp_gather_launch(const rad::XpBox* box, uint64_t max_bytes, uint32_t* do
 
 /* Compute stream, before a layer's routed GEMMs: put back the previous layer's patches, then point this
  * layer's units at the ring where an entry still holds what the plan read and the gather has landed. */
+namespace {
+struct XpStepArgs { const rad::XpRec* rrec; const int32_t* rn; const rad::XpRec* prec; const int32_t* pn;
+                    const uint32_t* done; uint32_t seq, pad; };   /* no padding bytes (see LogitsArgs) */
+}  // namespace
+/* v2 (owner note 139 stage 1): recorded once a layer, so its arguments are fixed. It puts back every other
+ * group's patches (threads 0-23; at most kXpSlots x kXpParts entries a group, each a compare-and-swap that does
+ * nothing where the entry no longer holds the patch), so no patch outlives the next routed layer, across passes
+ * too; then, with `patch`, points this layer's units (group `g`) at the ring (threads 64-71) where `done` -- pinned
+ * host memory the copy engine writes after the copies -- holds the group's current device ticket. The own group is
+ * left out of the put-back: its records are this layer's plan, and the two would race on the same entries. */
+namespace {
+struct XpStep2Args { const rad::XpRec* rec; const int32_t* nrec; int32_t g, patch; const uint32_t* done;
+                     const uint32_t* tick; };
+}  // namespace
+extern "C" __attribute__((visibility("default")))
+int rad_xp_step2_launch(const rad::XpRec* rec, const int32_t* nrec, int g, int patch, const uint32_t* done,
+                        const uint32_t* tick, void* stream) {
+    if (!rec || !nrec || g < 0 || g >= rad::kXpGroups) return -1;
+    flush_pending();
+    const XpStep2Args a{ rec, nrec, g, patch, done, tick };
+    auto kfn = [=](sycl::nd_item<1> it) {
+        constexpr int kPer = rad::kXpSlots * rad::kXpParts;
+        const int t = (int)it.get_local_id(0);
+        if (t < rad::kXpGroups * kPer) {
+            const int gg = t / kPer, j = (t % kPer) / rad::kXpParts, qq = t % rad::kXpParts;
+            if (gg != a.g && j < a.nrec[gg]) {
+                const rad::XpRec& r = a.rec[gg * rad::kXpSlots + j];
+                if (r.ent[qq]) {
+                    u64 want = (u64)r.newv[qq];
+                    dev_atomic<u64>(*(u64*)r.ent[qq]).compare_exchange_strong(want, (u64)r.oldv[qq]);
+                }
+            }
+            return;
+        }
+        if (!a.patch || !a.done || !a.tick || t < 64 || t >= 64 + kPer) return;
+        const uint32_t want_seq = dev_atomic<uint32_t>(*(uint32_t*)a.tick).load();
+        if (want_seq == 0 || sys_atomic<uint32_t>(*(uint32_t*)a.done).load(sycl::memory_order::acquire) != want_seq)
+            return;
+        const int j = (t - 64) / rad::kXpParts, qq = (t - 64) % rad::kXpParts;
+        if (j >= a.nrec[a.g]) return;
+        const rad::XpRec& r = a.rec[a.g * rad::kXpSlots + j];
+        if (r.ent[qq]) {
+            u64 want = (u64)r.oldv[qq];
+            dev_atomic<u64>(*(u64*)r.ent[qq]).compare_exchange_strong(want, (u64)r.newv[qq]);
+        }
+    };
+    return launch_1d(stream, a, kfn, 128, 128);
+}
+
 extern "C" __attribute__((visibility("default")))
 int rad_xp_step_launch(const rad::XpRec* rrec, const int32_t* rn, const rad::XpRec* prec, const int32_t* pn,
                        const uint32_t* done, uint32_t seq, void* stream) {
     flush_pending();
-    struct StepArgs { const rad::XpRec* rrec; const int32_t* rn; const rad::XpRec* prec; const int32_t* pn;
-                      const uint32_t* done; uint32_t seq; };
-    const StepArgs a{ rrec, rn, prec, pn, done, seq };
+    const XpStepArgs a{ rrec, rn, prec, pn, done, seq, 0u };
     auto kfn = [=](sycl::nd_item<1> it) {
         const int t = (int)it.get_local_id(0);
         if (a.rrec && t < *a.rn * rad::kXpParts) {

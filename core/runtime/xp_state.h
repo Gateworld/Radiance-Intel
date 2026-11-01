@@ -72,6 +72,12 @@ struct XpState {
     bool         gather = false;
     uint32_t*    ctr    = nullptr;     /* [kXpGroups], device: the gather's arrivals */
     RadEvent     mark_ev = nullptr;
+    /* v2 (Level Zero, RADIANCE_XE_EXPERT_PREFETCH=1, run 113): logits, plan and step are kernels on the compute
+     * stream, recorded with the pass (no host steps, no tape cuts); the plan numbers each request from the group's
+     * device ticket and writes the pinned mailbox, which the host thread (xp_poll) hands to the copy engine. */
+    bool         rec2 = false;
+    uint32_t*    tick = nullptr;       /* [kXpGroups], device: the group's last request number */
+    std::vector<uint8_t> pred;         /* [layers]: this pass predicted for the layer, until its step */
 
     /* The host thread: each mailbox, once the plan has written it, to the DMA queue. */
     std::thread              thr;

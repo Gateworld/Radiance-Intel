@@ -2804,17 +2804,70 @@ int z_runtime_version(char* out, int cap) {
  * immediate list on the compute group -- ordered against the compute stream by events. The ring and its
  * side buffers are plain device memory: only kernels touch them. */
 int z_xp_supported(int) {
-    static const bool on = [] { const char* e = std::getenv("RADIANCE_XE_EXPERT_PREFETCH"); return e && e[0] == '1'; }();
+    /* 1: v2 (recorded plan + the copy engine), 2: the first form (gather mode); xprefetch.cpp tells them apart */
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_XE_EXPERT_PREFETCH"); return e && (e[0] == '1' || e[0] == '2'); }();
     return on ? 1 : 0;
 }
 int z_xp_stream_create(RadStream* out) { return z_stream_create(out, 0); }
 int z_ride(RadStream, void**) { return RAD_E_UNSUPPORTED; }
 int z_ride_wait(RadStream, void*) { return RAD_E_UNSUPPORTED; }
 void z_ride_release(void*, RadStream, int64_t) {}
-int z_xp_list(int, void*, int, const uint64_t*, const uint64_t*, const uint64_t*, uint32_t*, uint32_t) {
-    return RAD_E_UNSUPPORTED;
+/* v2's copies (owner note 139 stage 1, run 113): a list is its copies and then the `done` word, on a queue of the
+ * backend's own per card -- an in-order queue, whose memcpy the runtime puts on the copy engine, the mover's engine,
+ * beside the compute stream (CP1: no cost to compute). Only the prefetch's host thread calls these; `mark` is never
+ * set here (no rides). The done value comes from a pinned ring the list reads when it runs. */
+struct XpCopyQ {
+    sycl::queue*            q = nullptr;
+    uint32_t*               vals = nullptr;
+    uint32_t                vi = 0;
+    std::deque<sycl::event> live;
+};
+constexpr int kXpCopyDevs = 16;
+XpCopyQ& xp_copyq(int dev) { static XpCopyQ qs[kXpCopyDevs]; return qs[dev]; }
+std::mutex& xp_copy_mutex() { static std::mutex m; return m; }
+int z_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
+              uint32_t* done, uint32_t done_val) {
+    (void)mark;
+    if (device < 0 || device >= (int)devs().size() || device >= kXpCopyDevs || n < 0) return RAD_E_INVAL;
+    std::lock_guard<std::mutex> lk(xp_copy_mutex());
+    XpCopyQ& c = xp_copyq(device);
+    const Dev& D = devs()[device];
+    try {
+        if (!c.q) {
+            c.q = new sycl::queue(D.ctx, D.d, async_errors, sycl::property_list{sycl::property::queue::in_order()});
+            c.vals = sycl::malloc_host<uint32_t>(256, D.ctx);
+            if (!c.vals) { device_set_error("rad_xp_list: no pinned word ring on card %d", device); return RAD_E_NOMEM; }
+        }
+        for (int i = 0; i < n; ++i)
+            c.q->memcpy((void*)(uintptr_t)dst[i], (const void*)(uintptr_t)src[i], (size_t)bytes[i]);
+        sycl::event ev;
+        if (done) {
+            uint32_t* v = c.vals + (c.vi++ & 255u);
+            *v = done_val;
+            ev = c.q->memcpy(done, v, 4);
+        } else {
+            ev = c.q->ext_oneapi_submit_barrier();
+        }
+        c.live.push_back(ev);
+    } catch (const sycl::exception& e) {
+        device_set_error("rad_xp_list: %s", e.what());
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
 }
-int64_t z_xp_behind(int) { return 0; }
+int64_t z_xp_behind(int device) {
+    if (device < 0 || device >= kXpCopyDevs) return 0;
+    std::lock_guard<std::mutex> lk(xp_copy_mutex());
+    XpCopyQ& c = xp_copyq(device);
+    try {
+        while (!c.live.empty() && c.live.front().get_info<sycl::info::event::command_execution_status>() ==
+                                      sycl::info::event_command_status::complete)
+            c.live.pop_front();
+    } catch (const sycl::exception&) {
+        return (int64_t)c.live.size();
+    }
+    return (int64_t)c.live.size();
+}
 void* z_alloc_uncached(int64_t bytes) { return z_alloc(bytes, RAD_MEM_DEVICE); }
 void z_free_uncached(void* p) { z_free(p, RAD_MEM_DEVICE); }
 
