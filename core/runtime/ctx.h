@@ -537,6 +537,7 @@ private:
     /* Keys seen once, and keys recorded once and not yet verified. */
     uint64_t              tape_seen_[32] = {};
     size_t                tape_seen_at_ = 0;
+    bool                  last_nondecode_ = false;   /* the previous pass was not a decode pass (run_pass) */
     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
     bool                  tape_on_ = false;    /* the backend can, and nothing needs every issue */
