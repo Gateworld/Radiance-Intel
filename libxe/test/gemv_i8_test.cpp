@@ -144,6 +144,55 @@ Result run_case(sycl::queue& q, int M, int N, int K, uint64_t seed, int reps) {
     return {ok, worst, ms};
 }
 
+/* run 115 (owner note 142 item 1, concatenated projections): is a column's output independent of where it sits in the
+ * launch? One launch over N columns, one over the same weights from column `shift` on (N - shift columns, the
+ * weight and scale pointers offset); the shared columns' bf16 bits are compared. bf16 weight scales (the served
+ * trunk's). */
+bool shift_case(sycl::queue& q, int M, int N, int K, int shift, uint64_t seed) {
+    const int G = K / 128;
+    std::vector<int8_t> a((size_t)M * K), b((size_t)N * K);
+    std::vector<float> as((size_t)M * G);
+    std::vector<uint16_t> bs((size_t)N * G);
+    for (size_t i = 0; i < a.size(); ++i) a[i] = (int8_t)((int)(h32(seed, i) % 255) - 127);
+    for (size_t i = 0; i < b.size(); ++i) b[i] = (int8_t)((int)(h32(seed ^ 7, i) % 255) - 127);
+    for (size_t i = 0; i < as.size(); ++i) as[i] = std::ldexp(1.0f + (h32(seed ^ 9, i) >> 9) * 0x1p-23f, -9);
+    for (size_t i = 0; i < bs.size(); ++i) bs[i] = to_bf(std::ldexp(1.0f + (h32(seed ^ 11, i) >> 9) * 0x1p-23f, -12));
+    int8_t* da = sycl::malloc_device<int8_t>(a.size(), q);
+    int8_t* db = sycl::malloc_device<int8_t>(b.size(), q);
+    float* das = sycl::malloc_device<float>(as.size(), q);
+    uint16_t* dbs = sycl::malloc_device<uint16_t>(bs.size(), q);
+    uint16_t* dy0 = sycl::malloc_device<uint16_t>((size_t)M * N, q);
+    uint16_t* dy1 = sycl::malloc_device<uint16_t>((size_t)M * N, q);
+    q.memcpy(da, a.data(), a.size()); q.memcpy(db, b.data(), b.size());
+    q.memcpy(das, as.data(), as.size() * 4); q.memcpy(dbs, bs.data(), bs.size() * 2).wait();
+    auto launch = [&](int n0, uint16_t* y) {
+        const int n = N - n0;
+        RadTensor t[5] = { tensor(da, RAD_I8, M, K), tensor(das, RAD_F32, M, G), tensor(db + (size_t)n0 * K, RAD_I8, n, K),
+                           tensor(dbs + (size_t)n0 * G, RAD_BF16, n, G), tensor(y, RAD_BF16, M, n) };
+        char dts[] = "i8a8h";
+        RadParam p[5]{};
+        const char* keys[4] = { "M", "N", "K", "group" };
+        const long long vals[4] = { M, n, K, 128 };
+        for (int i = 0; i < 4; ++i) { p[i].key = keys[i]; p[i].kind = RAD_P_INT; p[i].ival = vals[i]; }
+        p[4].key = "dtype"; p[4].kind = RAD_P_STR; p[4].sval = dts;
+        RadArgs args{};
+        args.t = t; args.n_t = 5; args.p = p; args.n_p = 5;
+        const int rc = xe_rad_gemm_i8a8_gemv(&args, (RadStream)&q);
+        q.wait_and_throw();
+        return rc == RAD_OK;
+    };
+    bool ok = launch(0, dy0) && launch(shift, dy1);
+    std::vector<uint16_t> y0((size_t)M * N), y1((size_t)M * N);
+    q.memcpy(y0.data(), dy0, y0.size() * 2); q.memcpy(y1.data(), dy1, y1.size() * 2).wait();
+    long long diff = 0;
+    const int n1 = N - shift;
+    for (int m = 0; m < M; ++m)
+        for (int j = 0; j < n1; ++j) diff += y0[(size_t)m * N + shift + j] != y1[(size_t)m * n1 + j];
+    std::printf("  shift M %d N %5d K %5d by %d: %lld of %d shared outputs differ\n", M, N, K, shift, diff, M * n1);
+    sycl::free(da, q); sycl::free(db, q); sycl::free(das, q); sycl::free(dbs, q); sycl::free(dy0, q); sycl::free(dy1, q);
+    return ok && diff == 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -170,6 +219,10 @@ int main(int argc, char** argv) {
         fails += !run_case(q, 256, 12288, 2560, 0xa1, 5).ok;
         fails += !run_case(q, 256, 2560, 6144, 0xa2, 5).ok;
     }
+    if (const char* e = std::getenv("RI_SHIFT"); e && e[0] == '1')
+        for (int m : {1, 4})
+            for (int s : {1, 3, 8, 37})
+                fails += !shift_case(q, m, 12288, 2560, s, 0x55 + s);
     std::printf("gemv_i8_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
