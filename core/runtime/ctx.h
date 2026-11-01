@@ -642,6 +642,31 @@ private:
     int  xp_predict_run(const RadPrefetchNext& next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark_run();
     int  xp_step_run(int layer);
+    /* Owner note 139 stage 0 (RADIANCE_XP_GUESS=<decode passes>, xprefetch.cpp): where no prefetch runs, the
+     * calls measure its guess instead, fetching nothing. Each rad_expert_prefetch of a decode pass ranks the next
+     * layer's router over its rows on the host (in call order: the arch's mixer input when it asks, then the
+     * router input); that layer's prefetch_step reads its routing counts and scores each guess, and the last
+     * pass's routing there, against what it routed and what of that sat in a pinned pool. Synchronises the
+     * stream at every call, and recorded passes are off. */
+    struct XgLayer {
+        RadPrefetchNext                   next{};
+        std::vector<float>                router;   /* host copy, [n_expert, n_embd] */
+        std::vector<std::vector<uint8_t>> guess;    /* this pass's guesses by model expert, in call order */
+        std::vector<uint8_t>              prev;     /* the last scored pass's routed (local) experts */
+        uint64_t routed = 0, missed = 0, passes = 0;
+        uint64_t v[4][5] = {};   /* per guess: hit, miss covered, fetches, fetches unused, guessed local */
+    };
+    std::vector<XgLayer>                        xg_;
+    std::vector<std::pair<uint64_t, uint64_t>>  xg_pools_;
+    int64_t                                     xg_steps_ = 0, xg_cap_ = 0;
+    int                                         xg_last_ = -1;
+public:
+    static int64_t xg_on();
+    void xg_open(const uint64_t* lo, const uint64_t* hi, int n);
+private:
+    int  xg_guess(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
+    void xg_judge(int layer);
+    void xg_report(bool layers);
 
     int       rank_       = 0;
     int       world_size_ = 1;

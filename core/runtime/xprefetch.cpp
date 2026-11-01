@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 
@@ -275,6 +276,7 @@ void Ctx::xp_judge(XpState& x) {
 /* When recording, each of the three calls becomes its own tape step and is re-run at every play:
  * its stream work and rides are issued afresh, not recorded. */
 int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
+    if (!xp_ && nx && rows > 0 && rows <= kXpMaxRows && xg_on()) return xg_guess(*nx, h, r0, rows, n_embd);
     /* Too wide to predict; keep the tape free of an empty step. */
     if (!xp_ || !nx || rows <= 0 || rows > kXpMaxRows) return RAD_OK;
     if (!rec_) return xp_predict_run(*nx, h, r0, rows, n_embd);
@@ -300,6 +302,7 @@ int Ctx::xp_mark() {
 }
 
 int Ctx::xp_step(int layer) {
+    if (!xp_ && xg_on()) xg_judge(layer);
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_step_run(layer);
     TapeStep st;
@@ -412,6 +415,161 @@ int Ctx::xp_step_run(int layer) {
     x.restore_g = patch ? L->g : -1;
     if (L) L->want = false;
     return RAD_OK;
+}
+
+/* ---- Owner note 139 stage 0: the guess measured (see ctx.h: XgLayer) ---- */
+
+int64_t Ctx::xg_on() {
+    /* The decode passes to score; "1" means 4096. */
+    static const int64_t n = [] {
+        const char* v = std::getenv("RADIANCE_XP_GUESS");
+        const long long x = v ? std::atoll(v) : 0;
+        return (int64_t)(x == 1 ? 4096 : x > 0 ? x : 0);
+    }();
+    return n;
+}
+
+void Ctx::xg_open(const uint64_t* lo, const uint64_t* hi, int n) {
+    xg_pools_.clear();
+    for (int i = 0; i < n; ++i)
+        if (hi[i] > lo[i]) xg_pools_.emplace_back(lo[i], hi[i]);
+    xg_cap_ = xg_on();
+    RAD_INFO("rank %d: expert guess tap on (owner note 139 stage 0): %lld decode passes, %d pinned pool ranges; "
+             "no fetches", rank_, (long long)xg_cap_, (int)xg_pools_.size());
+}
+
+int Ctx::xg_guess(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
+    /* Rank 0 only: every rank routes the same rows over the same experts here, and the host products heat the
+     * CPU (H87 stopped at 75 C). */
+    if (rank_ != 0 || last_nondecode_ || rec_ || xg_steps_ >= xg_cap_ || nx.layer < 0 || nx.n_expert <= 0 || nx.top_k <= 0 ||
+        nx.top_k > nx.n_expert || !nx.parts || nx.n_parts <= 0)
+        return RAD_OK;
+    if (xg_.size() < route_.size()) xg_.resize(route_.size());
+    if ((size_t)nx.layer >= xg_.size()) return RAD_OK;
+    XgLayer& L = xg_[(size_t)nx.layer];
+    const RadStream s = cur_stream();
+    if (L.router.empty()) {
+        const void* w = weight_ptr(nx.router);
+        if (!w) return RAD_OK;
+        std::vector<uint16_t> wb((size_t)(nx.n_expert * n_embd));
+        RAD_TRY(rad_memcpy_async(wb.data(), w, (int64_t)wb.size() * 2, s));
+        RAD_TRY(rad_stream_sync(s));
+        L.router.resize(wb.size());
+        for (size_t i = 0; i < wb.size(); ++i) {
+            const uint32_t u = (uint32_t)wb[i] << 16;
+            std::memcpy(&L.router[i], &u, 4);
+        }
+        L.next = nx;
+    }
+    const char* hb = (const char*)buf_ptr(h);
+    if (!hb) return RAD_OK;
+    std::vector<uint16_t> xb((size_t)(rows * n_embd));
+    RAD_TRY(rad_memcpy_async(xb.data(), hb + r0 * n_embd * 2, (int64_t)xb.size() * 2, s));
+    RAD_TRY(rad_stream_sync(s));
+    std::vector<float> x((size_t)n_embd), lg((size_t)nx.n_expert);
+    std::vector<int32_t> ix((size_t)nx.n_expert);
+    std::vector<uint8_t> g((size_t)nx.n_expert, 0);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t i = 0; i < n_embd; ++i) {
+            const uint32_t u = (uint32_t)xb[(size_t)(r * n_embd + i)] << 16;
+            std::memcpy(&x[(size_t)i], &u, 4);
+        }
+        for (int64_t e = 0; e < nx.n_expert; ++e) {
+            const float* we = L.router.data() + e * n_embd;
+            const float* xv = x.data();
+            float a[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };   /* eight sums, so the loop vectorises; n_embd % 8 == 0 */
+            for (int64_t i = 0; i + 8 <= n_embd; i += 8)
+                for (int j = 0; j < 8; ++j) a[j] += we[i + j] * xv[i + j];
+            lg[(size_t)e] = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
+            ix[(size_t)e] = (int32_t)e;
+        }
+        std::partial_sort(ix.begin(), ix.begin() + nx.top_k, ix.end(),
+                          [&](int32_t a, int32_t b) { return lg[(size_t)a] > lg[(size_t)b]; });
+        for (int64_t k = 0; k < nx.top_k; ++k) g[(size_t)ix[(size_t)k]] = 1;
+    }
+    L.guess.push_back(std::move(g));
+    return RAD_OK;
+}
+
+void Ctx::xg_judge(int layer) {
+    if (layer < 0 || (size_t)layer >= xg_.size() || last_nondecode_ || rec_) return;
+    XgLayer& L = xg_[(size_t)layer];
+    if (L.guess.empty()) return;
+    const RadPrefetchNext& nx = L.next;
+    const int32_t* cd = route_counts(layer, nx.n_expert);
+    if (!cd || route_n_expert_ <= 0) { L.guess.clear(); return; }
+    std::vector<int32_t> cnt((size_t)route_n_expert_);
+    const RadStream s = cur_stream();
+    if (rad_memcpy_async(cnt.data(), cd, (int64_t)cnt.size() * 4, s) < 0 || rad_stream_sync(s) < 0) {
+        L.guess.clear();
+        return;
+    }
+    /* In call order: the mixer input when the arch asked for it, then the router input. */
+    const std::vector<uint8_t>* v0 = L.guess.size() >= 2 ? &L.guess[0] : nullptr;
+    const std::vector<uint8_t>* v1 = &L.guess.back();
+    const bool have_prev = !L.prev.empty();
+    std::vector<uint8_t> routed_now((size_t)nx.n_expert, 0);
+    for (int64_t e = 0; e < nx.n_expert; ++e) {
+        const int32_t j = nx.count_at ? nx.count_at[e] : (int32_t)e;
+        const rad_weight w = nx.parts[e * nx.n_parts];
+        if (j < 0 || j >= route_n_expert_ || !w) continue;
+        const bool routed = cnt[(size_t)j] > 0;
+        const WeightSlot* ws = residency_ ? residency_->lookup(w) : nullptr;
+        const uint64_t p = (uint64_t)(uintptr_t)(ws ? ws->ptr : nullptr);
+        bool res = true;
+        for (const auto& r : xg_pools_)
+            if (p >= r.first && p < r.second) { res = false; break; }
+        routed_now[(size_t)e] = routed;
+        L.routed += routed;
+        L.missed += routed && !res;
+        const bool gs[4] = { v0 && (*v0)[(size_t)e], (bool)(*v1)[(size_t)e], have_prev && L.prev[(size_t)e],
+                             (*v1)[(size_t)e] || (have_prev && L.prev[(size_t)e]) };
+        for (int k = 0; k < 4; ++k) {
+            if (!gs[k]) continue;
+            L.v[k][0] += routed;
+            L.v[k][1] += routed && !res;
+            L.v[k][2] += !res;
+            L.v[k][3] += !res && !routed;
+            L.v[k][4] += 1;
+        }
+    }
+    L.prev.swap(routed_now);
+    L.guess.clear();
+    ++L.passes;
+    if (layer <= xg_last_) {
+        ++xg_steps_;
+        if (xg_steps_ % 128 == 0 || xg_steps_ == xg_cap_) xg_report(xg_steps_ % 1024 == 0 || xg_steps_ == xg_cap_);
+    }
+    xg_last_ = layer;
+}
+
+void Ctx::xg_report(bool layers) {
+    uint64_t routed = 0, missed = 0, v[4][5] = {};
+    for (const XgLayer& L : xg_) {
+        routed += L.routed;
+        missed += L.missed;
+        for (int k = 0; k < 4; ++k)
+            for (int i = 0; i < 5; ++i) v[k][i] += L.v[k][i];
+    }
+    const double st = xg_steps_ > 0 ? (double)xg_steps_ : 1.0;
+    auto pc = [](uint64_t a, uint64_t b) { return b ? 100.0 * (double)a / (double)b : 0.0; };
+    static const char* nm[4] = { "mixer-in", "router-in", "last-step", "router-in|last" };
+    RAD_INFO("rank %d: guess over %lld decode steps: routed %.2f, missed %.2f a step (local experts)", rank_,
+             (long long)xg_steps_, routed / st, missed / st);
+    for (int k = 0; k < 4; ++k)
+        RAD_INFO("rank %d: guess %-14s hit %.1f%% of routed, covers %.1f%% of misses, %.2f fetches a step "
+                 "(%.1f%% unused), %.2f guessed a step", rank_, nm[k], pc(v[k][0], routed), pc(v[k][1], missed),
+                 v[k][2] / st, pc(v[k][3], v[k][2]), v[k][4] / st);
+    if (!layers) return;
+    for (size_t l = 0; l < xg_.size(); ++l) {
+        const XgLayer& L = xg_[l];
+        if (!L.passes) continue;
+        RAD_INFO("rank %d: guess layer %zu: routed %.2f missed %.2f | hit mixer-in %.1f%% router-in %.1f%% last %.1f%% "
+                 "| covers %.1f%% %.1f%% %.1f%% %.1f%%", rank_, l, L.routed / (double)L.passes,
+                 L.missed / (double)L.passes, pc(L.v[0][0], L.routed), pc(L.v[1][0], L.routed),
+                 pc(L.v[2][0], L.routed), pc(L.v[0][1], L.missed), pc(L.v[1][1], L.missed), pc(L.v[2][1], L.missed),
+                 pc(L.v[3][1], L.missed));
+    }
 }
 
 }  /* namespace rad */

@@ -3654,6 +3654,13 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
+    /* Owner note 139 stage 0: the guess tap needs every pinned range, not the prefetch's first four. */
+    if (Ctx::xg_on() > 0)
+        for (auto& r : ranks_) {
+            uint64_t lo[64], hi[64], st[64];
+            const int n = r->mover.pool_ranges(lo, hi, st, 64);
+            r->ctx.xg_open(lo, hi, n);
+        }
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them

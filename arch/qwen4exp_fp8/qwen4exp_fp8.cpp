@@ -1641,6 +1641,12 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) m.ple.step(c, batch);
         l.hc_mix.read_pieces(c, T);
+        /* Owner note 139 stage 0 (RADIANCE_XP_GUESS): the next routed layer's guess from this layer's mixer
+         * input too, ahead of the one the MoE block makes from its router input. The core scores both. */
+        static const bool xg = [] { const char* e = std::getenv("RADIANCE_XP_GUESS"); return e && e[0] && e[0] != '0'; }();
+        if (xg && li + 1 < (int64_t)m.layers.size() && m.layers[(size_t)li + 1].mlp.xp.n_parts > 0)
+            (void)rad_expert_prefetch(c, &m.layers[(size_t)li + 1].mlp.xp, l.full ? l.attn.w.h.x : l.gdn.w.h.x, 0, T,
+                                      g.n_embd);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }

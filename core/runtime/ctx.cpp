@@ -121,7 +121,8 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps && xg_on() == 0;
+    if (xg_on() > 0 && rank_ == 0) RAD_INFO("recorded passes: off, the expert guess tap is on (RADIANCE_XP_GUESS)");
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
