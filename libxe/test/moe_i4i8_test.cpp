@@ -391,6 +391,49 @@ bool real_case(sycl::queue& q, LaunchFn fn, LaunchFn ref, const std::string& dir
     q.memcpy(hy.data(), dy, hy.size() * 2).wait();
     double amax = 0.0;
     for (float v : yref) amax = std::max(amax, (double)std::fabs(v));
+    if (std::getenv("RI_VERBOSE")) {
+        /* the entries' own headers against the offsets the kernel assumes, and a third opinion on row 0: the format's
+         * definition decoded on the host at those offsets */
+        const int64_t p0 = rad_planes_round((int64_t)sizeof(RadPlanesHeader) + 2 * (int64_t)sizeof(RadPlanesEntry));
+        for (int v = 0; v < 2; ++v) {
+            const RadPlanesHeader* hh = (const RadPlanesHeader*)(v ? hs[0].data() : hc[0].data());
+            const RadPlanesEntry* pe = (const RadPlanesEntry*)((const uint8_t*)hh + sizeof(RadPlanesHeader));
+            for (uint32_t x = 0; x < hh->n_planes && x < 2; ++x)
+                std::printf("  entry 0 %s plane %s: dtype %u kind %u block %lld,%lld rows %lld cols %lld row_bytes %lld offset %lld\n",
+                            v ? "scales" : "codes", pe[x].role, (unsigned)pe[x].dtype, (unsigned)pe[x].kind,
+                            (long long)pe[x].block[0], (long long)pe[x].block[1], (long long)pe[x].rows, (long long)pe[x].cols,
+                            (long long)pe[x].row_bytes, (long long)pe[x].offset);
+        }
+        std::printf("  assumed: codes %lld table %lld scale %lld scale.1 %lld\n", (long long)p0,
+                    (long long)rad_planes_round(p0 + N * (K / 2)), (long long)p0, (long long)rad_planes_round(p0 + N * (K / 64)));
+        int e = -1;
+        for (int x = 0; x < n_expert; ++x) if (off[(size_t)x] <= 0 && 0 < off[(size_t)x + 1]) e = x;
+        const int tok = sorted_a ? 0 : sorted[0] / top_k;
+        const uint8_t* ce = hc[e].data();
+        const uint8_t* se = hs[e].data();
+        const float* tab = (const float*)(ce + rad_planes_round(p0 + N * (K / 2)));
+        float s1, tam = 0.0f;
+        std::memcpy(&s1, se + rad_planes_round(p0 + N * (K / 64)), 4);
+        for (int t = 0; t < 16; ++t) tam = std::max(tam, std::fabs(tab[t]));
+        std::printf("  expert %d table:", e);
+        for (int t = 0; t < 16; ++t) std::printf(" %g", tab[t]);
+        std::printf(" s1 %g\n", s1);
+        const long long fy = N / parts;
+        for (int n = 0; n < 4; ++n) {
+            const long long row = (n / fy) * (N / parts) + (n % fy);
+            double y = 0.0;
+            for (long long g = 0; g < K / 64; ++g) {
+                long long is = 0;
+                for (long long k = g * 64; k < g * 64 + 64; ++k) {
+                    const uint8_t b = ce[p0 + row * (K / 2) + k / 2];
+                    const int code = (k & 1) ? (b >> 4) : (b & 15);
+                    is += (long long)a[(size_t)tok * K + k] * (long long)std::nearbyint(tab[code] * 127.0f / tam);
+                }
+                y += (double)is * as[(size_t)tok * (K / 128) + g / 2] * e4m3(se[p0 + row * (K / 64) + g]) * (double)(s1 * (tam / 127.0f));
+            }
+            std::printf("  row 0 col %d: libxe %.6g libref %.6g host-at-offsets %.6g\n", n, bf(hy[(size_t)n]), yref[(size_t)n], y);
+        }
+    }
     long long bad = 0;
     double worst = 0.0;
     for (size_t i = 0; i < hy.size(); ++i) {

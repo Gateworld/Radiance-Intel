@@ -21,6 +21,7 @@
  * (the raw directory from m3/tools/formatc-unpack.py; $RADIANCE_HOME for libquant). Without them the case skips, so
  * the unit tier passes over it. */
 #include "quant_fixture.h"
+#include "rad_planes.h"
 
 #include <algorithm>
 #include <fstream>
@@ -227,6 +228,78 @@ TEST(format_c_int8_levels_against_the_exact_codebook_and_format_b) {
             std::printf("MEAN %-7s over %2d | %.5f %.5f %.5f | %.4f %.4f\n", d ? "down" : "gate_up", cnt[d],
                         sum[d][0] / cnt[d], sum[d][1] / cnt[d], sum[d][2] / cnt[d], sum[d][1] / sum[d][0],
                         sum[d][2] / sum[d][0]);
+}
+
+/* Owner note 147's real-weight check, its host half (run 116): four real experts of one layer (the sample's first
+ * four in index.txt order) quantised by the served rule, as above, and written as the loader's joined entries --
+ * rad_planes_relayout of (codes, table) and of (scale, scale.1), the order xe_moe_planes.cpp's view_ok accepts -- to
+ * RI_FORMATC_JOINED/<n>.<gate_up|down>.{c,s}.bin, with meta.txt (n, matrix, rows, cols). libxe's moe_i4i8_test reads
+ * them (RI_FORMATC_JOINED, RI_LIBREF) and compares xe_rad_moe_gemm_w4nl_i8 on amd-host's CPU device with libref.
+ *   RI_FORMATC_RAW=DIR RI_FORMATC_GRAMS=DIR RI_FORMATC_JOINED=OUT formatc_study_test */
+TEST(format_c_real_experts_written_as_joined_entries) {
+    const char* rawe = std::getenv("RI_FORMATC_RAW");
+    const char* gde = std::getenv("RI_FORMATC_GRAMS");
+    const char* oute = std::getenv("RI_FORMATC_JOINED");
+    if (!rawe || !gde || !oute) SKIP("RI_FORMATC_RAW / RI_FORMATC_GRAMS / RI_FORMATC_JOINED not set (by hand)");
+    NEED_LIBQUANT();
+    const std::string raw = rawe, gdir = gde, out = oute;
+    std::ifstream idx(raw + "/index.txt");
+    REQUIRE(idx.good());
+    std::ofstream meta(out + "/meta.txt");
+    REQUIRE(meta.good());
+    int l, e, l0 = -1;
+    std::string which;
+    int64_t rows, cols;
+    int nexp[2] = { 0, 0 };
+    while (idx >> l >> e >> which >> rows >> cols) {
+        if (l0 < 0) l0 = l;
+        const int d = which == "down" ? 1 : 0;
+        if (l != l0 || nexp[d] >= 4) continue;
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/%d.%d.%s.f32", raw.c_str(), l, e, which.c_str());
+        const std::vector<float> w = read_f32(path, (size_t)(rows * cols));
+        REQUIRE(!w.empty());
+        char name[128];
+        std::snprintf(name, sizeof name, "blk.%d.%s.%d.weight", l, d ? "ffn_down_exps" : "ffn_gate_up_exps", e);
+        Opts os;
+        os.s("table", "w4nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32").s("block2", "*x*")
+          .f("scale2_value", 0.0001220703125).s("transform", "fwht128").s("rule", "search").i("cd", 3)
+          .s("calib", gdir.c_str());
+        const Quantised qs = quantise(quantizer("gptq"), os, name, rows, cols, w);
+        REQUIRE_EQ(qs.status, RAD_OK);
+        const char* roles[2][2] = { { "codes", "table" }, { "scale", "scale.1" } };
+        for (int v = 0; v < 2; ++v) {
+            int sel[2];
+            RadTensor pl[2]{};
+            for (int x = 0; x < 2; ++x) {
+                const RadEncPlane* p = rad_enc_plane(&qs.enc, roles[v][x]);
+                REQUIRE(p != nullptr);
+                sel[x] = (int)(p - qs.enc.plane);
+                pl[x].dtype = p->dtype;
+                pl[x].rank = 2;
+                pl[x].data = (void*)qs.planes[(size_t)sel[x]].data();
+                if (p->kind == RAD_PLANE_TABLE) { pl[x].shape[0] = p->extent[0]; pl[x].shape[1] = p->extent[1]; }
+                else if (p->block[0] == 0) { pl[x].shape[0] = 1; pl[x].shape[1] = 1; }   /* one value (scale.1) */
+                else { pl[x].shape[0] = rows / p->block[0]; pl[x].shape[1] = cols / p->block[1]; }
+                REQUIRE_EQ(rad_dtype_bytes(pl[x].dtype, pl[x].shape[0] * pl[x].shape[1]), (int64_t)qs.planes[(size_t)sel[x]].size());
+            }
+            RadPlanesEntry pe[2];
+            std::vector<uint8_t> j((size_t)rad_planes_plan(&qs.enc, sel, pl, 2, pe), 0);
+            REQUIRE_EQ(rad_planes_relayout(&qs.enc, sel, pl, 2, j.data(), (int64_t)j.size()), RAD_OK);
+            std::snprintf(path, sizeof path, "%s/%d.%s.%c.bin", out.c_str(), nexp[d], which.c_str(), v ? 's' : 'c');
+            FILE* f = std::fopen(path, "wb");
+            REQUIRE(f != nullptr);
+            REQUIRE_EQ(std::fwrite(j.data(), 1, j.size(), f), j.size());
+            std::fclose(f);
+        }
+        meta << nexp[d] << " " << which << " " << rows << " " << cols << " " << l << " " << e << "\n";
+        std::printf("joined %d %s (layer %d expert %d, %lld x %lld): %s\n", nexp[d], which.c_str(), l, e,
+                    (long long)rows, (long long)cols, rad::enc_name(qs.enc).c_str());
+        std::fflush(stdout);
+        ++nexp[d];
+    }
+    REQUIRE_EQ(nexp[0], 4);
+    REQUIRE_EQ(nexp[1], 4);
 }
 
 RAD_TEST_MAIN()
