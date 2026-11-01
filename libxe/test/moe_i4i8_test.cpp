@@ -224,6 +224,10 @@ int main(int argc, char** argv) {
     fails += !run_case(q, fn, true, 4, 10, 16, 512, 512, 256, 1, false, 3);
     fails += !run_case(q, fn, false, 4, 10, 16, 256, 256, 512, 2, true, 4);
     fails += !run_case(q, fn, true, 1, 10, 16, 512, 512, 256, 1, true, 5);
+    /* the run form's other widths (run 114): K 2560 (16 lanes a column, 5 chunks a lane, gate_up's) and K 384 (8 lanes,
+     * the second unit half past the row: a rank's down class) */
+    fails += !run_case(q, fn, false, 4, 10, 16, 512, 256, 2560, 2, true, 6);
+    fails += !run_case(q, fn, true, 4, 10, 16, 512, 512, 384, 1, true, 7);
     std::printf("%s (%d failing case(s))\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

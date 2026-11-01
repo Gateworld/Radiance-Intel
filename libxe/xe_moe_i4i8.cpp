@@ -23,6 +23,7 @@
 #include "r4d_args.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -115,6 +116,161 @@ void moe_i4i8_kernel(const int8_t* __restrict__ A, const float* __restrict__ As,
     if (lane == 0) Y[(size_t)i * y_ld + n] = to_bf16(acc);
 }
 
+/* The run form (moe_planes_v2m's shape, xe_moe_planes.cpp, at format B; the probe's L16 / L8 mappings): the
+ * work-group whose row starts a run of up to MT routed rows of one expert stages the run's activations and writes
+ * them all, so each weight chunk is loaded once for the run; the run's other work-groups return, and a padding row
+ * writes its zeros. A team of LPR lanes owns R output columns; lane l loads 16-byte chunks (32 codes) l + u * LPR.
+ * The activations are staged as (even, odd) dword pairs a block of eight, so a canonical code dword (byte b: element
+ * 2b low, 2b + 1 high) meets its two activation dwords directly; a group's two chunks sit on lanes l and l ^ 1 and
+ * their exact sums join by one xor (as floats: |sum| < 2^24) before the group's -8 sum(a) and libref's scaling. */
+constexpr int kMT = 4, kWG = 512;
+constexpr uint32_t kMaxK = 4096;
+template <int UPL, int LPR, int R>
+void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                         const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                         uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                         uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
+    XE_SHARED(uint32_t, s_a, kMT * (kMaxK / 4));   /* (even, odd) dwords a block of eight */
+    XE_SHARED(float, s_g, kMT * (kMaxK / 64));     /* each group's activation sum (exact) */
+    XE_SHARED(float, s_as, kMT * (kMaxK / 128));   /* the per-128 scales */
+    const int tid = (int)threadIdx.x;
+    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    if (i >= T) return;
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        e = (int32_t)lo;
+    }
+    uint32_t rn = 1;
+    if (e >= 0) {
+        const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % kMT != 0) return;
+        rn = (last - i) < (uint32_t)kMT ? (last - i) : (uint32_t)kMT;
+    }
+    uint32_t tokr[kMT];
+    bool liver[kMT];
+#pragma unroll
+    for (int q = 0; q < kMT; ++q) {
+        tokr[q] = 0; liver[q] = false;
+        if (e >= 0 && (uint32_t)q < rn) {
+            const int32_t fq = sorted[i + q];
+            const uint32_t t = a_sorted ? i + q : (uint32_t)fq / top_k;
+            tokr[q] = t;
+            liver[q] = fq >= 0 && t < a_rows;
+        }
+    }
+    const ICls& c = (e >= 0 && (e & 1)) ? c1 : c0;
+    const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? c.k : 0u;
+    if (e >= 0) {
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) {
+            if ((uint32_t)q >= rn || !liver[q]) continue;
+            const uint32_t* arow = (const uint32_t*)(A + (size_t)tokr[q] * a_ld);
+            for (uint32_t b = (uint32_t)tid; b < K / 8u; b += kWG) {
+                const uint32_t lo = arow[2 * b], hi = arow[2 * b + 1];
+                s_a[q * (kMaxK / 4) + 2 * b] = (uint32_t)a_even(lo, hi);
+                s_a[q * (kMaxK / 4) + 2 * b + 1] = (uint32_t)a_odd(lo, hi);
+            }
+            for (uint32_t g = (uint32_t)tid; g < K / 64u; g += kWG) {
+                const uint32_t* ag = arow + g * 16u;
+                int32_t sa = 0;
+                for (int d = 0; d < 16; ++d) sa = dp4((int32_t)ag[d], (int32_t)0x01010101, sa);
+                s_g[q * (kMaxK / 64) + g] = (float)sa;
+            }
+            for (uint32_t g = (uint32_t)tid; g < K / 128u; g += kWG)
+                s_as[q * (kMaxK / 128) + g] = As[(size_t)tokr[q] * as_ld + g];
+        }
+    }
+    __syncthreads();
+    const int team = tid / LPR, l = tid % LPR;
+    float acc[kMT][R];
+    uint32_t rowr[R];
+    bool rowok[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const uint32_t n = nb * ((kWG / LPR) * R) + (uint32_t)(team * R + r);
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        rowok[r] = e >= 0 && n < N && j < fc;
+        rowr[r] = pp * fc + j;
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) acc[q][r] = 0.0f;
+    }
+    if (e >= 0) {
+        const uint32_t CPR = K / 32u;
+        const uint32_t entry = (uint32_t)e >> 1;
+        const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry);
+        const uint16_t* se = (const uint16_t*)entry_of(c.sbase, c.stab, c.sstride, entry);
+        uint4 w[UPL][R];
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                w[u][r] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
+                                                 : uint4{0, 0, 0, 0};
+        }
+#pragma unroll
+        for (int u = 0; u < UPL; ++u) {
+            const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
+            /* No break: the join below is a sub-group shuffle every lane must reach. A chunk past the row (both of a
+             * group's, CPR being even) computes on zero codes and adds nothing; its scales are not read. */
+            const bool live = jc < CPR;
+            const uint32_t g = live ? jc / 2u : 0u;
+            float sbr[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                sbr[r] = rowok[r] && live ? __uint_as_float((uint32_t)se[(size_t)rowr[r] * c.s_ld + g] << 16) : 0.0f;
+#pragma unroll
+            for (int q = 0; q < kMT; ++q) {
+                if ((uint32_t)q >= rn) break;   /* uniform over the work-group */
+                const float asc = s_as[q * (kMaxK / 128) + g / 2u], gs = s_g[q * (kMaxK / 64) + g];
+                uint32_t a[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) a[t] = live ? s_a[q * (kMaxK / 4) + jc * 8u + (uint32_t)t] : 0u;
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t d[4] = { w[u][r].x, w[u][r].y, w[u][r].z, w[u][r].w };
+                    int32_t s = 0;
+#pragma unroll
+                    for (int x = 0; x < 4; ++x) {
+                        const uint32_t uu = d[x] ^ 0x88888888u;
+                        s = dp4((int32_t)(uu & 0x0F0F0F0Fu), (int32_t)a[2 * x], s);
+                        s = dp4((int32_t)((uu >> 4) & 0x0F0F0F0Fu), (int32_t)a[2 * x + 1], s);
+                    }
+                    float fs = (float)s;
+                    fs += __shfl_xor(fs, 1);   /* the group's other chunk */
+                    if ((l & 1) == 0 && rowok[r] && live) acc[q][r] += ((fs - 8.0f * gs) * asc) * sbr[r];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < kMT; ++q) {
+        if ((uint32_t)q >= rn) break;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[q][r];   /* the even lanes' sums (the odd lanes hold 0) */
+            if constexpr (LPR == 16) v += __shfl_xor(v, 8);
+            if constexpr (LPR >= 8) v += __shfl_xor(v, 4);
+            v += __shfl_xor(v, 2);
+            v += __shfl_xor(v, 1);
+            const uint32_t n = nb * ((kWG / LPR) * R) + (uint32_t)(team * R + r);
+            if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] ? v : 0.0f);
+        }
+    }
+}
+
+/* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
+bool plain_forced() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
+    return v;
+}
+
 /* One class's table: a pointer table (stride 0) or a stacked plane. */
 int table_of(const RadTensor* t, long long cnt, const uint8_t** base, const void* const** tab, uint64_t* stride) {
     if (!t || !t->data || t->rank < 2 || t->shape[0] < cnt) return R4D_NO(RAD_E_SHAPE);
@@ -186,6 +342,32 @@ extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) {
     }
     try {
         sycl::queue* qq = (sycl::queue*)s;
+        if (!plain_forced() && K <= (long long)kMaxK) {
+            /* the run form: 8 lanes a column at K <= 512 (down, 4-8 groups a row), else 16 (gate_up) */
+            const int lpr = K <= 512 ? 8 : 16;
+            const int upl = (int)((K / 32 + lpr - 1) / lpr);
+            const unsigned cpw = (unsigned)((kWG / lpr) * 2);
+            const dim3 grid((unsigned)((N + cpw - 1) / cpw), (unsigned)T), block(kWG);
+#define XE_I4I8_RUN(U, L)                                                                                    \
+    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, 2>), grid, block, 0, (const int8_t*)Aq->data,            \
+                 (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
+                 (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
+                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M)
+            if (lpr == 8) {
+                if (upl <= 1) XE_I4I8_RUN(1, 8); else XE_I4I8_RUN(2, 8);
+            } else switch (upl) {
+                case 1: XE_I4I8_RUN(1, 16); break;
+                case 2: XE_I4I8_RUN(2, 16); break;
+                case 3: XE_I4I8_RUN(3, 16); break;
+                case 4: XE_I4I8_RUN(4, 16); break;
+                case 5: XE_I4I8_RUN(5, 16); break;
+                case 6: XE_I4I8_RUN(6, 16); break;
+                case 7: XE_I4I8_RUN(7, 16); break;
+                default: XE_I4I8_RUN(8, 16); break;
+            }
+#undef XE_I4I8_RUN
+            return RAD_OK;
+        }
         XE_LAUNCH(qq, moe_i4i8_kernel, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
                   (const int8_t*)Aq->data, (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data,
                   (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
