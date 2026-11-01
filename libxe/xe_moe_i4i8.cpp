@@ -131,7 +131,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
-    XE_SHARED(uint32_t, s_a, kMT * (kMaxK / 4));   /* (even, odd) dwords a block of eight */
+    XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
     XE_SHARED(float, s_g, kMT * (kMaxK / 64));     /* each group's activation sum (exact) */
     XE_SHARED(float, s_as, kMT * (kMaxK / 128));   /* the per-128 scales */
     const int tid = (int)threadIdx.x;
@@ -181,8 +181,9 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                 const bool in = b < K / 8u;
                 const uint32_t lo = in ? arow[2 * b] : 0u, hi = in ? arow[2 * b + 1] : 0u;
                 if (in) {
-                    s_a[q * (kMaxK / 4) + 2 * b] = (uint32_t)a_even(lo, hi);
-                    s_a[q * (kMaxK / 4) + 2 * b + 1] = (uint32_t)a_odd(lo, hi);
+                    uint4& d = s_a[q * (kMaxK / 16) + b / 2u];   /* dwords 2b, 2b + 1: half of a uint4 */
+                    if (b & 1u) { d.z = (uint32_t)a_even(lo, hi); d.w = (uint32_t)a_odd(lo, hi); }
+                    else        { d.x = (uint32_t)a_even(lo, hi); d.y = (uint32_t)a_odd(lo, hi); }
                 }
                 int32_t sa = dp4((int32_t)hi, (int32_t)0x01010101, dp4((int32_t)lo, (int32_t)0x01010101, 0));
                 sa += __shfl_xor(sa, 4);
@@ -241,9 +242,14 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
             for (int q = 0; q < kMT; ++q) {
                 if ((uint32_t)q >= rn) break;   /* uniform over the work-group */
                 const float asc = s_as[q * (kMaxK / 128) + g / 2u], gs = s_g[q * (kMaxK / 64) + g];
+                /* 16-byte loads, unpredicated: a chunk past the row reads inside s_a (jc < kMaxK / 32 for every
+                 * instance: 16 lanes x 8 units, or GL's 2 x 4 groups) and its sum is never accumulated */
                 uint32_t a[8 * CH];
 #pragma unroll
-                for (int t = 0; t < 8 * CH; ++t) a[t] = live ? s_a[q * (kMaxK / 4) + jc * 8u + (uint32_t)t] : 0u;
+                for (int v = 0; v < 2 * CH; ++v) {
+                    const uint4 x = s_a[q * (kMaxK / 16) + jc * 2u + (uint32_t)v];
+                    a[4 * v] = x.x; a[4 * v + 1] = x.y; a[4 * v + 2] = x.z; a[4 * v + 3] = x.w;
+                }
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     int32_t s = 0;
