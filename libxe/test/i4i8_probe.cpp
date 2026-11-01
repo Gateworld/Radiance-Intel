@@ -56,8 +56,14 @@ uint8_t e4(uint32_t r) { return (uint8_t)((r & 0x80u) | ((1u + (r >> 8) % 10u) <
 float bf(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
 
 /* ---- the shapes and the routing (shared by the timing and the reference: everything from h32) ---- */
-struct Proj { const char* name; uint32_t N, K; bool sorted; };
-const Proj kProj[2] = { { "gate_up", 512, 2560, false }, { "down", 2560, 256, true } };
+/* N1 / K1: the odd experts' class (0: as the even's). The engine's shapes (run 116, AGT1's trace): the two-card parity
+ * split gives gate_up classes of 768 / 512 columns and down K 384 / 256 -- timed with today's form and format B's row
+ * only (the prototype's kernels take one shape) */
+struct Proj { const char* name; uint32_t N, K; bool sorted; uint32_t N1 = 0, K1 = 0; int parts = 1; };
+const Proj kProj[4] = { { "gate_up", 512, 2560, false, 0, 0, 2 }, { "down", 2560, 256, true, 0, 0, 1 },
+                        { "gate_up-engine", 768, 2560, false, 512, 2560, 2 }, { "down-engine", 2560, 384, true, 2560, 256, 1 } };
+uint32_t n_of(const Proj& P, int e) { return (e & 1) && P.N1 ? P.N1 : P.N; }
+uint32_t k_of(const Proj& P, int e) { return (e & 1) && P.K1 ? P.K1 : P.K; }
 
 struct Route {
     int T, tokens;
@@ -94,11 +100,11 @@ Route route_of(int mode, int L) {
 
 /* the i4 form of expert e: codes and scales */
 void i4_codes(int e, const Proj& P, std::vector<uint8_t>& c) {
-    c.resize((size_t)P.N * P.K / 2);
+    c.resize((size_t)n_of(P, e) * k_of(P, e) / 2);
     for (size_t i = 0; i < c.size(); ++i) c[i] = (uint8_t)h32(e * 7919 + 101, i);
 }
 void i4_scales(int e, const Proj& P, std::vector<uint16_t>& s) {
-    s.resize((size_t)P.N * (P.K / 64));
+    s.resize((size_t)n_of(P, e) * (k_of(P, e) / 64));
     for (size_t i = 0; i < s.size(); ++i) {   /* 2^-15 .. 2^-10, 7 mantissa bits: exact bf16 */
         const uint32_t h = h32(e * 104729 + 103, i);
         const float f = std::ldexp(1.0f + (float)(h & 127u) / 128.0f, -15 + (int)((h >> 7) % 6u));
@@ -374,22 +380,23 @@ int time_main(const char* lib, int launches, int runs) {
     const float levels[16] = { -8.f, -5.5f, -4.f, -3.f, -2.25f, -1.5f, -0.875f, -0.25f,
                                0.25f, 0.875f, 1.5f, 2.25f, 3.f, 4.f, 5.5f, 8.f };
     const int cnt = kNExpert / 2;
-    for (int pi = 0; pi < 2; ++pi) {
+    for (int pi = 0; pi < 4; ++pi) {
         const Proj& P = kProj[pi];
         const uint32_t G = P.K / 64;
-        /* both forms of all 512 experts in device memory (far past L2) */
-        const Form F = form_of(P.N, P.K);
+        /* both forms of all 512 experts in device memory (far past L2); each expert at its class's shape */
         std::vector<const void*> pc[2], ps[2];
         std::vector<const uint8_t*> wt(kNExpert);
         std::vector<const uint16_t*> st(kNExpert);
-        std::vector<uint8_t> hc(F.codes_bytes), hs(F.scale_bytes), ic;
+        std::vector<uint8_t> hc, hs, ic;
         std::vector<uint16_t> is;
         for (int e = 0; e < kNExpert; ++e) {
-            std::fill(hc.begin(), hc.end(), 0);
-            std::fill(hs.begin(), hs.end(), 0);
-            for (int64_t i = 0; i < (int64_t)P.N * (P.K / 2); ++i) hc[F.p0 + i] = (uint8_t)h32(e * 7919 + 1, i);
+            const int64_t Ne = n_of(P, e), Ke = k_of(P, e);
+            const Form F = form_of(Ne, Ke);
+            hc.assign((size_t)F.codes_bytes, 0);
+            hs.assign((size_t)F.scale_bytes, 0);
+            for (int64_t i = 0; i < Ne * (Ke / 2); ++i) hc[F.p0 + i] = (uint8_t)h32(e * 7919 + 1, i);
             std::memcpy(&hc[F.t_off], levels, sizeof levels);
-            for (int64_t i = 0; i < (int64_t)P.N * (P.K / 64); ++i) hs[F.p0 + i] = e4(h32(e * 104729 + 3, i));
+            for (int64_t i = 0; i < Ne * (Ke / 64); ++i) hs[F.p0 + i] = e4(h32(e * 104729 + 3, i));
             const float s1 = 1.0f / 8192.0f;
             std::memcpy(&hs[F.s1_off], &s1, 4);
             uint8_t* dc = sycl::malloc_device<uint8_t>(hc.size(), q);
@@ -464,7 +471,7 @@ int time_main(const char* lib, int launches, int runs) {
             char dt[] = "w4nl64a8h";
             RadParam p[11]{};
             const char* ik[] = { "M", "N", "K", "n_expert", "top_k", "group", "N_odd", "K_odd", "parts" };
-            const long long iv[] = { a_rows, P.N, P.K, kNExpert, kTopK, 128, P.N, P.K, pi == 0 ? 2 : 1 };
+            const long long iv[] = { a_rows, P.N, P.K, kNExpert, kTopK, 128, P.N1 ? P.N1 : P.N, P.K1 ? P.K1 : P.K, P.parts };
             for (int i = 0; i < 9; ++i) { p[i].key = ik[i]; p[i].kind = RAD_P_INT; p[i].ival = iv[i]; }
             p[9].key = "a_order"; p[9].kind = RAD_P_STR; p[9].sval = P.sorted ? "sorted" : "token";
             p[10].key = "dtype"; p[10].kind = RAD_P_STR; p[10].sval = dt;
