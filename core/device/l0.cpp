@@ -898,6 +898,22 @@ std::unordered_map<ze_command_list_handle_t, NProf>& nprof_lists() { static std:
 struct NProfAcc { uint64_t ticks = 0, count = 0; };
 std::unordered_map<std::string, NProfAcc>& nprof_acc() { static std::unordered_map<std::string, NProfAcc> m; return m; }
 uint64_t g_nprof_harvested = 0;
+/* The profiler's timeline (Intel port, run 124, owner note 151 C: the ~5.8 ms of host / sync a step). Each harvested
+ * play is a span on its device -- its first command's start to its last command's end -- with the idle time between
+ * its own commands, and the kernels at its two ends. At each print a device's spans are sorted and the idle time
+ * between consecutive plays is charged to the boundary (the kernel that ended -> the kernel that started next). Gaps
+ * over 5 ms (nothing queued: between requests) are counted apart. */
+struct NSpan { uint64_t a, b; const std::string* first; const std::string* last; };
+struct NTimeline { std::vector<NSpan> spans; uint64_t busy = 0, inner = 0, inner_n = 0; };
+std::unordered_map<const void*, NTimeline>& ntimeline() { static std::unordered_map<const void*, NTimeline> m; return m; }
+std::string nprof_short(const std::string* s) {
+    if (!s) return "(copy)";
+    std::string nm = *s;
+    const size_t z = nm.find("_Z");   /* the mangled kernel after launch_as's own prefix */
+    if (z != std::string::npos && z + 2 < nm.size() && nm.find("_Z", z + 2) != std::string::npos) nm = nm.substr(nm.find("_Z", z + 2));
+    if (nm.size() > 56) nm.resize(56);
+    return nm;
+}
 ZeDev& zedev(int d) { static ZeDev z[kMaxDevices]; return z[d]; }
 using AppendFn = ze_result_t (*)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t,
                                  uint32_t, ze_event_handle_t*);
@@ -1158,6 +1174,21 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
             acc.ticks += d;
             acc.count += 1;
         }
+        if (p.n > 0) {   /* the timeline: this play's span, its inner gaps */
+            NTimeline& tl = ntimeline()[&Z];
+            const uint64_t half = mask >> 1;
+            uint64_t prev_end = p.ts[1] & mask;
+            for (uint32_t k = 0; k < p.n; ++k) {
+                const uint64_t a = p.ts[2 * k] & mask, b = p.ts[2 * k + 1] & mask;
+                tl.busy += (b - a) & mask;
+                if (k > 0) {
+                    const uint64_t g = (a - prev_end) & mask;
+                    if (g <= half) { tl.inner += g; ++tl.inner_n; }
+                }
+                prev_end = b;
+            }
+            tl.spans.push_back(NSpan{ p.ts[0] & mask, p.ts[2 * (p.n - 1) + 1] & mask, p.names[0], p.names[p.n - 1] });
+        }
         if (++g_nprof_harvested % 8192 == 0) {
             std::vector<std::pair<std::string, NProfAcc>> rows(nprof_acc().begin(), nprof_acc().end());
             std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second.ticks > y.second.ticks; });
@@ -1173,6 +1204,55 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
                 if (nm.size() > 96) nm.resize(96);
                 RAD_INFO("  %6.1f%%  %8.1f ms  %8llu x  %7.1f us  %s", 100.0 * a.ticks / (tot ? tot : 1), a.ticks * Z.timer_ns * 1e-6,
                          (unsigned long long)a.count, a.count ? a.ticks * Z.timer_ns * 1e-3 / a.count : 0.0, nm.c_str());
+            }
+            /* the timeline, a device at a time, over the plays harvested since the last print */
+            for (auto& kv : ntimeline()) {
+                NTimeline& tl = kv.second;
+                if (tl.spans.empty()) continue;
+                int dev = -1;
+                for (int d = 0; d < kMaxDevices; ++d) if ((const void*)&zedev(d) == kv.first) dev = d;
+                const ZeDev& D = *(const ZeDev*)kv.first;
+                const uint64_t dmask = D.ts_bits >= 64 ? ~0ull : ((1ull << D.ts_bits) - 1);
+                const uint64_t base = tl.spans[0].a;
+                auto rel = [&](uint64_t t) { return (t - base) & dmask; };
+                std::sort(tl.spans.begin(), tl.spans.end(), [&](const NSpan& x, const NSpan& y) { return rel(x.a) < rel(y.a); });
+                const double ns = D.timer_ns;
+                uint64_t cur = rel(tl.spans[0].b), gap = 0, big = 0, gap_n = 0, big_n = 0;
+                const NSpan* holder = &tl.spans[0];
+                std::vector<double> gaps_us;
+                std::unordered_map<std::string, std::pair<double, uint64_t>> by_edge;
+                for (size_t i = 1; i < tl.spans.size(); ++i) {
+                    const NSpan& s = tl.spans[i];
+                    const uint64_t sa = rel(s.a), sb = rel(s.b);
+                    if (sa > cur) {
+                        const uint64_t g = sa - cur;
+                        if (g * ns > 5e6) { big += g; ++big_n; }
+                        else {
+                            gap += g; ++gap_n;
+                            gaps_us.push_back(g * ns * 1e-3);
+                            auto& e = by_edge[nprof_short(holder->last) + " -> " + nprof_short(s.first)];
+                            e.first += g * ns * 1e-3;
+                            e.second += 1;
+                        }
+                    }
+                    if (sb >= cur) { cur = sb; holder = &s; }
+                }
+                std::sort(gaps_us.begin(), gaps_us.end());
+                auto q = [&](double f) { return gaps_us.empty() ? 0.0 : gaps_us[std::min(gaps_us.size() - 1, (size_t)(f * (gaps_us.size() - 1)))]; };
+                RAD_INFO("l0 tape timeline, device %d: %zu plays over %.1f ms; commands busy %.1f ms, idle inside plays %.1f ms "
+                         "(%llu boundaries), idle between plays %.1f ms (%llu boundaries: p50 %.1f us, p95 %.1f, max %.1f), "
+                         "%llu gaps over 5 ms apart (%.1f ms)",
+                         dev, tl.spans.size(), cur * ns * 1e-6, tl.busy * ns * 1e-6, tl.inner * ns * 1e-6,
+                         (unsigned long long)tl.inner_n, gap * ns * 1e-6, (unsigned long long)gap_n, q(0.5), q(0.95),
+                         gaps_us.empty() ? 0.0 : gaps_us.back(), (unsigned long long)big_n, big * ns * 1e-6);
+                std::vector<std::pair<std::string, std::pair<double, uint64_t>>> edges(by_edge.begin(), by_edge.end());
+                std::sort(edges.begin(), edges.end(), [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+                for (size_t i = 0; i < edges.size() && i < 10; ++i)
+                    RAD_INFO("  between plays %8.1f ms  %7llu x  %7.1f us  %s", edges[i].second.first * 1e-3,
+                             (unsigned long long)edges[i].second.second, edges[i].second.first / (double)edges[i].second.second,
+                             edges[i].first.c_str());
+                tl.spans.clear();
+                tl.busy = tl.inner = tl.inner_n = 0;
             }
         }
     }
