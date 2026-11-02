@@ -532,6 +532,9 @@ private:
         int64_t verify = 0, fired = 0, fired_prop = 0, fired_acc = 0;
         int64_t sh_n[kNgramMax + 1] = {}, sh_head[kNgramMax + 1] = {}, sh_look[kNgramMax + 1] = {};
         int64_t sh_ahead[kNgramMax + 1] = {}, sh_behind[kNgramMax + 1] = {};
+        /* where the plan's gate saw a decode row: the head's proposal there, none, or no speculation allowed; the
+         * lookups run and those that matched; shadows made and dropped (their step committed from elsewhere) */
+        int64_t gate_head = 0, gate_empty = 0, gate_nospec = 0, looked = 0, matched = 0, sh_made = 0, sh_dropped = 0;
     };
     NgramStats ngs_;
     void ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, bool fired, int32_t n_spec, int32_t a);

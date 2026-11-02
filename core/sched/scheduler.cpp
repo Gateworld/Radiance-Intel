@@ -753,10 +753,16 @@ int Scheduler::draft_ngram(const SchedReq& s, int depth, int32_t* out, int* matc
  * lookup's proposal is kept aside (SchedReq::shadow); the commit that emits from its position records what the head's
  * verify emitted, and once enough of the output is known the shadow is scored: the tokens a verify of it would have
  * emitted (its matching prefix plus the bonus token), against the head's, by the length of the pattern it matched. */
-static bool ngram_stats_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_NGRAM_STATS"); return e && e[0] == '1'; }();
+/* the log period in verifies: RADIANCE_NGRAM_STATS=1 every 2048, a larger value that many; 0 off */
+static long ngram_stats_period() {
+    static const long v = [] {
+        const char* e = std::getenv("RADIANCE_NGRAM_STATS");
+        const long n = e ? std::strtol(e, nullptr, 10) : 0;
+        return n <= 0 ? 0L : (n == 1 ? 2048L : n);
+    }();
     return v;
 }
+static bool ngram_stats_on() { return ngram_stats_period() > 0; }
 
 void Scheduler::ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, bool fired, int32_t n_spec, int32_t a) {
     const Request& r = *s.req;
@@ -766,7 +772,7 @@ void Scheduler::ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, boo
     if (s.shadow_pos >= 0) {
         if (s.shadow_head < 0) {
             if (o0 == s.shadow_pos) s.shadow_head = emitted;
-            else if (o0 > s.shadow_pos) s.shadow_pos = -1;   /* its step committed elsewhere: dropped */
+            else if (o0 > s.shadow_pos) { s.shadow_pos = -1; ++g.sh_dropped; }   /* its step committed elsewhere */
         }
         if (s.shadow_pos >= 0 && s.shadow_head >= 0) {
             const int64_t have = (int64_t)r.output.size() - s.shadow_pos;
@@ -784,11 +790,33 @@ void Scheduler::ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, boo
             }
         }
     }
-    if (g.verify % 2048 == 0) {
-        char buf[512];
-        int o = std::snprintf(buf, sizeof buf, "prompt lookup (RADIANCE_NGRAM_STATS): %lld verifies; it drafted %lld "
-                              "(%lld proposed, %lld accepted); where the head drafted, by match length:",
-                              (long long)g.verify, (long long)g.fired, (long long)g.fired_prop, (long long)g.fired_acc);
+    /* The shadow for the next step, from the output as now committed (run 123: decode steps are issued ahead by
+     * step_next, so the plan's gate never sees a decode row -- M208 / M209 -- and lookup never runs; a lookup step
+     * would be planned at this point, after the commit). Its depth: the head's window. */
+    if (s.shadow_pos < 0) {
+        int k = 0;
+        const int depth = draft_.step_window() > 0 ? draft_.step_window() : 3;
+        const int sn = draft_ngram(s, depth, s.shadow, &k);
+        ++g.looked;
+        if (sn > 0) {
+            ++g.matched;
+            ++g.sh_made;
+            s.shadow_pos = (int64_t)r.output.size();
+            s.shadow_n = sn;
+            s.shadow_k = k;
+            s.shadow_head = -1;
+        }
+    }
+    if (g.verify % ngram_stats_period() == 0) {
+        char buf[768];
+        int o = std::snprintf(buf, sizeof buf, "prompt lookup (RADIANCE_NGRAM_STATS): %lld verifies; the plan's gate saw "
+                              "%lld rows with the head's proposal, %lld with none, %lld not speculating; %lld lookups, "
+                              "%lld matched; shadows %lld made, %lld dropped; it drafted %lld (%lld proposed, %lld "
+                              "accepted); where the head drafted, by match length:",
+                              (long long)g.verify, (long long)g.gate_head, (long long)g.gate_empty,
+                              (long long)g.gate_nospec, (long long)g.looked, (long long)g.matched, (long long)g.sh_made,
+                              (long long)g.sh_dropped, (long long)g.fired, (long long)g.fired_prop,
+                              (long long)g.fired_acc);
         for (int k = kNgramMin; k <= kNgramMax && o < (int)sizeof buf - 96; ++k) {
             const double n = g.sh_n[k] ? (double)g.sh_n[k] : 1.0;
             o += std::snprintf(buf + o, sizeof buf - (size_t)o, " k%d n %lld, a verify head %.2f lookup %.2f, lookup "
@@ -1414,10 +1442,16 @@ const RadBatch* Scheduler::step() {
              * drafts this step and no deeper. */
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
+            if (ngram_stats_on()) {
+                if (!r.may_speculate) ++ngs_.gate_nospec;
+                else if (s.n_draft == 0) ++ngs_.gate_empty;
+                else ++ngs_.gate_head;
+            }
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
                 s.n_draft = (int32_t)draft_ngram(s, draft_.step_window(), s.draft);
                 ngram = s.n_draft > 0;
+                if (ngram_stats_on()) { ++ngs_.looked; if (ngram) ++ngs_.matched; }
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
@@ -1425,7 +1459,10 @@ const RadBatch* Scheduler::step() {
             if (ngram_stats_on() && !ngram && s.n_draft > 0 && s.shadow_pos < 0) {
                 int k = 0;
                 const int sn = draft_ngram(s, draft_.step_window(), s.shadow, &k);
+                ++ngs_.looked;
                 if (sn > 0) {
+                    ++ngs_.matched;
+                    ++ngs_.sh_made;
                     s.shadow_pos = (int64_t)r.output.size();
                     s.shadow_n = sn;
                     s.shadow_k = k;
