@@ -1223,7 +1223,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
 
     unsigned char* const s_w = ST ? (unsigned char*)sd + hc_up_st_off(RG, lr) : nullptr;
     if constexpr (ST) {
-        static_assert(F8 == 1, "the staged form reads E4M3 rows");
+        static_assert(F8 == 1 || F8 == 3, "the staged form copies one-byte rows (E4M3, or int8: owner note 158)");
         const long run = (long)ipb * uld;           /* bytes of one sub-stream's rows */
         const unsigned char* const ub = (const unsigned char*)upv + i0 * uld;
         for (long o = (long)tid * 16; o < (long)hc * run; o += kThreads * 16) {
@@ -1378,8 +1378,8 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
     const long rg = hc_up_rg(rows, lr);
     const dim3 grid((unsigned)(n / (kUpRows / hc)), (unsigned)((rows + rg - 1) / rg));
     /* The staged form (owner note 66): E4M3 rows of whole 16-byte units that fit beside `d`. */
-    st = st && f8 == 1 && uld % 16 == 0 && hc_up_st_off(rg, lr) + kUpRows * uld <= 60 * 1024;
-    s8 = s8 && st;   /* the S8 decode only with the staged E4M3 form */
+    st = st && (f8 == 1 || f8 == 3) && uld % 16 == 0 && hc_up_st_off(rg, lr) + kUpRows * uld <= 60 * 1024;
+    s8 = s8 && st && f8 == 1;   /* the S8 decode only with the staged E4M3 form (int8 rows: WI8) */
     const unsigned lds = (unsigned)(st ? hc_up_st_off(rg, lr) + kUpRows * uld : rg * lr * sizeof(float));
     const void* upp = up->data;
 #define HC_UPMIX_CASE4(RG_, F8_, I8_, ST_, S8_)                                                  \
@@ -1390,9 +1390,9 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
                        (long)rsrow, wadd)
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
-    do { /* st / s8 only with f8 == 1: no staged instantiation of the other forms */          \
+    do { /* st with one-byte rows (f8 1 or 3), s8 with E4M3 only: no other staged instantiations */ \
         if (s8) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1), (F8_ == 1));                           \
-        else if (st) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1), false);                           \
+        else if (st) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1 || F8_ == 3), false);              \
         else HC_UPMIX_CASE4(RG_, F8_, I8_, false, false);                                        \
     } while (0)
 #define HC_UPMIX_CASE(RG_, F8_)                                                                  \
@@ -1627,7 +1627,7 @@ void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void*
 /* Owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): hc_v2_down_rows_kernel's grid and sums on int8 rows and int8 N by
  * DP4A (hc8_dot_down_rows_q8), at every row count up to kHcQ8MaxRows (kRG 1 for a single row); the inject gains keep
  * their own launch on the bf16 N. */
-constexpr long kHcQ8MaxRows = 8;
+constexpr long kHcQ8MaxRows = 64;   /* the verify's rows, and the engine's smallest prefill chunk (the KL replay's) */
 template <int kRG>
 __global__ __launch_bounds__(kWave * kV2RowCols)
 void hc_v2_down_rows_q8_kernel(const signed char* __restrict__ nq, const float* __restrict__ nqs,
