@@ -724,7 +724,7 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  * Longest pattern and most recent occurrence first: a longer match predicts better, and falling
  * back to shorter ones only on a miss keeps common bigrams from dragging acceptance down. A
  * declared draft head calls set_draft() before step(), so this only fills an empty proposal. */
-int Scheduler::draft_ngram(SchedReq& s, int depth) const {
+int Scheduler::draft_ngram(const SchedReq& s, int depth, int32_t* out, int* match_k) const {
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
     const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
@@ -740,11 +740,63 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
             for (int t = 0; t < k && hit; ++t) hit = (at(j + t) == at(n - k + t));
             if (!hit) continue;
             int d = 0;
-            while (d < depth && j + k + d < n) { s.draft[d] = at(j + k + d); ++d; }
+            while (d < depth && j + k + d < n) { out[d] = at(j + k + d); ++d; }
+            if (match_k) *match_k = k;
             return d;
         }
     }
     return 0;
+}
+
+/* RADIANCE_NGRAM_STATS=1 (Intel port, run 123, owner note 151 B): measure prompt lookup on live traffic. A verify that
+ * prompt lookup drafted (the head declined) counts its proposal and acceptance. At a step where the head drafted, the
+ * lookup's proposal is kept aside (SchedReq::shadow); the commit that emits from its position records what the head's
+ * verify emitted, and once enough of the output is known the shadow is scored: the tokens a verify of it would have
+ * emitted (its matching prefix plus the bonus token), against the head's, by the length of the pattern it matched. */
+static bool ngram_stats_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_NGRAM_STATS"); return e && e[0] == '1'; }();
+    return v;
+}
+
+void Scheduler::ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, bool fired, int32_t n_spec, int32_t a) {
+    const Request& r = *s.req;
+    NgramStats& g = ngs_;
+    ++g.verify;
+    if (fired) { ++g.fired; g.fired_prop += n_spec; g.fired_acc += a; }
+    if (s.shadow_pos >= 0) {
+        if (s.shadow_head < 0) {
+            if (o0 == s.shadow_pos) s.shadow_head = emitted;
+            else if (o0 > s.shadow_pos) s.shadow_pos = -1;   /* its step committed elsewhere: dropped */
+        }
+        if (s.shadow_pos >= 0 && s.shadow_head >= 0) {
+            const int64_t have = (int64_t)r.output.size() - s.shadow_pos;
+            int L = 0;
+            while (L < s.shadow_n && L < have && r.output[(size_t)(s.shadow_pos + L)] == s.shadow[L]) ++L;
+            if (L == s.shadow_n || L < have) {   /* decided: every proposed token matched, or a mismatch seen */
+                const int k = s.shadow_k < 0 ? 0 : (s.shadow_k > kNgramMax ? kNgramMax : s.shadow_k);
+                const int look = L + 1;
+                ++g.sh_n[k];
+                g.sh_head[k] += s.shadow_head;
+                g.sh_look[k] += look;
+                if (look > s.shadow_head) ++g.sh_ahead[k];
+                if (look < s.shadow_head) ++g.sh_behind[k];
+                s.shadow_pos = -1;
+            }
+        }
+    }
+    if (g.verify % 2048 == 0) {
+        char buf[512];
+        int o = std::snprintf(buf, sizeof buf, "prompt lookup (RADIANCE_NGRAM_STATS): %lld verifies; it drafted %lld "
+                              "(%lld proposed, %lld accepted); where the head drafted, by match length:",
+                              (long long)g.verify, (long long)g.fired, (long long)g.fired_prop, (long long)g.fired_acc);
+        for (int k = kNgramMin; k <= kNgramMax && o < (int)sizeof buf - 96; ++k) {
+            const double n = g.sh_n[k] ? (double)g.sh_n[k] : 1.0;
+            o += std::snprintf(buf + o, sizeof buf - (size_t)o, " k%d n %lld, a verify head %.2f lookup %.2f, lookup "
+                               "ahead %lld behind %lld;", k, (long long)g.sh_n[k], (double)g.sh_head[k] / n,
+                               (double)g.sh_look[k] / n, (long long)g.sh_ahead[k], (long long)g.sh_behind[k]);
+        }
+        RAD_INFO("%s", buf);
+    }
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1364,11 +1416,22 @@ const RadBatch* Scheduler::step() {
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
-                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
+                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window(), s.draft);
                 ngram = s.n_draft > 0;
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
+            /* RADIANCE_NGRAM_STATS: what prompt lookup would have proposed where the head drafted (not used) */
+            if (ngram_stats_on() && !ngram && s.n_draft > 0 && s.shadow_pos < 0) {
+                int k = 0;
+                const int sn = draft_ngram(s, draft_.step_window(), s.shadow, &k);
+                if (sn > 0) {
+                    s.shadow_pos = (int64_t)r.output.size();
+                    s.shadow_n = sn;
+                    s.shadow_k = k;
+                    s.shadow_head = -1;
+                }
+            }
             /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
              * rotary row or block-table column. commit() finishes a sequence before it reaches
              * the limit, so the one token itself always fits. */
@@ -2013,10 +2076,13 @@ int Scheduler::commit(const StepResult& res) {
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
                 if (!server::sink_push(r.sink, t, lp)) overflowed = true;
             };
+            const int64_t o0 = (int64_t)r.output.size();
             for (int32_t j = 0; j < a; ++j) emit(s.draft[j], j);
             if (res.token) emit(res.token[i], a);
             r.n_computed = valid;
             step_decode_tok_ += 1 + a;
+            if (ngram_stats_on())
+                ngram_stats_commit(s, o0, (int32_t)((int64_t)r.output.size() - o0), e.ngram, e.n_spec, a);
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);

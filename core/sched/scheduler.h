@@ -70,6 +70,7 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        shadow_pos   = -1;
     }
 
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
@@ -77,6 +78,13 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* RADIANCE_NGRAM_STATS=1 (Intel port, run 123, owner note 151 B): prompt lookup's proposal at a step where the
+     * head drafted -- not used, scored against the real continuation once it is known
+     * (Scheduler::ngram_stats_commit). shadow_pos: the output index of its first token, -1 for none; shadow_k: the
+     * length of the match it came from; shadow_head: what the head's verify emitted at that step, -1 until then. */
+    int64_t    shadow_pos = -1;
+    int32_t    shadow_n = 0, shadow_k = 0, shadow_head = -1;
+    int32_t    shadow[RAD_SCHED_MAX_SPEC] = {};
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -511,11 +519,22 @@ private:
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
-    /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
-     * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
-     * lengths it tries, longest first. */
-    int draft_ngram(SchedReq& s, int depth) const;
+    /* The built-in prompt-lookup drafter (scheduler.cpp). Fills `out` (s.draft when it drafts) and
+     * returns how many tokens it proposed; 0 when the sequence has no repeated pattern to extend;
+     * `match_k`, when given, the length of the pattern it matched. The pattern lengths it tries,
+     * longest first. */
+    int draft_ngram(const SchedReq& s, int depth, int32_t* out, int* match_k = nullptr) const;
     enum { kNgramMin = 2, kNgramMax = 4 };
+    /* RADIANCE_NGRAM_STATS=1 (Intel port, run 123, owner note 151 B): how often prompt lookup drafts and how well,
+     * and -- by the length of its match -- what it would have emitted at the steps where the head drafted instead,
+     * against what the head's verify did emit. Logged every 2048 verifies. */
+    struct NgramStats {
+        int64_t verify = 0, fired = 0, fired_prop = 0, fired_acc = 0;
+        int64_t sh_n[kNgramMax + 1] = {}, sh_head[kNgramMax + 1] = {}, sh_look[kNgramMax + 1] = {};
+        int64_t sh_ahead[kNgramMax + 1] = {}, sh_behind[kNgramMax + 1] = {};
+    };
+    NgramStats ngs_;
+    void ngram_stats_commit(SchedReq& s, int64_t o0, int32_t emitted, bool fired, int32_t n_spec, int32_t a);
 
     mutable std::mutex mu_;
 
