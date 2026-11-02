@@ -844,7 +844,19 @@ int ntape_sync();
 constexpr int64_t kWaitSpinUs = 100;
 constexpr int64_t kWaitSleepMinUs = 20, kWaitSleepMaxUs = 200;
 
-constexpr uint32_t kRingEvents = 256;
+/* The ring's size: RADIANCE_L0_RING (run 127; default 256, 64-8192). With the glue a step appends a few hundred
+ * times and the host runs a step ahead, so a slot can come round before its last append has completed: ring_take
+ * then waits on the host (counted below). */
+uint32_t ring_events() {
+    static const uint32_t n = [] {
+        const char* v = std::getenv("RADIANCE_L0_RING");
+        const long x = v ? std::atol(v) : 256;
+        return (uint32_t)(x < 64 ? 64 : x > 8192 ? 8192 : x);
+    }();
+    return n;
+}
+#define kRingEvents ring_events()
+std::atomic<int64_t> g_ring_waits{0}, g_ring_wait_us{0};
 struct NKernel {
     ze_kernel_handle_t k = nullptr;
     uint32_t nargs = 0;
@@ -1067,6 +1079,13 @@ ZeDev::Ring& ring_take(ZeDev& Z) {
     ZeDev::Ring& r = Z.ring[Z.next];
     Z.next = (Z.next + 1) % kRingEvents;
     if (r.used) {
+        if (zeEventQueryStatus(r.ev) != ZE_RESULT_SUCCESS) {   /* the slot came round still in flight: a host wait */
+            const auto w0 = std::chrono::steady_clock::now();
+            done_wait(r.ev);
+            g_ring_waits.fetch_add(1, std::memory_order_relaxed);
+            g_ring_wait_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - w0).count(),
+                                     std::memory_order_relaxed);
+        }
         done_wait(r.ev);
         for (const ZeDev::Consumer& c : r.consumers) n_slot_wait(c.dev, c.slot, c.serial, "a slot's consumer");
         r.consumers.clear();
@@ -2367,10 +2386,11 @@ int play_now(Tape& tr, int from, int to) {
                 if (t->dev == 0 && g.n > 0 && g.n % 2000 == 0 && g.n != told_at && (told_at = g.n) > 0)
                     RAD_INFO("l0 play host time (device 0, %ld appends, %.1f lists each; %ld same-list waits), us an "
                              "append: compose %.1f, same-list wait %.1f, queue waits %.1f, lock + ring %.1f, append %.1f, "
-                             "rest %.1f, stretch cache + re-record %.1f; glued %lld, plain after a glue answer %lld",
+                             "rest %.1f, stretch cache + re-record %.1f; glued %lld, plain after a glue answer %lld; ring %u, ring waits %lld (%lld us)",
                              g.n, (double)g.lists / (double)g.n, g.same_n, g.compose / (double)g.n, g.same / (double)g.n,
                              g.qwait / (double)g.n, g.ring / (double)g.n, g.append / (double)g.n, g.rest / (double)g.n,
-                             g.rerec / (double)g.n, (long long)g_glued.load(), (long long)g_glue_plain.load());
+                             g.rerec / (double)g.n, (long long)g_glued.load(), (long long)g_glue_plain.load(), kRingEvents,
+                             (long long)g_ring_waits.load(), (long long)g_ring_wait_us.load());
             }
         });
     }
