@@ -8,6 +8,7 @@
 #include "../plugin/registry.h"
 
 #include <algorithm>
+#include <chrono>
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdlib>
@@ -1254,10 +1255,24 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
     return true;
 }
 
+/* RADIANCE_DEBUG_STAGE (Intel port, run 126, owner note 159): a draft pass's host time inside run_step, by part
+ * (the rank threads' 3.8 ms "issue" of M214), and inside a play by tape step kind. Running sums a thread. */
+namespace {
+bool stage_timing() { static const bool on = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr; return on; }
+using stage_clock = std::chrono::steady_clock;
+double stage_us(stage_clock::time_point a, stage_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+thread_local double g_play_us[8] = {};   /* by TapeStep kind */
+thread_local long   g_play_n[8]  = {};
+}   // namespace
+
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
+    const bool tim = stage_timing();
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
+        const auto ts0 = tim ? stage_clock::now() : stage_clock::time_point{};
         switch (st.kind) {
         case kTapePlay:
             rc = tape_play(t.dev, st.a, st.b);
@@ -1311,6 +1326,10 @@ int Ctx::play_pass(PassTape& t) {
             rc = xp_ ? xp_step_run(st.a) : RAD_OK;
             lane_ = l0;
             break;
+        }
+        if (tim && (int)st.kind < 8) {
+            g_play_us[st.kind] += stage_us(ts0, stage_clock::now());
+            ++g_play_n[st.kind];
         }
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
@@ -1495,13 +1514,20 @@ int Ctx::run_step(const RadBatch* b) {
         return RAD_E_STATE;
     }
 
+    /* RADIANCE_DEBUG_STAGE: the parts' times, t[0] .. t[7] (see the print at the end) */
+    const bool tim = stage_timing();
+    stage_clock::time_point tp[8];
+    if (tim) tp[0] = stage_clock::now();
+
     /* Before the residency sync, which carries any weights a declining stager gave back into the
      * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
 
     tape_refusals_apply();   /* owner note 42 item 3: the refusals the engine made common */
     if (tape_shed_pending_) { tape_shed_pending_ = false; tape_shed_one(); }   /* owner note 58 */
+    if (tim) tp[1] = stage_clock::now();
     sync_residency();
+    if (tim) tp[2] = stage_clock::now();
 
     batch_       = b;
     step_status_ = RAD_OK;
@@ -1512,6 +1538,7 @@ int Ctx::run_step(const RadBatch* b) {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
+    if (tim) tp[3] = stage_clock::now();
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
      * compute stream, so work left on lane 1 could be read by the sampler or freed while in
@@ -1521,6 +1548,7 @@ int Ctx::run_step(const RadBatch* b) {
         const int lj = lane_join(1, 0);   /* no-op when lane 1 is unbuilt */
         if (lj < 0 && step_status_ >= 0) step_status_ = lj;
     }
+    if (tim) tp[4] = stage_clock::now();
     /* After the join, so the compute stream is behind every reader of staged weights; regardless
      * of status, because a staged weight must never outlive its pass. */
     if (staging_) {
@@ -1533,10 +1561,38 @@ int Ctx::run_step(const RadBatch* b) {
         if (rf < 0 && step_status_ >= 0) step_status_ = rf;
     }
 
+    if (tim) tp[5] = stage_clock::now();
     if (profiling_) profile_collect();
     flush_issued();
+    if (tim) tp[6] = stage_clock::now();
     ar_stalls_read();
     tape_room_read();
+    if (tim) {
+        tp[7] = stage_clock::now();
+        /* draft passes (draft_pass != 0) and trunk passes apart; printed by rank 0 every 400 draft passes */
+        thread_local double sum[2][8] = {};
+        thread_local long   n[2] = {};
+        const int k = b->draft_pass != 0 ? 1 : 0;
+        for (int i = 1; i < 8; ++i) sum[k][i] += stage_us(tp[i - 1], tp[i]);
+        if (++n[k] % 400 == 0 && k == 1 && rank_ == 0) {
+            const double m = (double)n[k];
+            RAD_INFO("run_step (draft passes, %ld): stager %.1f, residency %.1f, pass %.1f, lane join %.1f, "
+                     "stager end + routes %.1f, profile + flush %.1f, stalls + room %.1f us; in plays (all passes) "
+                     "a step of kind 0 play %.1f us x %ld, 1 table %.1f x %ld, 2 host %.1f x %ld, 3 route %.1f x %ld, "
+                     "4-6 xp %.1f",
+                     n[k], sum[k][1] / m, sum[k][2] / m, sum[k][3] / m, sum[k][4] / m, sum[k][5] / m, sum[k][6] / m,
+                     sum[k][7] / m, g_play_n[0] ? g_play_us[0] / (double)g_play_n[0] : 0.0, g_play_n[0],
+                     g_play_n[1] ? g_play_us[1] / (double)g_play_n[1] : 0.0, g_play_n[1],
+                     g_play_n[2] ? g_play_us[2] / (double)g_play_n[2] : 0.0, g_play_n[2],
+                     g_play_n[3] ? g_play_us[3] / (double)g_play_n[3] : 0.0, g_play_n[3],
+                     g_play_us[4] + g_play_us[5] + g_play_us[6]);
+            const double t0 = (double)(n[0] ? n[0] : 1);
+            RAD_INFO("run_step (trunk passes, %ld): stager %.1f, residency %.1f, pass %.1f, lane join %.1f, "
+                     "stager end + routes %.1f, profile + flush %.1f, stalls + room %.1f us",
+                     n[0], sum[0][1] / t0, sum[0][2] / t0, sum[0][3] / t0, sum[0][4] / t0, sum[0][5] / t0,
+                     sum[0][6] / t0, sum[0][7] / t0);
+        }
+    }
     return step_status_;
 }
 
