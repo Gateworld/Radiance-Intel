@@ -10,6 +10,8 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -21,6 +23,7 @@ extern "C" int r4d_rad_unrelayout_hc_e4m3(const RadParam* p, int n_p, int operan
                                           const int* sel, const void* src, int64_t src_bytes, const RadTensor* pl,
                                           int n);
 bool xe_hc_f16_on();                                      // r4d_hc_bf16.cpp
+bool xe_hc_i8_on();                                       // r4d_hc_bf16.cpp (owner note 158, run 125)
 long long xe_hc16_row_bytes(long long K, long long G);    // r4d_hc_bf16.cpp
 
 namespace {
@@ -56,10 +59,44 @@ float f32_of(uint16_t b) {
     return (float)h;
 }
 
+/* Owner note 158 (run 125, RADIANCE_XE_HC_I8=1): libr4d's E4M3 rows rewritten in place as int8. Each group of G codes
+ * is rounded to int8 at its own max -- q = nearbyint(v * 127 / max), v the code's E4M3 value -- and its f32 scale
+ * multiplied by max / 127, so q x scale' approximates v x scale; the same bytes and row layout (K codes, then the
+ * K / G scales, padded), under its own tag so a cached E4M3 layout is never read as int8. Lossy: no unrelayout. */
+int i8_rows(uint8_t* d, long long rows, long long K, long long ng, long long stride) {
+    const long long G = K / ng;
+    for (long long r = 0; r < rows; ++r) {
+        uint8_t* row = d + r * stride;
+        for (long long g = 0; g < ng; ++g) {
+            float amax = 0.0f;
+            for (long long k = g * G; k < (g + 1) * G; ++k) {
+                const float v = rad_fp8e4m3_to_f32(row[k]);
+                if (v != v) return RAD_E_DTYPE;   /* a NaN code: quantised weights never hold one */
+                amax = std::max(amax, std::fabs(v));
+            }
+            float sc;
+            std::memcpy(&sc, row + K + 4 * g, 4);
+            for (long long k = g * G; k < (g + 1) * G; ++k) {
+                const float v = rad_fp8e4m3_to_f32(row[k]);
+                const float q = amax > 0.0f ? std::nearbyint(v * 127.0f / amax) : 0.0f;
+                row[k] = (uint8_t)(int8_t)std::max(-127.0f, std::min(127.0f, q));
+            }
+            if (amax > 0.0f) sc = sc * (amax / 127.0f);
+            std::memcpy(row + K + 4 * g, &sc, 4);
+        }
+    }
+    return RAD_OK;
+}
+
 }  // namespace
 
 extern "C" int xe_hc_layout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                                  const RadTensor* pl, int n, RadLayout* out) {
+    if (xe_hc_i8_on()) {
+        const int rc = r4d_rad_layout_hc_e4m3(p, n_p, operand, enc, sel, pl, n, out);
+        if (rc == RAD_OK) out->tag = std::strcmp(out->tag, "r4d.hc.e4m3.g128") == 0 ? "xe.hc.i8.g128" : "xe.hc.i8.q4";
+        return rc;
+    }
     if (!xe_hc_f16_on()) return r4d_rad_layout_hc_e4m3(p, n_p, operand, enc, sel, pl, n, out);
     Geo g;
     return geo(p, n_p, operand, enc, sel, pl, n, out, &g);
@@ -67,6 +104,14 @@ extern "C" int xe_hc_layout_e4m3(const RadParam* p, int n_p, int operand, const 
 
 extern "C" int xe_hc_relayout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                                    const int* sel, const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    if (xe_hc_i8_on()) {
+        int rc = r4d_rad_relayout_hc_e4m3(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
+        if (rc != RAD_OK) return rc;
+        if (n < 2 || pl[0].rank != 2 || pl[1].rank != 2) return RAD_E_SHAPE;
+        const long long rows = pl[0].shape[0], K = pl[0].shape[1], ng = pl[1].shape[1];
+        if (rows <= 0 || K <= 0 || ng <= 0 || K % ng || dst_bytes % rows) return RAD_E_SHAPE;
+        return i8_rows((uint8_t*)dst, rows, K, ng, dst_bytes / rows);
+    }
     if (!xe_hc_f16_on()) return r4d_rad_relayout_hc_e4m3(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
     RadLayout L{};
     Geo g;
@@ -88,6 +133,7 @@ extern "C" int xe_hc_relayout_e4m3(const RadParam* p, int n_p, int operand, cons
 extern "C" int xe_hc_unrelayout_e4m3(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                                      const int* sel, const void* src, int64_t src_bytes, const RadTensor* pl,
                                      int n) {
+    if (xe_hc_i8_on()) return RAD_E_UNSUPPORTED;   /* the int8 rows are lossy: the codes cannot be recovered */
     if (!xe_hc_f16_on()) return r4d_rad_unrelayout_hc_e4m3(p, n_p, operand, enc, sel, src, src_bytes, pl, n);
     RadLayout L{};
     Geo g;
