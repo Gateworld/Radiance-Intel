@@ -1107,7 +1107,10 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
         return 0;
     }
     const int bit = b->draft_pass + 8;
-    if (rank_ == 0 && bit >= 0 && bit < 64 && !(tape_told_ & (1ull << bit))) {
+    /* under the tape profiler every recording is said (rank 0), right after the backend's "l0 tape N" line, so the
+     * timeline's tape ids map to passes (run 127) */
+    static const bool prof_all = std::getenv("RADIANCE_L0_NTAPE_PROFILE") != nullptr;
+    if (rank_ == 0 && bit >= 0 && bit < 64 && (prof_all || !(tape_told_ & (1ull << bit)))) {
         tape_told_ |= 1ull << bit;
         RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- %d records, %d of the %d "
                  "dispatches unordered behind the one before; %zu host op(s), "

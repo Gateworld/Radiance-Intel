@@ -904,6 +904,7 @@ struct NProf {
     std::vector<int> kinds;
     uint32_t n = 0;
     bool played = false;               /* the timestamps hold a completed play */
+    uint64_t tape = 0;                 /* the tape the list plays (run 127: the timeline's edges name it) */
 };
 std::mutex& nprof_mutex() { static std::mutex m; return m; }
 std::unordered_map<ze_command_list_handle_t, NProf>& nprof_lists() { static std::unordered_map<ze_command_list_handle_t, NProf> m; return m; }
@@ -915,7 +916,7 @@ uint64_t g_nprof_harvested = 0;
  * its own commands, and the kernels at its two ends. At each print a device's spans are sorted and the idle time
  * between consecutive plays is charged to the boundary (the kernel that ended -> the kernel that started next). Gaps
  * over 5 ms (nothing queued: between requests) are counted apart. */
-struct NSpan { uint64_t a, b; const std::string* first; const std::string* last; };
+struct NSpan { uint64_t a, b; const std::string* first; const std::string* last; uint64_t tape; };
 struct NTimeline { std::vector<NSpan> spans; uint64_t busy = 0, inner = 0, inner_n = 0; };
 std::unordered_map<const void*, NTimeline>& ntimeline() { static std::unordered_map<const void*, NTimeline> m; return m; }
 std::string nprof_short(const std::string* s) {
@@ -1174,11 +1175,12 @@ int ntape_sync() {   /* 0 the design, 3 the host oracle, 4 the host wait before 
 }
 /* The tape profiler's harvest: the list's previous play has completed, so its timestamps are final;
  * every command's device time goes to its kernel's total. Every 8192 plays the table is printed. */
-void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
+void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, uint64_t tape) {
     std::lock_guard<std::mutex> lk(nprof_mutex());
     auto it = nprof_lists().find(l);
     if (it == nprof_lists().end()) return;
     NProf& p = it->second;
+    p.tape = tape;   /* a list plays one tape all its life */
     if (played_before && p.played) {
         const uint64_t mask = Z.ts_bits >= 64 ? ~0ull : ((1ull << Z.ts_bits) - 1);
         for (uint32_t k = 0; k < p.n; ++k) {
@@ -1202,7 +1204,7 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
                 }
                 prev_end = b;
             }
-            tl.spans.push_back(NSpan{ p.ts[0] & mask, p.ts[2 * (p.n - 1) + 1] & mask, p.names[0], p.names[p.n - 1] });
+            tl.spans.push_back(NSpan{ p.ts[0] & mask, p.ts[2 * (p.n - 1) + 1] & mask, p.names[0], p.names[p.n - 1], p.tape });
         }
         if (++g_nprof_harvested % 8192 == 0) {
             std::vector<std::pair<std::string, NProfAcc>> rows(nprof_acc().begin(), nprof_acc().end());
@@ -1245,7 +1247,7 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
                         else {
                             gap += g; ++gap_n;
                             gaps_us.push_back(g * ns * 1e-3);
-                            auto& e = by_edge[nprof_short(holder->last) + " -> " + nprof_short(s.first)];
+                            auto& e = by_edge[nprof_short(holder->last) + " @T" + std::to_string(holder->tape) + " -> " + nprof_short(s.first) + " @T" + std::to_string(s.tape)];
                             e.first += g * ns * 1e-3;
                             e.second += 1;
                         }
@@ -1276,7 +1278,7 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
 /* Appends `n` closed lists to the backend's own immediate list, after the home stream's last
  * command (and the other recorded streams' when fenced) and after the previous play; marks the
  * streams so their next runtime submission waits for it. */
-void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before);
+void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, uint64_t tape);
 /* RADIANCE_DEBUG_STAGE (Intel port, run 126, owner note 159): a native play's host time by part, a thread's sums
  * (play_now prints device 0's): the lists' composition, the same-list wait, the queues' waits, the device lock and
  * ring slot, the append, the rest, and the events' re-record. */
@@ -1305,7 +1307,7 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
                 if (stg) ++t_nstage.same_n;
                 n_slot_wait(t.dev, it->second.first, it->second.second, "this list's previous play");
             }
-            if (ntape_profile()) n_prof_harvest(Z, lists[i], it != t.nlast.end());
+            if (ntape_profile()) n_prof_harvest(Z, lists[i], it != t.nlast.end(), t.id);
         }
     if (stg) s1 = clk::now();
     std::vector<sycl::event> keep;
@@ -2007,9 +2009,9 @@ RadTape z_tape_end(int keep) {
     for (const Seg& s : t->segs) { nodes += s.nodes; evs += s.evs.size(); }
     t->fence = evs > 0;
     static std::atomic<int> told{0};
-    if (told.fetch_add(1) < 8)
-        RAD_INFO("l0 tape: %zu segment(s), %zu %s, %zu event record(s), %zu stream(s) recorded%s",
-                 t->segs.size(), nodes, t->native ? "command(s) in native lists" : "graph node(s)", evs, t->qs.size(),
+    if (told.fetch_add(1) < (ntape_profile() ? 64 : 8))   /* the profiler's edges name tapes by id (run 127) */
+        RAD_INFO("l0 tape %llu: %zu segment(s), %zu %s, %zu event record(s), %zu stream(s) recorded%s",
+                 (unsigned long long)t->id, t->segs.size(), nodes, t->native ? "command(s) in native lists" : "graph node(s)", evs, t->qs.size(),
                  t->fence ? "" : ", played unfenced");
     if (t->native) {
         const int rc = guarded("tape_end", [t] { n_early_end(*t); });
