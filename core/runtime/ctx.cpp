@@ -1294,13 +1294,25 @@ int Ctx::play_pass(PassTape& t) {
             /* the touch state this op's join saw when recorded: the play re-recorded the events */
             host_touch_pending_[0] = th.pend[0];
             host_touch_pending_[1] = th.pend[1];
+            const auto hj0 = tim ? stage_clock::now() : stage_clock::time_point{};
             rc = host_join_wait(th.drain);
+            const auto hj1 = tim ? stage_clock::now() : stage_clock::time_point{};
             if (rc >= 0) {
                 th.args.t = th.t;
                 rc = th.launch(&th.args, cur_stream());
                 rad_dev_host_wrote();
             }
             lane_ = l0;
+            if (tim && rank_ == 0) {
+                /* RADIANCE_DEBUG_STAGE (run 126): which host-site op a recorded pass runs, its join and its host time */
+                thread_local int told = 0;
+                if (told < 24 || told % 200 == 0)
+                    RAD_INFO("host op in a recorded pass: '%s' n=%lld draft_pass %d, join %.1f us (drain %d), launch %.1f us",
+                             (size_t)th.h < plans_.size() && plans_[th.h].info ? plans_[th.h].info->op.c_str() : "?",
+                             (long long)th.n, batch_ ? batch_->draft_pass : -9, stage_us(hj0, hj1), th.drain ? 1 : 0,
+                             stage_us(hj1, stage_clock::now()));
+                ++told;
+            }
             if (rc < 0) step_fail_ = fmt("a host op of a recorded pass (op %u) failed: %s",
                                          (unsigned)th.h, rad_strerror(rc));
             break;
