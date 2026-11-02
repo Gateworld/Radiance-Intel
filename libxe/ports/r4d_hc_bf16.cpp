@@ -323,6 +323,54 @@ __device__ __forceinline__ void hc8_dot_down_rows_s8(const unsigned short* __res
     }
 }
 
+/* Owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): DP4A's arithmetic, the form IGC recognises (xe_moe_i4i8.cpp's dp4),
+ * and sixteen int8 codes against sixteen int8 values of N by four of them. */
+__device__ __forceinline__ int32_t hc_dp4(uint32_t a, uint32_t b, int32_t acc) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc += (int32_t)(int8_t)(a >> (8 * i)) * (int32_t)(int8_t)(b >> (8 * i));
+    return acc;
+}
+__device__ __forceinline__ int32_t hc_dp16(const uint4& a, const uint4& b) {
+    return hc_dp4(a.w, b.w, hc_dp4(a.z, b.z, hc_dp4(a.y, b.y, hc_dp4(a.x, b.x, 0))));
+}
+
+/* hc8_dot_down_rows_s8 on int8 rows (WI8) and int8 N (hc_v2_norm_q8_kernel): each sixteen codes are loaded once and
+ * meet each row's sixteen int8 values by DP4A; the integer sum times the row's sixteen-value scale, then the group's.
+ * Not the S8 form's bits: N is rounded to int8 too. */
+template <int kU, int R>
+__device__ __forceinline__ void hc8_dot_down_rows_q8(const signed char* __restrict__ nq, const float* __restrict__ nqs,
+                                                     long svs, int nr, const unsigned char* __restrict__ wr, long K,
+                                                     int lane, float* acc) {
+    const float* __restrict__ sr = (const float*)(wr + hc_codes_bytes<false>(K));
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    auto block = [&](const uint4& c, float s, long e) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= nr) break;
+            const uint4 a = *(const uint4*)(nq + r * svs + e);
+            acc[r] = fmaf((float)hc_dp16(c, a) * nqs[(r * svs + e) / 16], s, acc[r]);
+        }
+    };
+    long j = 0;
+    for (; j + kHc8Step * kU <= K; j += kHc8Step * kU) {
+        uint4 c[kU];
+        float s[kU];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const long e = j + (long)u * kHc8Step + lane * 16;
+            c[u] = hc_load16<false>(wr, e).a;
+            s[u] = sr[e / r4d_hc8::kDownGroup];
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) block(c[u], s[u], j + (long)u * kHc8Step + lane * 16);
+    }
+    for (; j < K; j += kHc8Step) {
+        const long e = j + lane * 16;
+        block(hc_load16<false>(wr, e).a, sr[e / r4d_hc8::kDownGroup], e);
+    }
+}
+
 /* One thread's quarter of an E4M3 row of mix_up against RG rows of `d` in LDS. The quarter is the
  * row's scale group (r4d_hc8::up_group), so its partial sums are complete before scaling, and four
  * threads' sums make the row. All of a quarter's sixteen-code loads issue before the first is used
@@ -1385,12 +1433,15 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
  * lives and which workgroup runs what change. */
 constexpr int kV2Cols = kWaves;   // columns of W_down a workgroup owns: one a wave
 
-__global__ __launch_bounds__(kThreads)
-void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
-                       unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
-                       long rows, long n, int hc, long hrow, float eps, float wadd) {
-    XE_SHARED(float, s_part, kWaves);
-    XE_SHARED_VAR(float, s_sc);
+/* kQ8 (owner note 158 stage 2, RADIANCE_XE_HC_I8=2): N also as int8, each 16 values rounded at their own max (the
+ * max / 127 an f32 beside them, `nqs`), for the down product's DP4A dots; the bf16 N is the same values either way,
+ * each thread writing 16 consecutive of them instead of every kThreads-th. */
+template <bool kQ8>
+__device__ __forceinline__ void hc_v2_norm_body(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                                unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
+                                                signed char* __restrict__ nq, float* __restrict__ nqs,
+                                                long rows, long n, int hc, long hrow, float eps, float wadd,
+                                                float* s_part, float& s_sc) {
     const int  c = blockIdx.x;
     const long r = blockIdx.y;
     if (r >= rows || c >= hc) return;
@@ -1423,7 +1474,50 @@ void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __rest
     __syncthreads();
     const float sc = s_sc;
     unsigned short* np = nbuf + r * (long)hc * n + cb;
-    for (long j = tid; j < n; j += kThreads) np[j] = f2bf(bf2f(hp[cb + j]) * sc * (w[cb + j] + wadd));
+    if constexpr (kQ8) {
+        signed char* qp = nq + r * (long)hc * n + cb;
+        float* qsp = nqs + (r * (long)hc * n + cb) / 16;
+        for (long j0 = (long)tid * 16; j0 < n; j0 += (long)kThreads * 16) {
+            float v[16];
+            float amax = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const unsigned short b = f2bf(bf2f(hp[cb + j0 + t]) * sc * (w[cb + j0 + t] + wadd));
+                np[j0 + t] = b;
+                v[t] = bf2f(b);
+                amax = fmaxf(amax, fabsf(v[t]));
+            }
+            const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            uint32_t pk[4] = { 0u, 0u, 0u, 0u };
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int q = (int)fminf(127.0f, fmaxf(-127.0f, rintf(v[t] * inv)));
+                pk[t >> 2] |= ((uint32_t)q & 0xffu) << (8 * (t & 3));
+            }
+            *(uint4*)(qp + j0) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+            qsp[j0 / 16] = amax / 127.0f;
+        }
+    } else {
+        for (long j = tid; j < n; j += kThreads) np[j] = f2bf(bf2f(hp[cb + j]) * sc * (w[cb + j] + wadd));
+    }
+}
+
+__global__ __launch_bounds__(kThreads)
+void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                       unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
+                       long rows, long n, int hc, long hrow, float eps, float wadd) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc);
+}
+__global__ __launch_bounds__(kThreads)
+void hc_v2_norm_q8_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                          unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
+                          signed char* __restrict__ nq, float* __restrict__ nqs,
+                          long rows, long n, int hc, long hrow, float eps, float wadd) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    hc_v2_norm_body<true>(h, w, nbuf, scaleout, nq, nqs, rows, n, hc, hrow, eps, wadd, s_part, s_sc);
 }
 
 /* kPart (RADIANCE_XE_HC_V2=3, a timing split): 0 the columns and, in the last workgroup, the inject gains; 1 the
@@ -1522,6 +1616,31 @@ void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void*
     const float inv_hc = 1.0f / (float)hc;
     float acc[kRG];
     hc8_dot_down_rows_s8<2, kRG, kWI8>(nbuf + r0 * HN, HN, nr, (const unsigned char*)downv + k * dld, HN, lane, acc);
+#pragma unroll
+    for (int i = 0; i < kRG; ++i) {
+        if (i >= nr) break;
+        const float a = wave_sum(acc[i]);
+        if (lane == 0) dout[(r0 + i) * lr + k] = f2bf(siluf_(a * inv_hc));
+    }
+}
+
+/* Owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): hc_v2_down_rows_kernel's grid and sums on int8 rows and int8 N by
+ * DP4A (hc8_dot_down_rows_q8), at every row count up to kHcQ8MaxRows (kRG 1 for a single row); the inject gains keep
+ * their own launch on the bf16 N. */
+constexpr long kHcQ8MaxRows = 8;
+template <int kRG>
+__global__ __launch_bounds__(kWave * kV2RowCols)
+void hc_v2_down_rows_q8_kernel(const signed char* __restrict__ nq, const float* __restrict__ nqs,
+                               const void* __restrict__ downv, long dld, unsigned short* __restrict__ dout, long rows,
+                               int hc, long HN, long lr) {
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * kRG;
+    const long k = (long)blockIdx.x * kV2RowCols + wave;
+    if (k >= lr || r0 >= rows) return;
+    const int nr = (int)(rows - r0 < kRG ? rows - r0 : kRG);
+    const float inv_hc = 1.0f / (float)hc;
+    float acc[kRG];
+    hc8_dot_down_rows_q8<2, kRG>(nq + r0 * HN, nqs + r0 * HN / 16, HN, nr, (const unsigned char*)downv + k * dld, HN, lane, acc);
 #pragma unroll
     for (int i = 0; i < kRG; ++i) {
         if (i >= nr) break;
@@ -4166,6 +4285,10 @@ extern "C" int64_t r4d_rad_mtp_enter_scratch(const RadArgs* a) {
 }
 /* `d` between the two kernels, with the per-stream norm scales beside it. Sized from the band's `M`,
  * not the operand: the arena is sized once per band and the launch checks the same number. */
+int xe_hc_i8_level();   /* below */
+/* Stage 2's int8 N and its scales for kHcQ8MaxRows rows, at the end of hc_read's scratch (16-byte aligned) */
+static inline long long hc_q8_bytes(long long HN) { return 16 + kHcQ8MaxRows * HN + kHcQ8MaxRows * (HN / 16) * 4; }
+
 extern "C" int64_t r4d_rad_hc_read_scratch(const RadArgs* a) {
     const long long M  = r4d_geti_or(a, "M", 0);
     const long long lr = r4d_geti_or(a, "lowrank", 0);
@@ -4183,7 +4306,7 @@ extern "C" int64_t r4d_rad_hc_read_scratch(const RadArgs* a) {
      * whether there are inject weights, so both derive `kc` from `lr` and the buffer is sized for
      * the widest ncol; mismatched derivations overrun the partial buffer. */
     return M * ((long long)lr * 2 + (long long)kHcMax * 4) + hc_u_rows(M, lr, hc) * HN * 2
-           + hc_part_bytes(M, lr, HN);
+           + hc_part_bytes(M, lr, HN) + (xe_hc_i8_level() == 2 ? hc_q8_bytes(HN) : 0);
 }
 
 /* Owner note 56 (Intel port, milestone 3): RADIANCE_XE_HC_F16=1 stores hc_read's E4M3 mixing matrices with every
@@ -4196,10 +4319,16 @@ bool xe_hc_f16_on() {
 /* Owner note 158 (run 125): RADIANCE_XE_HC_I8=1 stores the E4M3 mixing matrices as int8 in place at load -- each
  * group rounded at its own max, the max / 127 moved into its f32 scale (xe_hc_relayout_e4m3) -- and the V2 kernels read
  * them so (WI8 in the dots above). Same bytes and row layout as E4M3. Read once, as xe_hc_f16_on. */
-bool xe_hc_i8_on() {
-    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_I8"); return v && v[0] == '1'; }();
-    return on;
+int xe_hc_i8_level() {   /* 1 the int8 rows; 2 also N in int8 for the down product's DP4A (stage 2) */
+    static const int lv = [] {
+        const char* v = std::getenv("RADIANCE_XE_HC_I8");
+        const int l = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        if (l) std::fprintf(stderr, "[xe] hc_read on int8 rows (RADIANCE_XE_HC_I8=%d)\n", l);
+        return l;
+    }();
+    return lv;
 }
+bool xe_hc_i8_on() { return xe_hc_i8_level() >= 1; }
 /* A stored FP16 row: K two-byte codes, then the K / G f32 group scales, padded to 16 bytes as the E4M3 row. */
 long long xe_hc16_row_bytes(long long K, long long G) { return (2 * K + 4 * (K / G) + 15) & ~15LL; }
 
@@ -4504,14 +4633,30 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     if (wf == 3 && !v2) return R4D_NO(RAD_E_UNSUPPORTED);
     unsigned short* nbuf = v2 ? ubuf : nullptr;
     if (v2) {
-        emit_rc = R4D_EMIT(s, hc_v2_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
-                           (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
-                           (long)n, (int)hc, (long)hrow, eps, wadd);
         const unsigned dcols = (unsigned)((lr + kV2Cols - 1) / kV2Cols);
         /* levels 5 / 6: the S8 form, its gains first in the grid, a workgroup each with the row in 2 x HN bytes of LDS */
         /* the gains stage N and their row in halves of a whole number of wave_dot_lds steps (kWave * 8 * kDotU) */
         const bool s8d = xe_hc_v2_level() >= 5 && HN % (2L * kWave * 8 * kDotU) == 0 && HN * 2 <= 56 * 1024;
         const unsigned glds = s8d ? (unsigned)(HN * 2) : 0u;
+        /* owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): at level 8 and up to kHcQ8MaxRows rows, N also in int8 (at the
+         * scratch's end) and the down product's columns by DP4A; the gains, hc_up_mix and every other shape as stage 1 */
+        const bool q8 = wf == 3 && xe_hc_i8_level() == 2 && s8d && xe_hc_v2_level() == 8 && rows <= kHcQ8MaxRows
+                        && n % 16 == 0 && a->scratch_bytes >= fixed + hc_q8_bytes(HN);
+        signed char* nq = nullptr;
+        float* nqs = nullptr;
+        if (q8) {
+            const uintptr_t qb = ((uintptr_t)a->scratch + (uintptr_t)(a->scratch_bytes - hc_q8_bytes(HN)) + 15u)
+                                 & ~(uintptr_t)15u;
+            nq = (signed char*)qb;
+            nqs = (float*)(qb + (uintptr_t)(kHcQ8MaxRows * HN));
+            emit_rc = R4D_EMIT(s, hc_v2_norm_q8_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
+                               (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, nq, nqs, (long)rows,
+                               (long)n, (int)hc, (long)hrow, eps, wadd);
+        } else {
+            emit_rc = R4D_EMIT(s, hc_v2_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
+                               (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
+                               (long)n, (int)hc, (long)hrow, eps, wadd);
+        }
 #define HC_V2_DOWN_W(P_, S8_, GX_, LDS_, W_)                                                                    \
         R4D_EMIT(s, (hc_v2_down_kernel<P_, S8_, W_>), dim3((GX_), (unsigned)rows), dim3(kThreads), (LDS_),        \
                  (const unsigned short*)nbuf, (const void*)down->data, (long)dld,                                 \
@@ -4519,7 +4664,18 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                  (long)rows, (int)hc, (long)HN, (long)lr, (long)irow)
 #define HC_V2_DOWN(P_, S8_, GX_, LDS_) \
         (wf == 3 ? HC_V2_DOWN_W(P_, S8_, GX_, LDS_, true) : HC_V2_DOWN_W(P_, S8_, GX_, LDS_, false))
-        if (emit_rc == RAD_OK && xe_hc_v2_level() == 3) {
+        if (emit_rc == RAD_OK && q8) {
+            const dim3 qg((unsigned)((lr + kV2RowCols - 1) / kV2RowCols), (unsigned)(rows > 1 ? (rows + 3) / 4 : 1));
+            if (rows > 1)
+                emit_rc = R4D_EMIT(s, hc_v2_down_rows_q8_kernel<4>, qg, dim3(kWave * kV2RowCols), 0u,
+                                   (const signed char*)nq, (const float*)nqs, (const void*)down->data, (long)dld, dbuf,
+                                   (long)rows, (int)hc, (long)HN, (long)lr);
+            else
+                emit_rc = R4D_EMIT(s, hc_v2_down_rows_q8_kernel<1>, qg, dim3(kWave * kV2RowCols), 0u,
+                                   (const signed char*)nq, (const float*)nqs, (const void*)down->data, (long)dld, dbuf,
+                                   (long)rows, (int)hc, (long)HN, (long)lr);
+            if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, true, (unsigned)hc, glds);
+        } else if (emit_rc == RAD_OK && xe_hc_v2_level() == 3) {
             emit_rc = HC_V2_DOWN(1, false, dcols, 0u);
             if (emit_rc == RAD_OK && injw && inj) emit_rc = HC_V2_DOWN(2, false, 1u, 0u);
         } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 6) {
