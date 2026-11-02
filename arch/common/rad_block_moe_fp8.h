@@ -676,16 +676,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         c = pc;
     }
-    /* Format C: a layer whose experts are w4nl64a8h (format 5) takes int8 activations. The default in the Intel port's
-     * build (owner note 160, run 135: RAD_HAVE_L0, where libxe serves w4nl64i8h; RADIANCE_MOE_FORMAT_C=0 turns it off);
-     * opt-in (=1) elsewhere, where libr4d has no w4nl64i8h kernel. */
+    /* Format C, opt-in: a layer whose experts are w4nl64a8h (format 5) takes int8 activations. The Level Zero backend
+     * sets RADIANCE_MOE_FORMAT_C=1 at discovery unless it is set (owner note 160: the Intel port's default; libr4d
+     * has no w4nl64i8h kernel, so elsewhere it stays opt-in). */
     if (!c.expert_i8 && c.expert_nl && c.expert_g64 == 2 && !c.expert_w5) {
         const char* fc = std::getenv("RADIANCE_MOE_FORMAT_C");   /* read at each declare (not hot), so a test can set it */
-#ifdef RAD_HAVE_L0
-        c.expert_c8 = fc && fc[0] == '0' ? 0 : 1;
-#else
         c.expert_c8 = fc && fc[0] == '1' ? 1 : 0;
-#endif
     }
     const int64_t ne = c.n_expert;
     for (int64_t e = 0; e < ne; ++e) {

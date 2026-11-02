@@ -6882,7 +6882,7 @@ TEST(qwen35moe_fp8_serves_codebook_experts_against_int8_activations_opt_in) {
     const RadEncoding wc = w4nl64_enc();
     REQUIRE(rad_enc_valid(&wc));
     for (int on : { 0, 1 }) {
-        /* both explicit: the default is on in the Level Zero build, off elsewhere (owner note 160) */
+        /* both explicit: the Level Zero backend sets it at discovery (owner note 160), so the process may have it on */
         setenv("RADIANCE_MOE_FORMAT_C", on ? "1" : "0", 1);
         for (int world : { 1, 2 }) {
             RadBuilder b;

@@ -3298,6 +3298,10 @@ const DeviceBackend* l0_backend_if_present(void) {
             ok = false;
         }
         if (ok) {
+            /* Owner note 160 (run 135): format C (w4nl64a8h experts against int8 activations, libxe's w4nl64i8h) is the
+             * default where this backend serves. The architecture plugins are backend-neutral and read the flag at
+             * declare, which follows device discovery; an explicit RADIANCE_MOE_FORMAT_C (=0 off) is kept. */
+            setenv("RADIANCE_MOE_FORMAT_C", "1", 0);
             g = make_backend();
             /* kernel libraries that allocate at init (libxe's all-reduce rows) find rank r's
              * device and the shared context through rad_l0k (l0_kernels.sycl) */
