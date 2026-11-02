@@ -1565,8 +1565,13 @@ int Ctx::run_step(const RadBatch* b) {
     if (profiling_) profile_collect();
     flush_issued();
     if (tim) tp[6] = stage_clock::now();
-    ar_stalls_read();
-    tape_room_read();
+    /* RADIANCE_L0_GLUE (owner note 159, run 126): once a step, at the trunk pass -- the stall count is a blocking
+     * read and the room a Sysman query (~0.5 ms a draft pass in M218), and the room's verdict is a step's anyway */
+    static const bool glue = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return v && v[0] == '1'; }();
+    if (!glue || b->draft_pass == 0) {
+        ar_stalls_read();
+        tape_room_read();
+    }
     if (tim) {
         tp[7] = stage_clock::now();
         /* draft passes (draft_pass != 0) and trunk passes apart; printed by rank 0 every 400 draft passes */

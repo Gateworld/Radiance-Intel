@@ -128,10 +128,22 @@ int flush_held();   /* "recorded passes": submits a held tape play */
  * the host for a native play the stream's work must follow (settle) -- in that order, so a
  * submission right after a held play follows it (N9: settling before the flush let the bench's sync
  * return before the play). */
+void glue_disarm_check();
+bool glue_on(const L0Stream& s);
 int enter(L0Stream& s) {
+    glue_disarm_check();
     touch(s);
     RAD_TRY(flush_held());
     if (!native_on(s)) settle(s);
+    return RAD_OK;
+}
+/* enter for the entries the glue serves (RADIANCE_L0_GLUE): no settle while the stream's last work is native --
+ * the entry then appends behind it, or settles itself before any runtime submission */
+int enter_g(L0Stream& s) {
+    glue_disarm_check();
+    touch(s);
+    RAD_TRY(flush_held());
+    if (!native_on(s) && !glue_on(s)) settle(s);
     return RAD_OK;
 }
 
@@ -1096,6 +1108,9 @@ std::string slot_story(int dev, int slot, uint64_t serial) {
     if (r.kind == 1)
         std::snprintf(buf, sizeof buf, "a cross-stream wait on device %d slot %d serial %llu (%s), its own signal %p %s",
                       r.dep_dev, r.dep_slot, (unsigned long long)r.dep_serial, dep, (void*)r.ev, ev);
+    else if (r.kind == 2)
+        std::snprintf(buf, sizeof buf, "a glued append (RADIANCE_L0_GLUE) after slot %d serial %llu (%s), its signal %p %s",
+                      r.dep_slot, (unsigned long long)r.dep_serial, dep, (void*)r.ev, ev);
     else
         std::snprintf(buf, sizeof buf, "tape %llu range [%d, %d) in %u list(s), signal event %p %s; after slot %d serial %llu of device %d (%s) and %u runtime event(s)",
                       (unsigned long long)r.tape, r.from, r.to, r.nlists, (void*)r.ev, ev, r.dep_slot, (unsigned long long)r.dep_serial,
@@ -1458,19 +1473,96 @@ void n_stop(const std::string& why) { stop_recording(why); }
 void n_sep(ZeDev& Z) {
     if (!Z.inorder && t_rec.ncmds) zeCommandListAppendBarrier(t_rec.nlist, nullptr, 0, nullptr);
 }
+/* ---- the glue (owner note 159, run 126, RADIANCE_L0_GLUE=1): what a stream submits after a native play, on the
+ * backend's own immediate list instead of the runtime's queue.
+ *
+ * A stream's next runtime submission after a native play host-waits for the play (settle): the runtime's queue
+ * cannot wait on the backend's events (N2-N10). The engine issues a step's draft passes back to back, and between
+ * them every rank submits a little -- the pass's routing copy and event (route_flush), the next pass's advance
+ * kernel, the sampler, the table refreshes' copies -- so each of those waited for the pass before it on the host,
+ * and the card then sat idle while the next pass was issued (P60: ~3.7 ms a step; M218 / M219: run_step's route
+ * flush 1.6 ms a draft pass, the Level Zero appends ~56 us each). With the glue, while a stream's last work is a
+ * native play (npend), its kernel launches (the recorder's hooks), copies, event records and event waits are
+ * appended to the device's immediate list behind the device's previous append, each with a ring slot that the
+ * stream then settles on. Nothing reaches the runtime's queue between plays, so nothing waits on the host until
+ * the step's own sync. Anything not glued (2D copies, device fills, stream syncs) settles as before. */
+bool glue_mode() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return v && v[0] == '1'; }();
+    return on;
+}
+std::atomic<int64_t> g_glued{0}, g_glue_plain{0};
+/* The stream's last work is a native play (or a glued append) of its own device, and this thread is not recording. */
+bool glue_on(const L0Stream& s) {
+    if (!glue_mode() || recording() || s.npend_slot < 0 || s.npend_dev != s.dev) return false;
+    const ZeDev& Z = zedev(s.dev);
+    return Z.ok && Z.imm;
+}
+/* `fn(list, signal, n_waits, waits)` appends the commands; the slot it signals becomes the device's previous append
+ * and the stream's pending one. */
+template <class F> int glue_append(L0Stream& s, const char* what, F&& fn) {
+    ZeDev& Z = zedev(s.dev);
+    std::lock_guard<std::mutex> lk(Z.m);
+    ze_event_handle_t wait = nullptr;
+    if (Z.prev_slot >= 0) {
+        const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
+        if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS)
+            wait = pr.ev;
+    }
+    const int dep_slot = Z.prev_slot;
+    const uint64_t dep_serial = Z.prev_serial;
+    ZeDev::Ring& r = ring_take(Z);
+    const ze_result_t rc = fn(Z.imm, r.ev, wait ? 1u : 0u, wait ? &wait : nullptr);
+    if (rc != ZE_RESULT_SUCCESS) {
+        device_set_error("%s: the glued append failed (0x%x)", what, (unsigned)rc);
+        return RAD_E_DEVICE;
+    }
+    r.used = true;
+    r.keep.clear();
+    r.kind = 2; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = wait ? 1u : 0u;
+    r.dep_dev = s.dev; r.dep_slot = dep_slot; r.dep_serial = dep_serial;
+    const int slot = (int)(&r - Z.ring.get());
+    Z.prev_slot = slot;
+    Z.prev_serial = r.serial.load(std::memory_order_relaxed);
+    s.npend_dev = s.dev;
+    s.npend_slot = slot;
+    s.npend_serial = Z.prev_serial;
+    g_glued.fetch_add(1, std::memory_order_relaxed);
+    return RAD_OK;
+}
+/* A hook answer of "native" for the glue that no glued launch followed: the library launched plainly (its kernel
+ * object failed), unordered against the play. Counted and said: the glue's one unguarded path. */
+thread_local const void* t_glue_armed = nullptr;
+void glue_disarm_check() {
+    if (!t_glue_armed) return;
+    t_glue_armed = nullptr;
+    if (g_glue_plain.fetch_add(1) < 4)
+        RAD_WARN("l0 glue: a library launch went to the runtime's queue after the glue answered for it (no kernel "
+                 "object): it was not ordered behind the native play (RADIANCE_L0_GLUE)");
+}
+
 /* ---- the hooks (rad_l0_rec.h) */
 int n_hook_device(const void* queue) {
+    glue_disarm_check();
     if (!native_recording() || !queue) {
         /* a library launch reaches the queue without a backend call: a held tape play goes first
          * (N3: a play held past the next libxe launch ran after it) */
         if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
+        if (queue && glue_on(S((RadStream)queue))) { t_glue_armed = queue; return S((RadStream)queue).dev; }
         if (queue) settle(S((RadStream)queue));
         return -1;
     }
     return recorded_stream(S((RadStream)queue)) ? t_rec.t->dev : -1;
 }
+int n_glue_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
+                  const void* arg0, size_t arg0_size, size_t lds);
 int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
                   const void* arg0, size_t arg0_size, size_t lds) {
+    if (queue && t_glue_armed == queue) {
+        t_glue_armed = nullptr;
+        if (kernel && kernel->kernel && n_glue_launch(queue, kernel, grid, block, arg0, arg0_size, lds) == 0) return 0;
+        settle(S((RadStream)queue));   /* not glued: the plain launch that follows must come after the play */
+        return -1;
+    }
     if (!queue || !kernel || !kernel->kernel || !native_on(S((RadStream)queue))) return -1;
     ZeDev& Z = zedev(t_rec.t->dev);
     NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
@@ -1531,7 +1623,52 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     t_rec.cmds.push_back(std::move(c));
     return 0;
 }
+/* A library kernel appended to the immediate list behind the play (the glue): the recorder's kernel object and its
+ * checks, the arguments set and the launch appended under the device's lock (they are the object's state). */
+int n_glue_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
+                  const void* arg0, size_t arg0_size, size_t lds) {
+    L0Stream& s = S((RadStream)queue);
+    if (!glue_on(s)) return -1;
+    ZeDev& Z = zedev(s.dev);
+    NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
+    if (!nk.k) return -1;
+    int i_lds = kernel->i_lds;
+    uint32_t want_args = 1u + (i_lds >= 0 ? 1u : 0u);
+    if (i_lds < 0 && nk.nargs == 2) { i_lds = 1; want_args = 2; }
+    if ((nk.nargs && nk.nargs != want_args) || (kernel->arg0_size && kernel->arg0_size != arg0_size) ||
+        kernel->i_arg0 < 0 || kernel->i_arg0 > 1 || i_lds > 1 || i_lds == kernel->i_arg0 || (lds && i_lds < 0))
+        return -1;
+    const int rc = glue_append(s, "a library launch", [&](ze_command_list_handle_t l, ze_event_handle_t sig, uint32_t nw,
+                                                           ze_event_handle_t* w) -> ze_result_t {
+        ze_result_t r = zeKernelSetArgumentValue(nk.k, (uint32_t)kernel->i_arg0, arg0_size, arg0);
+        if (r == ZE_RESULT_SUCCESS && i_lds >= 0) {
+            r = zeKernelSetArgumentValue(nk.k, (uint32_t)i_lds, lds, nullptr);
+            if (r != ZE_RESULT_SUCCESS && !lds) r = ZE_RESULT_SUCCESS;   /* as the recorder: a zero-size refusal is no matter */
+        }
+        if (r == ZE_RESULT_SUCCESS) r = zeKernelSetGroupSize(nk.k, block[0], block[1], block[2]);
+        ze_group_count_t gc{grid[0], grid[1], grid[2]};
+        if (r == ZE_RESULT_SUCCESS) r = zeCommandListAppendLaunchKernel(l, nk.k, &gc, sig, nw, w);
+        return r;
+    });
+    return rc == RAD_OK ? 0 : -1;
+}
 int n_hook_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
+    if (queue && t_glue_armed == queue) {
+        t_glue_armed = nullptr;
+        L0Stream& s = S((RadStream)queue);
+        if (!width || !height) return 0;
+        ze_copy_region_t dr{0, 0, 0, (uint32_t)width, (uint32_t)height, 1};
+        ze_copy_region_t sr{0, 0, 0, (uint32_t)width, (uint32_t)height, 1};
+        if (glue_on(s) &&
+            glue_append(s, "a library 2D copy", [&](ze_command_list_handle_t l, ze_event_handle_t sig, uint32_t nw,
+                                                     ze_event_handle_t* w) {
+                return zeCommandListAppendMemoryCopyRegion(l, dst, &dr, (uint32_t)dpitch, 0, src, &sr, (uint32_t)spitch, 0,
+                                                           sig, nw, w);
+            }) == RAD_OK)
+            return 0;
+        settle(s);
+        return -1;
+    }
     if (!queue || !native_on(S((RadStream)queue))) return -1;
     if (!width || !height) return 0;
     ZeDev& Z = zedev(t_rec.t->dev);
@@ -1563,6 +1700,13 @@ const RadL0RecHooks g_rec_hooks{n_hook_device, n_hook_launch, n_hook_copy2d};
  * refusal, which has run the segment so far -- submitted plainly, so the pass never drops a copy. */
 int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
     if (native_on(S(s)) && n_copy(dst, src, bytes) == RAD_OK) return RAD_OK;
+    if (glue_on(S(s))) {
+        if (glue_append(S(s), "a copy", [&](ze_command_list_handle_t l, ze_event_handle_t sig, uint32_t nw, ze_event_handle_t* w) {
+                return zeCommandListAppendMemoryCopy(l, dst, src, bytes, sig, nw, w);
+            }) == RAD_OK)
+            return RAD_OK;
+    }
+    if (!native_on(S(s))) settle(S(s));   /* after a glued entry's enter (enter_g): the runtime copy follows the play */
     return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, bytes); });
 }
 
@@ -2220,10 +2364,10 @@ int play_now(Tape& tr, int from, int to) {
                 if (t->dev == 0 && g.n > 0 && g.n % 2000 == 0 && g.n != told_at && (told_at = g.n) > 0)
                     RAD_INFO("l0 play host time (device 0, %ld appends, %.1f lists each; %ld same-list waits), us an "
                              "append: compose %.1f, same-list wait %.1f, queue waits %.1f, lock + ring %.1f, append %.1f, "
-                             "rest %.1f, stretch cache + re-record %.1f",
+                             "rest %.1f, stretch cache + re-record %.1f; glued %lld, plain after a glue answer %lld",
                              g.n, (double)g.lists / (double)g.n, g.same_n, g.compose / (double)g.n, g.same / (double)g.n,
                              g.qwait / (double)g.n, g.ring / (double)g.n, g.append / (double)g.n, g.rest / (double)g.n,
-                             g.rerec / (double)g.n);
+                             g.rerec / (double)g.n, (long long)g_glued.load(), (long long)g_glue_plain.load());
             }
         });
     }
@@ -2626,7 +2770,21 @@ int z_event_record(RadEvent ev, RadStream s) {
         return RAD_E_INVAL;
     }
     auto* e = static_cast<L0Event*>(ev);
-    RAD_TRY(enter(S(s)));
+    RAD_TRY(enter_g(S(s)));
+    if (glue_on(S(s))) {
+        /* the glue: the stream's last work is native, so the event is that slot's, as a tape's re-recorded events */
+        const L0Stream& st = S(s);
+        std::lock_guard<std::mutex> lk(e->m);
+        e->ev = sycl::event();
+        e->recorded = true;
+        e->stamped = false;
+        e->zdev = st.npend_dev;
+        e->zslot = st.npend_slot;
+        e->zserial = st.npend_serial;
+        g_glued.fetch_add(1, std::memory_order_relaxed);
+        return RAD_OK;
+    }
+    if (!native_on(S(s))) settle(S(s));
     if (recording()) {
         if (!recorded_stream(S(s))) { refuse("an event record on a stream outside the recording"); }
         else if (t_rec.native) {
@@ -2656,7 +2814,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
         return RAD_E_INVAL;
     }
     auto* e = static_cast<L0Event*>(ev);
-    RAD_TRY(enter(S(s)));
+    RAD_TRY(enter_g(S(s)));
     sycl::event b;
     if (recording()) {
         bool here = false, earlier = false, never = false;
@@ -2693,7 +2851,8 @@ int z_event_wait(RadStream s, RadEvent ev) {
          * fresh slot's signal that the stream's next submission settles on and the next play follows */
         L0Stream& st = S(s);
         ZeDev& Z = zedev(st.dev);
-        if (!Z.ok || !Z.imm) { n_slot_wait(zdev, zslot, zserial, "rad_event_wait without a native list"); return RAD_OK; }
+        if (!Z.ok || !Z.imm) { settle(st); n_slot_wait(zdev, zslot, zserial, "rad_event_wait without a native list"); return RAD_OK; }
+        if (!Z.inorder) settle(st);   /* the glue (enter_g) left the stream's play pending: only an in-order list orders it */
         int slot;
         uint64_t serial;
         {
@@ -2725,6 +2884,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
         st.npend_serial = serial;
         return RAD_OK;
     }
+    settle(S(s));   /* a runtime event: the barrier goes on the runtime's queue, after the stream's native work (enter_g) */
     return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
 }
 
@@ -2811,7 +2971,7 @@ void z_host_wrote(void) { (void)flush_held(); }   /* a held play was issued befo
 /* ------------------------------------------------------------------ copies and fills */
 int z_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_async"));
-    RAD_TRY(enter(S(s)));
+    RAD_TRY(enter_g(S(s)));
     if (bytes < 0 || (bytes > 0 && (!dst || !src))) {
         device_set_error("rad_memcpy_async: bad arguments (%p, %p, %lld)", dst, src, (long long)bytes);
         return RAD_E_INVAL;
@@ -2871,7 +3031,7 @@ int z_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
 int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadCopyRange* ranges, int n,
                           RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_ranges_async"));
-    RAD_TRY(enter(S(s)));
+    RAD_TRY(enter_g(S(s)));
     if (!dst || !src || prefix < 0 || prefix % 16 || n < 0 || (n > 0 && !ranges)) {
         device_set_error("rad_memcpy_ranges_async: bad arguments (the prefix is a multiple of 16)");
         return RAD_E_INVAL;
@@ -2891,7 +3051,7 @@ int z_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
 
 int z_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
     RAD_TRY(check_stream(s, "rad_memcpy_list_async"));
-    RAD_TRY(enter(S(s)));
+    RAD_TRY(enter_g(S(s)));
     if (n < 0 || (n > 0 && !segs)) { device_set_error("rad_memcpy_list_async: bad arguments"); return RAD_E_INVAL; }
     for (int i = 0; i < n; ++i)
         if (segs[i].bytes > 0) RAD_TRY(copy_on(s, segs[i].dst, segs[i].src, (size_t)segs[i].bytes));
