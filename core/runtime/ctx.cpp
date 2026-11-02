@@ -1567,7 +1567,7 @@ int Ctx::run_step(const RadBatch* b) {
     if (tim) tp[6] = stage_clock::now();
     /* RADIANCE_L0_GLUE (owner note 159, run 126): once a step, at the trunk pass -- the stall count is a blocking
      * read and the room a Sysman query (~0.5 ms a draft pass in M218), and the room's verdict is a step's anyway */
-    static const bool glue = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return v && v[0] == '1'; }();
+    static const bool glue = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return !(v && v[0] == '0'); }();   /* default on */
     if (!glue || b->draft_pass == 0) {
         ar_stalls_read();
         tape_room_read();

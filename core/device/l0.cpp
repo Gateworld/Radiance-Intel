@@ -1473,7 +1473,7 @@ void n_stop(const std::string& why) { stop_recording(why); }
 void n_sep(ZeDev& Z) {
     if (!Z.inorder && t_rec.ncmds) zeCommandListAppendBarrier(t_rec.nlist, nullptr, 0, nullptr);
 }
-/* ---- the glue (owner note 159, run 126, RADIANCE_L0_GLUE=1): what a stream submits after a native play, on the
+/* ---- the glue (owner note 159, run 126; the default, RADIANCE_L0_GLUE=0 off): what a stream submits after a native play, on the
  * backend's own immediate list instead of the runtime's queue.
  *
  * A stream's next runtime submission after a native play host-waits for the play (settle): the runtime's queue
@@ -1486,8 +1486,8 @@ void n_sep(ZeDev& Z) {
  * appended to the device's immediate list behind the device's previous append, each with a ring slot that the
  * stream then settles on. Nothing reaches the runtime's queue between plays, so nothing waits on the host until
  * the step's own sync. Anything not glued (2D copies, device fills, stream syncs) settles as before. */
-bool glue_mode() {
-    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return v && v[0] == '1'; }();
+bool glue_mode() {   /* the default since run 126 (H107 against H106: median +21 %, every response identical); =0 off */
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_GLUE"); return !(v && v[0] == '0'); }();
     return on;
 }
 std::atomic<int64_t> g_glued{0}, g_glue_plain{0};
