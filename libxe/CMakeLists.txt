@@ -114,6 +114,16 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_i4i8_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_i4i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Run 123 (owner note 151 C): the int8 lm_head's 4-row form against the rows form (the same bytes), and a microbench.
+  # The CPU test at a small vocabulary; the card at the real one.
+  add_executable(xe_logits_i8_test test/logits_i8_test.cpp)
+  rad_l0_sycl(xe_logits_i8_test)
+  target_link_libraries(xe_logits_i8_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_logits_i8_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_logits_i8_test libxe)
+  add_test(NAME xe_logits_i8_cpu COMMAND xe_logits_i8_test $<TARGET_FILE:libxe> 4096 2048 2)
+  set_tests_properties(xe_logits_i8_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Milestone 3 (owner note 52 item 2): the shim's branch-free E4M3 decode against the ABI's, all 256 codes.
   add_executable(xe_e4m3_decode_test test/e4m3_decode_test.cpp)
   rad_l0_sycl(xe_e4m3_decode_test)

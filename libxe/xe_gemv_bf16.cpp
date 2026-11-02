@@ -396,6 +396,78 @@ void logits_i8_kernel(const uint16_t* __restrict__ x, long x_ld, const uint8_t* 
     }
 }
 
+/* The rows form (owner note 151 C, run 123): R weight rows a sub-group. The 4-row form above spends its time on the
+ * activations, not the weights -- per 16-code chunk a lane reads 16 bytes of codes but 4 x 32 bytes of bf16 rows, again
+ * for every weight row -- and a lane's chunk indices are the same for every weight row. So a sub-group takes R weight
+ * rows, loads each chunk's activation rows once (as packed bf16 in registers) and applies them to its R rows. Every
+ * output keeps the 4-row form's arithmetic in the same order (the chunk's 16 products in e order, then the scale, the
+ * chunks in the lane's order, the same butterfly), so the outputs are its bytes. */
+template <int MB, int R>
+void logits_i8_rows_kernel(const uint16_t* __restrict__ x, long x_ld, const uint8_t* __restrict__ w, long w_ld,
+                           float* __restrict__ y, long y_ld, int N, int K, int M) {
+    const int lane = (int)threadIdx.x & 31;
+    const int n0 = ((int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5)) * R;
+    float acc[R][MB];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < MB; ++m) acc[r][m] = 0.0f;
+    const int nchunk = K / 16;
+    for (int c = lane; c < nchunk && n0 < N; c += 32) {
+        uint4 xq[MB][2];
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            const uint4* xr = (const uint4*)(x + (size_t)(m < M ? m : 0) * x_ld + (size_t)c * 16);
+            xq[m][0] = xr[0];
+            xq[m][1] = xr[1];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int n = n0 + r;
+            if (n >= N) break;   /* uniform over the sub-group */
+            const uint8_t* row = w + (size_t)n * w_ld;
+            const uint16_t* srow = (const uint16_t*)(row + K);
+            const uint4 q = *(const uint4*)(row + (size_t)c * 16);
+            const unsigned qv[4] = {q.x, q.y, q.z, q.w};
+            float wf[16];
+#pragma unroll
+            for (int u = 0; u < 16; ++u) wf[u] = (float)(int8_t)((qv[u >> 2] >> (8 * (u & 3))) & 0xffu);
+            const float sc = ld_bf16(srow, c >> 3);
+#pragma unroll
+            for (int m = 0; m < MB; ++m) {
+                if (m >= M) break;
+                const unsigned xv[8] = {xq[m][0].x, xq[m][0].y, xq[m][0].z, xq[m][0].w,
+                                        xq[m][1].x, xq[m][1].y, xq[m][1].z, xq[m][1].w};
+                float s = 0.0f;
+#pragma unroll
+                for (int e = 0; e < 16; ++e) {
+                    const unsigned h = (e & 1) ? (xv[e >> 1] & 0xffff0000u) : (xv[e >> 1] << 16);
+                    s += __uint_as_float(h) * wf[e];
+                }
+                acc[r][m] += s * sc;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n = n0 + r;
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            float v = acc[r][m];
+            for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
+            if (n < N && lane == 0 && m < M) y[(size_t)m * y_ld + n] = v;
+        }
+    }
+}
+
+/* RADIANCE_XE_LOGITS_R=2 / 4: the rows form at more than one row (owner note 151 C, run 123); unset or 0 the 4-row form.
+ * Read at every call (one a step), so a test can compare the forms in one process. */
+int logits_rows() {
+    const char* e = std::getenv("RADIANCE_XE_LOGITS_R");
+    const int v = e ? std::atoi(e) : 0;
+    return v == 2 || v == 4 ? v : 0;
+}
+
 }  // namespace
 
 /* logits_gemm over the int8 head: x (bf16), lm_head (the stored row above, declared [n_vocab,
@@ -421,10 +493,17 @@ extern "C" int xe_rad_logits_gemm_i8(const RadArgs* args, RadStream s) {
     try {
         sycl::queue* q = (sycl::queue*)s;
         const dim3 grid((unsigned)((V + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+        const int rr = logits_rows();
         for (long long m0 = 0; m0 < M; m0 += kMaxM) {
             const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
             const uint16_t* xm = (const uint16_t*)X->data + (size_t)m0 * x_ld;
             float* ym = (float*)Y->data + (size_t)m0 * y_ld;
+            if (mb > 1 && rr > 0) {
+                const dim3 gr((unsigned)((V + kRowsPerWG * rr - 1) / (kRowsPerWG * rr)));
+                if (rr == 2) XE_LAUNCH(q, (logits_i8_rows_kernel<kMaxM, 2>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+                else XE_LAUNCH(q, (logits_i8_rows_kernel<kMaxM, 4>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+                continue;
+            }
             if (mb == 1) XE_LAUNCH(q, (logits_i8_kernel<1>), grid, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
             else XE_LAUNCH(q, (logits_i8_kernel<kMaxM>), grid, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
         }
