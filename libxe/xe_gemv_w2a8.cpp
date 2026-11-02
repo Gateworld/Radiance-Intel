@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -105,6 +106,101 @@ void gemv_w2a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
                                                                                  : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
         }
     }
+}
+
+/* The rows form (owner note 151 C, run 123): R output rows a sub-group. Per group a lane read 4 bytes of codes but 16
+ * bytes of activation for every row and every output row -- the same activation for all of them, a lane's (group,
+ * chunk) being the same for every row. Here a sub-group takes R output rows and loads each group's activation chunk
+ * once (MB rows), then for each of its rows does exactly the one-row-a-sub-group form's work: the same exact int32
+ * sum, the same butterfly, the same float expression, the groups in the same order, so the same bytes. */
+template <int MB, int R>
+void gemv_w2a8_rows_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as,
+                           const float* __restrict__ asum, long mpad, const uint8_t* __restrict__ b,
+                           const uint8_t* __restrict__ bs, uint16_t* __restrict__ y, long y_ld, int N, int K, int M,
+                           uint32_t dt_u8) {
+    const int lane = (int)threadIdx.x & 31;
+    const int n0 = ((int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5)) * R;
+    const int G = K / 128;
+    const int chunk = lane & 7, gsub = lane >> 3;
+    const RadPlanesEntry* e = (const RadPlanesEntry*)(bs + sizeof(RadPlanesHeader));
+    const uint8_t* sp = bs + e[0].offset;
+    const long s_rb = (long)e[0].row_bytes;
+    const uint8_t* zp = bs + e[1].offset;
+    const long z_rb = (long)e[1].row_bytes;
+    const bool z8 = e[1].dtype == dt_u8;
+    float acc[R][MB];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < MB; ++m) acc[r][m] = 0.0f;
+    for (int g0 = 0; g0 < G; g0 += 4) {
+        const int g = g0 + gsub;
+        const bool gg = g < G;
+        uint4 xq[MB];
+#pragma unroll
+        for (int m = 0; m < MB; ++m)
+            xq[m] = gg && m < M ? *(const uint4*)(a + (size_t)m * a_ld + (size_t)g * 128 + chunk * 16) : uint4{0, 0, 0, 0};
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int n = n0 + r;
+            if (n >= N) break;   /* uniform over the sub-group */
+            const bool gl = gg;
+            const uint8_t* brow = b + (size_t)n * (size_t)(K / 4);
+            uint32_t w = 0;
+            if (gl) w = *(const uint32_t*)(brow + (size_t)g * 32 + chunk * 4);
+            float sb = 0.0f, z = 0.0f;
+            if (gl) {
+                sb = (float)*(const __fp16*)(sp + (size_t)n * s_rb + (size_t)g * 2);
+                const uint8_t zb = zp[(size_t)n * z_rb + (size_t)(z8 ? g : g >> 1)];
+                z = (float)(z8 ? zb : (uint8_t)((zb >> (4 * (g & 1))) & 15));
+            }
+#pragma unroll
+            for (int m = 0; m < MB; ++m) {
+                int s = 0;
+                if (gl && m < M) {
+                    const unsigned xv[4] = {xq[m].x, xq[m].y, xq[m].z, xq[m].w};
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int sq = (q == 1) ? 2 : (q == 2 ? 1 : q);
+                        const unsigned cb = (w >> (8 * sq)) & 0xffu;
+#pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            s += (int)(int8_t)(xv[q] >> (8 * k)) * (int)((cb >> (2 * k)) & 3u);
+                    }
+                }
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 1) << 2, s);
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 2) << 2, s);
+                s += __builtin_amdgcn_ds_bpermute((lane ^ 4) << 2, s);
+                if (gl && m < M && chunk == 0) {
+                    const float sub = (float)s - z * asum[(size_t)g * mpad + m];
+                    acc[r][m] += (sub * as[m]) * sb;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n = n0 + r;
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            float v = acc[r][m];
+            v += __shfl_xor(v, 8);
+            v += __shfl_xor(v, 16);
+            if (n < N && lane == 0 && m < M) {
+                const uint32_t u = __float_as_uint(v);
+                y[(size_t)m * y_ld + n] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
+                                                                                     : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+            }
+        }
+    }
+}
+
+/* RADIANCE_XE_W2A8_R=2 / 4: the rows form (owner note 151 C, run 123); unset or 0 one row a sub-group. Read at every
+ * call (a few a step), so a test can compare the forms in one process. */
+int w2a8_rows() {
+    const char* v = std::getenv("RADIANCE_XE_W2A8_R");
+    const int r = v ? std::atoi(v) : 0;
+    return r == 2 || r == 4 ? r : 0;
 }
 
 /* The w2a8 grid's b_scale: the encoding's "scale" (f16) and "zero" (u8 or u4), one each per
@@ -185,12 +281,23 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
     try {
         sycl::queue* q = (sycl::queue*)s;
         const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+        const int rr = w2a8_rows();
         for (long long m0 = 0; m0 < M; m0 += kMaxM) {
             const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
             const int8_t* am = (const int8_t*)A->data + (size_t)m0 * a_ld;
             const float* asm_ = (const float*)AS->data + m0;
             const float* sm = (const float*)SUM->data + m0;
             uint16_t* ym = (uint16_t*)Y->data + (size_t)m0 * y_ld;
+            if (rr > 0) {
+                const dim3 gr((unsigned)((N + kRowsPerWG * rr - 1) / (kRowsPerWG * rr)));
+#define XE_W2R(MB_, R_) XE_LAUNCH(q, (gemv_w2a8_rows_kernel<MB_, R_>), gr, block, 0, am, (long)a_ld, asm_, sm,     \
+                                  (long)mpad, (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld,   \
+                                  (int)N, (int)K, mb, (uint32_t)RAD_U8)
+                if (mb == 1) { if (rr == 2) XE_W2R(1, 2); else XE_W2R(1, 4); }
+                else { if (rr == 2) XE_W2R(kMaxM, 2); else XE_W2R(kMaxM, 4); }
+#undef XE_W2R
+                continue;
+            }
             if (mb == 1)
                 XE_LAUNCH(q, (gemv_w2a8_kernel<1>), grid, block, 0, am, (long)a_ld, asm_, sm, (long)mpad,
                           (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld, (int)N, (int)K, mb,
