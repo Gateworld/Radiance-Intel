@@ -94,8 +94,14 @@ inline void ar_gave_up(uint32_t* seq_ctr, uint32_t rank, uint32_t s, uint32_t b,
  * -- an indirect access, so under NEO's DisableIndirectAccess=1 the ring was not resident and its first store
  * page-faulted on the card; the CPU device has no residency.) */
 constexpr uint32_t kSkewRing = 1u << 20;
-inline void ar_skew(uint64_t* ring, uint32_t s, uint32_t polls) {
-    if (ring) ring[s & (kSkewRing - 1u)] = ((uint64_t)s << 32) | polls;
+/* the entry: s << 32 | total << 16 | first -- `first` the polls before the peer's first word (the arrival skew plus
+ * the link's latency), `total` thread 0's polls over all its words (the payload's streaming too); each saturates at
+ * 65535 (run 123: M207's first-word record alone could not tell the skew from the transfer) */
+inline void ar_skew(uint64_t* ring, uint32_t s, uint32_t first, uint32_t total) {
+    if (!ring) return;
+    first = first < 65535u ? first : 65535u;
+    total = total < 65535u ? total : 65535u;
+    ring[s & (kSkewRing - 1u)] = ((uint64_t)s << 32) | (total << 16) | first;
 }
 
 struct Inst {
@@ -331,7 +337,7 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
         const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
         for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
-        uint32_t ok = 1, polls0 = 0;
+        uint32_t ok = 1, polls0 = 0, polls_all = 0;
         bool first = true;
         for (uint32_t k = w0 + t; k < w1 && ok; k += kWG) {
             uint32_t budget = spin;
@@ -343,9 +349,10 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
                 if (--budget == 0) { ok = 0; break; }
             }
             if (first) { polls0 = spin - budget; first = false; }
+            polls_all += spin - budget;
             if (ok) emit(k, x[k], (uint32_t)v);
         }
-        if (b == 0 && t == 0) ar_skew(ring, s, polls0);
+        if (b == 0 && t == 0) ar_skew(ring, s, polls0, polls_all);
         if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
     } else {
     for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st(out + k, x[k]);
@@ -365,7 +372,7 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
-    if (b == 0 && t == 0) ar_skew(ring, s, spin - budget);
+    if (b == 0 && t == 0) ar_skew(ring, s, spin - budget, spin - budget);
     if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
     else {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -466,7 +473,7 @@ void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uin
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
         if (--budget == 0) { ok = 0; break; }
     }
-    if (b == 0 && t == 0) ar_skew(ring, s, spin - budget);
+    if (b == 0 && t == 0) ar_skew(ring, s, spin - budget, spin - budget);
     if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);   /* no return: the block still arrives below */
     else {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
