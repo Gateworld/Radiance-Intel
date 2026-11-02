@@ -195,11 +195,12 @@ void gemv_w2a8_rows_kernel(const int8_t* __restrict__ a, long a_ld, const float*
     }
 }
 
-/* RADIANCE_XE_W2A8_R=2 / 4: the rows form (owner note 151 C, run 123); unset or 0 one row a sub-group. Read at every
- * call (a few a step), so a test can compare the forms in one process. */
+/* RADIANCE_XE_W2A8_R: the rows form (owner note 151 C, run 123) -- the default R=2 since owner note 155
+ * (bit-identical); 4 the wider form, 0 one row a sub-group. Read at every call (a few a step), so a test can compare
+ * the forms in one process. */
 int w2a8_rows() {
     const char* v = std::getenv("RADIANCE_XE_W2A8_R");
-    const int r = v ? std::atoi(v) : 0;
+    const int r = v ? std::atoi(v) : 2;
     return r == 2 || r == 4 ? r : 0;
 }
 

@@ -99,8 +99,8 @@ int main(int argc, char** argv) {
         std::vector<float> ref;
         uint64_t ref_hash = 0;
         for (int form : { 0, 2, 4 }) {
-            if (form) { char v[4]; std::snprintf(v, sizeof v, "%d", form); setenv("RADIANCE_XE_LOGITS_R", v, 1); }
-            else unsetenv("RADIANCE_XE_LOGITS_R");
+            /* form 0 set explicitly: unset is the default R=2 since owner note 155 */
+            { char v[4]; std::snprintf(v, sizeof v, "%d", form); setenv("RADIANCE_XE_LOGITS_R", v, 1); }
             q.memset(dy, 0xA7, (size_t)(MM * V) * 4).wait();
             const int rc = call(q, fn, dx, dw, dy, M, V, K);
             q.wait_and_throw();

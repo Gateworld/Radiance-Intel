@@ -460,11 +460,12 @@ void logits_i8_rows_kernel(const uint16_t* __restrict__ x, long x_ld, const uint
     }
 }
 
-/* RADIANCE_XE_LOGITS_R=2 / 4: the rows form at more than one row (owner note 151 C, run 123); unset or 0 the 4-row form.
- * Read at every call (one a step), so a test can compare the forms in one process. */
+/* RADIANCE_XE_LOGITS_R: the rows form at more than one row (owner note 151 C, run 123) -- the default R=2 since owner
+ * note 155 (bit-identical); 4 the wider form, 0 the 4-row form. Read at every call (one a step), so a test can compare
+ * the forms in one process. */
 int logits_rows() {
     const char* e = std::getenv("RADIANCE_XE_LOGITS_R");
-    const int v = e ? std::atoi(e) : 0;
+    const int v = e ? std::atoi(e) : 2;
     return v == 2 || v == 4 ? v : 0;
 }
 
