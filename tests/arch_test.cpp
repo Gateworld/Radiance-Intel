@@ -6882,7 +6882,8 @@ TEST(qwen35moe_fp8_serves_codebook_experts_against_int8_activations_opt_in) {
     const RadEncoding wc = w4nl64_enc();
     REQUIRE(rad_enc_valid(&wc));
     for (int on : { 0, 1 }) {
-        if (on) setenv("RADIANCE_MOE_FORMAT_C", "1", 1); else unsetenv("RADIANCE_MOE_FORMAT_C");
+        /* both explicit: the default is on in the Level Zero build, off elsewhere (owner note 160) */
+        setenv("RADIANCE_MOE_FORMAT_C", on ? "1" : "0", 1);
         for (int world : { 1, 2 }) {
             RadBuilder b;
             b.encs = { { "ffn_gate_up_exps", wc }, { "ffn_down_exps", wc } };
