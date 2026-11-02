@@ -1262,8 +1262,21 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before) {
  * command (and the other recorded streams' when fenced) and after the previous play; marks the
  * streams so their next runtime submission waits for it. */
 void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before);
+/* RADIANCE_DEBUG_STAGE (Intel port, run 126, owner note 159): a native play's host time by part, a thread's sums
+ * (play_now prints device 0's): the lists' composition, the same-list wait, the queues' waits, the device lock and
+ * ring slot, the append, the rest, and the events' re-record. */
+bool l0_stage_on() { static const bool on = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr; return on; }
+struct NStage { double compose = 0, same = 0, qwait = 0, ring = 0, append = 0, rest = 0, rerec = 0; long n = 0, lists = 0, same_n = 0; };
+thread_local NStage t_nstage;
+double l0_us(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
 void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool replay = true, int from = -1, int to = -1) {
     if (!n) return;
+    const bool stg = l0_stage_on();
+    using clk = std::chrono::steady_clock;
+    clk::time_point s0, s1, s2, s3, s4;
+    if (stg) s0 = clk::now();
     ZeDev& Z = zedev(t.dev);
     sycl::queue& H = t.qs[0]->q;
     const bool host = ntape_sync() == 3;
@@ -1274,10 +1287,12 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
             auto it = t.nlast.find(lists[i]);
             if (it != t.nlast.end() && !n_slot_done(t.dev, it->second.first, it->second.second)) {
                 g_same_tape_waits.fetch_add(1, std::memory_order_relaxed);
+                if (stg) ++t_nstage.same_n;
                 n_slot_wait(t.dev, it->second.first, it->second.second, "this list's previous play");
             }
             if (ntape_profile()) n_prof_harvest(Z, lists[i], it != t.nlast.end());
         }
+    if (stg) s1 = clk::now();
     std::vector<sycl::event> keep;
     std::vector<ze_event_handle_t> waits;
     /* the runtime's queue(s) first: a device-side wait on the queue's last event, the sycl::event
@@ -1311,6 +1326,7 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
      * the second lane's next plain submission (the draft head's sampler) ran ahead of the replay */
     add_wait(H);
     for (size_t k = 1; k < t.qs.size(); ++k) add_wait(t.qs[k]->q);
+    if (stg) s2 = clk::now();
     std::lock_guard<std::mutex> lk(Z.m);
     const int dep_slot = Z.prev_slot;          /* named by the 10 s warning (owner note 42) */
     const uint64_t dep_serial = Z.prev_serial;
@@ -1335,7 +1351,9 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
             return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
         return append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
     };
+    if (stg) s3 = clk::now();
     ze_result_t rc = do_append();
+    if (stg) s4 = clk::now();
     for (int attempt = 1; attempt <= 3 && (rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
                                            rc == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY); ++attempt) {
         if (!t.oom_told) {
@@ -1380,6 +1398,12 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
         t.qs[k]->npend_dev = t.dev;
         t.qs[k]->npend_slot = slot;
         t.qs[k]->npend_serial = Z.prev_serial;
+    }
+    if (stg) {
+        const clk::time_point s5 = clk::now();
+        NStage& g = t_nstage;
+        g.same += l0_us(s0, s1); g.qwait += l0_us(s1, s2); g.ring += l0_us(s2, s3); g.append += l0_us(s3, s4);
+        g.rest += l0_us(s4, s5); ++g.n; g.lists += n;
     }
 }
 /* Events recorded in a native tape's segments: recorded for real after a play as the play's slot. */
@@ -2117,6 +2141,8 @@ int play_now(Tape& tr, int from, int to) {
     Tape* t = &tr;
     if (t->native) {
         return guarded("tape_play", [&] {
+            const bool stg = l0_stage_on();
+            const auto p0 = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::vector<ze_command_list_handle_t> lists;
             if (!t->nseg_dead.empty()) n_early_reap(*t);   /* RADIANCE_L0_TAPE_EARLY_LAZY: the recording's lists, once done */
             /* phase 2 of the pool: from the first play on, every range is a composed list; the segment
@@ -2158,7 +2184,9 @@ int play_now(Tape& tr, int from, int to) {
                 for (int i = from; i < to; ++i)
                     if (t->segs[(size_t)i].list) lists.push_back(t->segs[(size_t)i].list);
             }
+            if (stg) t_nstage.compose += l0_us(p0, std::chrono::steady_clock::now());
             n_play_lists(*t, lists.data(), (uint32_t)lists.size(), true, from, to);
+            const auto p1 = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (compose) {
                 /* the bounded cache: the least recently played range out, its list destroyed once this play
                  * (which the tape's next play waits for) has completed */
@@ -2185,6 +2213,18 @@ int play_now(Tape& tr, int from, int to) {
             for (int i = from; i < to; ++i) evs.insert(evs.end(), t->segs[(size_t)i].evs.begin(), t->segs[(size_t)i].evs.end());
             /* an event-only range after played segments follows the tape's latest play (owner note 42) */
             if (!lists.empty() || (from > 0 && t->nslot >= 0)) n_rerecord(*t, evs); else rerecord(*t, evs);
+            if (stg) {
+                NStage& g = t_nstage;
+                g.rerec += l0_us(p1, std::chrono::steady_clock::now());
+                static thread_local long told_at = 0;
+                if (t->dev == 0 && g.n > 0 && g.n % 2000 == 0 && g.n != told_at && (told_at = g.n) > 0)
+                    RAD_INFO("l0 play host time (device 0, %ld appends, %.1f lists each; %ld same-list waits), us an "
+                             "append: compose %.1f, same-list wait %.1f, queue waits %.1f, lock + ring %.1f, append %.1f, "
+                             "rest %.1f, stretch cache + re-record %.1f",
+                             g.n, (double)g.lists / (double)g.n, g.same_n, g.compose / (double)g.n, g.same / (double)g.n,
+                             g.qwait / (double)g.n, g.ring / (double)g.n, g.append / (double)g.n, g.rest / (double)g.n,
+                             g.rerec / (double)g.n);
+            }
         });
     }
     const int mode = compose_mode();
