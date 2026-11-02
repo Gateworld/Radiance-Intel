@@ -1542,7 +1542,8 @@ void glue_disarm_check() {
 
 /* ---- the hooks (rad_l0_rec.h) */
 int n_hook_device(const void* queue) {
-    glue_disarm_check();
+    /* xe::launch_as asks twice for one launch (itself, then launch_native): the same queue asked again keeps the answer */
+    if (t_glue_armed != queue) glue_disarm_check();
     if (!native_recording() || !queue) {
         /* a library launch reaches the queue without a backend call: a held tape play goes first
          * (N3: a play held past the next libxe launch ran after it) */

@@ -385,8 +385,12 @@ inline bool launch_native(sycl::queue& q, dim3 g, dim3 b, size_t lds, const void
     const int rd = rad_l0k_rec_device(&q);
     if (rd < 0) return false;
     const RadL0RecKernel* k = rad_l0_rec::kernel_of<KN>(q, rd);
-    if (!k) return false;
     const uint32_t grid[3] = {g.x, g.y, g.z}, block[3] = {b.x, b.y, b.z};
+    if (!k) {
+        /* no kernel object: told to the backend, which orders the plain launch that follows (RADIANCE_L0_GLUE) */
+        (void)rad_l0k_rec_launch(&q, nullptr, grid, block, nullptr, 0, 0);
+        return false;
+    }
     return rad_l0k_rec_launch(&q, k, grid, block, arg0, arg0_size, lds) == 0;
 }
 

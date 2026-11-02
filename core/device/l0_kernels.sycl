@@ -52,9 +52,12 @@ static int launch_1d(void* stream, const A& args, const F& kfn, size_t global, s
     sycl::queue& q = *static_cast<sycl::queue*>(stream);
     const int rd = rad_l0k_rec_device(stream);
     if (rd >= 0) {
+        const uint32_t grid[3] = {(uint32_t)(global / wg), 1, 1}, block[3] = {(uint32_t)wg, 1, 1};
         if (const RadL0RecKernel* k = rad_l0_rec::kernel_of<F>(q, rd)) {
-            const uint32_t grid[3] = {(uint32_t)(global / wg), 1, 1}, block[3] = {(uint32_t)wg, 1, 1};
             if (rad_l0k_rec_launch(stream, k, grid, block, &args, sizeof args, 0) == 0) return 0;
+        } else {
+            /* no kernel object: told to the backend, which orders the plain launch below (RADIANCE_L0_GLUE) */
+            (void)rad_l0k_rec_launch(stream, nullptr, grid, block, nullptr, 0, 0);
         }
     }
     try {
