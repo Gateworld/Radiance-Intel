@@ -1270,9 +1270,20 @@ thread_local double g_play_us[8] = {};   /* by TapeStep kind */
 thread_local long   g_play_n[8]  = {};
 }   // namespace
 
+/* RADIANCE_TAPE_HOST_BURST (Intel port, run 127; on by default, =0 off): after a host op the card has drained to it
+ * (the op's join waited for its inputs), and the backend holds each played stretch until its next call, which in a
+ * steady decode pass is the pass's end -- so the card idled while the host walked the rest of the pass (P74-P76: the
+ * verify pass's n-gram gather at layer 1, then ~0.75 ms idle). After a host op the held play is submitted after the
+ * next stretch, then after 2, 4, 8 ... more, until the host is a few hundred stretches ahead. Ordering only. */
+static bool tape_host_burst() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_TAPE_HOST_BURST"); return !(v && v[0] == '0'); }();
+    return on;
+}
+
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
     const bool tim = stage_timing();
+    int burst_n = -1, burst_at = 1;   /* stretches played since the last submission after a host op; the next bound */
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
         const auto ts0 = tim ? stage_clock::now() : stage_clock::time_point{};
@@ -1281,6 +1292,12 @@ int Ctx::play_pass(PassTape& t) {
             rc = tape_play(t.dev, st.a, st.b);
             if (rc < 0) step_fail_ = fmt("a recorded pass could not be submitted: %s",
                                          rad_dev_last_error());
+            if (rc >= 0 && burst_n >= 0 && ++burst_n >= burst_at) {
+                rad_dev_host_wrote();   /* submits the held play */
+                burst_n = 0;
+                burst_at *= 2;
+                if (burst_at > 256) burst_n = -1;
+            }
             break;
         case kTapeTable: {
             WeightTable& wt = wtabs_[(size_t)st.a];
@@ -1306,6 +1323,7 @@ int Ctx::play_pass(PassTape& t) {
                 rad_dev_host_wrote();
             }
             lane_ = l0;
+            if (tape_host_burst()) { burst_n = 0; burst_at = 1; }
             if (tim && rank_ == 0) {
                 /* RADIANCE_DEBUG_STAGE (run 126): which host-site op a recorded pass runs, its join and its host time */
                 thread_local int told = 0;
