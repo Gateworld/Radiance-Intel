@@ -409,6 +409,9 @@ private:
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
     rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    /* run 162 (owner note 165 item 1): the draft head's top-R logit values plane (`mtp_dval`, [rows, R] f32,
+     * descending), found by name when the gate is on: a round's margin is column 0 minus column 1. */
+    rad_buf  gate_dval_buf_ = 0;
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */

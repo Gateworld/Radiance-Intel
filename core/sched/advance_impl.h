@@ -28,6 +28,14 @@ RAD_ADV_FN bool adv_is_eog(const AdvanceArgs& a, int32_t t) {
     return lo < a.n_eog && a.eog[lo] == t;
 }
 
+/* run 162 (owner note 165 item 1): the head's confidence at row i -- the proposal plane's top-2 values (a pitch of
+ * at least 2: column 0 minus column 1, the logit margin), or the sampler's margin a row (pitch 1); 0 without one. */
+RAD_ADV_FN float adv_margin(const AdvanceArgs& a, int32_t i) {
+    if (!a.srcf) return 0.0f;
+    const int64_t o = (int64_t)i * a.src_pitch;
+    return a.src_pitch >= 2 ? a.srcf[o] - a.srcf[o + 1] : a.srcf[o];
+}
+
 /* Every group's slots for the row's `n` positions (from the positions just written) and its
  * length from `base`. A position past the block table gets slot -1 ("no slot"); the builder sizes
  * tables for the furthest reachable position, so only a row whose output is unused hits this.
@@ -172,7 +180,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         const int32_t base = a.shared_kv ? S.head : S.head + a.round - 1;
         const int32_t t = a.src[(int64_t)i * a.src_pitch];
         S.tok[a.round - 1] = t;
-        S.conf[a.round - 1] = a.srcf ? a.srcf[(int64_t)i * a.src_pitch] : 0.0f;
+        S.conf[a.round - 1] = adv_margin(a, i);
         tok[k] = t;
         adv_pos(a, pos, k, a.shared_kv ? base + a.rot_shift : base);
         ctx[i] = base;
@@ -181,7 +189,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_TAKE:
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
-        S.conf[a.round] = a.srcf ? a.srcf[(int64_t)i * a.src_pitch] : 0.0f;
+        S.conf[a.round] = adv_margin(a, i);
         return;
     case ADV_BLOCK: {
         /* A block drafter's query row: the anchor (the token the verify just chose) at the

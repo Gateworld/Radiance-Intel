@@ -59,6 +59,21 @@ int Engine::step_state_init() {
      * path, so the flag's absence and its contradiction are told apart here: the flag is on and the
      * head declared nothing means the architecture refused it (it returns RAD_E_UNSUPPORTED at its
      * own declare), and a silent no-op would serve uncoupled drafts while the flag said otherwise. */
+    /* RADIANCE_DRAFT_GATE (run 162): the head's own top-R values plane is the margin's source for a head that
+     * proposes through `mtp_didx` (the sampler never sees its logits: rad_block_mtp_hc.h row_topk at R = 8). */
+    gate_dval_buf_ = 0;
+    if (draft_gate_enabled()) {
+        const Program& prog = ranks_[0]->program;
+        for (size_t i = 0; i < prog.buffers.size(); ++i) {
+            const std::string& name = prog.buffers[i].name;
+            const char* suffix = "mtp_dval";
+            const size_t n = std::strlen(suffix);
+            if (name.size() >= n && name.compare(name.size() - n, n, suffix) == 0) gate_dval_buf_ = (rad_buf)i;
+        }
+        RAD_INFO("draft gate (RADIANCE_DRAFT_GATE): %s; the head's top-R values plane %s, proposal pitch %lld",
+                 draft_gate_threshold() > 0 ? "on" : "stats only", gate_dval_buf_ ? "found (mtp_dval)" : "not found",
+                 (long long)(drafter_.proposal_pitch > 0 ? drafter_.proposal_pitch : 1));
+    }
     mtp_couple_ = mtp_coupled_enabled();
     if (mtp_couple_) {
         /* THE DRAFTER SHAPE IS CHECKED HERE, where the declaration is in hand, not against
@@ -199,8 +214,13 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         /* run 162: the sampler's margin a row rides beside its tokens -- whenever `src` is the sampler's token
          * buffer (the serial rounds read it "from the proposal" with no proposal plane declared: H115 read every
          * margin as 0 when this was keyed on from_proposal alone); never beside a drafter's own proposal plane */
-        a.srcf  = (rk.sampler.margin_on() && !(from_proposal && drafter_.proposal))
-                      ? static_cast<const float*>(rk.ctx.buf_ptr(rk.sampler.margin_buf())) : nullptr;
+        a.srcf  = nullptr;
+        if (from_proposal && drafter_.proposal) {
+            /* the head's own top-R values beside its proposals (the same pitch; the margin is column 0 - 1) */
+            if (gate_dval_buf_) a.srcf = static_cast<const float*>(rk.ctx.buf_ptr(gate_dval_buf_));
+        } else if (rk.sampler.margin_on()) {
+            a.srcf = static_cast<const float*>(rk.ctx.buf_ptr(rk.sampler.margin_buf()));
+        }
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
                                                                   : rk.ctx.buf_ptr(rk.tok_buf));
@@ -372,12 +392,13 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * top-2 logit margin at it reaches the threshold; otherwise the next verify runs one row shorter. The
          * verify is unchanged, so every emitted token is still the target's own. */
         int pub = done;
-        if (draft_gate_enabled() && done >= 2 && r0.sampler.margin_on()) {
+        if (draft_gate_enabled() && done >= 2 && (gate_dval_buf_ || r0.sampler.margin_on())) {
             static bool said = false;
             if (!said) {
                 said = true;
-                RAD_INFO("draft gate (RADIANCE_DRAFT_GATE): %s, the margin op resolved; the last of %d drafts is "
-                         "cut under a margin of %.3g", draft_gate_threshold() > 0 ? "on" : "stats only", done,
+                RAD_INFO("draft gate (RADIANCE_DRAFT_GATE): %s, the margin from %s; the last of %d drafts is cut "
+                         "under a margin of %.3g", draft_gate_threshold() > 0 ? "on" : "stats only",
+                         gate_dval_buf_ ? "the head's top-R values" : "the sampler's margin op", done,
                          (double)draft_gate_threshold());
             }
             const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
@@ -385,7 +406,13 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             DraftGateStats& g = g_gate;
             ++g.rows; g.sum += m; ++g.bins[gate_bin(m)];
             if (draft_gate_threshold() > 0 && m < draft_gate_threshold()) { pub = done - 1; ++g.cut; } else ++g.whole;
-            if (g.rows % 2048 == 0)
+            /* RADIANCE_DRAFT_GATE_LOG: the period in rows (2048 unless set; a single prompt wants ~64) */
+            static const long long period = [] {
+                const char* e = std::getenv("RADIANCE_DRAFT_GATE_LOG");
+                const long long v = e ? std::strtoll(e, nullptr, 10) : 0;
+                return v > 0 ? v : 2048LL;
+            }();
+            if (g.rows % period == 0)
                 RAD_INFO("draft gate: %lld rows, published whole %lld (%.1f %%), cut by one %lld; the last draft's "
                          "margin mean %.2f, by bin <0.5 %lld <1 %lld <2 %lld <4 %lld <8 %lld <16 %lld <32 %lld "
                          ">=32 %lld", g.rows, g.whole, 100.0 * (double)g.whole / (double)g.rows, g.cut,
@@ -393,7 +420,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
                          g.bins[6], g.bins[7]);
         } else if (draft_gate_enabled() && done >= 2) {
             static bool said = false;
-            if (!said) { said = true; RAD_WARN("draft gate (RADIANCE_DRAFT_GATE) asked for, but no sample_argmax_margin op on this backend: off"); }
+            if (!said) { said = true; RAD_WARN("draft gate (RADIANCE_DRAFT_GATE) asked for, but neither the head's values plane nor a sample_argmax_margin op: off"); }
         }
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], pub);
         if (!mtp_couple_) continue;
