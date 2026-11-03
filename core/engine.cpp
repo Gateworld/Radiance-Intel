@@ -407,8 +407,13 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !embedding_ &&
+    /* RADIANCE_STEP_AHEAD=0 (Intel port, run 162, owner note 165 item 1): no step issued ahead, so the draft gate
+     * can size the next verify from this step's margins (a step issued ahead is planned with the drafter's full
+     * count before its rounds have run); the cost is the host's readback and plan between steps. */
+    static const bool step_ahead = [] { const char* e = std::getenv("RADIANCE_STEP_AHEAD"); return !(e && e[0] == '0'); }();
+    pipelining_ = step_ahead && !cfg_.kld() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    if (!step_ahead) RAD_INFO("step loop: RADIANCE_STEP_AHEAD=0, no step issued ahead of the previous step's readback");
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
