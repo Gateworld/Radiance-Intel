@@ -70,6 +70,14 @@ using uc_u64 = syclex::annotated_ptr<uint64_t, decltype(syclex::properties(
     intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>))>;
 inline void uc_st64(uint64_t* p, uint64_t v) { uc_u64 a(p); a[0] = v; }
 inline uint64_t uc_ld64(const uint64_t* p) { uc_u64 a((uint64_t*)p); return a[0]; }
+/* and for two of them in one aligned 16-byte store (run 161's LL form, RADIANCE_XE_AR_PROTO=5: PEER2 measured 16-byte
+ * tagged stores at ~28 % under the 8-byte form's exchange at the decode sizes, and anything wider a slow path) */
+using v2u64 = sycl::vec<uint64_t, 2>;
+using uc_u128 = syclex::annotated_ptr<v2u64, decltype(syclex::properties(
+    intelex::write_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>,
+    intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L2, syclex::cache_level::L3>>))>;
+inline void uc_st128(uint64_t* p, v2u64 v) { uc_u128 a((v2u64*)p); a[0] = v; }
+inline v2u64 uc_ld128(const uint64_t* p) { uc_u128 a((v2u64*)p); return a[0]; }
 #ifdef __SYCL_DEVICE_ONLY__
 #define XE_AR_CONSTANT __attribute__((opencl_constant))
 #else
@@ -165,7 +173,10 @@ template <class T> T* alloc(const Inst& in, size_t n) {
  * form as an opt-out. (Forms 1-3, the old handshake with lighter fences, were measured in AB1 -- no gain, and the
  * same large-message divergence -- and removed.) */
 int ar_proto() {
-    static const int v = [] { const char* e = std::getenv("RADIANCE_XE_AR_PROTO"); return e && e[0] == '0' ? 0 : 4; }();
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_XE_AR_PROTO");
+        return !e ? 4 : (e[0] == '0' ? 0 : (e[0] == '5' ? 5 : 4));   /* 5: the LL form with 16-byte stores (run 161) */
+    }();
     return v;
 }
 
@@ -174,7 +185,7 @@ int build(Inst* in) {
     in->slot_bytes = ((in->numel * eb + 4095) / 4096) * 4096;
     /* the LL form carries a sequence number with every payload word: twice the bytes, so every message up to the
      * bound takes it (the shipped form's large-message divergence is what it removes) */
-    if (ar_proto() == 4) in->slot_bytes *= 2;
+    if (ar_proto() >= 4) in->slot_bytes *= 2;
     in->my_scratch = alloc<uint8_t>(*in, (size_t)(2 * in->slot_bytes));
     in->my_flags = alloc<uint32_t>(*in, 2 * kMaxBlocks);
     in->my_seq = sycl::aligned_alloc_device<uint32_t>(4096, 1024, *in->dev, *in->ctx);
@@ -301,7 +312,8 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     const uint32_t par = s & 1u;
     uint32_t* out = peer_slots + par * slot_words;
     const uint32_t* in = my_slots + par * slot_words;
-    const uint32_t per = (n32 + nblk - 1) / nblk;
+    const uint32_t per0 = (n32 + nblk - 1) / nblk;
+    const uint32_t per = PR == 5 ? ((per0 + 1u) & ~1u) : per0;   /* PR 5: a block's words in pairs, 16-byte aligned */
     const uint32_t w0 = b * per, w1 = (w0 + per < n32) ? w0 + per : n32;
     /* the sum of one word, rank 0's first, into y (and, with HW, hc_write's update of the streams) */
     auto emit = [&](uint32_t k, uint32_t mine, uint32_t theirs) {
@@ -327,7 +339,38 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
             }
         }
     };
-    if constexpr (PR == 4) {
+    if constexpr (PR == 5) {
+        /* RADIANCE_XE_AR_PROTO=5 (run 161, owner note 163 item 2): the LL form below with 16-byte stores -- a lane
+         * carries two tagged words in one aligned store (PEER2: ~28 % off the 8-byte form's exchange at the decode
+         * sizes; 32 and 64-byte stores were a slow path). The tags are still checked a word, so a store that lands
+         * in pieces is still read right. `per` is even: a pair never straddles a block, and the slots are
+         * page-aligned, so every pair's store is 16-byte aligned. An odd last word of the message goes alone. */
+        uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
+        const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
+        for (uint32_t k = w0 + 2u * t; k < w1; k += 2u * kWG) {
+            if (k + 1u < w1) uc_st128(out64 + k, v2u64{((uint64_t)s << 32) | x[k], ((uint64_t)s << 32) | x[k + 1u]});
+            else uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
+        }
+        uint32_t ok = 1, polls0 = 0, polls_all = 0;
+        bool first = true;
+        for (uint32_t k = w0 + 2u * t; k < w1 && ok; k += 2u * kWG) {
+            uint32_t budget = spin;
+            const bool pair = k + 1u < w1;
+            v2u64 v;
+            for (;;) {
+                if (pair) v = uc_ld128(in64 + k);
+                else { v[0] = uc_ld64(in64 + k); v[1] = v[0]; }
+                if ((uint32_t)(v[0] >> 32) == s && (uint32_t)(v[1] >> 32) == s) break;
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                if (--budget == 0) { ok = 0; break; }
+            }
+            if (first) { polls0 = spin - budget; first = false; }
+            polls_all += spin - budget;
+            if (ok) { emit(k, x[k], (uint32_t)v[0]); if (pair) emit(k + 1u, x[k + 1u], (uint32_t)v[1]); }
+        }
+        if (b == 0 && t == 0) ar_skew(ring, s, polls0, polls_all);
+        if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
+    } else if constexpr (PR == 4) {
         /* RADIANCE_XE_AR_PROTO=4 (run 102): the LL form (NCCL's low-latency protocol). Each payload word goes to the
          * peer with this launch's sequence number in the same aligned 8-byte store, and the reader polls each word
          * until its number matches -- no flag word, no system-scope fence, nothing assumed about the order in which
@@ -433,8 +476,8 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
         /* the LL form (a sequence number in every payload word; the default since run 105, RADIANCE_XE_AR_PROTO=0 the
          * old form), taken when the message's 8-byte words fit a parity's slot -- build() doubles the slots, so always */
         const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
-        const bool ll = ar_proto() == 4 && 2ull * n32 <= slot_words;
-#define XE_AR(DT, HW_) do { if (ll) XE_ARP(DT, HW_, 4); else XE_ARP(DT, HW_, 0); } while (0)
+        const bool ll = ar_proto() >= 4 && 2ull * n32 <= slot_words;
+#define XE_AR(DT, HW_) do { if (!ll) XE_ARP(DT, HW_, 0); else if (ar_proto() == 5) XE_ARP(DT, HW_, 5); else XE_ARP(DT, HW_, 4); } while (0)
         if (hw && in->dtype == 0) XE_AR(0, true);
         else switch (in->dtype) { case 0: XE_AR(0, false); break; case 1: XE_AR(1, false); break; default: XE_AR(2, false); break; }
 #undef XE_AR
