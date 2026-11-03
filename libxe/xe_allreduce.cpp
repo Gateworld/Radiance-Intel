@@ -175,7 +175,9 @@ template <class T> T* alloc(const Inst& in, size_t n) {
 int ar_proto() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_XE_AR_PROTO");
-        return !e ? 4 : (e[0] == '0' ? 0 : (e[0] == '5' ? 5 : 4));   /* 5: the LL form with 16-byte stores (run 161) */
+        /* 5, the LL form with 16-byte stores, is the default since run 161 (owner note 163 item 2: 25.1 -> 20.2 us a
+         * launch, the rotation +1.6 % median at the same texts); =4 the 8-byte form, =0 the old flag form */
+        return !e ? 5 : (e[0] == '0' ? 0 : (e[0] == '4' ? 4 : 5));
     }();
     return v;
 }
