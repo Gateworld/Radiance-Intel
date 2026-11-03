@@ -217,6 +217,11 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     /* The logprobs summary is PERSIST too: no declared op reads it (rank 0 copies it to the host
      * behind the pick), so liveness would let the candidate planes reuse its bytes. */
     buf_lp_ = decl("sampler.logprobs", RAD_F32, rows, lp_width(), RAD_BUF_PERSIST);
+    /* The draft gate's margin a row (run 162): PERSIST, since the advance reads it after the step's passes. */
+    if (cfg_.margin) {
+        buf_margin_ = decl("sampler.margin", RAD_F32, rows, 1, RAD_BUF_PERSIST);
+        if (!buf_margin_) { RAD_ERR("sampler: the margin plane failed to declare"); return RAD_E_NOMEM; }
+    }
     if (vocab_parallel())
         buf_lp_g_ = decl("sampler.logprobs_gathered", RAD_F32, rows,
                          lp_width() * cfg_.world_size, RAD_BUF_PERSIST);
@@ -269,6 +274,7 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     op_mask_      = op_vocab("sample_mask");
     op_topk_      = op_vocab_off("sample_topk");
     op_argmax_    = op_vocab("sample_argmax");
+    op_argmax_margin_ = cfg_.margin ? op_vocab("sample_argmax_margin") : RAD_NULL_HANDLE;
 
     op_topp_      = op_cand("sample_topp");
     op_minp_      = op_cand("sample_minp");
@@ -1178,7 +1184,10 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
      * parallelism no row is flagged greedy (see build_step). */
     if (any_greedy) {
         if (any_mask) RAD_TRY(issue(op_mask_, { o_logits, o_params, o_mask }));
-        RAD_TRY(issue(op_argmax_, { o_logits, o_params, o_tok }));
+        if (margin_on())
+            RAD_TRY(issue(op_argmax_margin_, { o_logits, o_params, o_tok, opd_rows(buf_margin_, n_seq_) }));
+        else
+            RAD_TRY(issue(op_argmax_, { o_logits, o_params, o_tok }));
     }
 
     if (!any_chain) return RAD_OK;

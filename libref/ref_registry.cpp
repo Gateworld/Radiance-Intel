@@ -741,6 +741,9 @@ static const RadParamSpec pTopk[]        = { P_INT("M"), P_INT("n_vocab"), P_INT
 static const RadOperandSpec oTopk[]      = { OPD("logits"), OPD("params"),
                                              OUT("cand_idx"), OUT("cand_val"), OUT_O("pairs") };
 static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("token") };
+/* Intel port, run 162 (owner note 165 item 1): the argmax with the top-2 logit margin a row; a device kernel
+ * (libxe) serves it, the reference has no implementation. */
+static const RadOperandSpec oArgmaxMargin[] = { OPD("logits"), OPD("params"), OUT("token"), OUT("margin") };
 /* `stats` is [M, 2 + 2k]: max, sum of exp(l - max), then k (id, logit) pairs. `k` is geometry
  * (the sampler declares one width every request's top_logprobs fits); `vocab_off` is as on
  * sample_topk. */
@@ -1629,6 +1632,9 @@ static const RadOpSchema kSchemas[] = {
   "same descending form the single-rank path produces. Token ids in `gathered` are already "
   "global." },
 { "sample_argmax", ARR(pMVocab), ARR(oArgmax), "Greedy, ties to the lower token id." },
+{ "sample_argmax_margin", ARR(pMVocab), ARR(oArgmaxMargin),
+  "Greedy, ties to the lower token id, and the margin between the row's two largest logits (the draft gate's "
+  "confidence; Intel port, run 162)." },
 { "sample_logprobs", ARR(pLogprobs), ARR(oLogprobs),
   "For a row with RAD_SP_LOGPROBS: the raw logits' max, sum of exp(l - max) and k largest as (id, "
   "logit) pairs, descending, ties to the lower id. Other rows are not written." },

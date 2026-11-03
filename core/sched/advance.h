@@ -36,6 +36,9 @@ struct StepSlot {
     /* The next verify step's input tokens: the bonus token, then the draft head's proposals. */
     int32_t tok[1 + RAD_SCHED_MAX_SPEC];
     int32_t pad[3];
+    /* Intel port, run 162 (owner note 165 item 1): beside each draft round's token, the head's top-2 logit margin
+     * there (0 when the sampler has no margin plane); the host's draft gate reads conf[round]. */
+    float   conf[1 + RAD_SCHED_MAX_SPEC];
 };
 
 enum AdvMode : int32_t {
@@ -97,6 +100,8 @@ struct AdvanceArgs {
      * proposals, row i's from i * src_pitch. */
     const int32_t* src = nullptr;
     int64_t src_pitch = 1;
+    /* ADV_ROUND and ADV_TAKE: the sampler's margin a row beside `src` (row i at i * src_pitch), or null. */
+    const float* srcf = nullptr;
     const int32_t* eog = nullptr;   /* end-of-generation ids, sorted */
     int32_t n_eog = 0;
     /* Rotary planes (RadBatch::rope_pos), [3][rope_pitch] at rope_off; rope_off -1 when the build

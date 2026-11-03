@@ -172,6 +172,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         const int32_t base = a.shared_kv ? S.head : S.head + a.round - 1;
         const int32_t t = a.src[(int64_t)i * a.src_pitch];
         S.tok[a.round - 1] = t;
+        S.conf[a.round - 1] = a.srcf ? a.srcf[(int64_t)i * a.src_pitch] : 0.0f;
         tok[k] = t;
         adv_pos(a, pos, k, a.shared_kv ? base + a.rot_shift : base);
         ctx[i] = base;
@@ -180,6 +181,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_TAKE:
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
+        S.conf[a.round] = a.srcf ? a.srcf[(int64_t)i * a.src_pitch] : 0.0f;
         return;
     case ADV_BLOCK: {
         /* A block drafter's query row: the anchor (the token the verify just chose) at the

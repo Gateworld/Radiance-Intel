@@ -30,6 +30,14 @@
 #include "sched/scheduler.h"
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
+
+namespace rad {
+/* RADIANCE_DRAFT_GATE (Intel port, run 162, owner note 165 item 1): the confidence-gated draft depth. Unset or 0:
+ * off. A positive number: the last draft of a step is published only when the head's top-2 logit margin at it
+ * reaches the number; "stats" (or a negative number): the margins are measured and logged, nothing is cut. */
+float draft_gate_threshold();
+bool  draft_gate_enabled();
+}  /* namespace rad */
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"

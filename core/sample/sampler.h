@@ -117,6 +117,9 @@ struct SamplerConfig {
      * from this many of the most likely tokens, not the whole vocabulary. A request asking for a
      * larger top-k is refused at admission, not silently narrowed. */
     int64_t max_candidates = kSampleCandidates;
+    /* Intel port, run 162 (owner note 165 item 1): greedy rows also write the top-2 logit margin a row
+     * (`sample_argmax_margin`, a device op; absent on a backend without it, and then the plain argmax runs). */
+    bool    margin = false;
 };
 
 /* ================================================================== the driver */
@@ -192,6 +195,9 @@ public:
      * parallel the candidate merge (`sample_merge_topk`, or `row_topk_merge` fused with the
      * top-k) runs between the top-k and the cuts; full logits are never gathered. */
     int run(RadCtx* c, rad_buf logits, rad_buf out_tokens);
+    /* The margin plane ([rows] f32) greedy rows write beside their tokens, when configured and the op resolved. */
+    rad_buf margin_buf() const { return buf_margin_; }
+    bool    margin_on() const { return buf_margin_ != RAD_NULL_HANDLE && op_argmax_margin_ != RAD_NULL_HANDLE; }
 
     /* The emitted token's logprobs, once the step the last build_step staged has completed.
      * `row` must have been staged with SamplingParams::n_probs >= 0 and `token` is what was
@@ -286,6 +292,8 @@ private:
     rad_op op_xtc_       = RAD_NULL_HANDLE;
     rad_op op_pick_      = RAD_NULL_HANDLE;
     rad_op op_argmax_    = RAD_NULL_HANDLE;
+    rad_op op_argmax_margin_ = RAD_NULL_HANDLE;   /* run 162: the argmax with the top-2 margin */
+    rad_buf buf_margin_  = RAD_NULL_HANDLE;       /* [rows, 1] f32, PERSIST (read back by the advance) */
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
     rad_op op_couple_    = RAD_NULL_HANDLE;   /* RADIANCE_MTP_COUPLED only */

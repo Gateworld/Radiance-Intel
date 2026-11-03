@@ -154,6 +154,36 @@ bool Engine::serial_drafting() const {
     return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
+/* RADIANCE_DRAFT_GATE (run 162, owner note 165 item 1): see engine.h. Parsed once. */
+namespace {
+struct DraftGateCfg { bool on = false; float thr = 0.0f; };
+const DraftGateCfg& draft_gate_cfg() {
+    static const DraftGateCfg c = [] {
+        DraftGateCfg g;
+        const char* e = std::getenv("RADIANCE_DRAFT_GATE");
+        if (!e || !e[0]) return g;
+        if (!std::strcmp(e, "stats")) { g.on = true; g.thr = -1.0f; return g; }
+        const float v = std::strtof(e, nullptr);
+        if (v == 0.0f) return g;
+        g.on = true; g.thr = v;
+        return g;
+    }();
+    return c;
+}
+/* the gate's record: steps published whole or cut, and the last draft's margin by bin; logged every 2048 */
+struct DraftGateStats {
+    long long rows = 0, whole = 0, cut = 0;
+    long long bins[8] = {};             /* < 0.5, < 1, < 2, < 4, < 8, < 16, < 32, >= 32 */
+    double sum = 0.0;
+};
+DraftGateStats g_gate;
+int gate_bin(float m) {
+    return m < 0.5f ? 0 : m < 1.0f ? 1 : m < 2.0f ? 2 : m < 4.0f ? 3 : m < 8.0f ? 4 : m < 16.0f ? 5 : m < 32.0f ? 6 : 7;
+}
+}  /* namespace */
+float draft_gate_threshold() { return draft_gate_cfg().thr; }
+bool  draft_gate_enabled() { return draft_gate_cfg().on; }
+
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
  * when given, else all. */
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
@@ -166,6 +196,9 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.st    = rk.step_slots;
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
+        /* run 162: the sampler's margin a row rides beside its tokens (never beside a coupled proposal plane) */
+        a.srcf  = (!from_proposal && rk.sampler.margin_on())
+                      ? static_cast<const float*>(rk.ctx.buf_ptr(rk.sampler.margin_buf())) : nullptr;
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
                                                                   : rk.ctx.buf_ptr(rk.tok_buf));
@@ -333,7 +366,34 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        /* The draft gate (run 162, owner note 165 item 1): the step's last draft goes out only when the head's
+         * top-2 logit margin at it reaches the threshold; otherwise the next verify runs one row shorter. The
+         * verify is unchanged, so every emitted token is still the target's own. */
+        int pub = done;
+        if (draft_gate_enabled() && done >= 2 && r0.sampler.margin_on()) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                RAD_INFO("draft gate (RADIANCE_DRAFT_GATE): %s, the margin op resolved; the last of %d drafts is "
+                         "cut under a margin of %.3g", draft_gate_threshold() > 0 ? "on" : "stats only", done,
+                         (double)draft_gate_threshold());
+            }
+            const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
+            const float m = S.conf[done];
+            DraftGateStats& g = g_gate;
+            ++g.rows; g.sum += m; ++g.bins[gate_bin(m)];
+            if (draft_gate_threshold() > 0 && m < draft_gate_threshold()) { pub = done - 1; ++g.cut; } else ++g.whole;
+            if (g.rows % 2048 == 0)
+                RAD_INFO("draft gate: %lld rows, published whole %lld (%.1f %%), cut by one %lld; the last draft's "
+                         "margin mean %.2f, by bin <0.5 %lld <1 %lld <2 %lld <4 %lld <8 %lld <16 %lld <32 %lld "
+                         ">=32 %lld", g.rows, g.whole, 100.0 * (double)g.whole / (double)g.rows, g.cut,
+                         g.sum / (double)g.rows, g.bins[0], g.bins[1], g.bins[2], g.bins[3], g.bins[4], g.bins[5],
+                         g.bins[6], g.bins[7]);
+        } else if (draft_gate_enabled() && done >= 2) {
+            static bool said = false;
+            if (!said) { said = true; RAD_WARN("draft gate (RADIANCE_DRAFT_GATE) asked for, but no sample_argmax_margin op on this backend: off"); }
+        }
+        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], pub);
         if (!mtp_couple_) continue;
         /* BOUND ONLY FOR A REQUEST STILL RUNNING. A truncated publication keeps a prefix, whose
          * rows carry their own rounds' states; a request this commit finished (a max_tokens or

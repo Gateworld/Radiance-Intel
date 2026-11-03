@@ -59,6 +59,15 @@ static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4
   ROW(cSampleVoc), NOTUNE,
   nullptr, nullptr, r4d_rad_sample_argmax, nullptr, nullptr, nullptr,
   nullptr },
+/* added by hand (Intel port, run 162, owner note 165 item 1): the argmax with the top-2 logit margin a row */
+{ "sample_argmax_margin_f32", "sample_argmax_margin", "sample",
+  "greedy, ties to the lower token id, and the margin between the row's two largest logits",
+  "any vocabulary; the same (key, ~id) walk keeping the runner-up; margin 0 when tied",
+  "f32 logits, i32 token, f32 margin",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSampleVoc), NOTUNE,
+  nullptr, nullptr, r4d_rad_sample_argmax_margin, nullptr, nullptr, nullptr,
+  nullptr },
 { "sample_logprobs_f32", "sample_logprobs", "sample",
   "the raw distribution's summary for a logprobs row: max, sum of exp(l - max), the k largest",
   "any vocabulary; k <= 64, the LDS the sort runs in. sample_topk's radix select at the op's k, so "

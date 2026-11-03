@@ -156,6 +156,7 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.max_spec      = cfg_.n_spec;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
+    sc.margin        = draft_gate_enabled();   /* run 162: the draft gate's margin a greedy row */
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the

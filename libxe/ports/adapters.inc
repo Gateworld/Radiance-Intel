@@ -91,6 +91,7 @@ extern "C" int r4d_rad_rowtopk(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_rowtopk_merge(const RadArgs* a, RadStream s);
 extern "C" int64_t r4d_rad_rowtopk_scratch(const RadArgs* a);
 extern "C" int r4d_rad_sample_argmax(const RadArgs* a, RadStream s);
+extern "C" int r4d_rad_sample_argmax_margin(const RadArgs* a, RadStream s);   /* run 162: the draft gate's margin */
 extern "C" int r4d_rad_sample_dry(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_sample_logprobs(const RadArgs* a, RadStream s);
 extern "C" int r4d_rad_sample_mask(const RadArgs* a, RadStream s);

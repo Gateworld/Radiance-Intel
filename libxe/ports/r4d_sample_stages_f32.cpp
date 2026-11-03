@@ -393,6 +393,58 @@ __global__ __launch_bounds__(TH) void argmax_kernel(
     tok[m] = (int32_t)(~(uint32_t)(lds[0] & 0xffffffffull));
 }
 
+// The same walk keeping the runner-up (Intel port, run 162, owner note 165 item 1: the draft gate): beside the
+// token, the margin between the row's largest logit and its second largest, one float a row (0 when tied or the
+// vocabulary has one entry). Each thread keeps its two largest keys; a wave takes its largest, then the largest of
+// what is left (the lane holding the wave's largest offers its second); thread 0 merges the waves the same way.
+__device__ __forceinline__ float fkey_inv(uint32_t k) {
+    const uint32_t u = (k & 0x80000000u) ? (k & 0x7fffffffu) : ~k;
+    return __builtin_bit_cast(float, u);
+}
+__device__ __forceinline__ void top2_push(unsigned long long& b1, unsigned long long& b2, unsigned long long e) {
+    if (e > b1) { b2 = b1; b1 = e; } else if (e > b2) b2 = e;
+}
+template <uint32_t TH, bool VEC>
+__global__ __launch_bounds__(TH) void argmax_margin_kernel(
+    const float* __restrict__ lg, int32_t* __restrict__ tok, float* __restrict__ margin, uint32_t n_vocab,
+    uint32_t lg_ld) {
+    XE_SHARED(unsigned long long, lds1, TH / kWave);
+    XE_SHARED(unsigned long long, lds2, TH / kWave);
+    const uint32_t m = blockIdx.x;
+    const float* __restrict__ row = lg + (size_t)m * lg_ld;
+    unsigned long long b1 = 0, b2 = 0;
+    if (VEC) {
+        const uint32_t  n4 = n_vocab >> 2;
+        const float4* __restrict__ r4 = (const float4*)row;
+        for (uint32_t j = threadIdx.x; j < n4; j += TH) {
+            const float4   v = r4[j];
+            const uint32_t i = j << 2;
+            top2_push(b1, b2, ((unsigned long long)fkey(v.x) << 32) | (unsigned long long)(~(i + 0u)));
+            top2_push(b1, b2, ((unsigned long long)fkey(v.y) << 32) | (unsigned long long)(~(i + 1u)));
+            top2_push(b1, b2, ((unsigned long long)fkey(v.z) << 32) | (unsigned long long)(~(i + 2u)));
+            top2_push(b1, b2, ((unsigned long long)fkey(v.w) << 32) | (unsigned long long)(~(i + 3u)));
+        }
+        for (uint32_t i = (n4 << 2) + threadIdx.x; i < n_vocab; i += TH)
+            top2_push(b1, b2, ((unsigned long long)fkey(row[i]) << 32) | (unsigned long long)(~i));
+    } else {
+        for (uint32_t i = threadIdx.x; i < n_vocab; i += TH)
+            top2_push(b1, b2, ((unsigned long long)fkey(row[i]) << 32) | (unsigned long long)(~i));
+    }
+    const unsigned long long w1 = wave_max_u64(b1);
+    const unsigned long long w2 = wave_max_u64(b1 == w1 ? b2 : b1);
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    if (lane == 0) { lds1[wave] = w1; lds2[wave] = w2; }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    unsigned long long g1 = lds1[0], g2 = lds2[0];
+    for (uint32_t w = 1; w < TH / kWave; ++w) {
+        if (lds1[w] > g1) { g2 = (g1 > lds2[w]) ? g1 : lds2[w]; g1 = lds1[w]; }
+        else if (lds1[w] > g2) g2 = lds1[w];
+    }
+    tok[m] = (int32_t)(~(uint32_t)(g1 & 0xffffffffull));
+    margin[m] = g2 == 0ull ? 0.0f : fkey_inv((uint32_t)(g1 >> 32)) - fkey_inv((uint32_t)(g2 >> 32));
+}
+
 // ---------------------------------------------------------------------------- sample_topk
 //
 // The radix select: four passes over the row, most significant byte first, narrowing a prefix of
@@ -1388,6 +1440,37 @@ extern "C" int r4d_rad_sample_argmax(const RadArgs* a, RadStream s) {
     if (!r4d_contig(tok) || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
     return r4d_sample_argmax_f32(r4d_addr(lg), r4d_addr(tok), (int)M, (int)nv, (int)ld,
                                  (long)(uintptr_t)s);
+}
+
+/* sample_argmax_margin (Intel port, run 162): the argmax and, in operand 3, the top-2 logit margin a row (f32 [M]). */
+static int r4d_sample_argmax_margin_f32(long lg, long tok, long margin, int M, int n_vocab, int lg_ld, long stream) {
+    if (!lg || !tok || !margin) return R4D_NO(RAD_E_INVAL);
+    if (M <= 0 || n_vocab <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (!lg_ld) lg_ld = n_vocab;
+    const bool vec = ((uintptr_t)lg % (4 * sizeof(float)) == 0) && ((uint32_t)lg_ld % 4u == 0u);
+    if (vec)
+        hipLaunchKernelGGL((argmax_margin_kernel<kArgmaxThreads, true>), dim3((uint32_t)M),
+                           dim3(kArgmaxThreads), 0, (hipStream_t)stream,
+                           (const float*)lg, (int32_t*)tok, (float*)margin, (uint32_t)n_vocab, (uint32_t)lg_ld);
+    else
+        hipLaunchKernelGGL((argmax_margin_kernel<kArgmaxThreads, false>), dim3((uint32_t)M),
+                           dim3(kArgmaxThreads), 0, (hipStream_t)stream,
+                           (const float*)lg, (int32_t*)tok, (float*)margin, (uint32_t)n_vocab, (uint32_t)lg_ld);
+    return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
+extern "C" int r4d_rad_sample_argmax_margin(const RadArgs* a, RadStream s) {
+    const RadTensor* lg;
+    long long M = 0, nv = 0, ld = 0;
+    R4D_NEED(logits_of(a, &lg, &M, &nv, &ld));
+    const RadTensor* tok = r4d_opt(a, 2);
+    const RadTensor* mg = r4d_opt(a, 3);
+    if (!tok || !mg) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_i32(tok));
+    if (mg->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tok) || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(mg) || r4d_numel(mg) < M) return R4D_NO(RAD_E_SHAPE);
+    return r4d_sample_argmax_margin_f32(r4d_addr(lg), r4d_addr(tok), r4d_addr(mg), (int)M, (int)nv, (int)ld,
+                                        (long)(uintptr_t)s);
 }
 
 /* stats [M, 2 + 2k] f32: max, sum of exp(l - max), then k (global id, logit) pairs. */
