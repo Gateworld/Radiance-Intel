@@ -2525,6 +2525,7 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_mask` | `M`(range) `n_vocab` | `logits`:inout, `params`, `bitmask` |
 | `sample_pick` | `M`(range) `n_cand` | `cand_idx`, `cand_val`, `params` → `token` |
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
+| `sample_argmax_margin` | `M`(range) `n_vocab` | `logits`, `params` → `token`, `margin` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
 | `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
