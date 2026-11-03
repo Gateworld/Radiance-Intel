@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 /* 1: this file compiled again as xe_moe_w4nl_i8.cpp, format C's own translation unit -- its own device image, so the
  * CPU device's JIT of one form never takes the other with it (run 116: the CPU JIT crashed on the joined image) */
@@ -38,7 +39,34 @@
 #define XE_I4I8_FC 0
 #endif
 
+extern "C" int rad_l0k_device(int index, const sycl::device** dev, const sycl::context** ctx);
+
 namespace {
+
+/* The tail skip (owner note 162 item 1, run 160; Strata's rule, opt-in RADIANCE_XE_TAIL_SKIP=R): a routed expert
+ * that is NOT in VRAM (its table entry points into the pinned host pool, read over the link) and sits at rank >= R
+ * of the token's top_k is dropped -- its output rows are zeros, so the gather adds nothing for it -- instead of
+ * being read over PCIe; a run whose live rows are all dropped skips the weight reads entirely. The weights are not
+ * renormalised: with expert parallelism each rank sees only its own experts' residency, and a per-rank
+ * renormalisation would make the two ranks' partial sums inconsistent (the owner's "or say why not").
+ *
+ * Residency on the device: a table entry's address. On this platform device USM allocations and host USM
+ * allocations lie on different sides of 2^47 (the probe at init says which side is the device; the feature refuses
+ * itself when they do not split). The stats (device memory, read once a step through xe_ar2_stalls): pairs by rank
+ * off the device [0, 16), dropped [16, 32), live [32, 48); runs skipped whole [48], runs with an off-device expert
+ * [49]. Both GEMMs of a layer count, so a layer's pairs appear twice. */
+struct TskipInst {
+    int                  rank = -1;
+    uint64_t             cfg = 0;          /* 0 off; else R | (device memory above 2^47 ? 256 : 0) */
+    uint32_t*            stats = nullptr;  /* 64 counters, device memory */
+    const sycl::device*  dev = nullptr;
+    const sycl::context* ctx = nullptr;
+    uint32_t             last[64] = {};
+    long                 calls = 0;
+    const void*          keys[8] = {};     /* the all-reduce instances that report: calls / keys ~ steps */
+    int                  nkeys = 0;
+};
+constexpr unsigned kTskipSplit = 47;
 
 struct ICls {
     const uint8_t* base;     /* the stacked codes plane, or null */
@@ -154,7 +182,8 @@ template <int UPL, int LPR, int R, bool GL, bool FC = false>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
-                         uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
+                         uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows,
+                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats) {
     XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
     /* each group's activation sum (exact); FC, which needs none: the 256-entry table, a byte -> two levels (bits).
      * (A separate FC-only array, declared and unused in format B's instantiation, crashed the CPU device: run 116.) */
@@ -180,29 +209,61 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         if ((i - first) % kMT != 0) return;
         rn = (last - i) < (uint32_t)kMT ? (last - i) : (uint32_t)kMT;
     }
-    uint32_t tokr[kMT];
-    bool liver[kMT];
+    uint32_t tokr[kMT], rankr[kMT];
+    bool liver[kMT], skipr[kMT];
 #pragma unroll
     for (int q = 0; q < kMT; ++q) {
-        tokr[q] = 0; liver[q] = false;
+        tokr[q] = 0; liver[q] = false; rankr[q] = 0; skipr[q] = false;
         if (e >= 0 && (uint32_t)q < rn) {
             const int32_t fq = sorted[i + q];
             const uint32_t t = a_sorted ? i + q : (uint32_t)fq / top_k;
             tokr[q] = t;
             liver[q] = fq >= 0 && t < a_rows;
+            rankr[q] = fq >= 0 ? (uint32_t)fq % top_k : 0u;   /* the slot's rank in its token's top_k */
         }
     }
     const ICls& c = (e >= 0 && (e & 1)) ? c1 : c0;
     const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? c.k : 0u;
+    /* The tail skip (TskipInst): the expert's table entry off the device, and a live row's rank at or past R, drops
+     * the row; all of the run's live rows dropped skips the reads. Uniform over the work-group (one entry, one run). */
+    bool all_skip = false;
+    if (sk_cfg && e >= 0 && c.tab) {
+        const uintptr_t wp = (uintptr_t)c.tab[(uint32_t)e >> 1];
+        const bool high = (wp >> kTskipSplit) != 0, dev_high = (sk_cfg & 256u) != 0;
+        const bool offdev = wp != 0 && high != dev_high;
+        const uint32_t Rk = (uint32_t)(sk_cfg & 255u);
+        bool any_live = false;
+        all_skip = offdev;
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) {
+            if ((uint32_t)q >= rn || !liver[q]) continue;
+            any_live = true;
+            skipr[q] = offdev && rankr[q] >= Rk;
+            if (!skipr[q]) all_skip = false;
+        }
+        if (!any_live) all_skip = false;   /* nothing to drop: the plain path writes the zeros */
+        if (sk_stats && nb == 0 && tid == 0) {
+#pragma unroll
+            for (int q = 0; q < kMT; ++q) {
+                if ((uint32_t)q >= rn || !liver[q]) continue;
+                const uint32_t rk = rankr[q] < 16u ? rankr[q] : 15u;
+                atomicAdd(&sk_stats[32 + rk], 1u);
+                if (offdev) atomicAdd(&sk_stats[rk], 1u);
+                if (skipr[q]) atomicAdd(&sk_stats[16 + rk], 1u);
+            }
+            if (any_live && offdev) atomicAdd(&sk_stats[49], 1u);
+            if (all_skip) atomicAdd(&sk_stats[48], 1u);
+        }
+    }
     /* A work-group whose columns all fall past this class's width, in every part they touch, writes its zeros and
      * returns before staging (run 117; IP9, run 116: at the two-card split the smaller gate_up class's 512 of 768
      * columns left a third of its work-groups staging K 2560 for nothing). Uniform over the work-group: no barrier
-     * is skipped by part of it. */
+     * is skipped by part of it. A run the tail skip drops whole takes the same exit. */
     if (e >= 0) {
         const uint32_t cpw = (uint32_t)((kWG / LPR) * R), n0 = nb * cpw, n1 = n0 + cpw < N ? n0 + cpw : N;
         const uint32_t a = fy ? n0 % fy : 0u;
         const bool live = n0 < N && (n1 - n0 >= fy || a < fc || n0 + (fy - a) < n1);
-        if (!live) {
+        if (!live || all_skip) {
             const int team = tid / LPR, l = tid % LPR;
             if (l == 0)
                 for (int q = 0; q < kMT; ++q) {
@@ -385,7 +446,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
             if constexpr (LPR >= 4) v += __shfl_xor(v, 2);
             v += __shfl_xor(v, 1);
             const uint32_t n = nb * ((kWG / LPR) * R) + (uint32_t)(team * R + r);
-            if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] ? v : 0.0f);
+            if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] && !skipr[q] ? v : 0.0f);
         }
     }
 }
@@ -508,11 +569,16 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                                  a_sorted ? "sorted" : "token", (long long)M, grid.x, grid.y, kWG);
                 }
             }
+            /* the tail skip's instance (format C's row has the init; format B's has none) */
+            const TskipInst* ti = fc ? (const TskipInst*)a->instance : nullptr;
+            const uint64_t sk_cfg = ti ? ti->cfg : 0u;
+            uint32_t* const sk_stats = ti && ti->cfg ? ti->stats : nullptr;
 #define XE_I4I8_RUN_F(U, L, R, G, F)                                                                         \
     XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, (const int8_t*)Aq->data,      \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
-                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M)
+                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, \
+                 sk_cfg, sk_stats)
 #define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
             if (gl) switch (upl) {
                 case 1: XE_I4I8_RUN(1, 2, 2, true); break;
@@ -549,6 +615,79 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
 #if XE_I4I8_FC
 /* format C (owner note 147): w4nl64i8h, the w4nl64a8h planes against int8 activations */
 extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, true); }
+
+/* The tail skip's instance, one a rank (every resolved instance of the row shares it): the flag read, the address
+ * split probed on the rank's device, the stats zeroed. A refusal leaves the row serving with the skip off. */
+namespace {
+TskipInst* g_tskip[16] = {};
+std::mutex g_tskip_mu;
+}
+extern "C" int xe_tskip_init(const RadParam*, int, int rank, int, void** out) {
+    if (out) *out = nullptr;
+    if (rank < 0 || rank >= 16 || !out) return RAD_OK;
+    std::lock_guard<std::mutex> lk(g_tskip_mu);
+    if (!g_tskip[rank]) {
+        TskipInst* t = new TskipInst;
+        t->rank = rank;
+        const char* ev = std::getenv("RADIANCE_XE_TAIL_SKIP");
+        const long Rk = ev ? std::atol(ev) : 0;
+        if (Rk > 0 && Rk < 32 && rad_l0k_device(rank, &t->dev, &t->ctx) == 0 && t->dev && t->ctx) {
+            void* dp = nullptr;
+            void* hp = nullptr;
+            try {
+                dp = sycl::malloc_device(64, *t->dev, *t->ctx);
+                hp = sycl::malloc_host(64, *t->ctx);
+                const bool dh = dp && (((uintptr_t)dp >> kTskipSplit) != 0), hh = hp && (((uintptr_t)hp >> kTskipSplit) != 0);
+                if (dp && hp && dh != hh) {
+                    t->stats = sycl::aligned_alloc_device<uint32_t>(256, 64, *t->dev, *t->ctx);
+                    sycl::queue q(*t->ctx, *t->dev, sycl::property::queue::in_order());
+                    if (t->stats) q.memset(t->stats, 0, 64 * sizeof(uint32_t));
+                    q.wait_and_throw();
+                    t->cfg = (uint64_t)Rk | (dh ? 256u : 0u);
+                    std::fprintf(stderr, "[xe] tail skip on rank %d (RADIANCE_XE_TAIL_SKIP=%ld): an expert off the device is dropped at "
+                                 "ranks >= %ld; device memory %s 2^47 (probe: device %p, host %p)\n", rank, Rk, Rk,
+                                 dh ? "above" : "below", dp, hp);
+                } else {
+                    std::fprintf(stderr, "[xe] tail skip refused on rank %d: device %p and host %p memory do not split at 2^47\n",
+                                 rank, dp, hp);
+                }
+            } catch (const sycl::exception& x) {
+                std::fprintf(stderr, "[xe] tail skip refused on rank %d: %s\n", rank, x.what());
+                t->cfg = 0;
+            }
+            try { if (dp) sycl::free(dp, *t->ctx); if (hp) sycl::free(hp, *t->ctx); } catch (const sycl::exception&) {}
+        }
+        g_tskip[rank] = t;
+    }
+    *out = g_tskip[rank];
+    return RAD_OK;
+}
+extern "C" void xe_tskip_fini(void*) {}   /* the instance lives for the process (shared by the row's instances) */
+
+/* Once a step a rank (from xe_ar2_stalls, the engine's stall read, on the runtime queue): the stats every 200 calls
+ * as deltas, with the calls a step estimated from the distinct reporters. */
+extern "C" void xe_tskip_report(int rank, void* stream, const void* key) {
+    TskipInst* t = (rank >= 0 && rank < 16) ? g_tskip[rank] : nullptr;
+    if (!t || !t->cfg || !t->stats || !stream) return;
+    bool known = false;
+    for (int k = 0; k < t->nkeys; ++k) known = known || t->keys[k] == key;
+    if (!known && t->nkeys < 8) t->keys[t->nkeys++] = key;
+    if (++t->calls % 200 != 0) return;
+    uint32_t cur[64];
+    try { ((sycl::queue*)stream)->memcpy(cur, t->stats, sizeof cur).wait(); } catch (const sycl::exception&) { return; }
+    const double steps = t->nkeys ? 200.0 / (double)t->nkeys : 200.0;
+    char line[640];
+    int n = std::snprintf(line, sizeof line, "[xe] tail skip rank %d, ~%.0f steps: pairs by rank live / off-device / dropped:",
+                          rank, steps);
+    for (int r = 0; r < 16 && n < (int)sizeof line - 48; ++r) {
+        const uint32_t lv = cur[32 + r] - t->last[32 + r];
+        if (!lv) continue;
+        n += std::snprintf(line + n, sizeof line - (size_t)n, " r%d %u/%u/%u", r, lv, cur[r] - t->last[r], cur[16 + r] - t->last[16 + r]);
+    }
+    std::fprintf(stderr, "%s; runs with an off-device expert %u, skipped whole %u (both GEMMs of a layer count)\n", line,
+                 cur[49] - t->last[49], cur[48] - t->last[48]);
+    std::memcpy(t->last, cur, sizeof cur);
+}
 #else
 extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, false); }
 #endif

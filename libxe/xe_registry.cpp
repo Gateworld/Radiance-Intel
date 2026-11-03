@@ -73,8 +73,11 @@ static const RadConstraint cXeMoeI4I8[] = {
     C_GE("M", 1), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
     C_EQ("group", 128), C_IN("dtype", "w4g64i8h"),
 };
-/* format C (owner note 147, run 116): xe_moe_i4i8.cpp, over the w4nl64a8h planes' layout */
+/* format C (owner note 147, run 116): xe_moe_i4i8.cpp, over the w4nl64a8h planes' layout; its instance is the tail
+ * skip's (owner note 162 item 1, run 160: RADIANCE_XE_TAIL_SKIP) */
 extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s);
+extern "C" int xe_tskip_init(const RadParam*, int, int, int, void**);
+extern "C" void xe_tskip_fini(void*);
 static const RadConstraint cXeMoeW4nlI8[] = {
     C_GE("M", 1), C_DIV("K", 128), C_LE("K", 4096), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
     C_EQ("group", 128), C_IN("dtype", "w4nl64i8h"),
@@ -294,7 +297,7 @@ static const RadKernelInfo kKernels[] = {
   "per row per 64 of K times one f32; bf16 out",
   RAD_DOMAIN_DEVICE, 60,
   ROW(cXeMoeW4nlI8), NOTUNE,
-  nullptr, nullptr, xe_rad_moe_gemm_w4nl_i8, nullptr,
+  xe_tskip_init, xe_tskip_fini, xe_rad_moe_gemm_w4nl_i8, nullptr,
   xe_moe_planes_layout, xe_moe_planes_relayout, nullptr, xe_moe_planes_unrelayout, nullptr },
 { "xe_attn_paged_split", "attn_paged", "attn",
   "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "

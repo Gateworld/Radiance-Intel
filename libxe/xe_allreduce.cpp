@@ -645,12 +645,15 @@ extern "C" int xe_ar2_host_init(const RadParam* p, int n_p, int rank, int world,
 extern "C" void xe_ar2_fini(void* instance) { ar_fini(instance); }
 extern "C" int xe_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) { return launch(a, s, 0); }
 extern "C" int xe_rad_ar_oneshot_2rank_exact_host(const RadArgs* a, RadStream s) { return launch(a, s, 1); }
+/* the tail skip's stats (xe_moe_w4nl_i8.cpp, owner note 162 item 1): this is the engine's once-a-step call into libxe */
+extern "C" void xe_tskip_report(int rank, void* stream, const void* key);
 /* the blocks that gave up so far (seq_ctr[3]), for tests */
 extern "C" uint32_t xe_ar2_stalls(void* instance, RadStream s) {
     Inst* in = (Inst*)instance;
     if (!in) return 0;
     uint32_t v = 0;
     ((sycl::queue*)s)->memcpy(&v, in->my_seq + 3, 4).wait();
+    xe_tskip_report(in->rank, (void*)s, instance);
     /* RADIANCE_XE_AR_SKEW: the engine calls this once a step -- append the launches completed since the last call
      * (their sequence numbers up to the counter, my_seq[0]) with the call count, the step's index for this rank */
     if (in->skew_f && in->ring) {
