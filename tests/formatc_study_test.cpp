@@ -24,6 +24,8 @@
 #include "rad_planes.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -168,6 +170,7 @@ TEST(format_c_int8_levels_against_the_exact_codebook_and_format_b) {
     const char* rawe = std::getenv("RI_FORMATC_RAW");
     const char* gde = std::getenv("RI_FORMATC_GRAMS");
     if (!rawe || !gde) SKIP("RI_FORMATC_RAW / RI_FORMATC_GRAMS not set (a study run by hand)");
+    if (std::getenv("RI_FORMATC_STUDY")) SKIP("RI_FORMATC_STUDY selects another study");
     NEED_LIBQUANT();
     const std::string raw = rawe, gdir = gde;
     const int maxn = std::getenv("RI_FORMATC_MAX") ? std::atoi(std::getenv("RI_FORMATC_MAX")) : 84;
@@ -221,6 +224,128 @@ TEST(format_c_int8_levels_against_the_exact_codebook_and_format_b) {
         std::fflush(stdout);
         const int d = down ? 1 : 0;
         sum[d][0] += es; sum[d][1] += ec; sum[d][2] += eb; ++cnt[d];
+        ++done;
+    }
+    for (int d = 0; d < 2; ++d)
+        if (cnt[d])
+            std::printf("MEAN %-7s over %2d | %.5f %.5f %.5f | %.4f %.4f\n", d ? "down" : "gate_up", cnt[d],
+                        sum[d][0] / cnt[d], sum[d][1] / cnt[d], sum[d][2] / cnt[d], sum[d][1] / sum[d][0],
+                        sum[d][2] / sum[d][0]);
+}
+
+/* Owner note 162 item 4 (track 2; briefs/2026-11-01-mixed-bits-experts.md step 2, run 160): a 3-bit codebook -- four
+ * magnitudes and their negatives, Lloyd-fitted on the sample's rotated, group-amax-normalised weights the way w4nl's
+ * sixteen were -- quantised by the served rule (a searched E4M3 scale per 64, GPTQ, cd 3) and scored by the same
+ * measure beside the served w4nl, with and without format C's int8 rounding of the levels. RI_FORMATC_STUDY=3bit
+ * runs this study alone (m1/build.sh fc3bit). */
+TEST(format_c_three_bit_codebook_against_w4nl) {
+    const char* rawe = std::getenv("RI_FORMATC_RAW");
+    const char* gde = std::getenv("RI_FORMATC_GRAMS");
+    const char* st = std::getenv("RI_FORMATC_STUDY");
+    if (!rawe || !gde || !st || std::strcmp(st, "3bit"))
+        SKIP("RI_FORMATC_STUDY=3bit with RI_FORMATC_RAW / RI_FORMATC_GRAMS (a study run by hand)");
+    NEED_LIBQUANT();
+    const std::string raw = rawe, gdir = gde;
+    const int maxn = std::getenv("RI_FORMATC_MAX") ? std::atoi(std::getenv("RI_FORMATC_MAX")) : 84;
+    int l, e;
+    std::string which;
+    int64_t rows, cols;
+
+    /* pass 1, the fit: every eighth rotated weight of every group of 64, as |w| / the group's amax */
+    std::vector<float> samp;
+    {
+        std::ifstream idx(raw + "/index.txt");
+        REQUIRE(idx.good());
+        int done = 0;
+        while (done < maxn && idx >> l >> e >> which >> rows >> cols) {
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/%d.%d.%s.f32", raw.c_str(), l, e, which.c_str());
+            std::vector<float> wr = read_f32(path, (size_t)(rows * cols));
+            REQUIRE(!wr.empty());
+            fwht_rows(wr, rows, cols);
+            for (int64_t r = 0; r < rows; ++r)
+                for (int64_t g0 = 0; g0 + 64 <= cols; g0 += 64) {
+                    const float* p = wr.data() + r * cols + g0;
+                    float amax = 0.0f;
+                    for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(p[i]));
+                    if (amax <= 0.0f) continue;
+                    for (int i = (int)(r & 7); i < 64; i += 8) samp.push_back(std::fabs(p[i]) / amax);
+                }
+            ++done;
+        }
+    }
+    REQUIRE(!samp.empty());
+    double c[4] = { 0.08, 0.25, 0.5, 1.0 };
+    for (int it = 0; it < 30; ++it) {
+        double s[4] = { 0, 0, 0, 0 }, n[4] = { 0, 0, 0, 0 };
+        for (float v : samp) {
+            int b = 0;
+            double bd = 1e30;
+            for (int k = 0; k < 4; ++k) {
+                const double d = std::fabs((double)v - c[k]);
+                if (d < bd) { bd = d; b = k; }
+            }
+            s[b] += v;
+            n[b] += 1.0;
+        }
+        for (int k = 0; k < 4; ++k) if (n[k] > 0.0) c[k] = s[k] / n[k];
+    }
+    /* the table at w4nl's scale (its top level 22), so the searched E4M3 scales sit in the served range */
+    const double top = c[3] > 0.0 ? c[3] : 1.0;
+    char tbl[256];
+    std::snprintf(tbl, sizeof tbl, "%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f", c[0] * 22.0 / top, c[1] * 22.0 / top,
+                  c[2] * 22.0 / top, 22.0, -c[0] * 22.0 / top, -c[1] * 22.0 / top, -c[2] * 22.0 / top, -22.0);
+    std::printf("# 3-bit Lloyd magnitudes (amax-normalised) %.4f %.4f %.4f %.4f over %zu samples; table=%s\n",
+                c[0], c[1], c[2], c[3], samp.size(), tbl);
+    std::vector<float>().swap(samp);
+
+    /* pass 2: the error, served w4nl against the 3-bit codebook exact and with its levels rounded to int8 */
+    std::ifstream idx(raw + "/index.txt");
+    REQUIRE(idx.good());
+    int done = 0;
+    double sum[2][3] = { { 0 } };
+    int cnt[2] = { 0, 0 };
+    bool said = false;
+    std::printf("layer expert matrix gram | served(w4nl) w3nl w3nl-int8 | w3nl/served w3nl-int8/served\n");
+    while (done < maxn && idx >> l >> e >> which >> rows >> cols) {
+        const bool down = which == "down";
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/%d.%d.%s.f32", raw.c_str(), l, e, which.c_str());
+        const std::vector<float> w = read_f32(path, (size_t)(rows * cols));
+        REQUIRE(!w.empty());
+        std::string gw;
+        const std::vector<float> h = gram_for(gdir, l, e, down, cols, &gw);
+        std::vector<float> wr = w;
+        fwht_rows(wr, rows, cols);
+        const double den = quad(wr, rows, cols, h);
+        char name[128];
+        std::snprintf(name, sizeof name, "blk.%d.%s.%d.weight", l, down ? "ffn_down_exps" : "ffn_gate_up_exps", e);
+        Opts os;
+        os.s("table", "w4nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32").s("block2", "*x*")
+          .f("scale2_value", 0.0001220703125).s("transform", "fwht128").s("rule", "search").i("cd", 3)
+          .s("calib", gdir.c_str());
+        const Quantised qs = quantise(quantizer("gptq"), os, name, rows, cols, w);
+        Opts o3;
+        o3.s("table", tbl).i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32").s("block2", "*x*")
+          .f("scale2_value", 0.0001220703125).s("transform", "fwht128").s("rule", "search").i("cd", 3)
+          .s("calib", gdir.c_str());
+        const Quantised q3 = quantise(quantizer("gptq"), o3, name, rows, cols, w);
+        REQUIRE_EQ(qs.status, RAD_OK);
+        REQUIRE_EQ(q3.status, RAD_OK);
+        std::string lv;
+        const Quantised q3i = int8_levels(q3, said ? nullptr : &lv);
+        if (!said) {
+            std::printf("# 3-bit encoding %s\n# its levels -> int8: %s\n", rad::enc_name(q3.enc).c_str(), lv.c_str());
+            said = true;
+        }
+        const double es = rel_out_err(wr, den, w, decode(qs, rows, cols), rows, cols, h);
+        const double e3 = rel_out_err(wr, den, w, decode(q3, rows, cols), rows, cols, h);
+        const double e3i = rel_out_err(wr, den, w, decode(q3i, rows, cols), rows, cols, h);
+        std::printf("%2d %3d %-7s %-14s | %.5f %.5f %.5f | %.4f %.4f\n", l, e, which.c_str(), gw.c_str(), es, e3, e3i,
+                    e3 / es, e3i / es);
+        std::fflush(stdout);
+        const int d = down ? 1 : 0;
+        sum[d][0] += es; sum[d][1] += e3; sum[d][2] += e3i; ++cnt[d];
         ++done;
     }
     for (int d = 0; d < 2; ++d)
