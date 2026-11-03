@@ -474,7 +474,6 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
     XE_SHARED(int8_t, sB, 2 * 4 * kDTileB);      /* [step 2][tile 4][packed 32 x 16]: one 64-K group */
     XE_SHARED(int8_t, sA, kDRows * 64);          /* the run's rows x this group's 64 K */
     XE_SHARED(int32_t, sC, kDWaves * 8 * 16);    /* one 8 x 16 int32 tile a sub-group */
-    XE_SHARED(uint32_t, sT, 256);                /* a code byte (low code, high code) -> its two int8 levels */
     const int tid = (int)threadIdx.x, wave = tid / 16, lane = tid % 16;
     const uint32_t i = blockIdx.y, nb = blockIdx.x, n0 = nb * (uint32_t)kDCols;
     if (i >= T || n0 >= N) return;
@@ -501,17 +500,28 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
     const uint32_t entry = (uint32_t)e >> 1;
     const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry) + c.c_off;
     const uint8_t* se8 = entry_of(c.sbase, c.stab, c.sstride, entry) + c.s_off;
-    /* the level table and smul, as the run form forms them */
+    /* the level table and smul, as the run form forms them. Run 166 (owner note 172 a): the 16 int8 levels live
+     * one per lane (level `lane`) and a code's level is a sub-group shuffle, not an LDS table read -- B90 counted
+     * 3.3e10 bank conflicts a 7K on this kernel, the random-code table reads and the strided B stores among them;
+     * the levels are the same integers, so the same bits. */
     const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, entry) + c.t_off);
     float amax = 0.0f;
 #pragma unroll
     for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
-    for (int x = tid; x < 256; x += kDThreads) {
-        const float l0 = tab[x & 15], l1 = tab[x >> 4];
-        const int i0 = amax > 0.0f ? (int)sycl::rint(l0 * 127.0f / amax) : (int)l0;
-        const int i1 = amax > 0.0f ? (int)sycl::rint(l1 * 127.0f / amax) : (int)l1;
-        sT[x] = ((uint32_t)i0 & 255u) | (((uint32_t)i1 & 255u) << 8);
-    }
+    const float lv = tab[lane];
+    const uint32_t lvi = (uint32_t)(amax > 0.0f ? (int)sycl::rint(lv * 127.0f / amax) : (int)lv) & 255u;
+    /* the 16 levels gathered once into four byte-packed words (B92: a per-code shuffle is lowered through the
+     * load/store path -- 7.4e10 cache accesses, +20 % a launch -- so the per-code lookup is a select chain) */
+    sycl::sub_group sg = xe::sg();
+    uint32_t pk[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+    auto lvl = [&](uint32_t cc) -> uint32_t {
+        const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
+        return (d >> (8u * (cc & 3u))) & 255u;
+    };
     const float s1 = *(const float*)(se8 - c.s_off + c.s1_off);
     const float smul = amax > 0.0f ? s1 * (amax / 127.0f) : s1;
     /* this sub-group's 8 rows: the activation row and whether it is live */
@@ -538,7 +548,6 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
         rowok[t] = n < N && j < fcw;
         rowr[t] = pp * fcw + j;
     }
-    sycl::sub_group sg = xe::sg();
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> Am;
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> Bt;
     jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> C[4];
@@ -561,36 +570,42 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
     {
       for (uint32_t g = 0; g < ng; ++g) {
         __syncthreads();                                  /* the previous group's tiles are consumed */
-        /* the A tile: 64 rows x 64 bytes, two 16-byte pieces a thread (row tid / 2, half tid % 2) */
-        {
-            const int q = tid / 2, half = tid % 2;
+        /* the A tile: 64 rows x 64 bytes as two 2 KB sweeps, a thread's 16 bytes at (sweep * 2048 + tid * 16): a
+         * sub-group's 16 stores are one 256-byte run (run 166: the old row / half split put lanes 32 bytes apart,
+         * two to a bank) */
+#pragma unroll
+        for (int sw = 0; sw < 2; ++sw) {
+            const int q = sw * 32 + tid / 4, piece = tid % 4;
             const uint32_t qw = (uint32_t)q;
-            uint4 v0 = {0, 0, 0, 0}, v1 = {0, 0, 0, 0};
+            uint4 v = {0, 0, 0, 0};
             if (qw < rn) {
                 const int32_t fq = sorted[i + qw];
                 const uint32_t t = a_sorted ? i + qw : (uint32_t)fq / top_k;
-                if (fq >= 0 && t < a_rows) {
-                    const uint4* src = (const uint4*)(A + (size_t)t * a_ld + (size_t)g * 64u + (size_t)half * 32u);
-                    v0 = src[0]; v1 = src[1];
-                }
+                if (fq >= 0 && t < a_rows)
+                    v = *(const uint4*)(A + (size_t)t * a_ld + (size_t)g * 64u + (size_t)piece * 16u);
             }
-            uint4* dst = (uint4*)(sA + q * 64 + half * 32);
-            dst[0] = v0; dst[1] = v1;
+            *(uint4*)(sA + q * 64 + piece * 16) = v;
         }
-        /* the B tiles: 64 columns x 16 words of 4 levels; word (step, tile, k4 % 8, n % 16) as the trunk's layout */
-        for (int idx = tid; idx < kDCols * 16; idx += kDThreads) {
-            const int n = idx / 16, k4 = idx % 16, t = n / 16, ln = n % 16;
-            uint32_t w = 0;
-            if (rowok[t] || true) {
-                const uint32_t nn = n0 + (uint32_t)n;
-                const uint32_t pp = fy ? nn / fy : 0u, j = nn - pp * fy;
-                if (nn < N && j < fcw) {
-                    const uint8_t* cb = we + (size_t)(pp * fcw + j) * c.w_ld + (size_t)g * 32u + (size_t)k4 * 2u;
-                    const uint32_t e0 = sT[cb[0]], e1 = sT[cb[1]];
-                    w = (e0 & 255u) | ((e0 >> 8) & 255u) << 8 | (e1 & 255u) << 16 | ((e1 >> 8) & 255u) << 24;
-                }
+        /* the B tiles: 64 columns x 16 words of 4 levels; word (step, tile, k4 % 8, n % 16) as the trunk's layout.
+         * Sub-group w owns tile w / 2 and step w % 2 (k4 = 8 step .. 8 step + 7); a lane is one column: it reads its
+         * row's 16 code bytes for the step once, decodes the 32 codes by shuffles from the level lanes, and stores
+         * word (k4 % 8, lane) -- a sub-group's 16 stores are 16 consecutive words (the old lanes were 64 bytes
+         * apart, four to a bank). */
+        {
+            const int t = wave >> 1, step = wave & 1;
+            uint32_t cw[4] = {0u, 0u, 0u, 0u};
+            if (rowok[t]) {
+                const uint8_t* cb = we + (size_t)rowr[t] * c.w_ld + (size_t)g * 32u + (size_t)step * 16u;
+                __builtin_memcpy(cw, cb, 16);
             }
-            sBw[((k4 / 8) * 4 + t) * 128 + (k4 % 8) * 16 + ln] = w;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t b2 = (cw[j >> 1] >> (16 * (j & 1))) & 0xffffu;   /* code bytes (4 k4 + 0,1 | 2,3) */
+                const uint32_t b0 = b2 & 255u, b1 = b2 >> 8;
+                const uint32_t l0 = lvl(b0 & 15u), l1 = lvl(b0 >> 4), l2 = lvl(b1 & 15u), l3 = lvl(b1 >> 4);
+                const uint32_t w = rowok[t] ? (l0 | (l1 << 8) | (l2 << 16) | (l3 << 24)) : 0u;
+                sBw[(step * 4 + t) * 128 + j * 16 + lane] = w;
+            }
         }
         __syncthreads();
 #pragma unroll
