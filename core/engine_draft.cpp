@@ -196,8 +196,10 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.st    = rk.step_slots;
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
-        /* run 162: the sampler's margin a row rides beside its tokens (never beside a coupled proposal plane) */
-        a.srcf  = (!from_proposal && rk.sampler.margin_on())
+        /* run 162: the sampler's margin a row rides beside its tokens -- whenever `src` is the sampler's token
+         * buffer (the serial rounds read it "from the proposal" with no proposal plane declared: H115 read every
+         * margin as 0 when this was keyed on from_proposal alone); never beside a drafter's own proposal plane */
+        a.srcf  = (rk.sampler.margin_on() && !(from_proposal && drafter_.proposal))
                       ? static_cast<const float*>(rk.ctx.buf_ptr(rk.sampler.margin_buf())) : nullptr;
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
