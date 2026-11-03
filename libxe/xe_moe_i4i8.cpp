@@ -26,6 +26,7 @@
 #include "xe_lanes.h"
 #include "r4d_args.h"
 #include "rad_planes.h"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the matrix-unit form (run 164) */
 
 #include <cstdint>
 #include <cstdio>
@@ -451,6 +452,197 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
     }
 }
 
+#if XE_I4I8_FC
+/* The matrix-unit form at prefill (owner note 168 item 2, run 164; RADIANCE_XE_I4I8_DPAS=1, format C only): the
+ * run form's 4-row runs read every expert's weights once per 4 rows, which at a 4,096-row chunk is the prefill's
+ * largest cost (B63: 5.5 s a rank of the 7K; B64: the f16 matrix form 2.8 s faster). Here a work-group of kDWaves
+ * sub-groups (SG16) owns one expert's run of up to kDRows sorted rows (8 a sub-group) and kDCols output columns
+ * (4 tiles of 16). Per 64-K group it stages the run's activations (8 rows x 64 int8 a sub-group, zeros past the
+ * run and for a dead row) and the columns' codes as their int8 levels in the packed B layout (the trunk's
+ * gemm_i8a8_dpas_kernel's), runs the two 32-deep joint_matrix steps into exact int32 tiles, then scales each tile's
+ * (m, n) by the row's activation scale (per 128) and the column's E4M3 scale x smul (per 64), accumulating in fp32
+ * in ascending g: the run kernel's exact per-group sums and its (sum x asc) x sbr order, so the same bits. Rows
+ * past the run write nothing; a padding row (sorted < 0) writes zeros, as the run form does. */
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kDWaves = 8, kDThreads = 16 * kDWaves, kDRows = 8 * kDWaves, kDCols = 64;
+constexpr int kDTileB = 8 * 16 * 4;   /* one packed B tile: 32 k x 16 n int8 */
+
+void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
+    XE_SHARED(int8_t, sB, 2 * 4 * kDTileB);      /* [step 2][tile 4][packed 32 x 16]: one 64-K group */
+    XE_SHARED(int8_t, sA, kDRows * 64);          /* the run's rows x this group's 64 K */
+    XE_SHARED(int32_t, sC, kDWaves * 8 * 16);    /* one 8 x 16 int32 tile a sub-group */
+    XE_SHARED(uint32_t, sT, 256);                /* a code byte (low code, high code) -> its two int8 levels */
+    const int tid = (int)threadIdx.x, wave = tid / 16, lane = tid % 16;
+    const uint32_t i = blockIdx.y, nb = blockIdx.x, n0 = nb * (uint32_t)kDCols;
+    if (i >= T || n0 >= N) return;
+    const int32_t flat0 = sorted[i];
+    int32_t e = -1;
+    if (flat0 >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        e = (int32_t)lo;
+    }
+    if (e < 0) {   /* a padding row: its zeros over this work-group's columns, as the run form writes them */
+        for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kDThreads)
+            Y[(size_t)i * y_ld + n] = 0;
+        return;
+    }
+    const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+    if ((i - first) % (uint32_t)kDRows != 0) return;
+    const uint32_t rn = (last - i) < (uint32_t)kDRows ? (last - i) : (uint32_t)kDRows;
+    const ICls& c = (e & 1) ? c1 : c0;
+    const uint32_t fy = N / parts, fcw = c.n / parts, K = c.k;
+    const uint32_t entry = (uint32_t)e >> 1;
+    const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry) + c.c_off;
+    const uint8_t* se8 = entry_of(c.sbase, c.stab, c.sstride, entry) + c.s_off;
+    /* the level table and smul, as the run form forms them */
+    const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, entry) + c.t_off);
+    float amax = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
+    for (int x = tid; x < 256; x += kDThreads) {
+        const float l0 = tab[x & 15], l1 = tab[x >> 4];
+        const int i0 = amax > 0.0f ? (int)sycl::rint(l0 * 127.0f / amax) : (int)l0;
+        const int i1 = amax > 0.0f ? (int)sycl::rint(l1 * 127.0f / amax) : (int)l1;
+        sT[x] = ((uint32_t)i0 & 255u) | (((uint32_t)i1 & 255u) << 8);
+    }
+    const float s1 = *(const float*)(se8 - c.s_off + c.s1_off);
+    const float smul = amax > 0.0f ? s1 * (amax / 127.0f) : s1;
+    /* this sub-group's 8 rows: the activation row and whether it is live */
+    uint32_t tokr[8];
+    bool liver[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const uint32_t qq = (uint32_t)(wave * 8 + q);
+        tokr[q] = 0; liver[q] = false;
+        if (qq < rn) {
+            const int32_t fq = sorted[i + qq];
+            const uint32_t t = a_sorted ? i + qq : (uint32_t)fq / top_k;
+            tokr[q] = t;
+            liver[q] = fq >= 0 && t < a_rows;
+        }
+    }
+    /* this lane's column in each tile: the weight row and whether the column is live (the parts split) */
+    uint32_t rowr[4];
+    bool rowok[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const uint32_t n = n0 + (uint32_t)(t * 16 + lane);
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        rowok[t] = n < N && j < fcw;
+        rowr[t] = pp * fcw + j;
+    }
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> Am;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> Bt;
+    jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> C[4];
+    /* The float order: every group's exact int32 sum, scaled as the run form scales it, into one accumulator in
+     * ascending g. The run form's team of 16 lanes holds eight partial sums by g mod 8 joined by an xor tree, so
+     * the last bits of a sum can differ (B66: the 7K's first-token logprob 0.006 off, the text the same); a sweep
+     * in the tree's order with three partial banks (B68) cost 60 % more time and a fold bug, so the form is judged
+     * by note 149's bar (the KL replay), as the owner's note says, not by the bits. */
+    float acc[4][8];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int q = 0; q < 8; ++q) acc[t][q] = 0.0f;
+    uint32_t* sBw = (uint32_t*)sB;
+    int32_t* sCw = sC + wave * 128;
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    const uint32_t ng = K / 64u;
+    {
+      for (uint32_t g = 0; g < ng; ++g) {
+        __syncthreads();                                  /* the previous group's tiles are consumed */
+        /* the A tile: 64 rows x 64 bytes, two 16-byte pieces a thread (row tid / 2, half tid % 2) */
+        {
+            const int q = tid / 2, half = tid % 2;
+            const uint32_t qw = (uint32_t)q;
+            uint4 v0 = {0, 0, 0, 0}, v1 = {0, 0, 0, 0};
+            if (qw < rn) {
+                const int32_t fq = sorted[i + qw];
+                const uint32_t t = a_sorted ? i + qw : (uint32_t)fq / top_k;
+                if (fq >= 0 && t < a_rows) {
+                    const uint4* src = (const uint4*)(A + (size_t)t * a_ld + (size_t)g * 64u + (size_t)half * 32u);
+                    v0 = src[0]; v1 = src[1];
+                }
+            }
+            uint4* dst = (uint4*)(sA + q * 64 + half * 32);
+            dst[0] = v0; dst[1] = v1;
+        }
+        /* the B tiles: 64 columns x 16 words of 4 levels; word (step, tile, k4 % 8, n % 16) as the trunk's layout */
+        for (int idx = tid; idx < kDCols * 16; idx += kDThreads) {
+            const int n = idx / 16, k4 = idx % 16, t = n / 16, ln = n % 16;
+            uint32_t w = 0;
+            if (rowok[t] || true) {
+                const uint32_t nn = n0 + (uint32_t)n;
+                const uint32_t pp = fy ? nn / fy : 0u, j = nn - pp * fy;
+                if (nn < N && j < fcw) {
+                    const uint8_t* cb = we + (size_t)(pp * fcw + j) * c.w_ld + (size_t)g * 32u + (size_t)k4 * 2u;
+                    const uint32_t e0 = sT[cb[0]], e1 = sT[cb[1]];
+                    w = (e0 & 255u) | ((e0 >> 8) & 255u) << 8 | (e1 & 255u) << 16 | ((e1 >> 8) & 255u) << 24;
+                }
+            }
+            sBw[((k4 / 8) * 4 + t) * 128 + (k4 % 8) * 16 + ln] = w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, C[t], 0);
+#pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            jm::joint_matrix_load(sg, Am, lptr(sA + wave * 8 * 64 + step * 32), 64);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bt, lptr(sB + (step * 4 + t) * kDTileB), 64);
+                jm::joint_matrix_mad(sg, C[t], Am, Bt, C[t]);
+            }
+        }
+        /* the group's exact sums, scaled as the run form scales them: lane = column, 8 rows a lane */
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
+            xe::wave_barrier();
+            const float sb = rowok[t] ? e4m3_to_f32(se8[(size_t)rowr[t] * c.s_ld + g]) * smul : 0.0f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const float asc = liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
+                acc[t][q] += ((float)sCw[q * 16 + lane] * asc) * sb;
+            }
+            xe::wave_barrier();
+        }
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const uint32_t n = n0 + (uint32_t)(t * 16 + lane);
+        if (n >= N) continue;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const uint32_t qq = (uint32_t)(wave * 8 + q);
+            if (qq < rn) Y[(size_t)(i + qq) * y_ld + n] = to_bf16(rowok[t] && liver[q] ? acc[t][q] : 0.0f);
+        }
+    }
+}
+
+/* RADIANCE_XE_I4I8_DPAS: the matrix-unit form for steps of RADIANCE_XE_I4I8_DPAS_MIN sorted rows or more (512 unless
+ * set) -- the default since run 164 (B66: the 7K first token 13.7 -> 10.9 s); =0 the run form everywhere */
+bool dpas_on() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS"); return !(s && *s == '0'); }();
+    return v;
+}
+long long dpas_min_rows() {
+    static const long long v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_MIN"); const long long n = s ? std::strtoll(s, nullptr, 10) : 0; return n > 0 ? n : 512LL; }();
+    return v;
+}
+#endif
+
 /* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
 bool plain_forced() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
@@ -542,6 +734,17 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
     }
     try {
         sycl::queue* qq = (sycl::queue*)s;
+#if XE_I4I8_FC
+        /* the matrix-unit form at prefill (owner note 168 item 2): the same bits as the run form, from 64-row tiles */
+        if (fc && dpas_on() && T >= dpas_min_rows() && K % 64 == 0) {
+            const dim3 grid((unsigned)((N + kDCols - 1) / kDCols), (unsigned)T), block(kDThreads);
+            XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, grid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
+                         cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                         (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);
+            return RAD_OK;
+        }
+#endif
         if (!plain_forced() && K <= (long long)kMaxK) {
             /* the run form: at K <= 512 (down, 2-8 groups a row) a group a lane, 2 lanes a column and two columns a
              * team (the probe's GL2R2: 33 us at the verify against L8R2's 42); else 16 lanes a column (gate_up) and
