@@ -742,11 +742,12 @@ void real_record(L0Event* e, L0Stream& st) {
         stamped = true;
     } else {
         if (tags && g_timing.load(std::memory_order_relaxed)) g_rec_untimed.fetch_add(1, std::memory_order_relaxed);
-        /* Run 173 (Intel port): RADIANCE_L0_RECORD_BARRIER=1 takes a barrier for every record instead of the
-         * queue's last event -- B131 timed the records at ~6-14 ms each on a prefill chunk (3.5 s of a 3.6 s
-         * pass, the host blocked at every stager event), while a barrier submission with a dependency
-         * (z_event_wait) costs ~5 us; the test says whether the runtime's last-event query is the block. */
-        static const bool rec_barrier = [] { const char* v = std::getenv("RADIANCE_L0_RECORD_BARRIER"); return v && *v == '1'; }();
+        /* Run 173 (Intel port): a barrier for every record instead of the queue's last event -- B131 timed the
+         * records at ~6-14 ms each on a prefill chunk (3.5 s of a 3.6 s pass, the host blocked at every stager
+         * event: the runtime's last-event query waits for the queue's work), while a barrier submission with a
+         * dependency (z_event_wait) costs ~5 us. The default since run 174 (owner note 176 item 1; B133: the 7K
+         * first token −9 %, the 20K −12 %, exact); RADIANCE_L0_RECORD_BARRIER=0 takes the last-event form. */
+        static const bool rec_barrier = [] { const char* v = std::getenv("RADIANCE_L0_RECORD_BARRIER"); return !(v && *v == '0'); }();
         if (st.gated.load() || rec_barrier) {
             b = q.ext_oneapi_submit_barrier();
             g_rec_barriers.fetch_add(1, std::memory_order_relaxed);

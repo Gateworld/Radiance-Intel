@@ -419,12 +419,12 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* Run 167 (owner note 168 item 1): the sparse pass's attention as one launch on the matrix units
      * (attn_qsa_fmha: the row lists as a bitmap over the sequence's table, the context gathered dense, sycl-tla's
-     * flash-attention with the mask). Opt-in while its KL replay is being judged: RADIANCE_ATTN_QSA_FMHA=1. It
-     * takes a one-sequence chunk of >= 256 rows; the per-row path keeps everything else, and the gate + quant
-     * follow it as on the ungated path. */
+     * flash-attention with the mask). The default since run 174 (owner note 176 item 1; opt-in from run 167 while
+     * its KL replay was judged): RADIANCE_ATTN_QSA_FMHA=0 turns it off. It takes a one-sequence chunk of >= 256
+     * rows; the per-row path keeps everything else, and the gate + quant follow it as on the ungated path. */
     static const bool fmha_wanted = [] {
         const char* e = std::getenv("RADIANCE_ATTN_QSA_FMHA");
-        return e && *e == '1';
+        return !(e && *e == '0');
     }();
     if (op_attn && qsa_sel && qsa_sequ && fmha_wanted && rad_op_declared(b, "attn_qsa_fmha")) {
         op_attn_qsa = RAD_OP(b, "attn_qsa_fmha",

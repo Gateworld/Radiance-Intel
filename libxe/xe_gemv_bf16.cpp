@@ -15,7 +15,11 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the prefill form on the matrix unit (run 58) */
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <vector>
 
 extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream s);   /* ports/r4d_moe.cpp */
 
@@ -523,6 +527,51 @@ extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* args, RadStream s) {
     return gemv(r4d_opt(args, 0), B, r4d_opt(args, 2), N, K, s);
 }
 
+/* RADIANCE_XE_ROUTE_DUMP=<dir> (owner note 165 item 4, run 174): a measurement switch -- after the top-k of a
+ * decode-sized call (M <= 16 rows) the router's rows go to <dir>/route-<queue>.bin: a 16-byte header ('RTD1',
+ * M, n_expert, top_k as uint32), the bf16 logits (M x n_expert, de-pitched), the int32 ids (M x top_k) and
+ * the bf16 weights (M x top_k); m3/route_union.py reads them (the distinct experts a step reads a layer and
+ * the union under a routing bias). The copies wait for the queue, so the step's time is not a measurement;
+ * the tapes must be off (RADIANCE_L0_TAPE=0): a replayed pass does not run this host code. One file a queue
+ * (each rank's stream), so the two ranks' dumps are the same routing twice. */
+static void route_dump(sycl::queue* q, const RadTensor* lg, const RadTensor* ids, const RadTensor* w,
+                       long long E, long long top_k) {
+    static const char* dir = [] { const char* e = std::getenv("RADIANCE_XE_ROUTE_DUMP"); return e && *e ? e : nullptr; }();
+    if (!dir || !q || !lg || !ids || !w || !lg->data || !ids->data || !w->data || E <= 0 || top_k <= 0) return;
+    long long M = 0;
+    const long long ld = r4d_rows_pitch(lg, E, &M);
+    if (ld < 0 || M <= 0 || M > 16) return;
+    if (rad_tensor_numel(ids) < M * top_k || rad_tensor_numel(w) < M * top_k) return;
+    std::vector<uint16_t> L((size_t)(M * E)), Wv((size_t)(M * top_k));
+    std::vector<int32_t> I((size_t)(M * top_k));
+    try {
+        q->wait();
+        for (long long m = 0; m < M; ++m)
+            q->memcpy(L.data() + (size_t)m * E, (const uint16_t*)lg->data + (size_t)m * ld, (size_t)E * 2);
+        q->memcpy(I.data(), ids->data, I.size() * 4);
+        q->memcpy(Wv.data(), w->data, Wv.size() * 2);
+        q->wait();
+    } catch (const sycl::exception&) {
+        return;
+    }
+    static std::mutex mu;
+    static std::map<sycl::queue*, FILE*> files;
+    std::lock_guard<std::mutex> g(mu);
+    FILE*& f = files[q];
+    if (!f) {
+        char p[512];
+        std::snprintf(p, sizeof p, "%s/route-%p.bin", dir, (void*)q);
+        f = std::fopen(p, "ab");
+        if (!f) return;
+    }
+    const uint32_t h[4] = { 0x31445452u, (uint32_t)M, (uint32_t)E, (uint32_t)top_k };
+    std::fwrite(h, sizeof h[0], 4, f);
+    std::fwrite(L.data(), 2, L.size(), f);
+    std::fwrite(I.data(), 4, I.size(), f);
+    std::fwrite(Wv.data(), 2, Wv.size(), f);
+    std::fflush(f);
+}
+
 /* router_gemm_topk_scatter: a, b, gate_b?, logits, expert_ids, expert_w, sorted_tok, expert_offset,
  * expert_count, gate? -- the reference's own launches (libref: "the reference IS the launches"):
  * logits = a @ b^T, the shared expert's gate = a @ gate_b^T when both are present, then
@@ -548,7 +597,11 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
     RadArgs sub = *args;
     sub.t = args->t + 3;
     sub.n_t = 6;
-    return r4d_rad_router_topk_scatter(&sub, s);
+    rc = r4d_rad_router_topk_scatter(&sub, s);
+    if (rc == RAD_OK)
+        route_dump((sycl::queue*)s, r4d_opt(args, 3), r4d_opt(args, 4), r4d_opt(args, 5), E,
+                   r4d_geti_or(args, "top_k", 0));
+    return rc;
 }
 
 /* logits_gemm at dtype bf16: x, lm_head, logits. (Production's int8 lm_head is a joined code + scale

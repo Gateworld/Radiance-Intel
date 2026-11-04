@@ -153,6 +153,16 @@ __device__ __forceinline__ uint32_t wave_min_u32(uint32_t b) {
     o = r4d_xor_lane_u32<1>(b);  b = b < o ? b : o;
     return b;
 }
+/* The lean's wave maximum (owner note 165 item 4, run 174), the same exchange. */
+__device__ __forceinline__ uint32_t wave_max_u32(uint32_t b) {
+    uint32_t o;
+    o = r4d_xor_lane_u32<16>(b); b = b > o ? b : o;
+    o = r4d_xor_lane_u32<8>(b);  b = b > o ? b : o;
+    o = r4d_xor_lane_u32<4>(b);  b = b > o ? b : o;
+    o = r4d_xor_lane_u32<2>(b);  b = b > o ? b : o;
+    o = r4d_xor_lane_u32<1>(b);  b = b > o ? b : o;
+    return b;
+}
 
 /* ================================================================== router_topk
  *
@@ -276,6 +286,106 @@ __device__ __forceinline__ void router_topk_row(
     }
 }
 
+/* ---- the Intel port, owner note 165 item 4 (run 174): S2-MoE's routing bias at a decode-sized call, opt-in by
+ * RADIANCE_XE_ROUTE_LEAN=<n>,<margin>. After every row of the call has its top_k, a row's n lowest picks lean to
+ * the best expert the call's other rows keep among their top (top_k - n) picks (the "stable" picks, which never
+ * move) when that expert's softmax probability is within `margin` of the pick's own: the step's union of experts
+ * (what the expert kernels stream a layer) shrinks by the picks moved. Deterministic: the stable set is fixed
+ * before any row leans, so the rows lean independently of their order. Lossy by construction -- the moved pick's
+ * weight goes to the alternative and the row's weights are renormalised as the reference does; the gate is the
+ * KL replay (note 149's bar). A row is rewritten only when a pick moved, so an untouched row keeps its bits; the
+ * lean never runs without the variable, so the default path is the same code as before. */
+struct LeanLds { uint8_t stable[kMaxExpert]; };
+
+template <uint32_t MAXOWN>
+__device__ __forceinline__ void lean_row(
+    const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
+    uint32_t m, uint32_t n_expert, uint32_t top_k, uint32_t lg_ld, int norm, uint32_t lane,
+    SlotSink snk, const uint8_t* __restrict__ stable, uint32_t lean_n, float margin) {
+    const uint16_t* row = lg + (size_t)m * lg_ld;
+    /* the row's softmax, the expressions of router_topk_row */
+    uint16_t raw[MAXOWN];
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+        const uint32_t e = lane + i * kWave;
+        raw[i] = row[e < n_expert ? e : 0u];
+    }
+    float v[MAXOWN];
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+        const uint32_t e = lane + i * kWave;
+        v[i] = e < n_expert ? bf16_to_f32(raw[i]) : -INFINITY;
+    }
+    float mx = -INFINITY;
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) mx = fmaxf(mx, v[i]);
+    mx = fmaxf(mx, r4d_xor_lane<16>(mx));
+    mx = fmaxf(mx, r4d_xor_lane<8>(mx));
+    mx = fmaxf(mx, r4d_xor_lane<4>(mx));
+    mx = fmaxf(mx, r4d_xor_lane<2>(mx));
+    mx = fmaxf(mx, r4d_xor_lane<1>(mx));
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) sum += __expf(v[i] - mx);
+    sum = r4d_wave_sum(sum);
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    /* the row's picks: lane j holds pick j (round j's winner, so descending value) */
+    int32_t e = -1;
+    if (lane < top_k) e = ids[(size_t)m * top_k + lane];
+    const float bad = r4d_wave_sum(lane < top_k && (e < 0 || e >= (int32_t)n_expert) ? 1.0f : 0.0f);
+    if (bad > 0.0f) return;    /* a row with fewer live experts than top_k: left alone */
+    bool moved = false;
+    for (uint32_t t = 0; t < lean_n; ++t) {
+        const uint32_t s  = top_k - 1 - t;
+        const int32_t  es = __builtin_amdgcn_readlane(e, (int)s);
+        const float    ps = __expf(bf16_to_f32(row[es]) - mx) * inv;
+        /* which of this lane's experts the row already picks (after any earlier move) */
+        uint32_t own = 0u;
+        for (uint32_t j = 0; j < top_k; ++j) {
+            const int32_t pe = __builtin_amdgcn_readlane(e, (int)j);
+#pragma unroll
+            for (uint32_t i = 0; i < MAXOWN; ++i) own |= (uint32_t)((int32_t)(lane + i * kWave) == pe) << i;
+        }
+        /* the best candidate: a stable expert of the call the row does not pick, by the selection's key */
+        uint32_t key = 0u;
+#pragma unroll
+        for (uint32_t i = 0; i < MAXOWN; ++i) {
+            const uint32_t c  = lane + i * kWave;
+            const bool     ok = c < n_expert && stable[c] != 0 && !((own >> i) & 1u);
+            const uint32_t k  = topk_key(raw[i], c);
+            key = (ok && k > key) ? k : key;
+        }
+        const uint32_t best = wave_max_u32(key);
+        if (best == 0u) continue;
+        const int32_t alt = (int32_t)(~best & 0xFFFFu);
+        const float   pa  = __expf(bf16_to_f32(topk_key_raw(best)) - mx) * inv;
+        if (ps - pa <= margin) {
+            if (lane == s) e = alt;
+            moved = true;
+        }
+    }
+    if (!moved) return;
+    /* rewrite the row: the picks' probabilities as they stand, the weights renormalised as the reference */
+    const int32_t  eo = lane < top_k ? e : 0;
+    const float    p  = lane < top_k ? __expf(bf16_to_f32(row[eo]) - mx) * inv : 0.0f;
+    const uint16_t pb = f32_to_bf16(p);
+    float wsum = 0.0f;
+    for (uint32_t r = 0; r < top_k; ++r)
+        wsum += __builtin_bit_cast(float,
+                    __builtin_amdgcn_readlane(__builtin_bit_cast(int, p), (int)r));
+    if (lane < top_k) {
+        ids[(size_t)m * top_k + lane] = e;
+        w[(size_t)m * top_k + lane]   = (norm && wsum > 0.0f)
+                                      ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+    }
+    if (snk.e && lane < top_k) {
+        const int32_t el = e - snk.base;
+        const bool    ok = el >= 0 && el < (int32_t)snk.n_local;
+        snk.e[m * top_k + lane] = ok ? sort_place(el, snk.n_local, snk.prot) : -1;
+    }
+}
+
 template <uint32_t NW, uint32_t MAXOWN>
 __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
@@ -320,14 +430,29 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
     uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,
-    int32_t base, Protect prot) {
+    int32_t base, Protect prot, uint32_t lean_n, float lean_margin, uint32_t lean_rows) {
     XE_SHARED_VAR(ScatterLds<NW>, sl);
+    XE_SHARED_VAR(LeanLds, ll);
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     if constexpr (!DIRECT)
         for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
     const SlotSink snk{sl.e, base, n_local, prot};
     for (uint32_t m = wave; m < M; m += NW)
         router_topk_row<MAXOWN>(lg, ids, w, m, n_expert, top_k, lg_ld, norm, lane, snk);
+    /* owner note 165 item 4 (run 174): the lean, opt-in, at decode-sized calls (uniform over the block) */
+    if (lean_n > 0 && lean_n < top_k && M >= 2 && M <= lean_rows) {
+        for (uint32_t c = threadIdx.x; c < n_expert; c += blockDim.x) ll.stable[c] = 0;
+        lds_barrier();
+        for (uint32_t m = wave; m < M; m += NW)
+            if (lane < top_k - lean_n) {   /* this lane's own pick, written above by this lane */
+                const int32_t e = ids[(size_t)m * top_k + lane];
+                if (e >= 0 && e < (int32_t)n_expert) ll.stable[e] = 1;
+            }
+        lds_barrier();
+        for (uint32_t m = wave; m < M; m += NW)
+            lean_row<MAXOWN>(lg, ids, w, m, n_expert, top_k, lg_ld, norm, lane, snk, ll.stable,
+                             lean_n, lean_margin);
+    }
     lds_barrier();
     if constexpr (DIRECT) scatter_direct_place(sorted, off, cnt, M * top_k, n_local, sl.e);
     else scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
@@ -2276,7 +2401,28 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
                        (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,         \
                        (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                    \
                        (uint32_t)n_local, (uint32_t)top_k,                                      \
-                       (uint32_t)lg_ld, (int)norm, (int32_t)base, prot)
+                       (uint32_t)lg_ld, (int)norm, (int32_t)base, prot, lean_n, lean_margin,   \
+                       lean_rows)
+    /* owner note 165 item 4 (run 174): RADIANCE_XE_ROUTE_LEAN=<n>,<margin>[,<rows>] -- lean_row above: the n
+     * lowest picks, the probability margin, the largest call (rows) it applies to (16, the verify steps; a KL
+     * replay in small prefill chunks names its chunk); unset = off, the code path never taken */
+    static const uint32_t lean_n = [] {
+        const char* e = std::getenv("RADIANCE_XE_ROUTE_LEAN");
+        return e && *e ? (uint32_t)std::strtoul(e, nullptr, 10) : 0u;
+    }();
+    static const float lean_margin = [] {
+        const char* e = std::getenv("RADIANCE_XE_ROUTE_LEAN");
+        if (!e) return 0.0f;
+        while (*e && *e != ',') ++e;
+        return *e == ',' ? std::strtof(e + 1, nullptr) : 0.0f;
+    }();
+    static const uint32_t lean_rows = [] {
+        const char* e = std::getenv("RADIANCE_XE_ROUTE_LEAN");
+        if (!e) return 16u;
+        int commas = 0;
+        while (*e && commas < 2) { if (*e == ',') ++commas; ++e; }
+        return commas == 2 && *e ? (uint32_t)std::strtoul(e, nullptr, 10) : 16u;
+    }();
     /* The narrowest instantiation, as in the standalone selection.
      *
      * One wave per row, rounded to a power of two between 8 and 32 waves: a wave selects its rows

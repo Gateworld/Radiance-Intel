@@ -175,11 +175,12 @@ template <class T> T* alloc(const Inst& in, size_t n) {
 int ar_proto() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_XE_AR_PROTO");
-        /* 5, the LL form with 16-byte stores, is the default since run 161 (owner note 163 item 2: 25.1 -> 20.2 us a
+        /* 5, the LL form with 16-byte stores, was the default from run 161 (owner note 163 item 2: 25.1 -> 20.2 us a
          * launch, the rotation +1.6 % median at the same texts); =4 the 8-byte form, =0 the old flag form;
-         * =6 (run 170, owner note 172 d): the LL form 5 below ar_bw_min_bytes() and the bandwidth form (ar_kernel's
-         * PR 6: the payload once, a read-back before the flag) at or above it */
-        return !e ? 5 : (e[0] == '0' ? 0 : (e[0] == '4' ? 4 : (e[0] == '6' ? 6 : 5)));
+         * 6 (run 170, owner note 172 d) is the default since run 174 (owner note 176 item 1): the LL form 5 below
+         * ar_bw_min_bytes() and the bandwidth form (ar_kernel's PR 6: the payload once, a read-back before the
+         * flag) at or above it; =5 keeps the LL form for every size */
+        return !e ? 6 : (e[0] == '0' ? 0 : (e[0] == '4' ? 4 : (e[0] == '5' ? 5 : 6)));
     }();
     return v;
 }
