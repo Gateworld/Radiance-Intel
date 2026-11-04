@@ -69,7 +69,11 @@ int main(int argc, char** argv) {
     FiniFn fini = (FiniFn)dlsym(h, "xe_ar2_fini");
     LaunchFn launch[2] = { (LaunchFn)dlsym(h, "xe_rad_ar_oneshot_2rank_exact"), (LaunchFn)dlsym(h, "xe_rad_ar_oneshot_2rank_exact_host") };
     StallFn stalled = (StallFn)dlsym(h, "xe_ar2_stalled");
+    StallFn retries = (StallFn)dlsym(h, "xe_ar2_retries");   /* run 170: proto 6's checksum re-reads (null on older libxe) */
     if (!init[0] || !init[1] || !fini || !launch[0] || !launch[1] || !stalled) { std::printf("allreduce_test: symbols missing\n"); return 2; }
+    /* XE_AR_TEST_TEAR (run 170): the library holds one quad a block back under proto 6, so every peer case of the
+     * bandwidth form must re-read before passing -- a case that passes with no re-read then proves nothing */
+    const bool tear = std::getenv("XE_AR_TEST_TEAR") && std::atol(std::getenv("XE_AR_TEST_TEAR")) > 0;
 
     const char* dev = std::getenv("RI_DEVICE");
     const bool cpu = dev && !std::strcmp(dev, "cpu");
@@ -274,6 +278,13 @@ int main(int argc, char** argv) {
                 for (int r = 0; r < 2; ++r)
                     std::printf("  phases rank %d: thread start %.1f us, launch call %.1f us, queue wait %.1f us (means over %d)\n", r,
                                 ph_start[r] / timed, ph_launch[r] / timed, ph_wait[r] / timed, timed);
+            if (retries) {
+                const uint32_t rr0 = retries(inst[0], (RadStream)&q[0]), rr1 = retries(inst[1], (RadStream)&q[1]);
+                const bool large = bytes >= 256 * 1024;   /* the bandwidth form's default bound */
+                std::printf("  checksum re-reads before passing: rank 0 %u, rank 1 %u%s\n", rr0, rr1,
+                            tear && form == 0 && large ? (rr0 > 0 && rr1 > 0 ? " (the forced tear was caught)" : " (FORCED TEAR NOT CAUGHT)") : "");
+                if (tear && form == 0 && large && (rr0 == 0 || rr1 == 0)) ok = false;
+            }
             all_ok &= ok;
             for (int r = 0; r < 2; ++r) { sycl::free(x[r], q[r]); sycl::free(yb[r], q[r]); fini(inst[r]); }
         }

@@ -176,8 +176,31 @@ int ar_proto() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_XE_AR_PROTO");
         /* 5, the LL form with 16-byte stores, is the default since run 161 (owner note 163 item 2: 25.1 -> 20.2 us a
-         * launch, the rotation +1.6 % median at the same texts); =4 the 8-byte form, =0 the old flag form */
-        return !e ? 5 : (e[0] == '0' ? 0 : (e[0] == '4' ? 4 : 5));
+         * launch, the rotation +1.6 % median at the same texts); =4 the 8-byte form, =0 the old flag form;
+         * =6 (run 170, owner note 172 d): the LL form 5 below ar_bw_min_bytes() and the bandwidth form (ar_kernel's
+         * PR 6: the payload once, a read-back before the flag) at or above it */
+        return !e ? 5 : (e[0] == '0' ? 0 : (e[0] == '4' ? 4 : (e[0] == '6' ? 6 : 5)));
+    }();
+    return v;
+}
+/* RADIANCE_XE_AR_BW_MIN_KB (run 170): the message size from which proto 6 takes the bandwidth form; 256 KiB by
+ * default (decode's 2-20 KB messages keep the LL form's latency; a 4,096-row chunk's 20 MB takes the bandwidth form) */
+int64_t ar_bw_min_bytes() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_XE_AR_BW_MIN_KB");
+        const long n = e ? std::strtol(e, nullptr, 10) : 256L;
+        return (int64_t)(n > 0 ? n : 256L) * 1024;
+    }();
+    return v;
+}
+/* XE_AR_TEST_TEAR=N (the all-reduce test only): under proto 6 every block's thread 0 holds its first quad back
+ * for N polls after the control words, so the reader's check must fail first and the re-read path is exercised;
+ * the result must still be right (allreduce_test prints the re-reads it caused). 0 outside the test. */
+uint32_t ar_test_tear() {
+    static const uint32_t v = [] {
+        const char* e = std::getenv("XE_AR_TEST_TEAR");
+        const long n = e ? std::strtol(e, nullptr, 10) : 0L;
+        return (uint32_t)(n > 0 ? (n < 1000000L ? n : 1000000L) : 0L);
     }();
     return v;
 }
@@ -307,7 +330,7 @@ inline uint16_t hcw_f2bf(float f) { return (uint16_t)((__float_as_uint(f) + 0x80
 template <int DT, bool HW = false, int PR = 0>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
-               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw, uint64_t* ring) {
+               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw, uint64_t* ring, uint32_t tear) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
@@ -315,7 +338,8 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     uint32_t* out = peer_slots + par * slot_words;
     const uint32_t* in = my_slots + par * slot_words;
     const uint32_t per0 = (n32 + nblk - 1) / nblk;
-    const uint32_t per = PR == 5 ? ((per0 + 1u) & ~1u) : per0;   /* PR 5: a block's words in pairs, 16-byte aligned */
+    const uint32_t per = PR == 5 ? ((per0 + 1u) & ~1u)          /* PR 5: a block's words in pairs, 16-byte aligned */
+                       : PR == 6 ? ((per0 + 3u) & ~3u) : per0;  /* PR 6: in quads, a block's start 16-byte aligned */
     const uint32_t w0 = b * per, w1 = (w0 + per < n32) ? w0 + per : n32;
     /* the sum of one word, rank 0's first, into y (and, with HW, hc_write's update of the streams) */
     auto emit = [&](uint32_t k, uint32_t mine, uint32_t theirs) {
@@ -399,6 +423,141 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
         }
         if (b == 0 && t == 0) ar_skew(ring, s, polls0, polls_all);
         if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
+    } else if constexpr (PR == 6) {
+        /* RADIANCE_XE_AR_PROTO=6 (run 170, owner note 168 item 3 / note 172 d): the bandwidth form for prefill's
+         * large messages -- "flag + checksum". The payload crosses ONCE, untagged, in 16-byte uncached stores (a
+         * sub-group's 256 contiguous bytes an instruction, PR 5's width): 1x the bytes where the LL forms carry 2x.
+         * Nothing is assumed about the order the stores land in (the old flag form's flag overtook its payload on
+         * large messages, AB1 / AB2; one thread's read-back behind the block's stores did not fence them either,
+         * AR1): instead the block's 32-bit wrapping sum and 32-bit xor travel as two 8-byte TAGGED words (the LL
+         * form's proven atom: the launch's sequence number in the same aligned store), at the tail of the parity's
+         * slot. The reader polls both tags, then reads the block from its OWN slot (the peer's stores land in the
+         * reader's memory, so these reads are local), reduces the sum and xor, and only when both match reads the
+         * block once more and emits; a stale or partially landed block fails the 64-bit check (2^-64 a block) and
+         * is read again after the next poll, bounded like every wait here. One emit pass, as the fused hc write
+         * accumulates. Exact: emit is the same sum in the same order. */
+        /* The check is position-dependent (the supervisor's review, run 170): three 32-bit wrapping sums over the
+         * block's words w_i (i the word's index in the block) -- c1 = sum w_i, c2 = sum (i + 1) * w_i, c3 = sum
+         * rotl(w_i, i mod 32) -- so two words exchanging places, or a stale word and a fresh one whose difference
+         * cancels in a plain sum, fail it; each sum reduces across the block in any order. */
+        XE_SHARED(uint32_t, red_a, kWG);
+        XE_SHARED(uint32_t, red_b, kWG);
+        XE_SHARED(uint32_t, red_c, kWG);
+        /* the control words: the last 3 x kMaxBlocks 8-byte words of the parity's slot (the LL sizing doubles the
+         * slot, and the bandwidth form takes messages of 256 KiB or more, so the payload never reaches them) */
+        uint64_t* ctl_out = (uint64_t*)out + (slot_words / 2) - 3u * kMaxBlocks + 3u * b;
+        const uint64_t* ctl_in = (const uint64_t*)in + (slot_words / 2) - 3u * kMaxBlocks + 3u * b;
+        auto rotl = [](uint32_t v, uint32_t r) { r &= 31u; return r ? ((v << r) | (v >> (32u - r))) : v; };
+        uint32_t c1 = 0, c2 = 0, c3 = 0;
+        /* XE_AR_TEST_TEAR (the test's forced tear): thread 0 holds its first quad back until after the control
+         * words, so the reader must see a mismatch first; never set outside the test */
+        const bool hold = tear != 0u && t == 0u && w0 + 3u < w1;
+        for (uint32_t k = w0 + 4u * t; k < w1; k += 4u * kWG) {
+            if (k + 3u < w1) {
+                const uint32_t a0 = x[k], a1 = x[k + 1u], a2 = x[k + 2u], a3 = x[k + 3u];
+                if (!(hold && k == w0))
+                    uc_st128((uint64_t*)(out + k), v2u64{(uint64_t)a0 | ((uint64_t)a1 << 32), (uint64_t)a2 | ((uint64_t)a3 << 32)});
+                const uint32_t i = k - w0;
+                c1 += a0 + a1 + a2 + a3;
+                c2 += (i + 1u) * a0 + (i + 2u) * a1 + (i + 3u) * a2 + (i + 4u) * a3;
+                c3 += rotl(a0, i) + rotl(a1, i + 1u) + rotl(a2, i + 2u) + rotl(a3, i + 3u);
+            } else {
+                for (uint32_t j = k; j < w1; ++j) {
+                    uc_st(out + j, x[j]);
+                    const uint32_t i = j - w0;
+                    c1 += x[j]; c2 += (i + 1u) * x[j]; c3 += rotl(x[j], i);
+                }
+            }
+        }
+        red_a[t] = c1;
+        red_b[t] = c2;
+        red_c[t] = c3;
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        __syncthreads();
+        if (t == 0) {
+            uint32_t A = 0, B = 0, C = 0;
+            for (uint32_t i = 0; i < (uint32_t)kWG; ++i) { A += red_a[i]; B += red_b[i]; C += red_c[i]; }
+            uc_st64(ctl_out, ((uint64_t)s << 32) | A);
+            uc_st64(ctl_out + 1, ((uint64_t)s << 32) | B);
+            uc_st64(ctl_out + 2, ((uint64_t)s << 32) | C);
+            if (hold) {
+                for (uint32_t d = 0; d < tear; ++d) sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                uc_st128((uint64_t*)(out + w0), v2u64{(uint64_t)x[w0] | ((uint64_t)x[w0 + 1u] << 32),
+                                                      (uint64_t)x[w0 + 2u] | ((uint64_t)x[w0 + 3u] << 32)});
+            }
+        }
+        /* the poll: thread 0 waits for the three control words of this launch, then hands the wanted sums on */
+        uint32_t budget = spin, ok = 1;
+        if (t == 0) {
+            for (;;) {
+                const uint64_t v0 = uc_ld64(ctl_in), v1 = uc_ld64(ctl_in + 1), v2 = uc_ld64(ctl_in + 2);
+                if ((uint32_t)(v0 >> 32) == s && (uint32_t)(v1 >> 32) == s && (uint32_t)(v2 >> 32) == s) {
+                    red_a[0] = (uint32_t)v0; red_b[0] = (uint32_t)v1; red_c[0] = (uint32_t)v2;
+                    break;
+                }
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                if (--budget == 0) { ok = 0; break; }
+            }
+            red_a[1] = ok;
+        }
+        __syncthreads();
+        const uint32_t A_want = red_a[0], B_want = red_b[0], C_want = red_c[0];
+        ok = red_a[1];
+        __syncthreads();
+        if (b == 0 && t == 0) ar_skew(ring, s, spin - budget, spin - budget);
+        /* the check: the block's words from this rank's own slot, until the three sums are the writer's */
+        uint32_t tries = 0;
+        while (ok) {
+            c1 = 0; c2 = 0; c3 = 0;
+            for (uint32_t k = w0 + 4u * t; k < w1; k += 4u * kWG) {
+                if (k + 3u < w1) {
+                    const v2u64 v = uc_ld128((const uint64_t*)(in + k));
+                    const uint32_t b0 = (uint32_t)v[0], b1 = (uint32_t)(v[0] >> 32), b2 = (uint32_t)v[1], b3 = (uint32_t)(v[1] >> 32);
+                    const uint32_t i = k - w0;
+                    c1 += b0 + b1 + b2 + b3;
+                    c2 += (i + 1u) * b0 + (i + 2u) * b1 + (i + 3u) * b2 + (i + 4u) * b3;
+                    c3 += rotl(b0, i) + rotl(b1, i + 1u) + rotl(b2, i + 2u) + rotl(b3, i + 3u);
+                } else {
+                    for (uint32_t j = k; j < w1; ++j) {
+                        const uint32_t v = uc_ld(in + j), i = j - w0;
+                        c1 += v; c2 += (i + 1u) * v; c3 += rotl(v, i);
+                    }
+                }
+            }
+            red_a[t] = c1;
+            red_b[t] = c2;
+            red_c[t] = c3;
+            __syncthreads();
+            if (t == 0) {
+                uint32_t A = 0, B = 0, C = 0;
+                for (uint32_t i = 0; i < (uint32_t)kWG; ++i) { A += red_a[i]; B += red_b[i]; C += red_c[i]; }
+                red_a[0] = (A == A_want && B == B_want && C == C_want) ? 1u : 0u;
+            }
+            __syncthreads();
+            const uint32_t good = red_a[0];
+            __syncthreads();
+            if (good) break;
+            if (++tries > (spin >> 8)) { ok = 0; break; }   /* bounded: minutes of re-reads, never a hung card */
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        }
+        if (t == 0 && tries) {   /* the re-reads before a block passed: seq_ctr[4], read by xe_ar2_retries */
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> rt(seq_ctr[4]);
+            rt.fetch_add(tries);
+        }
+        if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
+        else {
+            for (uint32_t k = w0 + 4u * t; k < w1; k += 4u * kWG) {
+                if (k + 3u < w1) {
+                    const v2u64 v = uc_ld128((const uint64_t*)(in + k));
+                    emit(k, x[k], (uint32_t)v[0]);
+                    emit(k + 1u, x[k + 1u], (uint32_t)(v[0] >> 32));
+                    emit(k + 2u, x[k + 2u], (uint32_t)v[1]);
+                    emit(k + 3u, x[k + 3u], (uint32_t)(v[1] >> 32));
+                } else {
+                    for (uint32_t j = k; j < w1; ++j) emit(j, x[j], uc_ld(in + j));
+                }
+            }
+        }
     } else {
     for (uint32_t k = w0 + t; k < w1; k += kWG) uc_st(out + k, x[k]);
     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
@@ -474,12 +633,15 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
 #define XE_ARP(DT, HW_, PR_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_>), grid, block, 0, (const uint32_t*)x->data,       \
                             (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
                             in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
-                            spin_budget(), hw ? *hw : HcW{}, in->ring)
+                            spin_budget(), hw ? *hw : HcW{}, in->ring, ar_test_tear())
         /* the LL form (a sequence number in every payload word; the default since run 105, RADIANCE_XE_AR_PROTO=0 the
          * old form), taken when the message's 8-byte words fit a parity's slot -- build() doubles the slots, so always */
         const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
         const bool ll = ar_proto() >= 4 && 2ull * n32 <= slot_words;
-#define XE_AR(DT, HW_) do { if (!ll) XE_ARP(DT, HW_, 0); else if (ar_proto() == 5) XE_ARP(DT, HW_, 5); else XE_ARP(DT, HW_, 4); } while (0)
+        /* proto 6: the bandwidth form for a message of ar_bw_min_bytes() or more (its 1x payload always fits a
+         * parity's slot), the LL form 5 below it */
+        const bool bw = ar_proto() == 6 && bytes >= ar_bw_min_bytes() && n32 + 6u * kMaxBlocks <= slot_words;   /* the payload + the control tail fit */
+#define XE_AR(DT, HW_) do { if (bw) XE_ARP(DT, HW_, 6); else if (!ll) XE_ARP(DT, HW_, 0); else if (ar_proto() >= 5) XE_ARP(DT, HW_, 5); else XE_ARP(DT, HW_, 4); } while (0)
         if (hw && in->dtype == 0) XE_AR(0, true);
         else switch (in->dtype) { case 0: XE_AR(0, false); break; case 1: XE_AR(1, false); break; default: XE_AR(2, false); break; }
 #undef XE_AR
@@ -730,5 +892,14 @@ extern "C" uint32_t xe_ar2_stalled(void* instance, RadStream s) {
     if (!in) return 0;
     uint32_t v = 0;
     ((sycl::queue*)s)->memcpy(&v, in->my_seq + 1, 4).wait();
+    return v;
+}
+/* run 170 (proto 6): the checksum re-reads this instance's blocks made before passing, summed over its launches
+ * (seq_ctr[4]); zero means the bandwidth form never met a stale block */
+extern "C" uint32_t xe_ar2_retries(void* instance, RadStream s) {
+    Inst* in = (Inst*)instance;
+    if (!in) return 0;
+    uint32_t v = 0;
+    ((sycl::queue*)s)->memcpy(&v, in->my_seq + 4, 4).wait();
     return v;
 }
