@@ -370,6 +370,17 @@ static const RadOperandSpec oAttnPaged[] = {
  * query that omits it. On attn_paged the key is RAD_DERIVED and the constraint is skipped
  * (core/plugin/select.cpp). See the file header for the spec §7.2 consequence. */
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
+/* attn_qsa_fmha (run 167, owner note 168 item 1): attn_paged's parameters; the operands are a sparse pass's --
+ * every row's page list (`sel`, [T, topk + 1] page ids, -1 past the end) and key count (`seqused`), plus the
+ * sequence's own table and context length for the kernel's dense gather. */
+static const RadParamSpec pAttnQsa[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8")
+};
+static const RadOperandSpec oAttnQsa[] = {
+    OPD("q"), OPD("kv_cache"), OPD("sel"), OPD("seqused"), OPD("block_table"), OPD("ctx"), OUT("out")
+};
 
 static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                            P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
@@ -1358,6 +1369,11 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_qsa_fmha", ARR(pAttnQsa), ARR(oAttnQsa),
+  "attn_paged over a sparse (QSA) pass of one sequence in one launch: row m attends the first seqused[m] keys of "
+  "the pages in sel[m] (its own list), exactly attn_paged's value with each row as a sequence of one query; "
+  "block_table and ctx are the sequence's own table and context length, read by kernels that gather the context "
+  "and mask by position. `scale` defaults to 1/sqrt(head_dim)." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "Dense varlen attention over cu_seqlens segments (rows cu/cu_div). Nothing paged. `window` is "
   "attn_paged's rule over a segment's positions: causal, i - j < window; non-causal, |i - j| < "
@@ -2215,6 +2231,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_qsa_fmha", "attn_qsa_fmha", "attn",
+    "a sparse pass's attention, each row over its own page list (attn_paged's value, one query a row)",
+    "bf16 or f32 q and out; bf16 or fp8 kv cache",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_qsa_fmha, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",

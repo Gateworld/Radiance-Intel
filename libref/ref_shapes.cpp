@@ -1321,6 +1321,16 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("attn_paged", operand, out);
 }
 
+/* attn_qsa_fmha (run 167, owner note 168 item 1): no random description. Its operands are tied -- every row's
+ * page list must be a subset of the sequence's table before the row's position and `seqused` must agree with
+ * the list -- and a draw would not be, so the kernel's position-order sums and the reference's table-order
+ * walk would disagree on a different key set, not on rounding. The form is checked in the engine (the KL replay
+ * against the exact path, docs/QSA.md), not by rad-kbench. */
+int ref_attn_qsa_fmha_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    (void)p; (void)n_p; (void)operand; (void)out;
+    return RAD_E_UNSUPPORTED;
+}
+
 int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);

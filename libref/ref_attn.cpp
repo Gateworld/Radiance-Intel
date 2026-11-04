@@ -1105,3 +1105,28 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ attn_qsa_fmha (run 167, owner note 168 item 1)
+ * The value is attn_paged's on the sparse path: each of the T rows is its own sequence of one query with its page
+ * list as the block table and `seqused` as the length (rad_block_attn_gated_fp8.h issues exactly that, one row at
+ * a time). The sequence's table and context length (operands 4 and 5) are the kernel's shortcut and are not read
+ * here: the reference is the per-row definition. */
+int ref_attn_qsa_fmha(const RadArgs* a, RadStream s) {
+    if (!have(a, 7)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *sel = &a->t[2], *su = &a->t[3], *o = &a->t[6];
+    if (!q->data || !kv->data || !sel->data || !su->data || !o->data) return RAD_E_INVAL;
+    if (sel->rank != 2) return RAD_E_SHAPE;
+    const int64_t T = sel->shape[0];
+    if (T <= 0 || numel(su) < T) return RAD_E_SHAPE;
+    std::vector<int32_t> cu((size_t)T + 1);
+    for (int64_t i = 0; i <= T; ++i) cu[(size_t)i] = (int32_t)i;
+    RadTensor t2[8];
+    std::memset(t2, 0, sizeof t2);
+    t2[0] = *q; t2[1] = *kv; t2[2] = *sel; t2[3] = *su; t2[7] = *o;
+    RadTensor& cut = t2[6];
+    cut.data = cu.data(); cut.dtype = RAD_I32; cut.rank = 1; cut.shape[0] = T + 1; cut.stride[0] = 1;
+    RadArgs a2 = *a;
+    a2.t = t2;
+    a2.n_t = 8;
+    return ref_attn_paged(&a2, s);
+}

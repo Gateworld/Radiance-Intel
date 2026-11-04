@@ -114,6 +114,7 @@ struct AttnGatedFP8 {
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    rad_op     op_attn_qsa = 0;                              /* attn_qsa_fmha: a whole sparse chunk in one launch */
     /* The output gate as `sigmoid` then `mul`: the bf16-linear form (Geom::w_bf16), and with fp8
      * linears the chain gate_quant_fp8 fuses, where it is not served. `gate` is the sigmoid's
      * output (the wire's with bf16 linears, the block's own otherwise) and `q_gate` the chain's
@@ -416,6 +417,31 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         }
     }
 
+    /* Run 167 (owner note 168 item 1): the sparse pass's attention as one launch on the matrix units
+     * (attn_qsa_fmha: the row lists as a bitmap over the sequence's table, the context gathered dense, sycl-tla's
+     * flash-attention with the mask). Opt-in while its KL replay is being judged: RADIANCE_ATTN_QSA_FMHA=1. It
+     * takes a one-sequence chunk of >= 256 rows; the per-row path keeps everything else, and the gate + quant
+     * follow it as on the ungated path. */
+    static const bool fmha_wanted = [] {
+        const char* e = std::getenv("RADIANCE_ATTN_QSA_FMHA");
+        return e && *e == '1';
+    }();
+    if (op_attn && qsa_sel && qsa_sequ && fmha_wanted && rad_op_declared(b, "attn_qsa_fmha")) {
+        op_attn_qsa = RAD_OP(b, "attn_qsa_fmha",
+                             RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1), RAD_INT("window", 0),
+                                        RAD_INT("n_head", g.n_head),
+                                        RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                        RAD_INT("max_seqs", 1), RAD_INT("max_ctx", g.max_ctx),
+                                        RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                             RAD_NOWEIGHTS);
+        if (op_attn_qsa) {
+            const rad_buf rd[3] = { w.q, qsa_sel, qsa_sequ };
+            RAD_ARCH_TRY(rad_op_reads (b, op_attn_qsa, rd, 3));
+            RAD_ARCH_TRY(rad_op_writes(b, op_attn_qsa, &w.attn.x, 1));
+        }
+    }
+
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
                            0, {}, o_span_lo, o_span_hi));
@@ -534,7 +560,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
-    const bool gated = sparse && op_attn_gq;
+    /* run 167: a one-sequence sparse chunk of 256 rows or more goes to attn_qsa_fmha in one launch */
+    const bool fmha  = sparse && op_attn_qsa && batch->n_seq == 1 && T >= 256 && table && used;
+    const bool gated = sparse && op_attn_gq && !fmha;
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
@@ -579,6 +607,14 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.cq(), off, rows, qw),
                         brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
         }
+    } else if (fmha) {
+        RAD_ISSUE_N(c, op_attn_qsa, T,
+                    brows(w.q, T), kv_cache(kv, layer),
+                    brow_slice(qsa_sel, 0, T, qsa_topk + 1),
+                    brow_slice(qsa_sequ, 0, T, 1),
+                    praw2(table, RAD_I32, 1, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, 1),
+                    brows(w.attn.x, T));
     } else if (sparse) {
         const int64_t chunk = qsa_rows();
         const int64_t qw = g.q_dim();

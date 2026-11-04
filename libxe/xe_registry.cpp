@@ -98,6 +98,10 @@ extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGramAccum[] = { C_DIV("n", 4), C_EQ("group", 128), C_IN("dtype", "fp8a8") };
 extern "C" int xe_rad_attn_paged(const RadArgs* a, RadStream s);
 extern "C" int64_t xe_rad_attn_paged_scratch(const RadArgs* a);
+/* run 167 (owner note 168 item 1): a sparse prefill pass's attention as one launch on the matrix units */
+extern "C" int xe_rad_attn_qsa_fmha(const RadArgs* a, RadStream s);
+extern "C" int64_t xe_rad_attn_qsa_fmha_scratch(const RadArgs* a);
+static const RadConstraint cXeAttnQsa[] = { C_EQ("head_dim", 256), C_GE("gqa", 1), C_LE("gqa", 32) };
 /* block_size is derived on attn_paged: no EQ here, so the page size is the model's declared one */
 static const RadConstraint cXeAttnPaged[] = {
     C_DIV("head_dim", 128), C_LE("head_dim", 256), C_GE("gqa", 1), C_LE("gqa", 32),
@@ -308,6 +312,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cXeAttnPaged), NOTUNE,
   nullptr, nullptr, xe_rad_attn_paged, xe_rad_attn_paged_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_attn_qsa_fmha", "attn_qsa_fmha", "attn",
+  "a sparse (QSA) prefill pass's attention in one launch on the matrix units: the sequence's page table inverted, "
+  "each row's page list a bitmap, the context's K / V gathered dense from the cache, then sycl-tla's "
+  "flash-attention forward with the bitmap as a mask (xe_attn_qsa.cpp, fmha/)",
+  "head_dim 256, one sequence of >= 1 rows, causal, no window; GPU only (2D block loads); a tolerance form "
+  "(position-order sums, bf16 P) judged by the KL replay",
+  "bf16 query and out, fp8-e4m3 or bf16 kv cache without descales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cXeAttnQsa), NOTUNE,
+  nullptr, nullptr, xe_rad_attn_qsa_fmha, xe_rad_attn_qsa_fmha_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 

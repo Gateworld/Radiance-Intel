@@ -98,3 +98,12 @@ Community License 1.0 -- data/vectors/LICENSE.qwen-community-1.0.txt -- which ca
 every copy of it, including its condition that a Model-as-a-Service or AI-work-assistant business
 needs a separate license from Qwen to use it commercially. radiance's Apache-2.0 grant covers the
 code that loads and applies the file; it does not cover the file or its directions.
+
+libxe/fmha/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp and
+libxe/fmha/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp are copies of two headers of Intel's
+sycl-tla (CUTLASS for SYCL, github.com/intel/sycl-tla at 7b56b93), Copyright (C) 2025 - 2026 Intel
+Corporation, under the BSD-3-Clause license that each file carries; the Intel port changed them in
+the places its own comments mark (a per-query page mask on every key tile; the kv length readable
+from device memory). libxe/fmha/xe_fmha256.cpp instantiates sycl-tla's flash-attention forward from
+the tree at third_party/sycl-tla (pinned at that commit, not vendored here) when it is present at
+build time; libxe_fmha.so, the module it builds, is sycl-tla's code under sycl-tla's license.

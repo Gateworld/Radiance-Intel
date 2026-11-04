@@ -145,6 +145,7 @@ int ref_logits_gemm        (const RadArgs*, RadStream);
 
 /* ---- attention */
 int ref_attn_paged         (const RadArgs*, RadStream);
+int ref_attn_qsa_fmha      (const RadArgs*, RadStream);
 int ref_attn_dense         (const RadArgs*, RadStream);
 int ref_attn_cross         (const RadArgs*, RadStream);
 int ref_table_add          (const RadArgs*, RadStream);
@@ -397,6 +398,7 @@ REF_SHAPE_FN(ref_embed_lookup_q);
 REF_SHAPE_FN(ref_logits_gemm);
 
 REF_SHAPE_FN(ref_attn_paged);
+REF_SHAPE_FN(ref_attn_qsa_fmha);
 REF_SHAPE_FN(ref_attn_dense);
 REF_SHAPE_FN(ref_attn_cross);
 REF_SHAPE_FN(ref_table_add);

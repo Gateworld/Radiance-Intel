@@ -19,6 +19,33 @@ list(APPEND XE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/xe_hc_f16_layout.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
+# Run 167 (owner note 168 item 1): the flash-attention form (fmha/xe_fmha256.cpp, used by xe_attn_qsa.cpp) is
+# sycl-tla's kernel (Intel's CUTLASS, BSD-3-Clause, header-only, pinned at 7b56b93 in third_party/sycl-tla beside
+# src/) with its mainloop copied under fmha/ and the page mask added; compiled only when that tree is present, with
+# the SPIR-V extensions its kernels use (harmless for the other kernels: the CPU device never launches these).
+set(_tla ${CMAKE_SOURCE_DIR}/../third_party/sycl-tla)
+target_link_libraries(libxe PRIVATE ${CMAKE_DL_LIBS})   # xe_attn_qsa.cpp loads libxe_fmha.so beside libxe.so
+if(EXISTS ${_tla}/include/cutlass/cutlass.h)
+  # Its own module with the B70 target alone: with libxe's two targets the per-target translator flag lands
+  # on the wrong calls (run 167's flagtest), and the kernel never runs on the CPU device anyway.
+  add_library(xe_fmha MODULE ${CMAKE_CURRENT_SOURCE_DIR}/fmha/xe_fmha256.cpp)
+  # under kernels/xe/: the engine's plugin scan takes every .so in kernels/ for a plugin (shipped_plugins_test)
+  set_target_properties(xe_fmha PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/radiance_home/kernels/xe
+                        PREFIX "lib" OUTPUT_NAME xe_fmha)
+  target_include_directories(xe_fmha PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fmha
+                             ${_tla}/applications/flash_attention_v2/collective ${_tla}/include
+                             ${_tla}/tools/util/include ${_tla}/applications)
+  target_link_libraries(xe_fmha PRIVATE rad_abi)   # abi/rad_l0_rec.h: the launch through the engine's recorder hooks
+  target_compile_options(xe_fmha PRIVATE -fsycl -fsycl-targets=intel_gpu_bmg_g31 -DCUTLASS_ENABLE_SYCL
+    -DSYCL_INTEL_TARGET -Wno-unused-local-typedef -Wno-unused-but-set-variable -Wno-uninitialized -Wno-reorder-ctor
+    -Wno-logical-op-parentheses -Wno-unknown-pragmas -Wno-unused-function -Wno-unused-variable)
+  target_link_options(xe_fmha PRIVATE -fsycl -fsycl-targets=intel_gpu_bmg_g31 -Xspirv-translator
+    -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+  add_dependencies(libxe xe_fmha)
+  message(STATUS "libxe: the flash-attention module from ${_tla}")
+else()
+  message(STATUS "libxe: no third_party/sycl-tla -- attn_qsa_fmha unsupported")
+endif()
 # ports/ are libr4d units behind the shim: <hip/hip_runtime.h> resolves to compat/ (the shim), a
 # header edited for Xe2 to its copy in ports/ (beside the unit), and the rest to libr4d's own.
 target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
@@ -114,6 +141,16 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_i4i8_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_i4i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Run 169 (owner note 173 item 1): attn_qsa_fmha's checks and prep kernels on the CPU device with the operands in the
+  # engine's forms (RADIANCE_XE_ATTN_QSA_PREP_ONLY=1: the flash-attention kernel itself is card-only).
+  add_executable(xe_attn_qsa_test test/attn_qsa_test.cpp)
+  rad_l0_sycl(xe_attn_qsa_test)
+  target_link_libraries(xe_attn_qsa_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_attn_qsa_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_attn_qsa_test libxe)
+  add_test(NAME xe_attn_qsa_cpu COMMAND xe_attn_qsa_test $<TARGET_FILE:libxe>)
+  set_tests_properties(xe_attn_qsa_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
   # Run 123 (owner note 151 C): the int8 lm_head's 4-row form against the rows form (the same bytes), and a microbench.
   # The CPU test at a small vocabulary; the card at the real one.
   add_executable(xe_logits_i8_test test/logits_i8_test.cpp)
