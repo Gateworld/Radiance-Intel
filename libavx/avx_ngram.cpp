@@ -40,6 +40,7 @@
 #include <cstdlib>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -63,6 +64,18 @@ namespace {
 /* Prefetch distance, in rows, for cache lookups and decodes. Rows are scattered over an 80 MiB
  * cache and the set words over 4 MiB, so each is an L3 or DRAM miss. */
 constexpr long long kPrefetchRows = 8;
+
+/* RADIANCE_NGRAM_TIMING=1 (Intel port, milestone 3, run 169, owner notes 166 / 174): one stderr line a
+ * gather call with its phases (the cache walk, the reads, the waits on other threads' rows, the decode)
+ * and its hit / miss counts, and one a read-ahead job -- cold against warm, measured inside the engine. */
+inline bool ngram_timing() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_NGRAM_TIMING"); return v && v[0] == '1'; }();
+    return on;
+}
+using Clock = std::chrono::steady_clock;
+inline double ms_since(Clock::time_point t0, Clock::time_point t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
 
 /* One read of a row's aligned span: row m of the call, its key, and its cache slot (-1: decoded
  * straight from the read, not cached). */
@@ -620,25 +633,32 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     g.waits.clear();
     g.again.clear();
 
+    const bool timing = ngram_timing();
+    const Clock::time_point t0 = Clock::now();
+    long long n_hit = 0, n_pad = 0, n_none = 0;
     for (long long j = 0; j < M; ++j) {
         if (j + kPrefetchRows < M) {
             const long long mp = at(j + kPrefetchRows);
             if (!pad(row_of(mp))) __builtin_prefetch(rc.set_line(key_of(mp)));
         }
         const long long m = at(j);
-        if (pad(row_of(m))) { g.kind[m] = Gather::PAD; continue; }
+        if (pad(row_of(m))) { g.kind[m] = Gather::PAD; ++n_pad; continue; }
         const uint64_t key = key_of(m);
         int64_t s = -1;
         const RowCache::Found f = rc.find_or_claim(key, me, &s);
         g.slot[m] = s;
         g.kind[m] = (uint8_t)f;
         if (f == RowCache::CLAIMED)     g.reads.push_back({m, key, s});
-        else if (f == RowCache::NONE) { g.reads.push_back({m, key, -1}); g.kind[m] = Gather::DONE; }
+        else if (f == RowCache::NONE) { g.reads.push_back({m, key, -1}); g.kind[m] = Gather::DONE; ++n_none; }
         else if (f == RowCache::THEIRS) g.waits.push_back(m);
+        else                            ++n_hit;   /* HIT, or MINE (a row twice in one call) */
     }
+    const Clock::time_point t1 = Clock::now();
+    const size_t n_read = g.reads.size(), n_wait = g.waits.size();
 
     int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
     if (rs != RAD_OK) return rs;
+    const Clock::time_point t2 = Clock::now();
 
     /* Wait for rows other threads claimed to turn READY. `published` is read before the words, so
      * a batch landing after the scan makes the wait return at once. Released claims (failed reads)
@@ -657,6 +677,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         g.waits.resize(keep);
         if (keep) rc.published.wait(e, std::memory_order_acquire);
     }
+    const Clock::time_point t3 = Clock::now();
 
     /* Decode all READY rows in one batch: each word is read before the bytes and again after the
      * batch (the seqlock), and rows whose word changed are read again. */
@@ -682,11 +703,23 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     for (size_t i = 0; i < g.dm.size(); ++i)
         if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
             g.again.push_back(g.dm[i]);
+    const Clock::time_point t4 = Clock::now();
 
-    if (g.again.empty()) return RAD_OK;
-    g.reads.clear();
-    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
-    return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    const size_t n_again = g.again.size();
+    if (!g.again.empty()) {
+        g.reads.clear();
+        for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
+        rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    }
+    if (timing) {
+        const Clock::time_point t5 = Clock::now();
+        std::fprintf(stderr, "[avx] ngram gather rank %d: %lld rows: hit %lld, read %zu (%lld unslotted), waited-for %zu, "
+                     "pad %lld, again %zu; walk %.1f ms, read %.1f ms, wait %.1f ms, decode %.1f ms, again %.1f ms; "
+                     "%.1f ms in all; %lld rows ahead\n", q.rank, M, n_hit, n_read, n_none, n_wait, n_pad, n_again,
+                     ms_since(t0, t1), ms_since(t1, t2), ms_since(t2, t3), ms_since(t3, t4), ms_since(t4, t5),
+                     ms_since(t0, t5), (long long)q.n_ahead);
+    }
+    return rs;
 }
 
 /* ============================== the reader that runs a step ahead ==============================
@@ -705,6 +738,7 @@ struct AheadJob {
     RowCache*             rc = nullptr;
     long long             n  = 0;
     std::vector<uint64_t> keys;
+    Clock::time_point     queued{};   /* RADIANCE_NGRAM_TIMING: when the call handed the list over */
 };
 
 struct AheadReader {
@@ -725,7 +759,13 @@ struct AheadReader {
                 j = std::move(q.front());
                 q.pop_front();
             }
-            if (!rr || !me) continue;
+            if (!rr || !me) {
+                if (ngram_timing())
+                    std::fprintf(stderr, "[avx] ngram ahead: %zu rows dropped (%s)\n", j.keys.size(),
+                                 !rr ? "the reader thread has no ring" : "no owner tag");
+                continue;
+            }
+            const Clock::time_point t0 = Clock::now();
             g.reads.clear();
             for (size_t i = 0; i < j.keys.size(); ++i) {
                 if (i + kPrefetchRows < j.keys.size())
@@ -734,9 +774,16 @@ struct AheadReader {
                 if (j.rc->find_or_claim(j.keys[i], me, &slot) == RowCache::CLAIMED)
                     g.reads.push_back({0, j.keys[i], slot});
             }
+            const Clock::time_point t1 = Clock::now();
             /* Every read has a slot, so nothing is decoded and there is no output. */
-            (void)read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
-                                   nullptr, 0);
+            const int rs = read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
+                                            nullptr, 0);
+            if (ngram_timing()) {
+                const Clock::time_point t2 = Clock::now();
+                std::fprintf(stderr, "[avx] ngram ahead: %zu rows, %zu claimed and read: waited %.1f ms in the queue, "
+                             "walk %.1f ms, read %.1f ms (%s)\n", j.keys.size(), g.reads.size(),
+                             ms_since(j.queued, t0), ms_since(t0, t1), ms_since(t1, t2), rs == RAD_OK ? "ok" : "FAILED");
+            }
         }
     }
 };
@@ -764,6 +811,7 @@ void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
     j.tf = &tf;
     j.rc = &rc;
     j.n  = q.row_bytes;
+    j.queued = Clock::now();
     const long long base = tf.off + (long long)(q.tab - tf.lo);
     j.keys.reserve((size_t)q.n_ahead);
     for (long long m = 0; m < q.n_ahead; ++m) {
