@@ -1614,7 +1614,11 @@ int Ctx::run_step(const RadBatch* b) {
         thread_local double sum[2][8] = {};
         thread_local long   n[2] = {};
         const int k = b->draft_pass != 0 ? 1 : 0;
-        for (int i = 1; i < 8; ++i) sum[k][i] += stage_us(tp[i - 1], tp[i]);
+        /* Run 176 (owner note 177 item 6): the means are decode passes only -- a prompt's passes (printed on
+         * their own below) and a draft pass wider than 16 rows (a prompt-final tail) no longer fold into them */
+        const bool decode_sized = b->phase == RAD_PHASE_DECODE && b->n_tok <= 16;
+        if (decode_sized)
+            for (int i = 1; i < 8; ++i) sum[k][i] += stage_us(tp[i - 1], tp[i]);
         /* Run 173 (Intel port, owner note 165 item 3): a prefill-sized pass's own parts at once, not folded
          * into the means -- a prompt's chunk read beside decoding sequences ran ~2.5x its lone time (L1-L8)
          * and the step trace only said "enqueue"; this says which part of the rank's step it is. */
@@ -1659,7 +1663,7 @@ int Ctx::run_step(const RadBatch* b) {
                 std::fill(hst_calls_.begin(), hst_calls_.end(), 0);
             }
         }
-        if (++n[k] % 400 == 0 && k == 1 && rank_ == 0) {
+        if (decode_sized && ++n[k] % 400 == 0 && k == 1 && rank_ == 0) {
             const double m = (double)n[k];
             RAD_INFO("run_step (draft passes, %ld): stager %.1f, residency %.1f, pass %.1f, lane join %.1f, "
                      "stager end + routes %.1f, profile + flush %.1f, stalls + room %.1f us; in plays (all passes) "
