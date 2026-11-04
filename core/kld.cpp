@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -265,6 +266,14 @@ int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string&
         RAD_ERR("kld: cannot write %s/tokens.i32: %s", dir_.c_str(), std::strerror(errno));
         return RAD_E_IO;
     }
+    /* The Intel port (run 179, owner note 181): RADIANCE_KLD_NO_REF=1 records no reference -- the full logits rows are
+     * ~0.5 MB a position -- for a run whose only product is the MTP head's dump (engine_kld.cpp, RADIANCE_MTP_DUMP) */
+    if (const char* v = std::getenv("RADIANCE_KLD_NO_REF"); v && v[0] == '1') {
+        no_ref_ = true;
+        RAD_INFO("kld: RADIANCE_KLD_NO_REF=1: %lld positions over %zu documents, no reference written",
+                 (long long)n_rows_, docs_.size());
+        return RAD_OK;
+    }
     fd_logp_ = create_sized(dir_ + "/logp.f16", n_rows_ * n_vocab_ * 2);
     fd_top_  = create_sized(dir_ + "/top.bin", n_rows_ * kKldTop * (int64_t)sizeof(TopEntry));
     fd_rows_ = create_sized(dir_ + "/rows.f32", n_rows_ * 2 * 4);
@@ -360,7 +369,7 @@ int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& s
         std::vector<uint16_t> f16((size_t)n_vocab_);
         for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
             const Job& j = jobs[i];
-            if (record_) record_row(j, shards, f16);
+            if (record_) { if (!no_ref_) record_row(j, shards, f16); }
             else         score_row(j, shards, f16);
             if (!seen_[(size_t)j.row]) {
                 seen_[(size_t)j.row] = 1;
@@ -497,6 +506,7 @@ int Kld::finish() {
     }
     if (!record_) return report();
 
+    if (no_ref_) return RAD_OK;   /* RADIANCE_KLD_NO_REF: nothing recorded, so no index */
     for (int fd : { fd_logp_, fd_top_, fd_rows_ })
         if (::fsync(fd) != 0) { RAD_ERR("kld: fsync: %s", std::strerror(errno)); return RAD_E_IO; }
     json m;

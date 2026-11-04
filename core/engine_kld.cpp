@@ -7,6 +7,7 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -288,7 +289,9 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
         const int64_t ntok = b->n_tok;
         RAD_TRY(rad_memcpy_async(g_dump.host, hsrc, ntok * g_dump.width * 2, r0.ctx.stream()));
         RAD_TRY(rad_stream_sync(r0.ctx.stream()));
-        /* each scored entry's token offset in the step (every entry's rows, in batch order) */
+        /* each scored position: its meta, its hidden row (the step's token row) and its logits row */
+        struct DumpJob { int32_t meta[3]; int64_t tok, row; };
+        std::vector<DumpJob> jobs;
         int64_t tok_off = 0;
         int64_t srow = 0;
         for (const StepEntry& e : plan.e) {
@@ -296,48 +299,74 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
             if (scored) {
                 for (int64_t j = 0; j < (int64_t)e.n_tokens; ++j) {
                     const int64_t pos = (int64_t)e.ctx_len + j;
-                    const int32_t meta[3] = { (int32_t)e.req->id, (int32_t)pos,
-                                              pos < (int64_t)e.req->prompt.size() ? e.req->prompt[(size_t)pos] : -1 };
-                    std::fwrite(meta, 4, 3, g_dump.fm);
-                    std::fwrite((const uint8_t*)g_dump.host + (size_t)((tok_off + j) * g_dump.width * 2), 2,
-                                (size_t)g_dump.width, g_dump.fh);
-                    /* the top-32 over the whole vocabulary: the max and the running top across shards, then the
-                     * log-sum-exp for the normalisation */
-                    const int64_t row = srow + j;
-                    float mx = -INFINITY;
-                    std::vector<std::pair<float, int32_t>> top;
-                    top.reserve(kDumpTop + 1);
-                    for (const KldShard& s : shards) {
-                        const float* lr = s.rows + row * s.width;
-                        for (int64_t c = 0; c < s.width; ++c) {
-                            const float v = lr[c];
-                            if (v > mx) mx = v;
-                            if ((int)top.size() < kDumpTop || v > top.back().first) {
-                                top.emplace_back(v, (int32_t)(s.vocab0 + c));
-                                std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-                                if ((int)top.size() > kDumpTop) top.pop_back();
-                            }
-                        }
-                    }
-                    double se = 0.0;
-                    for (const KldShard& s : shards) {
-                        const float* lr = s.rows + row * s.width;
-                        for (int64_t c = 0; c < s.width; ++c) se += std::exp((double)(lr[c] - mx));
-                    }
-                    const float lse = mx + (float)std::log(se);
-                    int32_t ids[kDumpTop];
-                    float   lp[kDumpTop];
-                    for (int k = 0; k < kDumpTop; ++k) {
-                        ids[k] = k < (int)top.size() ? top[(size_t)k].second : -1;
-                        lp[k]  = k < (int)top.size() ? top[(size_t)k].first - lse : -INFINITY;
-                    }
-                    std::fwrite(ids, 4, kDumpTop, g_dump.ft);
-                    std::fwrite(lp, 4, kDumpTop, g_dump.ft);
-                    ++g_dump.rows;
+                    DumpJob dj{};
+                    dj.meta[0] = (int32_t)e.req->id;
+                    dj.meta[1] = (int32_t)pos;
+                    dj.meta[2] = pos < (int64_t)e.req->prompt.size() ? e.req->prompt[(size_t)pos] : -1;
+                    dj.tok = tok_off + j;
+                    dj.row = srow + j;
+                    jobs.push_back(dj);
                 }
                 srow += e.n_tokens;
             }
             tok_off += e.n_tokens;
+        }
+        /* the top-32 over the whole vocabulary and the log-sum-exp, rows split over threads (run 179: serial in
+         * double, ~2 ms a row, it held the ranks at the step barrier): an unsorted 32-slot table with its minimum
+         * tracked, then sorted; terms more than 30 below the row's max are below float's resolution of the sum */
+        std::vector<int32_t> tids(jobs.size() * kDumpTop);
+        std::vector<float>   tlps(jobs.size() * kDumpTop);
+        auto one = [&](size_t i) {
+            const int64_t row = jobs[i].row;
+            float mx = -INFINITY;
+            float tv[kDumpTop];
+            int32_t ti[kDumpTop];
+            int nt = 0, mi = 0;
+            for (const KldShard& s : shards) {
+                const float* lr = s.rows + row * s.width;
+                for (int64_t c = 0; c < s.width; ++c) {
+                    const float v = lr[c];
+                    if (v > mx) mx = v;
+                    if (nt < kDumpTop) {
+                        tv[nt] = v; ti[nt] = (int32_t)(s.vocab0 + c); ++nt;
+                        if (nt == kDumpTop) { mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k; }
+                    } else if (v > tv[mi]) {
+                        tv[mi] = v; ti[mi] = (int32_t)(s.vocab0 + c);
+                        mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k;
+                    }
+                }
+            }
+            float se = 0.0f;
+            const float lo = mx - 30.0f;
+            for (const KldShard& s : shards) {
+                const float* lr = s.rows + row * s.width;
+                for (int64_t c = 0; c < s.width; ++c) if (lr[c] > lo) se += std::exp(lr[c] - mx);
+            }
+            const float lse = mx + std::log(se);
+            int ord[kDumpTop];
+            for (int k = 0; k < kDumpTop; ++k) ord[k] = k;
+            std::sort(ord, ord + nt, [&](int x, int y) { return tv[x] > tv[y]; });
+            for (int k = 0; k < kDumpTop; ++k) {
+                tids[i * kDumpTop + (size_t)k] = k < nt ? ti[ord[k]] : -1;
+                tlps[i * kDumpTop + (size_t)k] = k < nt ? tv[ord[k]] - lse : -INFINITY;
+            }
+        };
+        {
+            const unsigned hw = std::thread::hardware_concurrency();
+            const unsigned nth = std::max(1u, std::min(hw ? hw : 1u, 8u));
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> th;
+            for (unsigned t = 0; t < nth; ++t)
+                th.emplace_back([&] { for (size_t i; (i = next.fetch_add(1)) < jobs.size();) one(i); });
+            for (auto& t : th) t.join();
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            std::fwrite(jobs[i].meta, 4, 3, g_dump.fm);
+            std::fwrite((const uint8_t*)g_dump.host + (size_t)(jobs[i].tok * g_dump.width * 2), 2,
+                        (size_t)g_dump.width, g_dump.fh);
+            std::fwrite(&tids[i * kDumpTop], 4, kDumpTop, g_dump.ft);
+            std::fwrite(&tlps[i * kDumpTop], 4, kDumpTop, g_dump.ft);
+            ++g_dump.rows;
         }
     }
     return kld_->score(spans, shards);

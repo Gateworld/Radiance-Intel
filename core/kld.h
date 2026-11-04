@@ -116,6 +116,7 @@ private:
     int  report();
 
     bool record_ = false;
+    bool no_ref_ = false;   /* RADIANCE_KLD_NO_REF=1 (the Intel port): record mode writes no reference */
     std::string dir_, out_, model_, ref_model_, corpus_;
     uint64_t corpus_hash_ = 0;
     int64_t n_vocab_ = 0;
