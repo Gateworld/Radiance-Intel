@@ -372,6 +372,17 @@ TEST(a_numeric_flag_refuses_what_is_not_a_number) {
     CHECK_EQ(c.n_spec, 3);
 }
 
+/* --startup-warmup is on by default (the Intel port, owner note 176 item 2) and takes on or off only. */
+TEST(startup_warmup_is_on_by_default_and_takes_on_or_off) {
+    Config d, c;
+    CHECK(d.startup_warmup);
+    CHECK_EQ(parse({ "--startup-warmup", "off" }, &c), RAD_OK);
+    CHECK(!c.startup_warmup);
+    CHECK_EQ(parse({ "--startup-warmup", "on" }, &c), RAD_OK);
+    CHECK(c.startup_warmup);
+    CHECK_EQ(parse({ "--startup-warmup", "1" }, &c), RAD_E_INVAL);
+}
+
 /* --prefill-interleave is a step count, off by default and at most 64. */
 TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     Config d;
@@ -424,6 +435,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--startup-warmup", { "off" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },

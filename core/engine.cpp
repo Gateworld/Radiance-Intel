@@ -1679,6 +1679,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
+    /* The startup warm-up pass (engine_warmup.cpp; owner note 176 item 2, the Intel port): before the
+     * server listens, one synthetic request through a full chunk, a tail and a few decode steps. A
+     * failure is logged and the server still serves. */
+    if (!cfg_.kld() && cfg_.startup_warmup) {
+        const int w = warmup();
+        if (w < 0) RAD_WARN("startup warm-up skipped: %s", rad_strerror(w));
+    }
     int s = cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 

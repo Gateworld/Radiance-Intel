@@ -989,6 +989,8 @@ TEST(op_vocabulary) {
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
+        /* the Intel port (run 167): a sparse pass's attention as one launch, attn_paged's value */
+        "attn_qsa_fmha",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
@@ -1059,9 +1061,12 @@ TEST(op_vocabulary) {
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
+    /* the Intel port (run 167): attn_qsa_fmha takes attn_paged's block-size constraint */
+    CHECK_EQ(kern("attn_qsa_fmha")->n_constraints, 1);
+    CHECK(std::strcmp(kern("attn_qsa_fmha")->constraints[0].key, "block_size") == 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 2);
+    CHECK_EQ(constrained, 3);
 }
 
 /* ================================================================== the numerics
@@ -8653,6 +8658,10 @@ std::vector<Geo> geometries() {
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
                                     .d("max_period", 10000.0).s("dtype", "f32")),
         G("gather_rows2", "M", 4, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        /* the Intel port (run 175): the sparse pass's flash attention (run 167), undrawable below */
+        G("attn_qsa_fmha", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
+                                       .i("window", 0).i("n_head", 4).i("block_size", 4).i("max_seqs", 1)
+                                       .i("max_ctx", 64).s("q_dtype", "bf16").s("kv_dtype", "bf16")),
         G("lane_gather", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
         G("lane_store", "M", 4, a.i("M", R).i("n", 8).i("stride", 8).s("dtype", "bf16")),
         G("randn_lanes", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
@@ -8795,7 +8804,8 @@ std::vector<Geo> geometries() {
  * them. */
 bool undrawable(const char* op) {
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2");
+           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+           !std::strcmp(op, "attn_qsa_fmha");   /* tied operands (ref_shapes.cpp); checked by the engine's KL replay */
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

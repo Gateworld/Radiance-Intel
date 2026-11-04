@@ -779,6 +779,7 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    bool    startup_warmup = true;     /* --startup-warmup on|off: the synthetic pass before listening */
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the

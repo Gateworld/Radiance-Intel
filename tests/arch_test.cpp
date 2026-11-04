@@ -7518,6 +7518,9 @@ TEST(flashnext_sparse_attention_chunks_by_its_scratch_not_by_max_seqs) {
     for (int gated = 0; gated < 2; ++gated) {
         RadBuilder b;
         if (!gated) b.refuse.insert("attn_paged_gate_quant");
+        /* the Intel port (run 175): attn_qsa_fmha, the default since owner note 176, takes a one-sequence chunk
+         * whole; this test is about the per-row forms' chunking, so it is refused here */
+        b.refuse.insert("attn_qsa_fmha");
         RadBuildCtx ctx = q4_ctx(0, 1, 4);
         REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
         const auto k = kit(b, {}, { 1024 }, 9000);
@@ -8489,14 +8492,14 @@ struct ArchCases {
             qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0xbe74d476c7fd04b8ull);
+            qwen4exp_fp8::step, 3, {}, 0x5834f461cb33eaaeull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0x9d7df7914590d6d8ull);
+            nullptr, 3, { "ar_hc_write" }, 0x2603f31271a9b6c4ull);
         add("qwen4exp_fp8, four-bit experts", [this](RadBuilder* b) {
                 b->encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0xb308d06b168a61f1ull);
+            qwen4exp_fp8::step, 3, {}, 0xcf4540becd39de8bull);
         add("llama_fp8 + DSpark", [this](RadBuilder* b) {
                 auto c = dspark_ctx(0, 1); return llama_fp8::declare(b, lla.meta(), &c); },
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
@@ -9178,11 +9181,11 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x14b9cab0bea2591full, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xc9bcbf1b538b597full, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x8b2f1786a4ac12b8ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0x69452dc1ce68a97bull, 0x2336609a1b43619aull },
+        { "qwen4exp_fp8", 2, 0, 0x524c34b11c99b839ull, 0x015b49fbefdbadd3ull },
+        { "qwen4exp_fp8", 2, 1, 0x33288d8053f171ceull, 0xaf58ef06853789f7ull },
+        { "qwen4exp_fp8", 4, 0, 0x22f6ba6125e49a65ull, 0xc8e5cc7d7cf087b7ull },
+        { "qwen4exp_fp8", 4, 3, 0xbb2c59dc2026e70dull, 0xfa44d61b25895befull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
         { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
         { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },

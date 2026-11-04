@@ -503,6 +503,8 @@ private:
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
      * block per rank, holding a step's tokens of that rank's logits columns. */
     int  run_kld();
+    /* The startup warm-up pass before the server listens (engine_warmup.cpp; owner note 176 item 2). */
+    int  warmup();
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
