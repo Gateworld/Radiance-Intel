@@ -518,7 +518,10 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
     for (int k = 0; k < 4; ++k)
 #pragma unroll
         for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+    /* slmc == 2 (run 170, test only -- WRONG numbers): the level decode skipped (lvl(c) = c), to time its share */
+    const bool nodec = slmc == 2u;
     auto lvl = [&](uint32_t cc) -> uint32_t {
+        if (nodec) return cc;
         const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
         return (d >> (8u * (cc & 3u))) & 255u;
     };
@@ -629,7 +632,7 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
             const float sb = rowok[t] ? e4m3_to_f32(se8[(size_t)rowr[t] * c.s_ld + g]) * smul : 0.0f;
-            if (slmc) {
+            if (slmc == 1u) {
                 jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
                 xe::wave_barrier();
 #pragma unroll
@@ -672,9 +675,10 @@ long long dpas_min_rows() {
     return v;
 }
 /* RADIANCE_XE_I4I8_DPAS_SLMC=1 (run 170): the group's int32 tiles scaled through shared memory as before the rework's
- * cut 1 (the store-and-read-back path), for the A/B and as the fallback should the card's accumulator layout differ */
-bool dpas_slmc() {
-    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_SLMC"); return s && *s == '1'; }();
+ * cut 1 (the store-and-read-back path), for the A/B and as the fallback should the card's accumulator layout differ;
+ * =2: TEST ONLY, the 4-bit level decode skipped (wrong numbers) to time the decode's share of the kernel */
+uint32_t dpas_slmc() {
+    static const uint32_t v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_SLMC"); return s ? (uint32_t)std::strtoul(s, nullptr, 10) : 0u; }();
     return v;
 }
 #endif
@@ -777,7 +781,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
             XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, grid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
                          cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
                          (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc() ? 1u : 0u);
+                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc());
             return RAD_OK;
         }
 #endif
