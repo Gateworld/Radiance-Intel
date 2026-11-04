@@ -197,6 +197,9 @@ private:
     int32_t  next_ = 0;                /* the next layer to stage this pass */
     /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
     int32_t  n_early_ = 0;
+    /* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): the pass's staged layers and bytes, printed at end_pass. */
+    int64_t  dbg_bytes_ = 0;
+    int32_t  dbg_layers_ = 0;
 
     enum { kStaged, kNone, kLater };
     int  stage_ahead(int32_t cur, bool* resync);

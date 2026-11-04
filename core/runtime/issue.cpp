@@ -396,9 +396,32 @@ static long   g_iss_n   = 0;
  * op's tables are resolved, followed by sync_residency if the stager changed the residency table.
  * after_op runs on the op's stream, where "every reader of this weight is behind us" can be
  * recorded. */
+/* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): a prefill-sized pass's host time per op, by part (ctx.h hst_*). */
+static bool hst_on() { static const bool on = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr; return on; }
+static double hst_ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
 int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
+    const bool hst = hst_on() && batch_ && batch_->phase != RAD_PHASE_DECODE && batch_->draft_pass == 0 &&
+                     program_ && (size_t)h < program_->ops.size();
+    std::chrono::steady_clock::time_point t0, t1, t2, t3;
+    if (hst) {
+        if (hst_calls_.size() < program_->ops.size()) {
+            hst_before_.resize(program_->ops.size(), 0.0);
+            hst_body_.resize(program_->ops.size(), 0.0);
+            hst_after_.resize(program_->ops.size(), 0.0);
+            hst_calls_.resize(program_->ops.size(), 0);
+        }
+        t0 = std::chrono::steady_clock::now();
+    }
     if (!staging_) {
         const int rc = issue_body(h, opd, n_opd, n);
+        if (hst) {
+            t2 = std::chrono::steady_clock::now();
+            hst_body_[(size_t)h] += hst_ms(t0, t2);
+            hst_calls_[(size_t)h] += 1;
+        }
         if (rc < 0 || (size_t)h >= plans_.size() || plans_[h].lora_site < 0) return rc;
         return issue_lora(h, opd, n_opd, n);
     }
@@ -408,9 +431,18 @@ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     if (sb < 0)
         return abort_step_msg(h, sb, "the weight stager could not stage this op's weights");
     if (resync) sync_residency();
+    if (hst) t1 = std::chrono::steady_clock::now();
     const int rc = issue_body(h, opd, n_opd, n);
+    if (hst) t2 = std::chrono::steady_clock::now();
     if (rc < 0) return rc;
     const int sa = stager_->after_op(h, cur_stream());
+    if (hst) {
+        t3 = std::chrono::steady_clock::now();
+        hst_before_[(size_t)h] += hst_ms(t0, t1);
+        hst_body_[(size_t)h] += hst_ms(t1, t2);
+        hst_after_[(size_t)h] += hst_ms(t2, t3);
+        hst_calls_[(size_t)h] += 1;
+    }
     if (sa < 0)
         return abort_step_msg(h, sa, "the weight stager could not release this op's weights");
     if ((size_t)h < plans_.size() && plans_[h].lora_site >= 0) return issue_lora(h, opd, n_opd, n);

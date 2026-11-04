@@ -622,9 +622,32 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
         stats_.h2d_bytes += (uint64_t)p.bytes;
         stats_.staged_bytes += (uint64_t)p.bytes;
     }
-    RAD_TRY(rad_memcpy_list_async(stage_segs_.data(), (int)stage_segs_.size(), RAD_COPY_YIELD,
-                                  mover_));
-    RAD_TRY(rad_event_record(done, mover_));
+    {
+        /* run 173: the submission's host time (stage_dbg), beside the pass's per-op waits */
+        const auto c0 = std::chrono::steady_clock::now();
+        RAD_TRY(rad_memcpy_list_async(stage_segs_.data(), (int)stage_segs_.size(), RAD_COPY_YIELD,
+                                      mover_));
+        RAD_TRY(rad_event_record(done, mover_));
+        dbg_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        dbg_segs_ += (int64_t)stage_segs_.size();
+        ++dbg_calls_;
+        /* RADIANCE_DEBUG_STAGE=2 (run 173, a diagnostic that serialises the pipeline): wait here for this
+         * layer's copies and log their completion time, i.e. the copy path's raw rate */
+        static const bool sync_dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_STAGE"); return v && v[0] == '2'; }();
+        if (sync_dbg) {
+            int64_t bytes = 0;
+            for (const RadCopySeg& sg : stage_segs_) bytes += sg.bytes;
+            /* the stager's `done` is a local event (no host wait on it): a host-waitable one of our own */
+            if (!dbg_ev_) RAD_TRY(rad_event_create(&dbg_ev_));
+            RAD_TRY(rad_event_record(dbg_ev_, mover_));
+            const auto w0 = std::chrono::steady_clock::now();
+            RAD_TRY(rad_event_sync(dbg_ev_));
+            const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+            RAD_INFO("stage copies: %zu segments, %.1f MiB, landed %.1f ms after the submission (%.2f GB/s)",
+                     stage_segs_.size(), (double)bytes / (1024.0 * 1024.0), wms,
+                     wms > 0 ? (double)bytes / (wms * 1e6) : 0.0);
+        }
+    }
     for (const StagePick& p : stage_picks_) {
         if (!p.dst) continue;
         const MoveUnit& mu = plan_->units[(size_t)p.u];

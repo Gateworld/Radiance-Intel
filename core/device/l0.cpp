@@ -528,6 +528,23 @@ std::atomic<int64_t> g_append_retries{0};   /* owner note 58: appends retried af
  * release's in-flight window, 1 its wait at tape_end, 2 the first play's release (the shipped form). Counted only when
  * the play had not completed; on the VRAM trace line. */
 std::atomic<int64_t> g_twait_n[3] = {}, g_twait_us[3] = {};
+/* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): the host time this thread spends inside the backend's four
+ * blocking suspects -- 0 the runtime memcpy call (copy_on), 1 settle's native slot wait, 2 a stream's
+ * barrier wait on an event (z_event_wait), 3 an event record (z_event_record) -- read and cleared by the
+ * engine's prefill-sized pass print (ctx.cpp run_step). Per thread: each rank's stream is its own. */
+thread_local double    g_dbgw_us[4] = {};
+thread_local long long g_dbgw_n[4] = {};
+struct DbgWait {
+    int k; std::chrono::steady_clock::time_point t0;
+    explicit DbgWait(int k_) : k(k_), t0(std::chrono::steady_clock::now()) {}
+    ~DbgWait() {
+        g_dbgw_us[k] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        ++g_dbgw_n[k];
+    }
+};
+void l0_dbg_waits_impl(double* ms, long long* n) {
+    for (int k = 0; k < 4; ++k) { ms[k] = g_dbgw_us[k] / 1e3; n[k] = g_dbgw_n[k]; g_dbgw_us[k] = 0.0; g_dbgw_n[k] = 0; }
+}
 void vtrace_list(int d, int kind, int delta);   /* RADIANCE_L0_VRAM_TRACE's list counts (below) */
 Tape::~Tape() {
     for (Seg& s : segs)
@@ -725,7 +742,12 @@ void real_record(L0Event* e, L0Stream& st) {
         stamped = true;
     } else {
         if (tags && g_timing.load(std::memory_order_relaxed)) g_rec_untimed.fetch_add(1, std::memory_order_relaxed);
-        if (st.gated.load()) {
+        /* Run 173 (Intel port): RADIANCE_L0_RECORD_BARRIER=1 takes a barrier for every record instead of the
+         * queue's last event -- B131 timed the records at ~6-14 ms each on a prefill chunk (3.5 s of a 3.6 s
+         * pass, the host blocked at every stager event), while a barrier submission with a dependency
+         * (z_event_wait) costs ~5 us; the test says whether the runtime's last-event query is the block. */
+        static const bool rec_barrier = [] { const char* v = std::getenv("RADIANCE_L0_RECORD_BARRIER"); return v && *v == '1'; }();
+        if (st.gated.load() || rec_barrier) {
             b = q.ext_oneapi_submit_barrier();
             g_rec_barriers.fetch_add(1, std::memory_order_relaxed);
             stamped = !tags;
@@ -1166,6 +1188,7 @@ void n_release_wait(int where, int dev, int slot, uint64_t serial, const char* w
 /* The stream's next submission to the runtime follows its pending native play: the host waits here. */
 void settle(L0Stream& s) {
     if (s.npend_slot < 0) return;
+    DbgWait dw(1);
     n_slot_wait(s.npend_dev, s.npend_slot, s.npend_serial, "settle before a runtime submission");
     s.npend_slot = -1;
 }
@@ -1729,6 +1752,7 @@ int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
             return RAD_OK;
     }
     if (!native_on(S(s))) settle(S(s));   /* after a glued entry's enter (enter_g): the runtime copy follows the play */
+    DbgWait dw(0);
     return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, bytes); });
 }
 
@@ -2828,6 +2852,7 @@ int z_event_record(RadEvent ev, RadStream s) {
         });
     }
     /* everything before it on the queue; a profiling tag carries a timestamp as well */
+    DbgWait dw(3);
     return guarded("rad_event_record", [&] { real_record(e, S(s)); });
 }
 
@@ -2908,6 +2933,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
         return RAD_OK;
     }
     settle(S(s));   /* a runtime event: the barrier goes on the runtime's queue, after the stream's native work (enter_g) */
+    DbgWait dw(2);
     return guarded("rad_event_wait", [&] { Q(s).ext_oneapi_submit_barrier({b}); });
 }
 
@@ -3363,5 +3389,8 @@ extern "C" void rad_l0_tape_stats(int64_t out[4]) {
     std::lock_guard<std::mutex> lk(dead_mutex());
     out[3] = (int64_t)dead_tapes().size();
 }
+
+/* run 173: the backend's host-wait counters with external linkage, for the engine's weak reference (ctx.cpp) */
+extern "C" void rad_l0_dbg_waits(double* ms, long long* n) { rad::l0_dbg_waits_impl(ms, n); }
 
 #endif /* RAD_HAVE_L0 */

@@ -248,6 +248,8 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     head_ = p.end;
     ring_order_.push_back(i);
     *got = kStaged;
+    dbg_bytes_ += need;   /* run 173: the pass's staged bytes, printed at end_pass under RADIANCE_DEBUG_STAGE */
+    ++dbg_layers_;
     return RAD_OK;
 }
 
@@ -343,6 +345,20 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
 int PrefillStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
+    /* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): what this pass staged -- beside the per-op host times (run_step),
+     * so a longer wait for the copies can be read as more bytes or as a slower link. */
+    static const bool dbg = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr;
+    if (dbg) {
+        double sub_ms = 0.0;
+        int64_t segs = 0, calls = 0;
+        mover_->stage_dbg(&sub_ms, &segs, &calls);
+        RAD_INFO("prefill stager pass: %d layers staged, %.1f MiB (ring %.1f MiB, %zu layers routed); the copy "
+                 "lists: %lld submissions, %lld segments, %.1f ms of host time inside them",
+                 (int)dbg_layers_, (double)dbg_bytes_ / (1024.0 * 1024.0), (double)ring_ / (1024.0 * 1024.0),
+                 layers_.size(), (long long)calls, (long long)segs, sub_ms);
+        dbg_bytes_ = 0;
+        dbg_layers_ = 0;
+    }
     int rc = RAD_OK;
     for (int32_t i : ring_order_) {
         Place& p = place_[i];

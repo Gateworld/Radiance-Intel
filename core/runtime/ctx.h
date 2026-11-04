@@ -801,6 +801,12 @@ private:
     /* Rows timed on the host clock rather than by a device event pair. A host row includes page
      * faults and link reads, a device row is kernel time, so the table labels each. */
     std::vector<uint8_t>  prof_host_;
+    /* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): a prefill-sized pass's host time per op in Ctx::issue --
+     * the stager's before_op, the issue body, the stager's after_op -- printed with the pass's parts by
+     * run_step and cleared. The host issue of such a pass paces on the device (the stager's ring), so the
+     * op whose issue blocks longest names where the device, or the link, is. */
+    std::vector<double>   hst_before_, hst_body_, hst_after_;
+    std::vector<int64_t>  hst_calls_;
     /* The stream drain a host-site op forces, timed apart from the op: it is the cost of stopping
      * the pipeline, which can exceed the op itself by 100x (PLE gather). */
     std::vector<double>   prof_join_ms_;

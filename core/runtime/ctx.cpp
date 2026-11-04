@@ -14,6 +14,9 @@
 #include <cstdlib>
 #include <string>
 
+/* Run 173: the Level Zero backend's per-thread host-wait counters (l0.cpp), absent in other backends */
+extern "C" void rad_l0_dbg_waits(double* ms, long long* n) __attribute__((weak));
+
 namespace rad {
 
 /* ================================================================== lifecycle */
@@ -1612,6 +1615,50 @@ int Ctx::run_step(const RadBatch* b) {
         thread_local long   n[2] = {};
         const int k = b->draft_pass != 0 ? 1 : 0;
         for (int i = 1; i < 8; ++i) sum[k][i] += stage_us(tp[i - 1], tp[i]);
+        /* Run 173 (Intel port, owner note 165 item 3): a prefill-sized pass's own parts at once, not folded
+         * into the means -- a prompt's chunk read beside decoding sequences ran ~2.5x its lone time (L1-L8)
+         * and the step trace only said "enqueue"; this says which part of the rank's step it is. */
+        if (k == 0 && b->phase != RAD_PHASE_DECODE) {
+            RAD_INFO("run_step prefill-sized pass (%d rows, rank %d): stager %.1f, residency %.1f, pass %.1f, "
+                     "lane join %.1f, stager end + routes %.1f, profile + flush %.1f, stalls + room %.1f ms",
+                     (int)b->n_tok, rank_, stage_us(tp[0], tp[1]) / 1e3, stage_us(tp[1], tp[2]) / 1e3,
+                     stage_us(tp[2], tp[3]) / 1e3, stage_us(tp[3], tp[4]) / 1e3, stage_us(tp[4], tp[5]) / 1e3,
+                     stage_us(tp[5], tp[6]) / 1e3, stage_us(tp[6], tp[7]) / 1e3);
+            /* the Level Zero backend's host time inside its blocking calls this pass (l0.cpp rad_l0_dbg_waits) */
+            if (rad_l0_dbg_waits) {
+                double wms[4];
+                long long wn[4];
+                rad_l0_dbg_waits(wms, wn);
+                RAD_INFO("  l0 host time: memcpy %.1f ms (%lld), settle %.1f (%lld), barrier waits %.1f (%lld), "
+                         "event records %.1f (%lld)", wms[0], wn[0], wms[1], wn[1], wms[2], wn[2], wms[3], wn[3]);
+            }
+            /* the pass's host time by op (issue.cpp, hst_*): slowest first, the three parts apart */
+            if (!hst_calls_.empty() && program_) {
+                std::vector<size_t> order;
+                for (size_t i = 0; i < hst_calls_.size(); ++i) if (hst_calls_[i]) order.push_back(i);
+                const auto tot_of = [&](size_t i) { return hst_before_[i] + hst_body_[i] + hst_after_[i]; };
+                std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return tot_of(x) > tot_of(y); });
+                double tot = 0.0, tb = 0.0, ta = 0.0;
+                for (size_t i : order) { tot += tot_of(i); tb += hst_before_[i]; ta += hst_after_[i]; }
+                RAD_INFO("  host time by op: %zu ops, %.1f ms (the stager's waits before %.1f, after %.1f); "
+                         "calls x op: total = before / issue / after ms, geometry #index weight",
+                         order.size(), tot, tb, ta);
+                size_t shown = 0;
+                for (size_t i : order) {
+                    if (shown++ >= 16) break;
+                    const OpInfo& o = program_->ops[i];
+                    const char* wname = !o.weights.empty() && o.weights[0] < program_->weights.size()
+                                            ? program_->weights[o.weights[0]].name.c_str() : "-";
+                    RAD_INFO("    %6lld x %-26s %8.1f = %7.1f / %8.1f / %6.1f  %s #%d %s",
+                             (long long)hst_calls_[i], o.op.c_str(), tot_of(i), hst_before_[i], hst_body_[i],
+                             hst_after_[i], o.base.str().c_str(), (int)o.index, wname);
+                }
+                std::fill(hst_before_.begin(), hst_before_.end(), 0.0);
+                std::fill(hst_body_.begin(), hst_body_.end(), 0.0);
+                std::fill(hst_after_.begin(), hst_after_.end(), 0.0);
+                std::fill(hst_calls_.begin(), hst_calls_.end(), 0);
+            }
+        }
         if (++n[k] % 400 == 0 && k == 1 && rank_ == 0) {
             const double m = (double)n[k];
             RAD_INFO("run_step (draft passes, %ld): stager %.1f, residency %.1f, pass %.1f, lane join %.1f, "

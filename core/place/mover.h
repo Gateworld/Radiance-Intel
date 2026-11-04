@@ -547,6 +547,12 @@ public:
     int64_t file_buffer_bytes() const { return file_vram_ ? file_buf_bytes_ : 0; }
 
     const MoverStats& stats() const { return stats_; }
+    /* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): the host time spent inside stage_units' copy-list submissions
+     * since the last call, with the calls and segments -- read and cleared by the prefill stager's pass print. */
+    void stage_dbg(double* ms, int64_t* segs, int64_t* calls) {
+        *ms = dbg_ms_; *segs = dbg_segs_; *calls = dbg_calls_;
+        dbg_ms_ = 0.0; dbg_segs_ = 0; dbg_calls_ = 0;
+    }
     std::string report() const;
 
 private:
@@ -640,6 +646,9 @@ private:
     MoverConfig    cfg_;
     Residency      res_;
     MoverStats     stats_;
+    double         dbg_ms_ = 0.0;      /* stage_dbg: the copy-list submissions' host time */
+    int64_t        dbg_segs_ = 0, dbg_calls_ = 0;
+    RadEvent       dbg_ev_ = nullptr;  /* RADIANCE_DEBUG_STAGE=2: a host-waitable event behind a layer's copies */
     Pools*         budget_ = nullptr;
     /* True only when this object called the allocator itself (the test path). A Pool
      * reservation belongs to the Pool; freeing it here would be a double free. */
