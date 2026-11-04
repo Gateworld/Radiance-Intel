@@ -329,6 +329,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
+        if (rd == 0 && drafted > 0 && cfg_.kld()) RAD_TRY(parity_issue(drafted));
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
@@ -357,6 +358,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
  * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    if (cfg_.kld()) RAD_TRY(parity_finish(so));
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {

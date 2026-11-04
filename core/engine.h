@@ -506,6 +506,10 @@ private:
     /* The startup warm-up pass before the server listens (engine_warmup.cpp; owner note 176 item 2). */
     int  warmup();
     int  score_rows(const RadBatch* b, const StepOut& so);
+    /* RADIANCE_MTP_PARITY (engine_kld.cpp): the MTP head's round-1 logits rows beside the dump, queued after the
+     * history pass and written after the step's wait. */
+    int  parity_issue(int drafted);
+    int  parity_finish(const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */

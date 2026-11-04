@@ -42,6 +42,61 @@ struct MtpDump {
 };
 MtpDump g_dump;
 constexpr int kDumpTop = 32;
+
+/* RADIANCE_MTP_PARITY=1 beside RADIANCE_MTP_DUMP (run 180, owner note 181's parity check): the head's own
+ * round-1 output for every drafting row of the history pass -- in the KL mode, each document's last prompt
+ * row, whose hidden row the dump holds. The head's logits rows are the shared logits buffer's first rows
+ * (rad_block_mtp_hc.h op_logits), so it needs the full-logits head (RADIANCE_MTP_DRAFT_HEAD_Q2=0: the trunk's
+ * lm_head, not the 2-bit copy). parity.bin, one record a drafting row:
+ *   int32 request id, int32 head index i, int32 the token fed (the trunk's draw at i, i.e. the token at i + 1),
+ *   then the head's 32 largest: int32 id x 32, float log-probability x 32 (the ranks' shards merged) */
+struct MtpParity {
+    bool                  on = false;
+    std::vector<float*>   host;       /* per rank read: max_seqs rows of its logits columns */
+    std::vector<uint64_t> seq;        /* the drafting rows' sequences, in draft order */
+    int                   n = 0;      /* rows copied by the last history pass, 0 once written */
+    FILE*                 f = nullptr;
+    int64_t               rows = 0;
+};
+MtpParity g_par;
+
+/* The 32 largest of a logits row over the merged shards and their log-softmax, largest first: an unsorted
+ * 32-slot table with its minimum tracked, then sorted; terms more than 30 below the row's max are below
+ * float's resolution of the sum. */
+void row_top32(const std::vector<KldShard>& shards, int64_t row, int32_t* ids, float* lps) {
+    float mx = -INFINITY;
+    float tv[kDumpTop];
+    int32_t ti[kDumpTop];
+    int nt = 0, mi = 0;
+    for (const KldShard& s : shards) {
+        const float* lr = s.rows + row * s.width;
+        for (int64_t c = 0; c < s.width; ++c) {
+            const float v = lr[c];
+            if (v > mx) mx = v;
+            if (nt < kDumpTop) {
+                tv[nt] = v; ti[nt] = (int32_t)(s.vocab0 + c); ++nt;
+                if (nt == kDumpTop) { mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k; }
+            } else if (v > tv[mi]) {
+                tv[mi] = v; ti[mi] = (int32_t)(s.vocab0 + c);
+                mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k;
+            }
+        }
+    }
+    float se = 0.0f;
+    const float lo = mx - 30.0f;
+    for (const KldShard& s : shards) {
+        const float* lr = s.rows + row * s.width;
+        for (int64_t c = 0; c < s.width; ++c) if (lr[c] > lo) se += std::exp(lr[c] - mx);
+    }
+    const float lse = mx + std::log(se);
+    int ord[kDumpTop];
+    for (int k = 0; k < kDumpTop; ++k) ord[k] = k;
+    std::sort(ord, ord + nt, [&](int x, int y) { return tv[x] > tv[y]; });
+    for (int k = 0; k < kDumpTop; ++k) {
+        ids[k] = k < nt ? ti[ord[k]] : -1;
+        lps[k] = k < nt ? tv[ord[k]] - lse : -INFINITY;
+    }
+}
 }  // namespace
 
 int Engine::run_kld() {
@@ -129,6 +184,34 @@ int Engine::run_kld() {
         g_dump.on = true;
         RAD_INFO("kld: the MTP head's pairs to %s (hidden rows of %lld bf16, the logits' top-%d)", dir.c_str(),
                  (long long)g_dump.width, kDumpTop);
+
+        /* RADIANCE_MTP_PARITY (see MtpParity above) */
+        if (const char* pv = std::getenv("RADIANCE_MTP_PARITY"); pv && pv[0] == '1') {
+            const char* q2 = std::getenv("RADIANCE_MTP_DRAFT_HEAD_Q2");
+            if (!q2 || q2[0] != '0') {
+                RAD_ERR("kld: RADIANCE_MTP_PARITY reads the head's full logits rows, which only the trunk's lm_head "
+                        "writes: set RADIANCE_MTP_DRAFT_HEAD_Q2=0 as well");
+                return RAD_E_INVAL;
+            }
+            if (!serial_drafting()) {
+                RAD_ERR("kld: RADIANCE_MTP_PARITY needs the serial MTP drafter (--num-speculative-tokens > 0)");
+                return RAD_E_UNSUPPORTED;
+            }
+            g_par.host.assign(kld_width_.size(), nullptr);
+            for (size_t r = 0; r < kld_width_.size(); ++r) {
+                g_par.host[r] = static_cast<float*>(rad_dev_alloc(
+                    (int64_t)cfg_.max_seqs * kld_width_[r] * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+                if (!g_par.host[r]) return RAD_E_NOMEM;
+            }
+            g_par.f = std::fopen((dir + "/parity.bin").c_str(), "wb");
+            if (!g_par.f) {
+                RAD_ERR("kld: RADIANCE_MTP_PARITY: cannot open %s/parity.bin", dir.c_str());
+                return RAD_E_IO;
+            }
+            g_par.on = true;
+            RAD_INFO("kld: the MTP head's own round-1 top-%d to %s/parity.bin (the full-logits head)", kDumpTop,
+                     dir.c_str());
+        }
     }
 
     auto kld = std::make_unique<Kld>();
@@ -241,6 +324,11 @@ int Engine::run_kld() {
         std::fclose(g_dump.fm); std::fclose(g_dump.fh); std::fclose(g_dump.ft);
         g_dump.on = false;
         RAD_INFO("kld: the MTP head's pairs: %lld positions written", (long long)g_dump.rows);
+        if (g_par.on) {
+            std::fclose(g_par.f);
+            g_par.on = false;
+            RAD_INFO("kld: the MTP head's parity rows: %lld written", (long long)g_par.rows);
+        }
     }
     return kld_->finish();
 }
@@ -311,46 +399,11 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
             }
             tok_off += e.n_tokens;
         }
-        /* the top-32 over the whole vocabulary and the log-sum-exp, rows split over threads (run 179: serial in
-         * double, ~2 ms a row, it held the ranks at the step barrier): an unsorted 32-slot table with its minimum
-         * tracked, then sorted; terms more than 30 below the row's max are below float's resolution of the sum */
+        /* the top-32 over the whole vocabulary and the log-sum-exp (row_top32), rows split over threads (run 179:
+         * serial in double, ~2 ms a row, it held the ranks at the step barrier) */
         std::vector<int32_t> tids(jobs.size() * kDumpTop);
         std::vector<float>   tlps(jobs.size() * kDumpTop);
-        auto one = [&](size_t i) {
-            const int64_t row = jobs[i].row;
-            float mx = -INFINITY;
-            float tv[kDumpTop];
-            int32_t ti[kDumpTop];
-            int nt = 0, mi = 0;
-            for (const KldShard& s : shards) {
-                const float* lr = s.rows + row * s.width;
-                for (int64_t c = 0; c < s.width; ++c) {
-                    const float v = lr[c];
-                    if (v > mx) mx = v;
-                    if (nt < kDumpTop) {
-                        tv[nt] = v; ti[nt] = (int32_t)(s.vocab0 + c); ++nt;
-                        if (nt == kDumpTop) { mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k; }
-                    } else if (v > tv[mi]) {
-                        tv[mi] = v; ti[mi] = (int32_t)(s.vocab0 + c);
-                        mi = 0; for (int k = 1; k < kDumpTop; ++k) if (tv[k] < tv[mi]) mi = k;
-                    }
-                }
-            }
-            float se = 0.0f;
-            const float lo = mx - 30.0f;
-            for (const KldShard& s : shards) {
-                const float* lr = s.rows + row * s.width;
-                for (int64_t c = 0; c < s.width; ++c) if (lr[c] > lo) se += std::exp(lr[c] - mx);
-            }
-            const float lse = mx + std::log(se);
-            int ord[kDumpTop];
-            for (int k = 0; k < kDumpTop; ++k) ord[k] = k;
-            std::sort(ord, ord + nt, [&](int x, int y) { return tv[x] > tv[y]; });
-            for (int k = 0; k < kDumpTop; ++k) {
-                tids[i * kDumpTop + (size_t)k] = k < nt ? ti[ord[k]] : -1;
-                tlps[i * kDumpTop + (size_t)k] = k < nt ? tv[ord[k]] - lse : -INFINITY;
-            }
-        };
+        auto one = [&](size_t i) { row_top32(shards, jobs[i].row, &tids[i * kDumpTop], &tlps[i * kDumpTop]); };
         {
             const unsigned hw = std::thread::hardware_concurrency();
             const unsigned nth = std::max(1u, std::min(hw ? hw : 1u, 8u));
@@ -370,6 +423,64 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
         }
     }
     return kld_->score(spans, shards);
+}
+
+/* RADIANCE_MTP_PARITY: right after the history pass is issued, before round 2's pass rewrites the logits buffer's
+ * first rows, queue each rank's `drafted` rows to the host behind it (the ranks are parked at the barrier, and each
+ * stream is in order). */
+int Engine::parity_issue(int drafted) {
+    if (!g_par.on || drafted <= 0) return RAD_OK;
+    const int n = std::min(drafted, (int)std::min<size_t>((size_t)cfg_.max_seqs, serial_row_.size()));
+    for (size_t r = 0; r < kld_width_.size(); ++r) {
+        Rank& rk = *ranks_[r];
+        RAD_TRY(rad_dev_set(rk.device));
+        const auto* src = static_cast<const float*>(rk.ctx.buf_ptr(rk.program.logits_buf));
+        if (!src) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(g_par.host[r], src, (int64_t)n * kld_width_[r] * (int64_t)sizeof(float),
+                                 rk.ctx.stream()));
+    }
+    RAD_TRY(rad_dev_set(ranks_[0]->device));
+    g_par.seq.resize((size_t)n);
+    for (int k = 0; k < n; ++k) g_par.seq[(size_t)k] = serial_row_[(size_t)k].seq;
+    g_par.n = n;
+    return RAD_OK;
+}
+
+/* After the step's wait: each drafting row's head index is its entry's last committed position (the verified
+ * start plus the drafts accepted; a prompt's last row in the KL mode) and the token fed is the token drawn there. */
+int Engine::parity_finish(const StepOut& so) {
+    if (!g_par.on || g_par.n <= 0) return RAD_OK;
+    for (size_t r = 0; r < kld_width_.size(); ++r) {
+        RAD_TRY(rad_dev_set(ranks_[r]->device));
+        RAD_TRY(rad_stream_sync(ranks_[r]->ctx.stream()));
+    }
+    RAD_TRY(rad_dev_set(ranks_[0]->device));
+    std::vector<KldShard> shards(kld_width_.size());
+    for (size_t r = 0; r < shards.size(); ++r) shards[r] = { g_par.host[r], kld_vocab0_[r], kld_width_[r] };
+    const StepPlan& plan = sched_.plan();
+    for (int k = 0; k < g_par.n; ++k) {
+        size_t i = 0;
+        while (i < plan.e.size() && !(plan.e[i].seq == g_par.seq[(size_t)k] && so.first_row[i] >= 0)) ++i;
+        if (i == plan.e.size()) {
+            RAD_WARN("kld: parity row %d (sequence %llu) has no entry in the step; skipped", k,
+                     (unsigned long long)g_par.seq[(size_t)k]);
+            continue;
+        }
+        const StepEntry& e = plan.e[i];
+        int32_t meta[3];
+        meta[0] = (int32_t)e.seq;
+        meta[1] = (int32_t)((int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec + so.accepted[i]);
+        meta[2] = so.token[i];
+        int32_t ids[kDumpTop];
+        float   lps[kDumpTop];
+        row_top32(shards, k, ids, lps);
+        std::fwrite(meta, 4, 3, g_par.f);
+        std::fwrite(ids, 4, kDumpTop, g_par.f);
+        std::fwrite(lps, 4, kDumpTop, g_par.f);
+        ++g_par.rows;
+    }
+    g_par.n = 0;
+    return RAD_OK;
 }
 
 }  /* namespace rad */
