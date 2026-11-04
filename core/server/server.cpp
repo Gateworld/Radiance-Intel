@@ -857,11 +857,18 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     if (ttft >= 0) std::snprintf(ttft_s, sizeof ttft_s, "ttft=%.2fs", ttft);
     char rate_s[32] = "";
     if (rate > 0) std::snprintf(rate_s, sizeof rate_s, " %.1f tok/s", rate);
+    /* the Intel port (run 176, owner note 179 item 3a): the request's speculative drafts and how many were kept,
+     * at the line's end, so acceptance reads by request (and so by prompt family) */
+    int64_t n_drafted = 0, n_kept = 0;
+    for (const auto& g : gens) { n_drafted += g.sink->n_drafted(); n_kept += g.sink->n_draft_accepted(); }
+    char draft_s[48] = "";
+    if (n_drafted > 0)
+        std::snprintf(draft_s, sizeof draft_s, " drafts=%lld kept=%lld", (long long)n_drafted, (long long)n_kept);
     RAD_LOG_AT(quiet ? Log::Debug : Log::Info,
-               "req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
+               "req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs%s",
                r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
                (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen,
-               reason, ttft_s, rate_s, e2e);
+               reason, ttft_s, rate_s, e2e, draft_s);
 }
 
 /* ------------------------------------------------------------------ non-streaming */
