@@ -166,8 +166,18 @@ bool chol_upper(std::vector<double>& a, int64_t k) {
     return chol_upper_loop(a, k);
 }
 
-/* Layer factors kept at once. */
-constexpr size_t kFactors = 4;
+/* Layer factors kept at once. The Intel port (run 177): RADIANCE_LQ_FACTORS=N raises it for a convert whose
+ * routed-expert rules pick experts across many layers (the jobs then interleave layers, and four kept factors are
+ * rebuilt for nearly every expert, under the lock: a coldest-quarter recipe of 6,134 per-expert rules ran ~27 s a
+ * rebuild); a layer's 2560-wide factor is ~26 MB in f32. Unset: 4, as before. */
+size_t factors_kept() {
+    static const size_t n = [] {
+        const char* v = std::getenv("RADIANCE_LQ_FACTORS");
+        const long long x = v ? std::atoll(v) : 0;
+        return x > 0 ? (size_t)x : (size_t)4;
+    }();
+    return n;
+}
 
 struct Cache {
     std::mutex mu;
@@ -222,7 +232,7 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
          * and alternate between its gate_up and down stems, so one kept factor would be
          * recomputed over and over. */
         if (layer && !c.f.count(key)) {
-            while (c.order.size() >= kFactors) {
+            while (c.order.size() >= factors_kept()) {
                 c.f.erase(c.order.front());
                 c.order.pop_front();
             }

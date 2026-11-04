@@ -105,6 +105,10 @@ namespace arch {
  * from whether those buffers exist. */
 inline bool mtp_draft_head_q2(RadBuilder* b, const char* head, const char* lm) {
     if (!head || !lm) return false;
+    /* The Intel port (run 176, owner note 180 A): RADIANCE_MTP_DRAFT_HEAD_Q2=0 declines the 2-bit copy, so the
+     * draft round reads the trunk's own lm_head (int8 in the served container) -- Flash-Next's MTP shares the
+     * lm_head, and the 2-bit copy is a converter's speed form. Unset: unchanged. */
+    if (const char* v = std::getenv("RADIANCE_MTP_DRAFT_HEAD_Q2"); v && v[0] == '0') return false;
     if (map_copy(b, head, lm) < 0) return false;
     RadEncoding e{};
     return weight_enc(b, head, &e) && e.n_planes > 0 && e.plane[0].dtype == RAD_U2;
