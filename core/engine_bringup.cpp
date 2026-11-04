@@ -930,15 +930,20 @@ int Engine::declare() {
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
      * rather than ignored. The tower stays off the card; the corpus is text. */
     if (cfg_.kld()) {
-        if (cfg_.n_spec > 0) {
+        /* The Intel port (run 187, owner note 181's parity check): RADIANCE_MTP_PARITY keeps the MTP drafter, whose
+         * history pass drafts once from each document's last prompt row (engine_kld.cpp). A KL request ends at its
+         * first token, so no draft is ever verified and the scored rows stay the trunk's. */
+        const char* par = std::getenv("RADIANCE_MTP_PARITY");
+        const bool parity = par && par[0] == '1';
+        if (cfg_.n_spec > 0 && !parity) {
             RAD_ERR("--num-speculative-tokens %d: the KL mode scores the trunk's own rows and "
                     "drafts nothing; leave it at auto or 0", cfg_.n_spec);
             return RAD_E_INVAL;
         }
-        cfg_.n_spec = 0;
+        if (!parity) cfg_.n_spec = 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
-        decide("--num-speculative-tokens", "0", "the KL mode scores the trunk's own rows");
+        if (!parity) decide("--num-speculative-tokens", "0", "the KL mode scores the trunk's own rows");
         prefix_off_why_ =
             "the KL mode: a prefix hit would start a document past positions the reference holds";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
