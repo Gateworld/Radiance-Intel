@@ -165,6 +165,11 @@ struct Model {
     ActFP8  a_hr{};
 
     rad_buf b_hout = 0, b_logits = 0;
+    /* The Intel port (run 179, owner note 181 phase 1): RADIANCE_DUMP_HWIDE=1 keeps a copy of the trunk's wide stream
+     * before the output mixer -- what the MTP head reads (rad_block_mtp_hc.h: `w.src`) -- in a buffer of its own, which
+     * the engine's KL mode writes out beside the logits' top-32 (engine_kld.cpp). Absent otherwise. */
+    rad_buf b_dump_h = 0;
+    rad_op  op_dump_h = 0;
 
     /* ---- the multi-token-prediction head (arch/common/rad_block_mtp_hc.h). Declared only when
      * the deployment speculates, since its ~2.5 GiB of weights would otherwise be loaded and never
@@ -1222,6 +1227,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "input_mix_weight_up.weight");
         RAD_ARCH_TRY(m.mixer.declare(b, nm, g, nm.f("output_hc"), mc, mixw, mixs));
     }
+    if (const char* dv = std::getenv("RADIANCE_DUMP_HWIDE"); dv && dv[0] == '1') {
+        m.b_dump_h  = decl_b(b, nm.f("dump_hwide"), g.act_dtype, {g.max_tok, HN}, RAD_BUF_PERSIST);
+        m.op_dump_h = rw(b, RAD_OP(b, "cast",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", HN),
+                                        RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                             RAD_NOWEIGHTS),
+                         {m.b_h}, {m.b_dump_h});
+        if (!m.op_dump_h) return RAD_E_INVAL;
+    }
 
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
@@ -1698,6 +1712,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const int32_t* pcu = pipe_bounds(c, batch, m);
     if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
     else                 step_serial(c, batch, m, pcu);
+
+    /* RADIANCE_DUMP_HWIDE (run 179): the wide rows the head would read, before the mixer (which only reads them) */
+    if (m.op_dump_h) RAD_ISSUE_N(c, m.op_dump_h, T, brows(m.b_h, T), brows(m.b_dump_h, T));
 
     m.mixer.read_pieces(c, T);
 

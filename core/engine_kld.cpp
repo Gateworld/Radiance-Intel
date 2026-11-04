@@ -8,12 +8,40 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace rad {
+
+/* The Intel port (run 179, owner note 181 phase 1): the MTP draft head's training pairs. With RADIANCE_MTP_DUMP=<dir>
+ * and an architecture that keeps its head's input rows in a buffer named `*dump_hwide` (qwen4exp_fp8:
+ * RADIANCE_DUMP_HWIDE=1), every scored position of the KL mode's teacher-forced corpus is written as
+ *   meta.bin    int32 doc (the request id), int32 position, int32 token at that position
+ *   hidden.bin  the head's input row (bf16, the buffer's width: 4 x 2560 hc streams for Flash-Next)
+ *   top32.bin   the served model's logits row at that position as its 32 largest: int32 id, float log-probability
+ *               (log-softmax over the whole vocabulary, the ranks' shards merged), largest first
+ * Head index i reads hidden(i) and the token at i + 1 and predicts the token at i + 2, whose teacher is the logits
+ * row at position i + 1 (rad_block_mtp_hc.h, THE INDEXING). One record a position, in the corpus's step order. */
+namespace {
+struct MtpDump {
+    bool    on = false;
+    rad_buf buf = RAD_NULL_HANDLE;
+    int64_t width = 0;
+    void*   host = nullptr;
+    FILE*   fm = nullptr;
+    FILE*   fh = nullptr;
+    FILE*   ft = nullptr;
+    int64_t rows = 0;
+};
+MtpDump g_dump;
+constexpr int kDumpTop = 32;
+}  // namespace
 
 int Engine::run_kld() {
     /* Each rank's logits buffer must hold a step's tokens after the sampler's rows
@@ -65,6 +93,41 @@ int Engine::run_kld() {
                     "--max-num-batched-tokens", (long long)(cfg_.max_tok * kld_width_[r] * 4 >> 20));
             return RAD_E_NOMEM;
         }
+    }
+
+    /* RADIANCE_MTP_DUMP (see MtpDump above) */
+    if (const char* dd = std::getenv("RADIANCE_MTP_DUMP"); dd && *dd) {
+        const Program& p0 = ranks_[0]->program;
+        for (size_t i = 0; i < p0.buffers.size(); ++i) {
+            const std::string& bn = p0.buffers[i].name;
+            if (bn.size() >= 10 && bn.compare(bn.size() - 10, 10, "dump_hwide") == 0) {
+                g_dump.buf = (rad_buf)i;
+                break;
+            }
+        }
+        if (g_dump.buf == RAD_NULL_HANDLE) {
+            RAD_ERR("kld: RADIANCE_MTP_DUMP is set and the program has no 'dump_hwide' buffer (the architecture "
+                    "keeps one under RADIANCE_DUMP_HWIDE=1)");
+            return RAD_E_UNSUPPORTED;
+        }
+        const RadBufDecl& d = p0.buffers[(size_t)g_dump.buf].decl;
+        if (d.dtype != RAD_BF16 || d.rank != 2 || d.shape[0] < cfg_.max_tok) {
+            RAD_ERR("kld: the 'dump_hwide' buffer is not [max_tok, n] bf16");
+            return RAD_E_UNSUPPORTED;
+        }
+        g_dump.width = d.shape[1];
+        g_dump.host = rad_dev_alloc(cfg_.max_tok * g_dump.width * 2, RAD_MEM_HOST_PINNED);
+        const std::string dir = dd;
+        g_dump.fm = std::fopen((dir + "/meta.bin").c_str(), "wb");
+        g_dump.fh = std::fopen((dir + "/hidden.bin").c_str(), "wb");
+        g_dump.ft = std::fopen((dir + "/top32.bin").c_str(), "wb");
+        if (!g_dump.host || !g_dump.fm || !g_dump.fh || !g_dump.ft) {
+            RAD_ERR("kld: RADIANCE_MTP_DUMP: cannot open %s's files or the pinned rows", dir.c_str());
+            return RAD_E_IO;
+        }
+        g_dump.on = true;
+        RAD_INFO("kld: the MTP head's pairs to %s (hidden rows of %lld bf16, the logits' top-%d)", dir.c_str(),
+                 (long long)g_dump.width, kDumpTop);
     }
 
     auto kld = std::make_unique<Kld>();
@@ -173,6 +236,11 @@ int Engine::run_kld() {
     RAD_INFO("kld: %zu documents in %.0f s, %lld preemption(s)", n,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
              (long long)sched_.metrics().preemptions);
+    if (g_dump.on) {
+        std::fclose(g_dump.fm); std::fclose(g_dump.fh); std::fclose(g_dump.ft);
+        g_dump.on = false;
+        RAD_INFO("kld: the MTP head's pairs: %lld positions written", (long long)g_dump.rows);
+    }
     return kld_->finish();
 }
 
@@ -212,6 +280,66 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
     std::vector<KldShard> shards(kld_width_.size());
     for (size_t r = 0; r < shards.size(); ++r)
         shards[r] = { kld_host_[r], kld_vocab0_[r], kld_width_[r] };
+    if (g_dump.on) {
+        /* the head's input rows: the step's token rows, rank 0's copy (the wide stream is replicated) */
+        Rank& r0 = *ranks_[0];
+        const void* hsrc = r0.ctx.buf_ptr(g_dump.buf);
+        if (!hsrc) return RAD_E_STATE;
+        const int64_t ntok = b->n_tok;
+        RAD_TRY(rad_memcpy_async(g_dump.host, hsrc, ntok * g_dump.width * 2, r0.ctx.stream()));
+        RAD_TRY(rad_stream_sync(r0.ctx.stream()));
+        /* each scored entry's token offset in the step (every entry's rows, in batch order) */
+        int64_t tok_off = 0;
+        int64_t srow = 0;
+        for (const StepEntry& e : plan.e) {
+            const bool scored = e.req && e.req->score && e.is_prefill && e.hidden_row < 0;
+            if (scored) {
+                for (int64_t j = 0; j < (int64_t)e.n_tokens; ++j) {
+                    const int64_t pos = (int64_t)e.ctx_len + j;
+                    const int32_t meta[3] = { (int32_t)e.req->id, (int32_t)pos,
+                                              pos < (int64_t)e.req->prompt.size() ? e.req->prompt[(size_t)pos] : -1 };
+                    std::fwrite(meta, 4, 3, g_dump.fm);
+                    std::fwrite((const uint8_t*)g_dump.host + (size_t)((tok_off + j) * g_dump.width * 2), 2,
+                                (size_t)g_dump.width, g_dump.fh);
+                    /* the top-32 over the whole vocabulary: the max and the running top across shards, then the
+                     * log-sum-exp for the normalisation */
+                    const int64_t row = srow + j;
+                    float mx = -INFINITY;
+                    std::vector<std::pair<float, int32_t>> top;
+                    top.reserve(kDumpTop + 1);
+                    for (const KldShard& s : shards) {
+                        const float* lr = s.rows + row * s.width;
+                        for (int64_t c = 0; c < s.width; ++c) {
+                            const float v = lr[c];
+                            if (v > mx) mx = v;
+                            if ((int)top.size() < kDumpTop || v > top.back().first) {
+                                top.emplace_back(v, (int32_t)(s.vocab0 + c));
+                                std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+                                if ((int)top.size() > kDumpTop) top.pop_back();
+                            }
+                        }
+                    }
+                    double se = 0.0;
+                    for (const KldShard& s : shards) {
+                        const float* lr = s.rows + row * s.width;
+                        for (int64_t c = 0; c < s.width; ++c) se += std::exp((double)(lr[c] - mx));
+                    }
+                    const float lse = mx + (float)std::log(se);
+                    int32_t ids[kDumpTop];
+                    float   lp[kDumpTop];
+                    for (int k = 0; k < kDumpTop; ++k) {
+                        ids[k] = k < (int)top.size() ? top[(size_t)k].second : -1;
+                        lp[k]  = k < (int)top.size() ? top[(size_t)k].first - lse : -INFINITY;
+                    }
+                    std::fwrite(ids, 4, kDumpTop, g_dump.ft);
+                    std::fwrite(lp, 4, kDumpTop, g_dump.ft);
+                    ++g_dump.rows;
+                }
+                srow += e.n_tokens;
+            }
+            tok_off += e.n_tokens;
+        }
+    }
     return kld_->score(spans, shards);
 }
 
