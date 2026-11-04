@@ -470,7 +470,7 @@ constexpr int kDTileB = 8 * 16 * 4;   /* one packed B tile: 32 k x 16 n int8 */
 void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                           uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
-                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
+                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc) {
     XE_SHARED(int8_t, sB, 2 * 4 * kDTileB);      /* [step 2][tile 4][packed 32 x 16]: one 64-K group */
     XE_SHARED(int8_t, sA, kDRows * 64);          /* the run's rows x this group's 64 K */
     XE_SHARED(int32_t, sC, kDWaves * 8 * 16);    /* one 8 x 16 int32 tile a sub-group */
@@ -619,18 +619,33 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
                 jm::joint_matrix_mad(sg, C[t], Am, Bt, C[t]);
             }
         }
-        /* the group's exact sums, scaled as the run form scales them: lane = column, 8 rows a lane */
+        /* the group's exact sums, scaled as the run form scales them: lane = column, 8 rows a lane. Run 170 (the
+         * expert kernel's rework, cut 1): B110's counters put the kernel on the SLM port (~20 GB of SLM traffic a
+         * 10.8 ms launch, bank conflicts 0), and this tile's store-and-read-back through sC was as much of it as the
+         * B tiles' reads (4 x 512 B written and read a sub-group a group); the accumulator's own work-item data is
+         * the same tile already laid out lane = column, element q = row q (what joint_matrix_store wrote and
+         * sCw[q * 16 + lane] read), so it is scaled in registers. The sC path stays behind RADIANCE_XE_I4I8_DPAS_SLMC=1
+         * (`slmc`) until the card's bits confirm the layout. The same products in the same order either way. */
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
-            xe::wave_barrier();
             const float sb = rowok[t] ? e4m3_to_f32(se8[(size_t)rowr[t] * c.s_ld + g]) * smul : 0.0f;
+            if (slmc) {
+                jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
+                xe::wave_barrier();
 #pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                const float asc = liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
-                acc[t][q] += ((float)sCw[q * 16 + lane] * asc) * sb;
+                for (int q = 0; q < 8; ++q) {
+                    const float asc = liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
+                    acc[t][q] += ((float)sCw[q * 16 + lane] * asc) * sb;
+                }
+                xe::wave_barrier();
+            } else {
+                auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, C[t]);
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const float asc = liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
+                    acc[t][q] += ((float)(int32_t)wd[q] * asc) * sb;
+                }
             }
-            xe::wave_barrier();
         }
       }
     }
@@ -654,6 +669,12 @@ bool dpas_on() {
 }
 long long dpas_min_rows() {
     static const long long v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_MIN"); const long long n = s ? std::strtoll(s, nullptr, 10) : 0; return n > 0 ? n : 512LL; }();
+    return v;
+}
+/* RADIANCE_XE_I4I8_DPAS_SLMC=1 (run 170): the group's int32 tiles scaled through shared memory as before the rework's
+ * cut 1 (the store-and-read-back path), for the A/B and as the fallback should the card's accumulator layout differ */
+bool dpas_slmc() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_SLMC"); return s && *s == '1'; }();
     return v;
 }
 #endif
@@ -756,7 +777,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
             XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, grid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
                          cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
                          (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M);
+                         (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc() ? 1u : 0u);
             return RAD_OK;
         }
 #endif
