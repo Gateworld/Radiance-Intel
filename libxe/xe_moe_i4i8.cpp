@@ -518,8 +518,10 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
     for (int k = 0; k < 4; ++k)
 #pragma unroll
         for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
-    /* slmc == 2 (run 170, test only -- WRONG numbers): the level decode skipped (lvl(c) = c), to time its share */
-    const bool nodec = slmc == 2u;
+    /* slmc == 2 (run 170, test only -- WRONG numbers): the level decode skipped (lvl(c) = c), to time its share;
+     * == 3: the scaling's loads skipped (acc += C); == 4: the B staging skipped (stale shared memory); == 5: the
+     * MMAs and their tile loads skipped (C stays 0) -- the pipeline's shares by ablation, every one wrong by design */
+    const bool nodec = slmc == 2u, noscale = slmc == 3u, nostage = slmc == 4u, nomma = slmc == 5u;
     auto lvl = [&](uint32_t cc) -> uint32_t {
         if (nodec) return cc;
         const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
@@ -594,7 +596,7 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
          * row's 16 code bytes for the step once, decodes the 32 codes by shuffles from the level lanes, and stores
          * word (k4 % 8, lane) -- a sub-group's 16 stores are 16 consecutive words (the old lanes were 64 bytes
          * apart, four to a bank). */
-        {
+        if (!nostage) {
             const int t = wave >> 1, step = wave & 1;
             uint32_t cw[4] = {0u, 0u, 0u, 0u};
             if (rowok[t]) {
@@ -613,14 +615,16 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
         __syncthreads();
 #pragma unroll
         for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, C[t], 0);
+        if (!nomma) {
 #pragma unroll
-        for (int step = 0; step < 2; ++step) {
+          for (int step = 0; step < 2; ++step) {
             jm::joint_matrix_load(sg, Am, lptr(sA + wave * 8 * 64 + step * 32), 64);
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 jm::joint_matrix_load(sg, Bt, lptr(sB + (step * 4 + t) * kDTileB), 64);
                 jm::joint_matrix_mad(sg, C[t], Am, Bt, C[t]);
             }
+          }
         }
         /* the group's exact sums, scaled as the run form scales them: lane = column, 8 rows a lane. Run 170 (the
          * expert kernel's rework, cut 1): B110's counters put the kernel on the SLM port (~20 GB of SLM traffic a
@@ -631,7 +635,7 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
          * (`slmc`) until the card's bits confirm the layout. The same products in the same order either way. */
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            const float sb = rowok[t] ? e4m3_to_f32(se8[(size_t)rowr[t] * c.s_ld + g]) * smul : 0.0f;
+            const float sb = noscale ? 1.0f : (rowok[t] ? e4m3_to_f32(se8[(size_t)rowr[t] * c.s_ld + g]) * smul : 0.0f);
             if (slmc == 1u) {
                 jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
                 xe::wave_barrier();
@@ -645,7 +649,7 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
                 auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, C[t]);
 #pragma unroll
                 for (int q = 0; q < 8; ++q) {
-                    const float asc = liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
+                    const float asc = noscale ? 1.0f : (liver[q] ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f);
                     acc[t][q] += ((float)(int32_t)wd[q] * asc) * sb;
                 }
             }
@@ -676,7 +680,8 @@ long long dpas_min_rows() {
 }
 /* RADIANCE_XE_I4I8_DPAS_SLMC=1 (run 170): the group's int32 tiles scaled through shared memory as before the rework's
  * cut 1 (the store-and-read-back path), for the A/B and as the fallback should the card's accumulator layout differ;
- * =2: TEST ONLY, the 4-bit level decode skipped (wrong numbers) to time the decode's share of the kernel */
+ * =2: TEST ONLY, the 4-bit level decode skipped (wrong numbers) to time the decode's share of the kernel; =3 / =4 / =5
+ * likewise the scaling's loads / the B staging / the MMAs skipped (the pipeline's shares by ablation) */
 uint32_t dpas_slmc() {
     static const uint32_t v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_SLMC"); return s ? (uint32_t)std::strtoul(s, nullptr, 10) : 0u; }();
     return v;
