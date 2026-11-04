@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,6 +58,10 @@ struct MtpParity {
     int                   n = 0;      /* rows copied by the last history pass, 0 once written */
     FILE*                 f = nullptr;
     int64_t               rows = 0;
+    /* The step thread writes after a step's commit, and run_kld closes once every document's sink is done -- which
+     * commit itself can make true -- so the close and a late write are serialised here (run 187: MD5c's last step's
+     * rows were lost to that order, and a write could have met a closed file). */
+    std::mutex            mu;
 };
 MtpParity g_par;
 
@@ -324,6 +329,7 @@ int Engine::run_kld() {
         std::fclose(g_dump.fm); std::fclose(g_dump.fh); std::fclose(g_dump.ft);
         g_dump.on = false;
         RAD_INFO("kld: the MTP head's pairs: %lld positions written", (long long)g_dump.rows);
+        std::lock_guard<std::mutex> lk(g_par.mu);
         if (g_par.on) {
             std::fclose(g_par.f);
             g_par.on = false;
@@ -449,6 +455,7 @@ int Engine::parity_issue(int drafted) {
 /* After the step's wait: each drafting row's head index is its entry's last committed position (the verified
  * start plus the drafts accepted; a prompt's last row in the KL mode) and the token fed is the token drawn there. */
 int Engine::parity_finish(const StepOut& so) {
+    std::lock_guard<std::mutex> lk(g_par.mu);
     if (!g_par.on || g_par.n <= 0) return RAD_OK;
     for (size_t r = 0; r < kld_width_.size(); ++r) {
         RAD_TRY(rad_dev_set(ranks_[r]->device));
