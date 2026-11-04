@@ -299,7 +299,15 @@ int Engine::run_kld() {
     const auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     for (size_t first = 0;;) {
-        while (first < n && sinks[first]->done()) ++first;
+        /* Reaped as they complete, as the server reaps (run 187: holding all of them to the end is the one
+         * difference from the service path left after MD5c / MD6 / MD7 -- the host's anonymous memory grew ~30 KB a
+         * scored position with the dump, the drafter or libref's gather each taken away). A failed document is
+         * still reported below from its sink. */
+        while (first < n && sinks[first]->done()) {
+            const server::Finish f = sinks[first]->finish_reason();
+            if (f != server::Finish::Error && f != server::Finish::Cancelled) sched_.reap(sinks[first]->id);
+            ++first;
+        }
         if (first == n) break;
         const int ls = loop_status_.load(std::memory_order_acquire);
         if (ls < 0) return ls;
