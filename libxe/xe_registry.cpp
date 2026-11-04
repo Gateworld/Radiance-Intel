@@ -76,6 +76,7 @@ static const RadConstraint cXeMoeI4I8[] = {
 /* format C (owner note 147, run 116): xe_moe_i4i8.cpp, over the w4nl64a8h planes' layout; its instance is the tail
  * skip's (owner note 162 item 1, run 160: RADIANCE_XE_TAIL_SKIP) */
 extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s);
+extern "C" int64_t xe_rad_moe_gemm_w4nl_i8_scratch(const RadArgs* a);   /* run 175: RADIANCE_XE_I4I8_DPAS_PRE's words */
 extern "C" int xe_tskip_init(const RadParam*, int, int, int, void**);
 extern "C" void xe_tskip_fini(void*);
 static const RadConstraint cXeMoeW4nlI8[] = {
@@ -301,7 +302,7 @@ static const RadKernelInfo kKernels[] = {
   "per row per 64 of K times one f32; bf16 out",
   RAD_DOMAIN_DEVICE, 60,
   ROW(cXeMoeW4nlI8), NOTUNE,
-  xe_tskip_init, xe_tskip_fini, xe_rad_moe_gemm_w4nl_i8, nullptr,
+  xe_tskip_init, xe_tskip_fini, xe_rad_moe_gemm_w4nl_i8, xe_rad_moe_gemm_w4nl_i8_scratch,
   xe_moe_planes_layout, xe_moe_planes_relayout, nullptr, xe_moe_planes_unrelayout, nullptr },
 { "xe_attn_paged_split", "attn_paged", "attn",
   "paged attention, split-KV: a work-group per (split, kv head, query row), a sub-group per query "

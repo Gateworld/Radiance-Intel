@@ -472,11 +472,17 @@ constexpr int kDTileB = 8 * 16 * 4;   /* one packed B tile: 32 k x 16 n int8 */
  * 8-row A tiles, so each B tile load feeds two MMAs and the staging, decode and barriers are paid once per 128
  * rows. (W = 16, the 256-thread work-group with the B staging split in halves, ran +15 % and not byte-exact in
  * B119 and is not instantiated; its code path stays generic in W.) */
+/* Run 175 (owner note 176 item 3, RADIANCE_XE_I4I8_DPAS_PRE=1): `pre`, when not null, holds every routed expert's B
+ * words already decoded by moe_i4i8_dec_kernel below -- word (step, tile, k4 % 8, n % 16) of (expert, 64-column block,
+ * 64-K group) at pre[((e * pnb + nb) * png + g) * 1024 + ...], the same words this kernel's staging computes -- and
+ * the staging copies them instead of loading and decoding the codes: the shared tiles hold the same bytes, so the
+ * bits are this form's. */
 template <int W, int RT>
 void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                             const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                             uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
-                            uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc) {
+                            uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
+                            const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png) {
     constexpr int kW = W, kT = 16 * W, kR = RT * W;  /* sub-groups, threads, rows a work-group */
     constexpr int kJ = 64 / W;                         /* B words a sub-group a group: 8 at W = 8 */
     constexpr int kRT = RT / 8;                        /* 8-row A tiles a sub-group */
@@ -611,8 +617,11 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     /* this sub-group's B tile, step and word range: W = 8 -> (w / 2, w % 2, words 0-7); W = 16 -> sub-groups w and
      * w + 8 share (tile, step) and take words 0-3 / 4-7 (code bytes 0-7 / 8-15 of the step's 16) */
     const int bt = (wave & 7) >> 1, bstep = wave & 1, jbase = (wave >> 3) * kJ;
-    const uint8_t* cbase = (rowok[bt] && !nostage)
+    const uint8_t* cbase = (rowok[bt] && !nostage && !pre)
         ? we + (size_t)rowr[bt] * c.w_ld + (size_t)bstep * 16u + (size_t)jbase * 2u : nullptr;
+    /* the pre-decoded words of this expert and column block (run 175), and this lane's first word in a group's 1024 */
+    const uint32_t* pblk = pre ? pre + ((size_t)e * pnb + nb) * (size_t)png * 1024u : nullptr;
+    const uint32_t pw0 = (uint32_t)((bstep * 4 + bt) * 128 + jbase * 16 + lane);
     for (uint32_t g = 0; g < ng; ++g) {
         __syncthreads();                                  /* the previous group's tiles are consumed */
         /* the group's loads, all in flight together (B118: exact, neutral) */
@@ -639,7 +648,12 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
         /* the B tiles: 64 columns x 16 words of 4 levels; word (step, tile, k4 % 8, n % 16) as the trunk's layout.
          * A lane is one column: its row's code bytes for its words decode to kJ words, stored as 16 consecutive
          * words a sub-group (the old lanes were 64 bytes apart, four to a bank). */
-        if (!nostage) {
+        if (pblk && !nostage) {
+            /* run 175: the words decoded once a call (moe_i4i8_dec_kernel), copied at the same positions */
+            const uint32_t* pg = pblk + (size_t)g * 1024u + pw0;
+#pragma unroll
+            for (int j = 0; j < kJ; ++j) sBw[pw0 + j * 16] = pg[j * 16];
+        } else if (!nostage) {
 #pragma unroll
             for (int j = 0; j < kJ; ++j) {
                 const uint32_t b2 = (cw[j >> 1] >> (16 * (j & 1))) & 0xffffu;   /* code bytes (4 k4 + 0,1 | 2,3) */
@@ -718,16 +732,69 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
 void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                           uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
-                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc) {
+                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
+                          const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png) {
     moe_i4i8_dpas_kernel_t<8, 8>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
-                                 parts, a_rows, slmc);
+                                 parts, a_rows, slmc, pre, pnb, png);
 }
 void moe_i4i8_dpas_kernel_rt16(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                                const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                                uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                                uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc) {
     moe_i4i8_dpas_kernel_t<8, 16>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
-                                  parts, a_rows, slmc);
+                                  parts, a_rows, slmc, nullptr, 0u, 0u);
+}
+
+/* Run 175 (owner note 176 item 3): the decode once a call -- one work-group of the DPAS kernel's shape (8 sub-groups
+ * of 16 lanes) a (64-column block, expert), each sub-group its (tile, step) as the GEMM's staging assigns it, every
+ * 64-K group's words computed by the staging's own expressions (the level table, the select chain, the dead-column
+ * zeros) and written to pre[((e * pnb + nb) * png + g) * 1024 + (step * 4 + tile) * 128 + k4 % 8 * 16 + n % 16]. An
+ * expert without rows in this call is skipped (its words are never read). */
+void moe_i4i8_dec_kernel(ICls c0, ICls c1, const int32_t* __restrict__ off, uint32_t N, uint32_t parts,
+                         uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png) {
+    constexpr int kJ = 8;
+    const int tid = (int)threadIdx.x, wave = tid / 16, lane = tid % 16;
+    const uint32_t nb = blockIdx.x, e = blockIdx.y, n0 = nb * (uint32_t)kDCols;
+    if (off[e + 1] <= off[e]) return;
+    const ICls& c = (e & 1) ? c1 : c0;
+    const uint32_t fy = N / parts, fcw = c.n / parts, K = c.k;
+    const uint32_t entry = e >> 1;
+    const uint8_t* we = entry_of(c.base, c.tab, c.stride, entry) + c.c_off;
+    const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, entry) + c.t_off);
+    float amax = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
+    const float lv = tab[lane];
+    const uint32_t lvi = (uint32_t)(amax > 0.0f ? (int)sycl::rint(lv * 127.0f / amax) : (int)lv) & 255u;
+    sycl::sub_group sg = xe::sg();
+    uint32_t pk[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+    auto lvl = [&](uint32_t cc) -> uint32_t {
+        const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
+        return (d >> (8u * (cc & 3u))) & 255u;
+    };
+    const int bt = (wave & 7) >> 1, bstep = wave & 1;
+    const uint32_t n = n0 + (uint32_t)(bt * 16 + lane);
+    const uint32_t pp = fy ? n / fy : 0u, jj = n - pp * fy;
+    const bool ok = n < N && jj < fcw;
+    const uint32_t row = pp * fcw + jj;
+    const uint8_t* cbase = ok ? we + (size_t)row * c.w_ld + (size_t)bstep * 16u : nullptr;
+    uint32_t* out = pre + ((size_t)e * pnb + nb) * (size_t)png * 1024u + (uint32_t)((bstep * 4 + bt) * 128 + lane);
+    const uint32_t ng = K / 64u;
+    for (uint32_t g = 0; g < ng; ++g) {
+        uint32_t cw[4] = {0u, 0u, 0u, 0u};
+        if (cbase) __builtin_memcpy(cw, cbase + (size_t)g * 32u, kJ * 2);
+#pragma unroll
+        for (int j = 0; j < kJ; ++j) {
+            const uint32_t b2 = (cw[j >> 1] >> (16 * (j & 1))) & 0xffffu;
+            const uint32_t b0 = b2 & 255u, b1 = b2 >> 8;
+            const uint32_t l0 = lvl(b0 & 15u), l1 = lvl(b0 >> 4), l2 = lvl(b1 & 15u), l3 = lvl(b1 >> 4);
+            out[(size_t)g * 1024u + j * 16] = ok ? (l0 | (l1 << 8) | (l2 << 16) | (l3 << 24)) : 0u;
+        }
+    }
 }
 /* RADIANCE_XE_I4I8_DPAS_ROWS=16 (run 171): 16 rows a sub-group (the 128-row work-group of 8 sub-groups) under the
  * large register file; 8 (64 rows) unless set */
@@ -753,6 +820,17 @@ long long dpas_min_rows() {
 uint32_t dpas_slmc() {
     static const uint32_t v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_SLMC"); return s ? (uint32_t)std::strtoul(s, nullptr, 10) : 0u; }();
     return v;
+}
+/* RADIANCE_XE_I4I8_DPAS_PRE=1 (run 175, owner note 176 item 3): the codes decoded once a call into the op's declared
+ * scratch (moe_i4i8_dec_kernel), the GEMM copying the words; opt-in -- the scratch, n_expert x N x K bytes, comes out
+ * of the arena (the expert slab shrinks by it), and the hook declares none when the switch is off */
+bool dpas_pre() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_PRE"); return s && *s == '1'; }();
+    return v;
+}
+/* the pre-decoded words' bytes for a call's geometry: every expert, every 64-column block, every 64-K group */
+int64_t pre_bytes(long long n_expert, long long N, long long K) {
+    return (int64_t)n_expert * ((N + kDCols - 1) / kDCols) * (K / 64) * 4096;
 }
 #endif
 
@@ -852,6 +930,24 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
         if (fc && dpas_on() && T >= dpas_min_rows() && K % 64 == 0) {
             const bool rt16 = dpas_rows() == 16;
             const dim3 grid((unsigned)((N + kDCols - 1) / kDCols), (unsigned)T), block(kDThreads);
+            /* run 175: the decode once a call (RADIANCE_XE_I4I8_DPAS_PRE=1), into the declared scratch */
+            const uint32_t* pre = nullptr;
+            const uint32_t pnb = (uint32_t)((N + kDCols - 1) / kDCols), png = (uint32_t)(K / 64);
+            if (dpas_pre() && !rt16) {
+                if (a->scratch && a->scratch_bytes >= pre_bytes(n_expert, N, K)) {
+                    XE_LAUNCH_SG(16, qq, moe_i4i8_dec_kernel, dim3(pnb, (unsigned)n_expert), block, 0, cl[0], cl[1],
+                                 (const int32_t*)off->data, (uint32_t)N, (uint32_t)parts, (uint32_t*)a->scratch, pnb, png);
+                    pre = (const uint32_t*)a->scratch;
+                } else {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "[xe] moe_gemm_q: RADIANCE_XE_I4I8_DPAS_PRE=1 but the scratch is %lld bytes of "
+                                     "the %lld it needs; decoding in the GEMM\n", (long long)a->scratch_bytes,
+                                     (long long)pre_bytes(n_expert, N, K));
+                    }
+                }
+            }
             if (rt16)
                 xe::launch_as_grf256<moe_i4i8_dpas_kernel_rt16, 16>(
                     moe_i4i8_dpas_kernel_rt16, *qq, grid, block, (const int8_t*)Aq->data, (const float*)As->data,
@@ -862,7 +958,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                 XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, grid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
                              cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
                              (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc());
+                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png);
             return RAD_OK;
         }
 #endif
@@ -939,6 +1035,19 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
 #if XE_I4I8_FC
 /* format C (owner note 147): w4nl64i8h, the w4nl64a8h planes against int8 activations */
 extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, true); }
+
+/* The scratch hook (declare time, from the geometry; run 175): the pre-decoded words when RADIANCE_XE_I4I8_DPAS_PRE=1,
+ * none otherwise -- n_expert x N x K bytes for the wider class */
+extern "C" int64_t xe_rad_moe_gemm_w4nl_i8_scratch(const RadArgs* a) {
+    if (!dpas_pre()) return 0;
+    const long long n_expert = r4d_geti_or(a, "n_expert", 0);
+    long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
+    const long long N1 = r4d_geti_or(a, "N_odd", N), K1 = r4d_geti_or(a, "K_odd", K);
+    if (N1 > N) N = N1;
+    if (K1 > K) K = K1;
+    if (n_expert <= 0 || N <= 0 || K <= 0) return 0;
+    return pre_bytes(n_expert, N, K);
+}
 
 /* The tail skip's instance, one a rank (every resolved instance of the row shares it): the flag read, the address
  * split probed on the rank's device, the stats zeroed. A refusal leaves the row serving with the skip off. */
