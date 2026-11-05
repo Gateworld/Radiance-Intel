@@ -180,11 +180,15 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
     std::printf("  M %d N %6d K %5d zero %s: %s, worst %.3f of tolerance, canaries %s\n", M, N, K, z8 ? "u8" : "u4",
                 ok ? "PASS" : "FAIL", worst, canary ? "ok" : "BROKEN");
     if (reps) std::printf("    %.4f ms, %.1f GB/s of weight\n", ms, (double)joined.size() / (ms * 1e6) + (double)N * K / 4 / (ms * 1e6));
-    /* run 123 (owner note 151 C): the rows form (RADIANCE_XE_W2A8_R=2 / 4) must give the same bytes */
-    for (int form : { 2, 4 }) {
+    /* run 123 (owner note 151 C): the rows form (RADIANCE_XE_W2A8_R=2 / 4) must give the same bytes; run 189 (owner
+     * note 183 item 1): and each with its quads by DP4A (RADIANCE_XE_W2A8_DP4=1) */
+    for (int fd : { 2, 4, 12, 14 }) {
+        const int form = fd % 10;
+        const bool d4 = fd >= 10;
         char v[4];
         std::snprintf(v, sizeof v, "%d", form);
         setenv("RADIANCE_XE_W2A8_R", v, 1);
+        if (d4) setenv("RADIANCE_XE_W2A8_DP4", "1", 1); else unsetenv("RADIANCE_XE_W2A8_DP4");
         q.memset(dyb, kPat, ybytes + 2 * kCanary).wait();
         const bool rc = xe_rad_gemm_w2a8_gemv(&args, (RadStream)&q) == RAD_OK;
         q.wait_and_throw();
@@ -199,10 +203,12 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
         q.memcpy(hr.data(), dyb, hr.size()).wait();
         const bool same = rc && std::memcmp(hr.data(), hy.data(), hr.size()) == 0;
         ok &= same;
-        std::printf("    rows form R=%d: %s the one-row form's bytes%s", form, same ? "=" : "DIFFERS FROM", reps ? "" : "\n");
+        std::printf("    rows form R=%d%s: %s the one-row form's bytes%s", form, d4 ? " DP4A" : "",
+                    same ? "=" : "DIFFERS FROM", reps ? "" : "\n");
         if (reps) std::printf(", %.4f ms\n", fms);
     }
     unsetenv("RADIANCE_XE_W2A8_R");
+    unsetenv("RADIANCE_XE_W2A8_DP4");
     sycl::free(da, q); sycl::free(db, q); sycl::free(das, q); sycl::free(dsum, q); sycl::free(dbs, q); sycl::free(dyb, q);
     return {ok, worst, ms};
 }

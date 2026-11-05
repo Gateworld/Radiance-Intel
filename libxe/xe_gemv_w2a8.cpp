@@ -113,7 +113,23 @@ void gemv_w2a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
  * chunk) being the same for every row. Here a sub-group takes R output rows and loads each group's activation chunk
  * once (MB rows), then for each of its rows does exactly the one-row-a-sub-group form's work: the same exact int32
  * sum, the same butterfly, the same float expression, the groups in the same order, so the same bytes. */
-template <int MB, int R>
+/* The sum of the four signed byte products plus acc: DP4A's arithmetic, in the form IGC recognises (xe_moe_i4i8.cpp's
+ * dp4; sycl's dot_acc is out of line and cannot be linked twice). */
+inline int32_t w2_dp4(int32_t a, int32_t b, int32_t acc) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc += (int32_t)(int8_t)(a >> (8 * i)) * (int32_t)(int8_t)(b >> (8 * i));
+    return acc;
+}
+/* A code byte's four u2 codes (element k at bits 2k) spread to the four bytes of a word, byte k = code k: the codes
+ * are 0..3, so as signed bytes they are the same values. */
+inline int32_t w2_spread(uint32_t cb) {
+    return (int32_t)((cb & 3u) | ((cb & 0xCu) << 6) | ((cb & 0x30u) << 12) | ((cb & 0xC0u) << 18));
+}
+
+/* kD4 (owner note 183 item 1, RADIANCE_XE_W2A8_DP4=1): each quad's four products by one DP4A on the spread codes,
+ * the spread done once a (row, group) for every activation row, in place of sixteen extracts and multiply-adds a chunk.
+ * The group's int32 sum is exact either way (|128 x 127 x 3| is far inside int32), so the same bytes. */
+template <int MB, int R, bool kD4 = false>
 void gemv_w2a8_rows_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as,
                            const float* __restrict__ asum, long mpad, const uint8_t* __restrict__ b,
                            const uint8_t* __restrict__ bs, uint16_t* __restrict__ y, long y_ld, int N, int K, int M,
@@ -154,18 +170,31 @@ void gemv_w2a8_rows_kernel(const int8_t* __restrict__ a, long a_ld, const float*
                 const uint8_t zb = zp[(size_t)n * z_rb + (size_t)(z8 ? g : g >> 1)];
                 z = (float)(z8 ? zb : (uint8_t)((zb >> (4 * (g & 1))) & 15));
             }
+            int32_t cw[4] = {0, 0, 0, 0};   /* kD4: activation quad q's codes, spread (code byte sq(q)) */
+            if constexpr (kD4) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int sq = (q == 1) ? 2 : (q == 2 ? 1 : q);
+                    cw[q] = w2_spread((w >> (8 * sq)) & 0xffu);
+                }
+            }
 #pragma unroll
             for (int m = 0; m < MB; ++m) {
                 int s = 0;
                 if (gl && m < M) {
                     const unsigned xv[4] = {xq[m].x, xq[m].y, xq[m].z, xq[m].w};
+                    if constexpr (kD4) {
 #pragma unroll
-                    for (int q = 0; q < 4; ++q) {
-                        const int sq = (q == 1) ? 2 : (q == 2 ? 1 : q);
-                        const unsigned cb = (w >> (8 * sq)) & 0xffu;
+                        for (int q = 0; q < 4; ++q) s = w2_dp4((int32_t)xv[q], cw[q], s);
+                    } else {
 #pragma unroll
-                        for (int k = 0; k < 4; ++k)
-                            s += (int)(int8_t)(xv[q] >> (8 * k)) * (int)((cb >> (2 * k)) & 3u);
+                        for (int q = 0; q < 4; ++q) {
+                            const int sq = (q == 1) ? 2 : (q == 2 ? 1 : q);
+                            const unsigned cb = (w >> (8 * sq)) & 0xffu;
+#pragma unroll
+                            for (int k = 0; k < 4; ++k)
+                                s += (int)(int8_t)(xv[q] >> (8 * k)) * (int)((cb >> (2 * k)) & 3u);
+                        }
                     }
                 }
                 s += __builtin_amdgcn_ds_bpermute((lane ^ 1) << 2, s);
@@ -202,6 +231,12 @@ int w2a8_rows() {
     const char* v = std::getenv("RADIANCE_XE_W2A8_R");
     const int r = v ? std::atoi(v) : 2;
     return r == 2 || r == 4 ? r : 0;
+}
+/* RADIANCE_XE_W2A8_DP4=1 (owner note 183 item 1, opt-in until timed): the rows form's quads by DP4A (kD4 above). Read
+ * at every call, as RADIANCE_XE_W2A8_R, so the test compares both in one process. */
+bool w2a8_dp4() {
+    const char* v = std::getenv("RADIANCE_XE_W2A8_DP4");
+    return v && v[0] == '1';
 }
 
 /* The w2a8 grid's b_scale: the encoding's "scale" (f16) and "zero" (u8 or u4), one each per
@@ -283,6 +318,7 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
         sycl::queue* q = (sycl::queue*)s;
         const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
         const int rr = w2a8_rows();
+        const bool d4 = w2a8_dp4();
         for (long long m0 = 0; m0 < M; m0 += kMaxM) {
             const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
             const int8_t* am = (const int8_t*)A->data + (size_t)m0 * a_ld;
@@ -291,11 +327,16 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
             uint16_t* ym = (uint16_t*)Y->data + (size_t)m0 * y_ld;
             if (rr > 0) {
                 const dim3 gr((unsigned)((N + kRowsPerWG * rr - 1) / (kRowsPerWG * rr)));
-#define XE_W2R(MB_, R_) XE_LAUNCH(q, (gemv_w2a8_rows_kernel<MB_, R_>), gr, block, 0, am, (long)a_ld, asm_, sm,     \
-                                  (long)mpad, (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld,   \
-                                  (int)N, (int)K, mb, (uint32_t)RAD_U8)
-                if (mb == 1) { if (rr == 2) XE_W2R(1, 2); else XE_W2R(1, 4); }
-                else { if (rr == 2) XE_W2R(kMaxM, 2); else XE_W2R(kMaxM, 4); }
+#define XE_W2R(MB_, R_, D_) XE_LAUNCH(q, (gemv_w2a8_rows_kernel<MB_, R_, D_>), gr, block, 0, am, (long)a_ld, asm_, \
+                                      sm, (long)mpad, (const uint8_t*)B->data, (const uint8_t*)BS->data, ym,     \
+                                      (long)y_ld, (int)N, (int)K, mb, (uint32_t)RAD_U8)
+                if (d4) {
+                    if (mb == 1) { if (rr == 2) XE_W2R(1, 2, true); else XE_W2R(1, 4, true); }
+                    else { if (rr == 2) XE_W2R(kMaxM, 2, true); else XE_W2R(kMaxM, 4, true); }
+                } else {
+                    if (mb == 1) { if (rr == 2) XE_W2R(1, 2, false); else XE_W2R(1, 4, false); }
+                    else { if (rr == 2) XE_W2R(kMaxM, 2, false); else XE_W2R(kMaxM, 4, false); }
+                }
 #undef XE_W2R
                 continue;
             }
