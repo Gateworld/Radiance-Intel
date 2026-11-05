@@ -712,7 +712,74 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* A weight as the writer records it, and --reuse's test against the container's entry: the same encoding,
+     * quantiser, options and shape (and, for an expert, the same layer, index and slot) give the same planes,
+     * assuming the same checkpoint (the operator's responsibility; neither container records e.g. a Hessian's
+     * contents). Shared by the write and --plan-only, so the plan's count is the write's. */
+    auto weight_of = [&](const Logical& L) {
+        RadWriter::Weight ww;
+        ww.name = L.src.name;
+        const RecipeRule* rr = L.rule ? L.rule->rule : L.import_rule;
+        ww.quantizer = rr ? rr->quantizer : "";
+        ww.options = rr ? rr->options_text() : "";
+        ww.enc = L.enc;
+        ww.rank = L.src.rank;
+        for (uint32_t i = 0; i < RAD_MAX_RANK; ++i) ww.shape[i] = L.src.shape[i];
+        ww.layer = L.layer;
+        ww.expert = L.expert;
+        ww.slot = L.slot;
+        return ww;
+    };
+    /* null when the same; else what differs */
+    auto differs = [&](const RadFileEntry& re, const RadWriter::Weight& ww) -> const char* {
+        /* The movement group is the declaration's either way (add_weight and add_existing record ww's), so a
+         * plugin that regroups a weight still reuses its planes; only an expert's layer, index and slot say
+         * where its planes sit in a stride table. */
+        if (!rad_enc_equal(&reuse.encoding(re), &ww.enc)) return "encoding";
+        if (ww.quantizer != reuse.str(re.quantizer)) return "quantiser";
+        if (ww.options != reuse.str(re.options)) return "options";
+        if (re.rank != ww.rank) return "rank";
+        for (uint32_t i = 0; i < RAD_MAX_RANK; ++i)
+            if (re.shape[i] != ww.shape[i]) return "shape";
+        if ((ww.expert >= 0 || re.expert >= 0) && (re.layer != ww.layer || re.expert != ww.expert || re.slot != ww.slot))
+            return "expert place";
+        return nullptr;
+    };
+
     if (plan_only) {
+        /* With --reuse (run 189: a draft-head-only convert was found re-quantising every expert, its calib= path
+         * expanded differently from the container's): what the write would copy, before anything is written. */
+        if (reuse.is_open()) {
+            int64_t n_copy = 0, n_chg = 0, n_diff = 0, n_new = 0, b_copy = 0, b_conv = 0, told = 0;
+            for (const Logical* L : plan) {
+                const RadWriter::Weight ww = weight_of(*L);
+                int64_t b = 0;
+                for (int k = 0; k < L->enc.n_planes; ++k) b += rad_enc_plane_bytes(&L->enc.plane[k], L->src.rows, L->src.cols);
+                const RadFileEntry* re = reuse.find(ww.name);
+                const char* why = nullptr;
+                if (!re) ++n_new;
+                else if (!changed.empty() && ckpt_reads_any(L->src, changed, &changed_read)) ++n_chg;
+                else if ((why = differs(*re, ww)) != nullptr) {
+                    ++n_diff;
+                    if (told++ < 8)
+                        RAD_INFO("--reuse would NOT copy '%s': its %s differ%s (container '%s %s', this run '%s %s')",
+                                 ww.name.c_str(), why, std::strcmp(why, "options") ? "s" : "",
+                                 reuse.str(re->quantizer), reuse.str(re->options), ww.quantizer.c_str(),
+                                 ww.options.c_str());
+                } else { ++n_copy; b_copy += b; continue; }
+                b_conv += b;
+            }
+            RAD_INFO("--plan-only --reuse: %lld weight(s), %s, would be copied from %s; %lld converted: %lld read a "
+                     "--changed tensor, %lld differ from the container's, %lld are not in it (%s)", (long long)n_copy,
+                     humanb(b_copy).c_str(), reuse_path.c_str(), (long long)(n_chg + n_diff + n_new), (long long)n_chg,
+                     (long long)n_diff, (long long)n_new, humanb(b_conv).c_str());
+            if (!changed.empty()) {
+                int64_t unread = 0;
+                for (const std::string& n : changed)
+                    if (!changed_read.count(n)) { if (unread++ < 8) RAD_WARN("--changed '%s': no weight reads it", n.c_str()); }
+                RAD_INFO("--changed: %zu tensor(s), %lld read by no weight", changed.size(), (long long)unread);
+            }
+        }
         int64_t bytes = 0;
         for (const Logical* L : plan) {
             int64_t b = 0;
@@ -808,24 +875,12 @@ int main(int argc, char** argv) {
 
     for (Logical* Lp : plan) {
         Logical& L = *Lp;
-        RadWriter::Weight ww;
-        ww.name = L.src.name;
-        const RecipeRule* rr = L.rule ? L.rule->rule : L.import_rule;
-        ww.quantizer = rr ? rr->quantizer : "";
-        ww.options = rr ? rr->options_text() : "";
-        ww.enc = L.enc;
-        ww.rank = L.src.rank;
-        for (uint32_t i = 0; i < RAD_MAX_RANK; ++i) ww.shape[i] = L.src.shape[i];
-        ww.layer = L.layer;
-        ww.expert = L.expert;
-        ww.slot = L.slot;
+        RadWriter::Weight ww = weight_of(L);
         int64_t plane_total = 0;
         for (int k = 0; k < L.enc.n_planes; ++k)
             plane_total += rad_enc_plane_bytes(&L.enc.plane[k], L.src.rows, L.src.cols);
 
-        /* --- Reused: the same encoding, quantiser, options and shape in the --reuse container give
-         * the same planes, assuming the same checkpoint (the operator's responsibility; neither
-         * container records e.g. a Hessian's contents). */
+        /* --- Reused: see weight_of / differs. */
         const RadFileEntry* re = reuse.is_open() ? reuse.find(ww.name) : nullptr;
         const bool reads_changed =
             !changed.empty() && ckpt_reads_any(L.src, changed, &changed_read);
@@ -834,17 +889,7 @@ int main(int argc, char** argv) {
             ++n_changed;
         }
         if (re) {
-            /* The movement group is the declaration's either way (add_weight and add_existing
-             * record ww's), so a plugin that regroups a weight still reuses its planes; only an
-             * expert's layer, index and slot say where its planes sit in a stride table. */
-            const bool expert = ww.expert >= 0 || re->expert >= 0;
-            bool same = rad_enc_equal(&reuse.encoding(*re), &ww.enc) &&
-                        ww.quantizer == reuse.str(re->quantizer) &&
-                        ww.options == reuse.str(re->options) && re->rank == ww.rank &&
-                        (!expert || (re->layer == ww.layer && re->expert == ww.expert &&
-                                     re->slot == ww.slot));
-            for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
-                if (re->shape[i] != ww.shape[i]) same = false;
+            const bool same = differs(*re, ww) == nullptr;
             if (in_place) {
                 if (!same) {
                     RAD_ERR("--in-place: '%s' is in %s as %s by '%s %s', and this run would write "

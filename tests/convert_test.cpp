@@ -304,6 +304,14 @@ TEST(changed_reconverts_exactly_the_weights_that_read_a_changed_tensor) {
     int64_t neg = 0;
     for (size_t i = 0; i < va.size(); ++i) neg += va[i] == -vb[i];
     CHECK_EQ(neg, (int64_t)va.size());
+    /* --plan-only says the same before writing anything (run 189): 14 copied, the changed one converted. */
+    std::string plan;
+    REQUIRE_EQ(convert(ck, { "-o", d / "plan.rad", "--recipe", w.recipe, "--reuse", w.base,
+                             "--changed", d / "changed", "--plan-only" }, &plan), 0);
+    CHECK(has(plan, "--plan-only --reuse: 14 weight(s)"));
+    CHECK(has(plan, "1 converted: 1 read a --changed tensor, 0 differ from the container's, 0 are not in it"));
+    CHECK(has(plan, "--changed: 1 tensor(s), 0 read by no weight"));
+    CHECK(!exists(d / "plan.rad"));
 }
 
 /* --changed is a list for --reuse: without it, or naming a tensor no weight reads (a typo would
