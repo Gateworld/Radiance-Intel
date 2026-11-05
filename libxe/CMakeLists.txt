@@ -398,4 +398,14 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_lane_cpu COMMAND xe_lane_test)
   set_tests_properties(xe_lane_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Milestone 3, owner note 186 item 3b (the megakernel's stage 1): xe_persist.h's phase barrier -- the chain over
+  # resident work-groups and the bounded spin; the CPU SYCL device here, a card as is.
+  add_executable(xe_persist_test test/persist_test.cpp)
+  set_source_files_properties(test/persist_test.cpp PROPERTIES COMPILE_OPTIONS "${RAD_SYCL_FLAGS}")
+  target_include_directories(xe_persist_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_options(xe_persist_test PRIVATE ${RAD_SYCL_FLAGS})
+  set_target_properties(xe_persist_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_persist_cpu COMMAND xe_persist_test)
+  set_tests_properties(xe_persist_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 300)
 endif()
