@@ -319,6 +319,20 @@ if(RAD_BUILD_TESTS)
   add_executable(xe_gram_accum_test test/gram_accum_test.cpp)
   rad_l0_sycl(xe_gram_accum_test)
   target_include_directories(xe_gram_accum_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  # Run 190 (owner notes 188 / 189): the expert-layout probe -- format C's decode GEMM against the same arithmetic
+  # over a load-time repack of the same entries, the bf16 outputs compared byte for byte, then timed per launch on
+  # the card (LAUNCHES > 0). The ctest is the byte check on the CPU device (LAUNCHES 0).
+  add_executable(xe_fc_tile_probe test/fc_tile_probe.cpp)
+  rad_l0_sycl(xe_fc_tile_probe)
+  target_include_directories(xe_fc_tile_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/libr4d
+                             ${CMAKE_SOURCE_DIR}/abi ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_link_libraries(xe_fc_tile_probe PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  target_compile_options(xe_fc_tile_probe PRIVATE -ffp-contract=off)   # libxe's: no fused multiply-adds, same bits
+  set_target_properties(xe_fc_tile_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_fc_tile_probe libxe)
+  add_test(NAME xe_fc_tile_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
+  set_tests_properties(xe_fc_tile_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
   target_link_libraries(xe_gram_accum_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_gram_accum_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_gram_accum_test libxe)
