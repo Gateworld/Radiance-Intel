@@ -172,6 +172,11 @@ public:
         AdvanceArgs a = builder_.advance_args(rank);
         a.shared_kv = serial_shared_ ? 1 : 0;
         a.rot_shift = serial_rot_shift_;
+        static const int32_t hist_ctx = [] {
+            const char* v = std::getenv("RADIANCE_MTP_HIST_CTX");
+            return v && v[0] == '1' ? 1 : 0;
+        }();
+        a.hist_ctx = hist_ctx;   /* see AdvanceArgs::hist_ctx */
         return a;
     }
     void fini();

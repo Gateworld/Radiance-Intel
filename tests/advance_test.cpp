@@ -355,6 +355,39 @@ TEST(a_history_pass_keeps_the_hosts_rows_and_repeats_the_last_committed_one) {
     CHECK_EQ(s.used(0, 0), 105);
 }
 
+/* AdvanceArgs::hist_ctx (upstream 64c652f, RADIANCE_MTP_HIST_CTX): the same pass with its context ending at the last
+ * committed position -- base + aux + acc + 1 = 104, not the run's 105 -- so round 1 (the last row) reads no key past
+ * its own position. The rows' positions, tokens, outputs and slots are those of the pass without it. */
+TEST(a_history_pass_under_hist_ctx_ends_its_context_at_the_last_committed_position) {
+    Slab s(ADV_HIST);
+    s.a.hist_ctx = 1;
+    s.row(0, true, 0, 5, 0, 1, 0, 6, /*aux=*/2);
+    s.w[Slab::TOK + 0] = 41; s.w[Slab::TOK + 1] = 42;
+    s.w[Slab::OUT + 0] = 20;
+    s.st[1].head = 103; s.st[1].acc = 1;
+    s.src[6] = 7001; s.src[7] = 7002; s.src[8] = 7003;
+    s.run();
+    const int32_t pos[5] = { 100, 101, 102, 103, 103 }, tok[5] = { 41, 42, 7001, 7002, 7002 };
+    for (int j = 0; j < 5; ++j) {
+        CHECK_EQ(s.w[Slab::POS + j], pos[j]);
+        CHECK_EQ(s.w[Slab::TOK + j], tok[j]);
+        CHECK_EQ(s.w[Slab::OUT + j], 20 + (j < 3 ? j : 3));
+        CHECK_EQ(s.slot(0, j), pos[j]);
+    }
+    CHECK_EQ(s.w[Slab::CTX], 100);
+    CHECK_EQ(s.used(0, 0), 104);
+    /* every acceptance: the context ends one past the committed position, whatever the run's length */
+    for (int acc = 0; acc <= 2; ++acc) {
+        Slab t(ADV_HIST);
+        t.a.hist_ctx = 1;
+        t.row(0, true, 0, 4, 0, 1, 0, 6, /*aux=*/0);
+        t.st[1].head = 200 + acc; t.st[1].acc = acc;
+        t.run();
+        CHECK_EQ(t.used(0, 0), 200 + acc + 1);   /* base 200 (= head - acc), + acc + 1: the committed position + 1 */
+        CHECK_EQ(t.w[Slab::POS + 3], 200 + acc);
+    }
+}
+
 /* What the card writes into a draft pass, for both head shapes. A verify at positions 101..105
  * accepted two drafts: committed position 103, trunk token 7003; slot p is position p. A head
  * with its own cache gets the verified run, tail repeated, context to its end; a cacheless head

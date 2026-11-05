@@ -117,6 +117,11 @@ struct AdvanceArgs {
      * position of those rows, 0 or 1 past the committed position. Zero for every other head. */
     int32_t shared_kv = 0;
     int32_t rot_shift = 0;
+    /* RADIANCE_MTP_HIST_CTX=1 (Intel port, run 193; upstream 64c652f, owner note 190's list), ADV_HIST only: a head
+     * with its own cache gets a history pass whose context ends at the last committed position, not at the run's
+     * end, so draft round 1 (the run's last row) reads no key past its own position -- the n_spec - acc slots after
+     * it hold the last step's rejected rounds. 0: the run's whole length, as before. */
+    int32_t hist_ctx = 0;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */
