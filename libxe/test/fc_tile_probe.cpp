@@ -20,6 +20,8 @@
  * Everything else is today's kernel line for line: the same lanes own the same chunks, each chunk's int32 sum is the
  * same exact sum of the same products, and the per-lane accumulation and the xor tree are the same, so the bf16
  * output must be the same bytes. The probe checks that (and 4 KiB canaries on both outputs) before it times anything.
+ * T1b (run 191, down's form only): T1 with the codes also moved, so a 16-lane sub-group's load at one (unit, chunk,
+ * row parity) reads 256 contiguous bytes instead of 16 pieces in 8 rows (t1b_off); the arithmetic is T1's.
  *
  *   xe_fc_tile_probe LIBXE.so [LAUNCHES=48] [RUNS=5]   LAUNCHES 0: the byte check only (the CPU device's ctest)
  * RESULT lines: per launch us (host wall over LAUNCHES back-to-back launches, the median of RUNS), today's and T1's.
@@ -72,9 +74,18 @@ struct TCls {
     uint32_t n, k, w_ld, s_ld, s_off, tab_off, smul_off;
 };
 
-/* ---- T1: moe_i4i8_run_kernel<UPL, LPR, R, GL, FC = true> with the repacked reads (see the header). The tail skip is
- * left out: the probe's experts are all resident, as the skip's own off-device test would find. */
-template <int UPL, int LPR, int R, bool GL>
+/* T1b (down's form only: LPR 2, R 2, GL): the same codes in sub-group order. Per 16-row block of a class, a 16-lane
+ * sub-group's load at (unit u, chunk ch, row parity r) reads its 8 teams x 2 lanes' 16-byte pieces as 256 contiguous
+ * bytes (row-major put them in 8 rows, half a line each). Byte offset of row `row`'s chunk `jc` in an entry: */
+inline uint32_t t1b_off(uint32_t row, uint32_t jc, uint32_t cpr) {
+    const uint32_t r = row & 1u, tl = (row & 15u) >> 1, ch = jc & 1u, wv = jc >> 1, l = wv & 1u, u = wv >> 1;
+    return (row >> 4) * (16u * cpr * 16u) + ((((u * 2u + ch) * 2u + r) * 16u + tl * 2u + l) * 16u);
+}
+
+/* ---- T1: moe_i4i8_run_kernel<UPL, LPR, R, GL, FC = true> with the repacked reads (see the header); TB: T1b's code
+ * order. The tail skip is left out: the probe's experts are all resident, as the skip's own off-device test would
+ * find. */
+template <int UPL, int LPR, int R, bool GL, bool TB = false>
 void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, TCls c0, TCls c1,
                    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -159,9 +170,10 @@ void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, T
             for (int ch = 0; ch < CH; ++ch) {
                 const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) + (uint32_t)ch : (uint32_t)l + (uint32_t)u * LPR;
 #pragma unroll
-                for (int r = 0; r < R; ++r)
-                    w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
-                                                         : uint4{0, 0, 0, 0};
+                for (int r = 0; r < R; ++r) {
+                    const size_t o = TB ? (size_t)t1b_off(rowr[r], jc, CPR) : (size_t)rowr[r] * c.w_ld + jc * 16u;
+                    w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + o) : uint4{0, 0, 0, 0};
+                }
             }
 #pragma unroll
         for (int u = 0; u < UPL; ++u) {
@@ -240,16 +252,21 @@ void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, T
 /* the launcher's choice of instance, as moe_i4i8()'s run form makes it */
 void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0, const TCls& c1, const int32_t* sorted,
                const int32_t* off, uint16_t* Y, uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k,
-               uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, bool a_sorted, uint32_t parts, uint32_t M) {
+               uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, bool a_sorted, uint32_t parts, uint32_t M,
+               bool tb = false) {
     const bool gl = K <= 512;
     const int lpr = gl ? 2 : 16, rpt = gl ? 2 : 1;
     const int upl = gl ? (int)((K / 64 + lpr - 1) / lpr) : (int)((K / 32 + lpr - 1) / lpr);
     const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
     const dim3 grid((N + cpw - 1) / cpw, T), block(kWG);
-#define T1(U, L, R, G)                                                                                      \
-    XE_LAUNCH_SG(16, &q, (t1_run_kernel<U, L, R, G>), grid, block, 0, A, As, c0, c1, sorted, off, Y, T, N,  \
+#define T1F(U, L, R, G, B)                                                                                     \
+    XE_LAUNCH_SG(16, &q, (t1_run_kernel<U, L, R, G, B>), grid, block, 0, A, As, c0, c1, sorted, off, Y, T, N,  \
                  n_expert, top_k, a_ld, as_ld, y_ld, a_sorted ? 1u : 0u, parts, M)
-    if (gl) switch (upl) {
+#define T1(U, L, R, G) T1F(U, L, R, G, false)
+    if (gl && tb) switch (upl) {
+        case 2: T1F(2, 2, 2, true, true); break;
+        default: T1F(3, 2, 2, true, true); break;
+    } else if (gl) switch (upl) {
         case 1: T1(1, 2, 2, true); break;
         case 2: T1(2, 2, 2, true); break;
         case 3: T1(3, 2, 2, true); break;
@@ -261,6 +278,7 @@ void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0,
         default: T1(8, 16, 1, false); break;
     }
 #undef T1
+#undef T1F
 }
 
 /* ---- inputs, as moe_i4i8_test.cpp's format C cases build them */
@@ -373,11 +391,29 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
             std::memcpy(t1 + tsm[c], &smul, 4);
         }
     }
+    /* T1b (down's form only): T1's entries with the codes moved to sub-group order (t1b_off); the table and the scale
+     * factor where they were */
+    const bool gl = Kmax <= 512;
+    std::vector<uint8_t> tbw[2];
+    if (gl)
+        for (int c = 0; c < 2; ++c) {
+            const uint32_t cpr = (uint32_t)Kcl[c] / 32u;
+            if (cpr % 4u || Ncl[c] % 16) { std::printf("T1b: K %d / N %d do not tile\n", Kcl[c], Ncl[c]); return false; }
+            tbw[c] = tw[c];
+            const size_t rb = (size_t)Kcl[c] / 2;
+            for (int e = 0; e < ne[c]; ++e) {
+                const uint8_t* src = &tw[c][(size_t)e * tent[c]];
+                uint8_t* dst = &tbw[c][(size_t)e * tent[c]];
+                for (int row = 0; row < Ncl[c]; ++row)
+                    for (uint32_t jc = 0; jc < cpr; ++jc)
+                        std::memcpy(dst + t1b_off((uint32_t)row, jc, cpr), src + (size_t)row * rb + jc * 16u, 16);
+            }
+        }
     /* device buffers */
     const size_t ybytes = (size_t)T * Nmax * 2;
     int8_t* da = sycl::malloc_device<int8_t>(a.size(), q);
     float* das = sycl::malloc_device<float>(as.size(), q);
-    uint8_t *dw[2], *dws[2], *dtw[2];
+    uint8_t *dw[2], *dws[2], *dtw[2], *dtbw[2] = { nullptr, nullptr };
     for (int c = 0; c < 2; ++c) {
         dw[c] = sycl::malloc_device<uint8_t>(w[c].size() + 64, q);
         dws[c] = sycl::malloc_device<uint8_t>(wsb[c].size() + 64, q);
@@ -385,11 +421,17 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
         q.memcpy(dw[c], w[c].data(), w[c].size());
         q.memcpy(dws[c], wsb[c].data(), wsb[c].size());
         q.memcpy(dtw[c], tw[c].data(), tw[c].size());
+        if (gl) {
+            dtbw[c] = sycl::malloc_device<uint8_t>(tbw[c].size() + 64, q);
+            q.memcpy(dtbw[c], tbw[c].data(), tbw[c].size());
+        }
     }
     int32_t* dso = sycl::malloc_device<int32_t>((size_t)T, q);
     int32_t* doff = sycl::malloc_device<int32_t>(off.size(), q);
     uint8_t* dy0 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
     uint8_t* dy1 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
+    uint8_t* dy2 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
+    q.memset(dy2, kPat, ybytes + 2 * kCanary);
     q.memcpy(da, a.data(), a.size());
     q.memcpy(das, as.data(), as.size() * 4);
     q.memcpy(dso, sorted.data(), sorted.size() * 4);
@@ -427,34 +469,53 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     for (int c = 0; c < 2; ++c)
         tc[c] = TCls{ dtw[c], tent[c], dws[c], sent[c], (uint32_t)Ncl[c], (uint32_t)Kcl[c], (uint32_t)(Kcl[c] / 2),
                       (uint32_t)(Kcl[c] / 64), (uint32_t)p0, (uint32_t)ttab[c], (uint32_t)tsm[c] };
+    TCls tcb[2] = { tc[0], tc[1] };
+    for (int c = 0; c < 2; ++c) tcb[c].base = dtbw[c];
     auto today = [&]() { return fn(&args, (RadStream)&q); };
-    auto t1 = [&]() {
-        t1_launch(q, da, das, tc[0], tc[1], dso, doff, (uint16_t*)(dy1 + kCanary), (uint32_t)T, (uint32_t)Nmax,
+    auto t1f = [&](const TCls* cls, uint8_t* dy, bool tb) {
+        t1_launch(q, da, das, cls[0], cls[1], dso, doff, (uint16_t*)(dy + kCanary), (uint32_t)T, (uint32_t)Nmax,
                   (uint32_t)Kmax, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)Kmax, (uint32_t)(Kmax / 128),
-                  (uint32_t)Nmax, sh.sorted_a, (uint32_t)sh.parts, (uint32_t)AR);
+                  (uint32_t)Nmax, sh.sorted_a, (uint32_t)sh.parts, (uint32_t)AR, tb);
         return 0;
     };
+    auto t1 = [&]() { return t1f(tc, dy1, false); };
+    auto t1b = [&]() { return t1f(tcb, dy2, true); };
     const int rc = today();
     t1();
+    if (gl) t1b();
     q.wait_and_throw();
-    std::vector<uint8_t> h0(ybytes + 2 * kCanary), h1(ybytes + 2 * kCanary);
+    std::vector<uint8_t> h0(ybytes + 2 * kCanary), h1(ybytes + 2 * kCanary), h2(ybytes + 2 * kCanary);
     q.memcpy(h0.data(), dy0, h0.size());
-    q.memcpy(h1.data(), dy1, h1.size()).wait();
-    bool canary = true;
-    for (size_t i = 0; i < kCanary; ++i)
-        canary &= h0[i] == kPat && h0[kCanary + ybytes + i] == kPat && h1[i] == kPat && h1[kCanary + ybytes + i] == kPat;
-    size_t diff = 0, first = (size_t)-1, nonzero = 0;
-    for (size_t i = 0; i < ybytes; i += 2) {
-        const bool d = h0[kCanary + i] != h1[kCanary + i] || h0[kCanary + i + 1] != h1[kCanary + i + 1];
-        if (d && first == (size_t)-1) first = i / 2;
-        diff += d;
-        nonzero += h0[kCanary + i] != 0 || h0[kCanary + i + 1] != 0;
-    }
-    const bool ok = rc == RAD_OK && canary && diff == 0 && nonzero > 0;
-    std::printf("%s %s tokens %d: T %d over %d experts, N %d/%d K %d/%d -- today rc %d; %zu of %zu outputs differ%s; "
-                "%zu nonzero; canaries %s\n", ok ? "PASS" : "FAIL", sh.name, tokens, T, pool_n, sh.N, sh.N1, sh.K, sh.K1,
-                rc, diff, ybytes / 2, diff ? "" : " (bit-identical)", nonzero, canary ? "intact" : "BROKEN");
-    if (diff) std::printf("  first difference at output %zu (row %zu, column %zu)\n", first, first / Nmax, first % Nmax);
+    q.memcpy(h1.data(), dy1, h1.size());
+    q.memcpy(h2.data(), dy2, h2.size()).wait();
+    /* one form's output against today's: differing outputs, the first of them, broken canaries */
+    auto cmp = [&](const std::vector<uint8_t>& hx, size_t* first) {
+        size_t diff = 0;
+        *first = (size_t)-1;
+        for (size_t i = 0; i < ybytes; i += 2) {
+            const bool d = h0[kCanary + i] != hx[kCanary + i] || h0[kCanary + i + 1] != hx[kCanary + i + 1];
+            if (d && *first == (size_t)-1) *first = i / 2;
+            diff += d;
+        }
+        return diff;
+    };
+    auto canary_ok = [&](const std::vector<uint8_t>& hx) {
+        bool ok = true;
+        for (size_t i = 0; i < kCanary; ++i) ok &= hx[i] == kPat && hx[kCanary + ybytes + i] == kPat;
+        return ok;
+    };
+    size_t nonzero = 0;
+    for (size_t i = 0; i < ybytes; i += 2) nonzero += h0[kCanary + i] != 0 || h0[kCanary + i + 1] != 0;
+    size_t f1 = 0, f2 = 0;
+    const size_t diff = cmp(h1, &f1), diff2 = gl ? cmp(h2, &f2) : 0;
+    const bool canary = canary_ok(h0) && canary_ok(h1) && (!gl || canary_ok(h2));
+    const bool ok = rc == RAD_OK && canary && diff == 0 && diff2 == 0 && nonzero > 0;
+    std::printf("%s %s tokens %d: T %d over %d experts, N %d/%d K %d/%d -- today rc %d; T1: %zu of %zu outputs differ%s"
+                "%s; %zu nonzero; canaries %s\n", ok ? "PASS" : "FAIL", sh.name, tokens, T, pool_n, sh.N, sh.N1, sh.K,
+                sh.K1, rc, diff, ybytes / 2, diff ? "" : " (bit-identical)",
+                gl ? (diff2 ? "; T1b DIFFERS" : "; T1b bit-identical") : "", nonzero, canary ? "intact" : "BROKEN");
+    if (diff) std::printf("  T1's first difference at output %zu (row %zu, column %zu)\n", f1, f1 / Nmax, f1 % Nmax);
+    if (diff2) std::printf("  T1b: %zu differ, the first at output %zu (row %zu, column %zu)\n", diff2, f2, f2 / Nmax, f2 % Nmax);
     if (ok && launches > 0) {
         auto time = [&](auto&& f) {
             for (int z = 0; z < 3; ++z) f();
@@ -469,12 +530,19 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
             }
             return median(per);
         };
-        const double u0 = time(today), u1 = time(t1), u0b = time(today);
-        std::printf("RESULT %s tokens %d: today %.1f us (re-timed %.1f), T1 %.1f us a launch -> %.0f %% of today\n",
-                    sh.name, tokens, u0, u0b, u1, 100.0 * u1 / std::min(u0, u0b));
+        const double u0 = time(today), u1 = time(t1), u2 = gl ? time(t1b) : 0.0, u0b = time(today);
+        const double base = std::min(u0, u0b);
+        std::printf("RESULT %s tokens %d: today %.1f us (re-timed %.1f), T1 %.1f us a launch -> %.0f %% of today", sh.name,
+                    tokens, u0, u0b, u1, 100.0 * u1 / base);
+        if (gl) std::printf("; T1b %.1f us -> %.0f %%", u2, 100.0 * u2 / base);
+        std::printf("\n");
     }
-    for (int c = 0; c < 2; ++c) { sycl::free(dw[c], q); sycl::free(dws[c], q); sycl::free(dtw[c], q); }
+    for (int c = 0; c < 2; ++c) {
+        sycl::free(dw[c], q); sycl::free(dws[c], q); sycl::free(dtw[c], q);
+        if (dtbw[c]) sycl::free(dtbw[c], q);
+    }
     sycl::free(da, q); sycl::free(das, q); sycl::free(dso, q); sycl::free(doff, q); sycl::free(dy0, q); sycl::free(dy1, q);
+    sycl::free(dy2, q);
     return ok;
 }
 
