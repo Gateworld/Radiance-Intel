@@ -77,6 +77,79 @@ inline bool persist_barrier_here(uint32_t* sync, uint32_t ngroups, uint32_t phas
     return persist_barrier(sycl::ext::oneapi::this_work_item::get_nd_item<3>(), sync, ngroups, phase, spin_max);
 }
 
+/* ---- stage 1b (owner note 187): work by ticket and per-item ready flags, no device-wide barrier.
+ * A group takes its next unit of work from a counter (persist_ticket), in a fixed order in which every unit's inputs
+ * come from units of lower tickets. A unit waits only on the flags of the units it reads (persist_wait_flag). Each
+ * flag's units were all ticketed before it -- by groups that are running, and that finish them without waiting on
+ * anything later -- so a wait always ends, whether or not every group of the launch is resident at once: no
+ * co-residency is needed for progress, only for speed, and the launch can be sized by occupancy. The spins stay
+ * bounded (the error word, as above). */
+using persist_aref = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>;
+
+/* The group's next ticket from `counter` (the same value in every thread of the group). */
+inline uint32_t persist_ticket(uint32_t* counter) {
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const auto g = it.get_group();
+    uint32_t t = 0;
+    if (it.get_local_linear_id() == 0) t = persist_aref(*counter).fetch_add(1u);
+    return sycl::group_broadcast(g, t, 0);
+}
+
+/* No earlier spin-out on these words: thread 0's read, the same answer in every thread of the group (a per-thread read
+ * could split a group around the ticket loop's collectives when another group sets the error meanwhile -- the CPU row
+ * test hung so, run 189). */
+inline bool persist_clean(uint32_t* sync) {
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    uint32_t e = 0;
+    if (it.get_local_linear_id() == 0) e = persist_aref(sync[1]).load(sycl::memory_order::relaxed);
+    return sycl::group_broadcast(it.get_group(), e, 0) == 0u;
+}
+
+/* The group's unit is written: every thread's stores, then one count on `flag` (release, device scope). */
+inline void persist_signal(uint32_t* flag) {
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    sycl::group_barrier(it.get_group(), sycl::memory_scope::device);
+    if (it.get_local_linear_id() == 0) persist_aref(*flag).fetch_add(1u, sycl::memory_order::release);
+}
+
+/* Until `flag` reaches `target` (thread 0 spins, acquire; the group then reads what the flag's units wrote). False when
+ * the spin ran out or the error word was already set: [1] = 1, [2] = `what` + 2; the kernel should return. */
+inline bool persist_wait_flag(uint32_t* flag, uint32_t target, uint32_t* sync, uint32_t what, uint64_t spin_max) {
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const auto g = it.get_group();
+    uint32_t bad = 0;
+    if (it.get_local_linear_id() == 0) {
+        persist_aref f(*flag), err(sync[1]);
+        uint64_t spins = 0;
+        while (f.load(sycl::memory_order::acquire) < target) {
+            if (err.load(sycl::memory_order::relaxed) != 0u || ++spins > spin_max) {
+                uint32_t zero = 0u;
+                if (err.compare_exchange_strong(zero, 1u)) persist_aref(sync[2]).store(what + 2u);
+                bad = 1u;
+                break;
+            }
+        }
+    }
+    bad = sycl::group_broadcast(g, bad, 0);
+    sycl::group_barrier(g, sycl::memory_scope::device);
+    return bad == 0u;
+}
+
+/* At the end of a ticketed launch: as persist_exit_here, and the last group out also zeroes the ticket counter [0]
+ * and `nflags` flags from sync[kPersistWords], for the next launch. Every group passes here, including one that
+ * stopped on an error (the error word itself stays set for the host). */
+inline void persist_exit_flags(uint32_t* sync, uint32_t ngroups, uint32_t nflags) {
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    if (it.get_local_linear_id() != 0) return;
+    persist_aref out(sync[3]);
+    if (out.fetch_add(1u) == ngroups - 1u) {
+        for (uint32_t i = 0; i < nflags; ++i) persist_aref(sync[kPersistWords + i]).store(0u);
+        persist_aref(sync[0]).store(0u);
+        out.store(0u);
+    }
+}
+
 /* At the kernel's end, after its last barrier: each group's thread 0 counts out in [3], and the last one zeroes the
  * arrival counter and [3] -- every other group has passed its last barrier by then (it counted out after it), so no
  * one reads the counter any more, and the next launch on the stream (a recorded pass's replay too) starts from 0

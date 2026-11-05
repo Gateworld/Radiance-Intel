@@ -417,7 +417,10 @@ if(RAD_BUILD_TESTS)
   set_target_properties(xe_hc_persist_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_hc_persist_test libxe)
   add_test(NAME xe_hc_persist_cpu COMMAND sh -c
-    "RADIANCE_XE_HC_PERSIST=0 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_off.bin && RADIANCE_XE_HC_PERSIST=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_on.bin && cmp hc_persist_off.bin hc_persist_on.bin && echo 'hc_persist: bit-identical'")
+    "RADIANCE_XE_HC_PERSIST=0 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_off.bin && RADIANCE_XE_HC_PERSIST=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_on.bin && cmp hc_persist_off.bin hc_persist_on.bin && echo 'hc_persist: bit-identical' && RADIANCE_XE_HC_PERSIST=2 RADIANCE_XE_HC_PERSIST_GPC=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_tk.bin && cmp hc_persist_off.bin hc_persist_tk.bin && echo 'hc_persist (stage 1b, ticketed): bit-identical'")
+  # run 189 (owner note 187): =2 is stage 1b (work by ticket, per-row flags); three runs of the row test. GPC=1: one
+  # group a compute unit, as =1's (the build container's 4 CPUs time-slice 32 groups, and a descheduled holder of a
+  # unit lets a waiter's bounded spin run out -- correct, then a fail-fast run, but not the bytes this compares)
   set_tests_properties(xe_hc_persist_cpu PROPERTIES LABELS "xe"
-    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8" TIMEOUT 600)
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8" TIMEOUT 1200)
 endif()

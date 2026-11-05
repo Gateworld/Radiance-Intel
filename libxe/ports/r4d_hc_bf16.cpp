@@ -1843,17 +1843,86 @@ void hc_v2_down_persist_kernel(const unsigned short* __restrict__ h, const float
     xe::persist_exit_here(sync, (uint32_t)G);
 }
 
+/* ============================================================== stage 1b (owner note 187), RADIANCE_XE_HC_PERSIST=2
+ * The same three bodies on the same values in the same order as stage 1a (so bit-identical by construction), with two
+ * changes from what M268 measured (-17 / -21 %: one group a core, a device-wide barrier between the phases):
+ *   - work by ticket (xe_persist.h): units in the order norms (c, r) -> column units (four of hc_v2_down_rows' blocks,
+ *     one a 64-thread slice) -> gains (c, r); every unit's inputs are lower tickets', so no co-residency is needed;
+ *   - per-row ready flags in place of the barrier: a norm unit counts on its row's flag, a column unit waits for its
+ *     rows' flags to reach hc, a gains unit for its own row's;
+ *   - occupancy-sized: several groups a core (persist_groups x RADIANCE_XE_HC_PERSIST_GPC, default the most the LDS
+ *     allows up to 8), at most one a unit.
+ * The flags sit after the launch's words; the last group out zeroes them and the ticket counter. */
+constexpr long kHcPersistMaxRows = 256;   /* flags a launch; more rows take the three launches */
+bool xe_hc_persist2_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_PERSIST"); return v && v[0] == '2'; }();
+    return on;
+}
+unsigned xe_hc_persist_gpc(unsigned lds_bytes, unsigned lds_cap) {
+    static const int env = [] { const char* v = std::getenv("RADIANCE_XE_HC_PERSIST_GPC"); return v ? std::atoi(v) : 0; }();
+    unsigned k = env > 0 ? (unsigned)env : 8u;
+    if (lds_bytes > 0 && lds_cap > 0) k = std::min(k, std::max(1u, lds_cap / lds_bytes));
+    return std::max(1u, k);
+}
+
+template <bool kWI8>
+__global__ __launch_bounds__(kThreads)
+void hc_v2_down_ticket_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                              unsigned short* __restrict__ nbuf, float* __restrict__ scaleout, long rows, long n,
+                              int hc, long hrow, float eps, float wadd, const void* __restrict__ downv, long dld,
+                              unsigned short* __restrict__ dout, long HN, long lr,
+                              const unsigned short* __restrict__ injw, unsigned short* __restrict__ inj, long irow,
+                              uint32_t* __restrict__ sync) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);
+    XE_DYN_LDS(unsigned short, s_nw);
+    const int tid = (int)threadIdx.x;
+    const uint32_t G = (uint32_t)gridDim.x;
+    uint32_t* const flag = sync + xe::kPersistWords;
+    constexpr int kSlice = kWave * kV2RowCols, kSlices = kThreads / kSlice;
+    const long nnorm = (long)hc * rows;
+    const long bxn = (lr + kV2RowCols - 1) / kV2RowCols, ncb = bxn * ((rows + 3) / 4);
+    const long ncol = (ncb + kSlices - 1) / kSlices;
+    const long ngain = (injw && inj) ? nnorm : 0;
+    const long total = nnorm + ncol + ngain;
+    const bool clean = xe::persist_clean(sync);   /* an earlier spin-out: fail fast (one answer a group) */
+    for (long t = clean ? (long)xe::persist_ticket(sync) : total; t < total; t = (long)xe::persist_ticket(sync)) {
+        if (t < nnorm) {                                    /* a norm: stream c of row r */
+            hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc,
+                                   (int)(t % hc), t / hc, tid);
+            xe::persist_signal(&flag[t / hc]);              /* (barrier inside: s_part / s_sc free for the next unit) */
+        } else if (t < nnorm + ncol) {                      /* four column blocks, one a slice */
+            const long u = t - nnorm, b0 = u * kSlices, b1 = std::min(ncb - 1, b0 + kSlices - 1);
+            const long ra = (b0 / bxn) * 4, rb = std::min(rows, (b1 / bxn) * 4 + 4);
+            bool ok = true;
+            for (long r = ra; r < rb && ok; ++r) ok = xe::persist_wait_flag(&flag[r], (uint32_t)hc, sync, 1u, kHcPersistSpin);
+            if (!ok) break;
+            const long vb = b0 + tid / kSlice;
+            if (vb <= b1)
+                hc_v2_down_rows_body<4, kWI8>(nbuf, downv, dld, dout, rows, hc, HN, lr, vb % bxn, vb / bxn, tid % kSlice);
+        } else {                                            /* the gains of stream c, row r */
+            const long v = t - nnorm - ncol, r = v / hc;
+            if (!xe::persist_wait_flag(&flag[r], (uint32_t)hc, sync, 2u, kHcPersistSpin)) break;
+            hc_v2_gain_body(nbuf + r * HN, injw, inj, hc, HN, irow, (int)(v % hc), r, tid, s_stage[0], s_nw);
+            __syncthreads();   /* wave 0 has read s_nw before the next unit refills it */
+        }
+    }
+    xe::persist_exit_flags(sync, G, (uint32_t)rows);
+}
+
 /* The launch's synchronisation words, one set a stream (two streams on a card must not share a counter), zeroed once
- * when made; the kernel leaves them zeroed for the next launch. */
+ * when made; the kernel leaves them zeroed for the next launch. Stage 1b's row flags follow the words. */
 uint32_t* hc_persist_sync(hipStream_t s) {
     static std::mutex m;
     static std::vector<std::pair<const void*, uint32_t*>> v;
     std::lock_guard<std::mutex> lk(m);
     for (auto& e : v) if (e.first == (const void*)s) return e.second;
     sycl::queue& q = *s;
-    uint32_t* p = sycl::malloc_device<uint32_t>(xe::kPersistWords, q);
+    constexpr size_t kWords = xe::kPersistWords + kHcPersistMaxRows;
+    uint32_t* p = sycl::malloc_device<uint32_t>(kWords, q);
     if (!p) return nullptr;
-    sycl::queue(q.get_context(), q.get_device()).memset(p, 0, xe::kPersistWords * sizeof(uint32_t)).wait();
+    sycl::queue(q.get_context(), q.get_device()).memset(p, 0, kWords * sizeof(uint32_t)).wait();
     v.emplace_back((const void*)s, p);
     return p;
 }
@@ -1864,7 +1933,8 @@ uint32_t* hc_persist_sync(hipStream_t s) {
  * fences (P32: 28.7 + 3.6 us against 33.7), 5 as 4 with the E4M3 codes decoded by e4m3x4_s8 in hc_v2_down and
  * hc_up_mix, and each inject gain in a workgroup of its own over LDS; 6 as 5 with the down product's columns and gains in
  * launches of their own, to time the two; 8 (run 103, owner note 119) as 6 with a verify's columns four rows a wave
- * (hc_v2_down_rows_kernel). (7, run 102's four-rows form on the per-row grid, was slower and removed.) */
+ * (hc_v2_down_rows_kernel). (7, run 102's four-rows form on the per-row grid, was slower and removed; 9, the same
+ * at one row too, run 112's M174: 13.4 + 9.8 us against level 5's 24.1, not clearly under -- removed.) */
 int xe_hc_v2_level() {
     static const int lv = [] {
         const char* v = std::getenv("RADIANCE_XE_HC_V2");
@@ -4813,7 +4883,34 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         /* RADIANCE_XE_HC_PERSIST=1 (the megakernel's stage 1a): the norm, level 8's columns and the gains as one
          * persistent launch (hc_v2_down_persist_kernel); the q8 form and every other shape keep their launches */
         bool persisted = false;
-        if (!q8 && s8d && xe_hc_v2_level() == 8 && rows > 1 && xe_hc_persist_on()) {
+        if (!q8 && s8d && xe_hc_v2_level() == 8 && rows > 1 && rows <= kHcPersistMaxRows && xe_hc_persist2_on()) {
+            /* stage 1b (owner note 187): by ticket, per-row flags, sized by occupancy */
+            if (uint32_t* sy = hc_persist_sync((hipStream_t)s)) {
+                sycl::queue& q = *(hipStream_t)s;
+                const unsigned plds = (injw && inj) ? glds : 0u;
+                const unsigned cap = (unsigned)q.get_device().get_info<sycl::info::device::local_mem_size>();
+                const long units = (long)hc * rows * ((injw && inj) ? 2 : 1) +
+                                   ((lr + kV2RowCols - 1) / kV2RowCols * ((rows + 3) / 4) + kThreads / (kWave * kV2RowCols) - 1) /
+                                       (kThreads / (kWave * kV2RowCols));
+                const unsigned G = (unsigned)std::max(1L, std::min(units,
+                                       (long)xe::persist_groups(q) * (long)xe_hc_persist_gpc(plds, cap)));
+#define HC_TICKET(W_)                                                                                             \
+                R4D_EMIT(s, hc_v2_down_ticket_kernel<W_>, dim3(G), dim3(kThreads), plds,                         \
+                         (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows, (long)n, \
+                         (int)hc, (long)hrow, eps, wadd, (const void*)down->data, (long)dld, dbuf, (long)HN,     \
+                         (long)lr, injw ? (const unsigned short*)injw->data : nullptr,                           \
+                         inj ? (unsigned short*)inj->data : nullptr, (long)irow, sy)
+                emit_rc = wf == 3 ? HC_TICKET(true) : HC_TICKET(false);
+#undef HC_TICKET
+                persisted = true;
+                static std::once_flag said;
+                std::call_once(said, [G, units] {
+                    std::fprintf(stderr, "[xe] hc_read's down half as one ticketed launch (RADIANCE_XE_HC_PERSIST=2, "
+                                         "%u work-groups for %ld units)\n", G, units);
+                });
+            }
+        }
+        if (!persisted && !q8 && s8d && xe_hc_v2_level() == 8 && rows > 1 && xe_hc_persist_on()) {
             if (uint32_t* sy = hc_persist_sync((hipStream_t)s)) {
                 const unsigned G = xe::persist_groups(*(hipStream_t)s);
                 const unsigned plds = (injw && inj) ? glds : 0u;
