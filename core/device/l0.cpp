@@ -1481,6 +1481,7 @@ void n_rerecord(Tape& t, const std::vector<L0Event*>& evs) {
     }
 }
 /* The recorder's kernel object for a library's sycl::kernel: its own, from the kernel's module. */
+bool glue_all_mode();   /* RADIANCE_L0_GLUE_ALL, below */
 NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
     const ze_kernel_handle_t rk = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(k);
     std::lock_guard<std::mutex> lk(Z.m);
@@ -1509,6 +1510,13 @@ NKernel& nkernel(ZeDev& Z, const sycl::kernel& k) {
     }
     ze_kernel_properties_t p{ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES, nullptr};
     if (zeKernelGetProperties(nk.k, &p) == ZE_RESULT_SUCCESS) nk.nargs = p.numKernelArgs;
+    /* RADIANCE_L0_GLUE_ALL (run 188): the adapter gives every kernel it creates indirect access to device, host and
+     * shared allocations (a kernel may reach USM through pointers inside its by-value argument); a kernel object of our
+     * own had none, and a glued PREFILL kernel reading the pinned host pool in place faulted on its host addresses
+     * (GA3: CAT, Faulted Address 0x7723...). The same flags here, under GLUE_ALL only (the default tapes unchanged). */
+    if (nk.own && glue_all_mode())
+        (void)zeKernelSetIndirectAccess(nk.k, ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE | ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST |
+                                                  ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED);
     return Z.kernels[rk] = nk;
 }
 /* The native recording's own refusal: what the open list holds runs, then the rest of the pass is
@@ -1544,26 +1552,33 @@ bool glue_on(const L0Stream& s) {
 }
 /* `fn(list, signal, n_waits, waits)` appends the commands; the slot it signals becomes the device's previous append
  * and the stream's pending one. */
-template <class F> int glue_append(L0Stream& s, const char* what, F&& fn) {
+/* `bridge` / `bridge_keep` (RADIANCE_L0_GLUE_ALL): a device-side wait on the stream's runtime work before the append,
+ * its sycl::event kept in the slot until the slot's reuse -- as a play waits on the queues it follows (T6: never a host
+ * wait inside a pass, the ranks' all-reduces would deadlock; GA2 did). */
+template <class F> int glue_append(L0Stream& s, const char* what, F&& fn, ze_event_handle_t bridge = nullptr,
+                                   const sycl::event* bridge_keep = nullptr) {
     ZeDev& Z = zedev(s.dev);
     std::lock_guard<std::mutex> lk(Z.m);
-    ze_event_handle_t wait = nullptr;
+    ze_event_handle_t waits[2];
+    uint32_t nw = 0;
     if (Z.prev_slot >= 0) {
         const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
         if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS)
-            wait = pr.ev;
+            waits[nw++] = pr.ev;
     }
+    if (bridge) waits[nw++] = bridge;
     const int dep_slot = Z.prev_slot;
     const uint64_t dep_serial = Z.prev_serial;
     ZeDev::Ring& r = ring_take(Z);
-    const ze_result_t rc = fn(Z.imm, r.ev, wait ? 1u : 0u, wait ? &wait : nullptr);
+    const ze_result_t rc = fn(Z.imm, r.ev, nw, nw ? waits : nullptr);
     if (rc != ZE_RESULT_SUCCESS) {
         device_set_error("%s: the glued append failed (0x%x)", what, (unsigned)rc);
         return RAD_E_DEVICE;
     }
     r.used = true;
     r.keep.clear();
-    r.kind = 2; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = wait ? 1u : 0u;
+    if (bridge && bridge_keep) r.keep.push_back(*bridge_keep);
+    r.kind = 2; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = nw;
     r.dep_dev = s.dev; r.dep_slot = dep_slot; r.dep_serial = dep_serial;
     const int slot = (int)(&r - Z.ring.get());
     Z.prev_slot = slot;
@@ -1585,15 +1600,71 @@ void glue_disarm_check() {
                  "object): it was not ordered behind the native play (RADIANCE_L0_GLUE)");
 }
 
+/* RADIANCE_L0_GLUE_ALL=1 (run 187, owner note 182; opt-in until measured): a library kernel launch outside a recording
+ * is glued even when its stream's last work went through the runtime's queue -- that work is drained first (the
+ * bridge), and the launch is appended to the device's immediate list as after a play. Every launch through the
+ * runtime makes the Level Zero adapter create an event whose pool is never freed (MD16: 17,310 pools created, 0
+ * destroyed, ~330 B kept a launch); recorded passes launch natively and keep nothing. Only kernel launches are
+ * bridged; a stream's copies and events follow the glue's existing rule (glued while its last work is native). */
+bool glue_all_mode() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_GLUE_ALL"); return v && v[0] == '1'; }();
+    return on;
+}
+std::atomic<int64_t> g_bridged{0};
+thread_local const void* t_glue_all_armed = nullptr;
+/* The bridge's device-side wait for the armed launch: the stream queue's last event (kept alive in the ring slot) and its
+ * native handle; null when the stream's last work is native already or the queue is idle. */
+thread_local std::optional<sycl::event> t_bridge_ev;
+thread_local ze_event_handle_t t_bridge_ze = nullptr;
+/* The stream may take a glued launch now: no gate closed, the device's immediate list, and the stream's runtime work
+ * ordered before it ON THE DEVICE (never a host wait inside a pass: GA2 hung and faulted on one). */
+bool glue_bridge(L0Stream& s) {
+    if (!glue_mode() || !glue_all_mode() || recording()) return false;
+    if (devs()[s.dev].cpu || s.gates.load() > 0 || s.gated.load()) return false;
+    /* the device's native state is made on first use (a run with no tape -- the KL mode -- never made it: GA1) */
+    if (!ze_ready(s.dev)) return false;
+    const ZeDev& Z = zedev(s.dev);
+    if (!Z.ok || !Z.imm) return false;
+    t_bridge_ev.reset();
+    t_bridge_ze = nullptr;
+    if (s.npend_slot >= 0 && s.npend_dev == s.dev) return true;   /* already behind native work: the glue's own case */
+    try {
+        /* a barrier on the queue, not its "last event": with launches submitted without events (ccd2051) the last
+         * event can be an older command's, and a glued kernel then ran ahead of the runtime work after it -- GA5 against
+         * GB2: six whole documents differed from position 0 (a sequence's state reset, read before it landed). The
+         * barrier's event follows every command before it on this in-order queue, by definition. */
+        sycl::event e = s.q.ext_oneapi_submit_barrier();
+        if (e.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+            t_bridge_ze = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(e);
+            t_bridge_ev = e;
+            /* the adapter may hold the work in a batch not yet on the device: submit it now (no wait), or the native wait
+             * on its event would never be satisfied (GA3 stalled on a glued slot) */
+            s.q.ext_oneapi_prod();
+        }
+    } catch (const sycl::exception&) { t_bridge_ev.reset(); t_bridge_ze = nullptr; return false; }
+    const int64_t n = g_bridged.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n % 100000 == 0)
+        RAD_INFO("l0 glue-all (RADIANCE_L0_GLUE_ALL): %lld bridges from the runtime's queue to the immediate list, "
+                 "%lld glued appends", (long long)n, (long long)g_glued.load());
+    return true;
+}
+
 /* ---- the hooks (rad_l0_rec.h) */
 int n_hook_device(const void* queue) {
     /* xe::launch_as asks twice for one launch (itself, then launch_native): the same queue asked again keeps the answer */
     if (t_glue_armed != queue) glue_disarm_check();
+    if (t_glue_all_armed && t_glue_all_armed != queue) t_glue_all_armed = nullptr;
     if (!native_recording() || !queue) {
         /* a library launch reaches the queue without a backend call: a held tape play goes first
          * (N3: a play held past the next libxe launch ran after it) */
         if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
         if (queue && glue_on(S((RadStream)queue))) { t_glue_armed = queue; return S((RadStream)queue).dev; }
+        if (queue && t_glue_all_armed == queue) { t_glue_armed = queue; return S((RadStream)queue).dev; }
+        if (queue && glue_bridge(S((RadStream)queue))) {
+            t_glue_all_armed = queue;
+            t_glue_armed = queue;
+            return S((RadStream)queue).dev;
+        }
         if (queue) settle(S((RadStream)queue));
         return -1;
     }
@@ -1605,7 +1676,9 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
                   const void* arg0, size_t arg0_size, size_t lds) {
     if (queue && t_glue_armed == queue) {
         t_glue_armed = nullptr;
-        if (kernel && kernel->kernel && n_glue_launch(queue, kernel, grid, block, arg0, arg0_size, lds) == 0) return 0;
+        const int glued = kernel && kernel->kernel ? n_glue_launch(queue, kernel, grid, block, arg0, arg0_size, lds) : -1;
+        t_glue_all_armed = nullptr;
+        if (glued == 0) return 0;
         settle(S((RadStream)queue));   /* not glued: the plain launch that follows must come after the play */
         return -1;
     }
@@ -1674,7 +1747,7 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
 int n_glue_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_t grid[3], const uint32_t block[3],
                   const void* arg0, size_t arg0_size, size_t lds) {
     L0Stream& s = S((RadStream)queue);
-    if (!glue_on(s)) return -1;
+    if (!glue_on(s) && t_glue_all_armed != queue) return -1;   /* the glue's case, or a bridged stream (GLUE_ALL) */
     ZeDev& Z = zedev(s.dev);
     NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
     if (!nk.k) return -1;
@@ -1695,7 +1768,10 @@ int n_glue_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
         ze_group_count_t gc{grid[0], grid[1], grid[2]};
         if (r == ZE_RESULT_SUCCESS) r = zeCommandListAppendLaunchKernel(l, nk.k, &gc, sig, nw, w);
         return r;
-    });
+    }, t_glue_all_armed == queue ? t_bridge_ze : nullptr,
+       t_glue_all_armed == queue && t_bridge_ev ? &*t_bridge_ev : nullptr);
+    t_bridge_ev.reset();
+    t_bridge_ze = nullptr;
     return rc == RAD_OK ? 0 : -1;
 }
 int n_hook_copy2d(const void* queue, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
