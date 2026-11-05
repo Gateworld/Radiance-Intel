@@ -20,6 +20,8 @@
  * Everything else is today's kernel line for line: the same lanes own the same chunks, each chunk's int32 sum is the
  * same exact sum of the same products, and the per-lane accumulation and the xor tree are the same, so the bf16
  * output must be the same bytes. The probe checks that (and 4 KiB canaries on both outputs) before it times anything.
+ * RI_PAIR=1 (run 193, owner note 191 item 2): also the concurrency probe -- gate_up's GEMM beside an int8 GEMV, in one
+ * in-order queue, one out-of-order queue and two in-order queues, outputs compared (PAIR lines).
  * T1b (run 191, down's form only): T1 with the codes also moved, so a 16-lane sub-group's load at one (unit, chunk,
  * row parity) reads 256 contiguous bytes instead of 16 pieces in 8 rows (t1b_off); the arithmetic is T1's.
  *
@@ -304,6 +306,8 @@ double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v
 
 /* One shape at `tokens` tokens: today's kernel and T1 on the same inputs; the bytes compared; then (launches > 0) the
  * per-launch times. Returns false on a mismatch or a broken canary. */
+LaunchFn pair_fn = nullptr;   /* RI_PAIR: libxe's xe_rad_gemm_i8a8_gemv */
+
 bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int launches, int runs, uint64_t seed) {
     const int top_k = 10, n_expert = 512, T = tokens * top_k, AR = sh.sorted_a ? T : tokens;
     const int Ncl[2] = { sh.N, sh.N1 }, Kcl[2] = { sh.K, sh.K1 };
@@ -516,6 +520,7 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                 gl ? (diff2 ? "; T1b DIFFERS" : "; T1b bit-identical") : "", nonzero, canary ? "intact" : "BROKEN");
     if (diff) std::printf("  T1's first difference at output %zu (row %zu, column %zu)\n", f1, f1 / Nmax, f1 % Nmax);
     if (diff2) std::printf("  T1b: %zu differ, the first at output %zu (row %zu, column %zu)\n", diff2, f2, f2 / Nmax, f2 % Nmax);
+    bool pair_bad = false;   /* RI_PAIR: a form's outputs differed, or a call failed */
     if (ok && launches > 0) {
         auto time = [&](auto&& f) {
             for (int z = 0; z < 3; ++z) f();
@@ -536,6 +541,79 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                     tokens, u0, u0b, u1, 100.0 * u1 / base);
         if (gl) std::printf("; T1b %.1f us -> %.0f %%", u2, 100.0 * u2 / base);
         std::printf("\n");
+        /* RI_PAIR=1 (run 193, owner note 191 item 2: independent kernels side by side, briefs/2026-11-05-concurrency.md),
+         * gate_up's shape at 4 tokens: today's routed-expert GEMM beside a shared-expert-shaped int8 GEMV (libxe's
+         * xe_rad_gemm_i8a8_gemv, N 1280 x K 2560, the same 4 activation rows), timed as a pair in three forms -- one
+         * in-order queue (today: back to back), one out-of-order queue (no barrier between them), two in-order queues
+         * -- with every form's two outputs compared byte for byte against the first's. */
+        if (std::getenv("RI_PAIR") && !sh.sorted_a && tokens == 4 && pair_fn) {
+            const int GN = 1280, GK = Kmax;
+            std::vector<int8_t> gb((size_t)GN * GK);
+            for (size_t i = 0; i < gb.size(); ++i) gb[i] = (int8_t)((int)(h32(seed + 70, i) % 255u) - 127);
+            std::vector<uint16_t> gbs((size_t)GN * (GK / 128));
+            for (size_t i = 0; i < gbs.size(); ++i) {
+                const float f = 0.0005f + (float)(h32(seed + 71, i) % 1000u) * 1e-6f;
+                uint32_t u; std::memcpy(&u, &f, 4); gbs[i] = (uint16_t)(u >> 16);
+            }
+            int8_t* dgb = sycl::malloc_device<int8_t>(gb.size(), q);
+            uint16_t* dgbs = sycl::malloc_device<uint16_t>(gbs.size(), q);
+            uint16_t* dgy = sycl::malloc_device<uint16_t>((size_t)AR * GN, q);
+            q.memcpy(dgb, gb.data(), gb.size());
+            q.memcpy(dgbs, gbs.data(), gbs.size() * 2).wait();
+            RadTensor gt[5];
+            gt[0] = tn(da, RAD_I8, { AR, GK });
+            gt[1] = tn(das, RAD_F32, { AR, GK / 128 });
+            gt[2] = tn(dgb, RAD_I8, { GN, GK });
+            gt[3] = tn(dgbs, RAD_BF16, { GN, GK / 128 });
+            gt[4] = tn(dgy, RAD_BF16, { AR, GN });
+            RadParam gp[3]{};
+            gp[0].key = "N"; gp[0].kind = RAD_P_INT; gp[0].ival = GN;
+            gp[1].key = "K"; gp[1].kind = RAD_P_INT; gp[1].ival = GK;
+            gp[2].key = "group"; gp[2].kind = RAD_P_INT; gp[2].ival = 128;
+            RadArgs ga{};
+            ga.t = gt; ga.n_t = 5; ga.p = gp; ga.n_p = 3;
+            sycl::queue q2(q.get_context(), q.get_device(), sycl::property::queue::in_order());
+            sycl::queue qo(q.get_context(), q.get_device());   /* out of order */
+            auto gemv = [&](sycl::queue& qq) { return pair_fn(&ga, (RadStream)&qq); };
+            auto moe = [&](sycl::queue& qq) { return fn(&args, (RadStream)&qq); };
+            /* the reference outputs: both on q */
+            int prc = moe(q) | gemv(q);
+            q.wait_and_throw();
+            std::vector<uint8_t> r_moe(ybytes), r_g((size_t)AR * GN * 2), c_moe(ybytes), c_g((size_t)AR * GN * 2);
+            q.memcpy(r_moe.data(), dy0 + kCanary, ybytes);
+            q.memcpy(r_g.data(), dgy, r_g.size()).wait();
+            auto form_ok = [&]() {
+                q.memcpy(c_moe.data(), dy0 + kCanary, ybytes);
+                q.memcpy(c_g.data(), dgy, c_g.size()).wait();
+                return c_moe == r_moe && c_g == r_g;
+            };
+            auto pair_time = [&](auto&& f) {
+                for (int z = 0; z < 3; ++z) f();
+                q.wait(); q2.wait(); qo.wait();
+                std::vector<double> per;
+                for (int r = 0; r < runs; ++r) {
+                    const auto a0 = std::chrono::steady_clock::now();
+                    for (int z = 0; z < launches; ++z) f();
+                    q.wait(); q2.wait(); qo.wait();
+                    per.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a0).count() /
+                                  launches);
+                }
+                return median(per);
+            };
+            const double t_m = pair_time([&]() { moe(q); }), t_g = pair_time([&]() { gemv(q); });
+            const double f1 = pair_time([&]() { moe(q); gemv(q); });
+            const bool ok1 = form_ok();
+            const double f2 = pair_time([&]() { moe(qo); gemv(qo); });
+            const bool ok2 = form_ok();
+            const double f3 = pair_time([&]() { moe(q); gemv(q2); });
+            const bool ok3 = form_ok();
+            std::printf("PAIR gate_up tokens 4 + int8 GEMV %d x %d: rc %d; alone %.1f + %.1f us; one in-order queue %.1f us%s; "
+                        "one out-of-order queue %.1f us (%.0f %%)%s; two in-order queues %.1f us (%.0f %%)%s\n",
+                        GN, GK, prc, t_m, t_g, f1, ok1 ? "" : " (OUTPUTS DIFFER)", f2, 100.0 * f2 / f1,
+                        ok2 ? "" : " (OUTPUTS DIFFER)", f3, 100.0 * f3 / f1, ok3 ? "" : " (OUTPUTS DIFFER)");
+            pair_bad = prc != RAD_OK || !ok1 || !ok2 || !ok3;
+            sycl::free(dgb, q); sycl::free(dgbs, q); sycl::free(dgy, q);
+        }
     }
     for (int c = 0; c < 2; ++c) {
         sycl::free(dw[c], q); sycl::free(dws[c], q); sycl::free(dtw[c], q);
@@ -543,7 +621,7 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     }
     sycl::free(da, q); sycl::free(das, q); sycl::free(dso, q); sycl::free(doff, q); sycl::free(dy0, q); sycl::free(dy1, q);
     sycl::free(dy2, q);
-    return ok;
+    return ok && !pair_bad;
 }
 
 }  // namespace
@@ -555,6 +633,7 @@ int main(int argc, char** argv) {
     if (!h) { std::printf("dlopen %s: %s\n", argv[1], dlerror()); return 2; }
     LaunchFn fn = (LaunchFn)dlsym(h, "xe_rad_moe_gemm_w4nl_i8");
     if (!fn) { std::printf("no xe_rad_moe_gemm_w4nl_i8\n"); return 2; }
+    pair_fn = (LaunchFn)dlsym(h, "xe_rad_gemm_i8a8_gemv");
     const int launches = argc > 2 ? std::atoi(argv[2]) : 48, runs = argc > 3 ? std::atoi(argv[3]) : 5;
     const char* dv = std::getenv("RI_DEVICE");
     sycl::queue q = (dv && !std::strcmp(dv, "cpu")) ? sycl::queue(sycl::cpu_selector_v, sycl::property::queue::in_order())

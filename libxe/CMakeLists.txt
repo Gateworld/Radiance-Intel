@@ -305,20 +305,6 @@ if(RAD_BUILD_TESTS)
   target_link_libraries(xe_i4i8_probe PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_i4i8_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_i4i8_probe libxe)
-  # Run 110 (owner note 129 item 4): router_topk_scatter's time a launch, against the selection alone and an empty
-  # launch. Not a ctest.
-  add_executable(xe_router_bench test/router_bench.cpp)
-  rad_l0_sycl(xe_router_bench)
-  target_include_directories(xe_router_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
-                             ${CMAKE_CURRENT_SOURCE_DIR}/compat)
-  target_link_libraries(xe_router_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
-  set_target_properties(xe_router_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-  add_dependencies(xe_router_bench libxe)
-  # Run 111 (owner note 135 item 3): libxe's gram_accum (libr4d's unit, ported) against a host reference, with
-  # canaries; small on the CPU device (amd-host), `full` adds the expert shapes for a card. Not a ctest.
-  add_executable(xe_gram_accum_test test/gram_accum_test.cpp)
-  rad_l0_sycl(xe_gram_accum_test)
-  target_include_directories(xe_gram_accum_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
   # Run 190 (owner notes 188 / 189): the expert-layout probe -- format C's decode GEMM against the same arithmetic
   # over a load-time repack of the same entries, the bf16 outputs compared byte for byte, then timed per launch on
   # the card (LAUNCHES > 0). The ctest is the byte check on the CPU device (LAUNCHES 0).
@@ -347,6 +333,25 @@ if(RAD_BUILD_TESTS)
   add_executable(xe_gdn_decode_bench test/gdn_decode_bench.cpp)
   rad_l0_sycl(xe_gdn_decode_bench)
   target_include_directories(xe_gdn_decode_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
+  # run 193 (owner note 191 item 2): the pair mode once (1 launch, 1 run) on the CPU device -- its three queue forms'
+  # outputs compared byte for byte (the times mean nothing there)
+  add_test(NAME xe_fc_tile_pair_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 1 1)
+  set_tests_properties(xe_fc_tile_pair_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RI_PAIR=1" TIMEOUT 1200)
+  # Run 110 (owner note 129 item 4): router_topk_scatter's time a launch, against the selection alone and an empty
+  # launch. Not a ctest.
+  add_executable(xe_router_bench test/router_bench.cpp)
+  rad_l0_sycl(xe_router_bench)
+  target_include_directories(xe_router_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
+                             ${CMAKE_CURRENT_SOURCE_DIR}/compat)
+  target_link_libraries(xe_router_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_router_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_router_bench libxe)
+  # Run 111 (owner note 135 item 3): libxe's gram_accum (libr4d's unit, ported) against a host reference, with
+  # canaries; small on the CPU device (amd-host), `full` adds the expert shapes for a card. Not a ctest.
+  add_executable(xe_gram_accum_test test/gram_accum_test.cpp)
+  rad_l0_sycl(xe_gram_accum_test)
+  target_include_directories(xe_gram_accum_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
                              ${CMAKE_CURRENT_SOURCE_DIR}/compat)
   target_link_libraries(xe_gdn_decode_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_gdn_decode_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
