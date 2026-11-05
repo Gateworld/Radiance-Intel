@@ -329,6 +329,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     /* ---- streams, events, move records ------------------------------------------------------ */
     RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
+    RAD_TRY(rad_stream_set_transfer(mover_));   /* a hint: the backend may keep its copies off the compute order */
     /* Every event here is local: they order the mover's queue against this card's compute queue
      * and tell the host when a slot is free, and the host never reads the ordered bytes through
      * them. A copy out to host memory carries system scope on its own packets. */

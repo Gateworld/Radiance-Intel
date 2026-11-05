@@ -106,6 +106,10 @@ extern "C" void* rad_link_gate(RadStream s);
  * card). */
 extern "C" int rad_host_prebind(RadStream s, const char* tag);
 
+/* Names `s` a transfer stream (the mover's): copies and event waits, few kernels. A hint only; RAD_OK where the
+ * backend has no use for it (Level Zero: RADIANCE_L0_GLUE_ALL=2 / 3 put its glued work on a list of its own). */
+extern "C" int rad_stream_set_transfer(RadStream s);
+
 /* Device half of the expert prefetch (core/runtime/xprefetch.cpp). A backend that cannot have a
  * dispatch complete a signal, or has no spare DMA engine, leaves these out; rad_xp_supported is
  * then 0 and the prefetch is off.
@@ -337,6 +341,9 @@ struct DeviceBackend {
 
     /* ---- see rad_host_prebind. Null on a backend that maps host memory at allocation. */
     int     (*host_prebind)(RadStream s, const char* tag);
+
+    /* ---- see rad_stream_set_transfer. Null on a backend with no use for the hint. */
+    int     (*stream_set_transfer)(RadStream s);
 };
 
 

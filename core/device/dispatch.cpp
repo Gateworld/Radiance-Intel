@@ -620,6 +620,10 @@ int rad_host_prebind(RadStream s, const char* tag) {
     if (const auto f = dev()->host_prebind) return f(s, tag);
     return RAD_OK;
 }
+int rad_stream_set_transfer(RadStream s) {
+    if (const auto f = dev()->stream_set_transfer) return f(s);
+    return RAD_OK;
+}
 int rad_xp_supported(int device) {
     const auto* d = dev();
     return d->xp_supported && d->xp_stream_create && d->ride && d->ride_wait && d->ride_release && d->xp_list &&

@@ -104,6 +104,9 @@ struct L0Stream {
      * next submission to the runtime's queue host-waits for it first (settle). */
     int npend_dev = -1, npend_slot = -1;
     uint64_t npend_serial = 0;
+    /* The mover's transfer stream (rad_stream_set_transfer): under RADIANCE_L0_GLUE_ALL=2 / 3 its glued work goes to
+     * the device's second list, in its own order (glue_xlist). */
+    bool xfer = false;
     explicit L0Stream(sycl::queue&& x) : q(std::move(x)) {}
 };
 std::mutex& stream_mutex() { static std::mutex m; return m; }
@@ -923,6 +926,11 @@ struct ZeDev {
     int prev_slot = -1;                /* the previous play's slot: the next play waits on it */
     uint64_t prev_serial = 0;
     bool inorder = true;               /* ZE_COMMAND_LIST_FLAG_IN_ORDER accepted; else a barrier before each command */
+    /* RADIANCE_L0_GLUE_ALL=2 / 3: the transfer streams' own in-order immediate list (2: a copy engine's, when the
+     * device has a copy-only group; 3, or no such group: a second compute list), so their copies overlap the compute
+     * list's work instead of joining its order. Ordered against the other list only by event waits. */
+    ze_command_list_handle_t ximm = nullptr;
+    bool ximm_copy = false;            /* ximm is on a copy engine: no kernels there */
     std::mutex m;                      /* the ring and the kernel table (plays may come from another thread) */
     std::map<ze_kernel_handle_t, NKernel> kernels;   /* by the runtime's handle */
     double timer_ns = 0;               /* the device timer's resolution (ns a tick) and valid bits (the tape profiler) */
@@ -979,6 +987,7 @@ int tape_mode() {   /* 0 off, 1 graphs, 2 native where the device allows */
     }();
     return m;
 }
+int glue_all_level();   /* RADIANCE_L0_GLUE_ALL, below */
 ze_command_list_handle_t n_list_create(ZeDev& Z, bool inorder) {
     ze_command_list_desc_t d{ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC, nullptr, 0, inorder ? ZE_COMMAND_LIST_FLAG_IN_ORDER : 0u};
     ze_command_list_handle_t l = nullptr;
@@ -1037,6 +1046,25 @@ bool ze_ready(int d) {
         Z.imm = nullptr;
         if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) { Z.why = "zeCommandListCreateImmediate failed"; return false; }
         RAD_WARN("l0 tape: the driver refused an in-order immediate list on device %d; plays are ordered by their events alone", d);
+    }
+    if (glue_all_level() >= 2) {
+        /* RADIANCE_L0_GLUE_ALL=2: a copy-only queue group's list for the transfer streams, else (or =3) a second compute
+         * list; in order, as the stream's own commands are. Without one the transfer streams join Z.imm (as =1). */
+        uint32_t ng = 0, ord = 0;
+        bool copy = false;
+        if (glue_all_level() == 2 && zeDeviceGetCommandQueueGroupProperties(Z.dev, &ng, nullptr) == ZE_RESULT_SUCCESS && ng) {
+            std::vector<ze_command_queue_group_properties_t> gp(ng, {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES, nullptr});
+            if (zeDeviceGetCommandQueueGroupProperties(Z.dev, &ng, gp.data()) == ZE_RESULT_SUCCESS)
+                for (uint32_t g = 0; g < ng && !copy; ++g)
+                    if ((gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) &&
+                        !(gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) && gp[g].numQueues > 0) { ord = g; copy = true; }
+        }
+        ze_command_queue_desc_t xd{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, ord, 0, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+        if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &xd, &Z.ximm) != ZE_RESULT_SUCCESS) Z.ximm = nullptr;
+        Z.ximm_copy = Z.ximm && copy;
+        if (Z.ximm) RAD_INFO("l0 glue-all (RADIANCE_L0_GLUE_ALL=%d): device %d's transfer streams on their own list, %s (group %u)",
+                             glue_all_level(), d, copy ? "a copy engine" : "a second compute list", ord);
+        else RAD_WARN("l0 glue-all: device %d gave no second list; its transfer streams join the compute list (as =1)", d);
     }
     ze_command_list_handle_t probe = n_list_create(Z, true);
     if (!probe) {
@@ -1555,12 +1583,41 @@ bool glue_on(const L0Stream& s) {
 /* `bridge` / `bridge_keep` (RADIANCE_L0_GLUE_ALL): a device-side wait on the stream's runtime work before the append,
  * its sycl::event kept in the slot until the slot's reuse -- as a play waits on the queues it follows (T6: never a host
  * wait inside a pass, the ranks' all-reduces would deadlock; GA2 did). */
+bool glue_xlist(const L0Stream& s);   /* RADIANCE_L0_GLUE_ALL=2 / 3, below */
 template <class F> int glue_append(L0Stream& s, const char* what, F&& fn, ze_event_handle_t bridge = nullptr,
                                    const sycl::event* bridge_keep = nullptr) {
     ZeDev& Z = zedev(s.dev);
     std::lock_guard<std::mutex> lk(Z.m);
     ze_event_handle_t waits[2];
     uint32_t nw = 0;
+    if (glue_xlist(s)) {
+        /* a transfer stream's own list: behind its own previous work, not the device's. Its pending slot is waited on
+         * explicitly (it may be a play on the compute list: the engine's thread names this stream too), read after the
+         * slot is taken -- a slot that came round is complete and reset, its serial moved on. */
+        ZeDev::Ring& r = ring_take(Z);
+        if (s.npend_slot >= 0 && s.npend_dev == s.dev) {
+            const ZeDev::Ring& pr = Z.ring[(size_t)s.npend_slot];
+            if (&pr != &r && pr.serial.load(std::memory_order_acquire) == s.npend_serial &&
+                zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS)
+                waits[nw++] = pr.ev;
+        }
+        if (bridge) waits[nw++] = bridge;
+        const ze_result_t rc = fn(Z.ximm, r.ev, nw, nw ? waits : nullptr);
+        if (rc != ZE_RESULT_SUCCESS) {
+            device_set_error("%s: the glued append on the transfer list failed (0x%x)", what, (unsigned)rc);
+            return RAD_E_DEVICE;
+        }
+        r.used = true;
+        r.keep.clear();
+        if (bridge && bridge_keep) r.keep.push_back(*bridge_keep);
+        r.kind = 2; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = nw;
+        r.dep_dev = s.npend_dev; r.dep_slot = s.npend_slot; r.dep_serial = s.npend_serial;
+        s.npend_dev = s.dev;
+        s.npend_slot = (int)(&r - Z.ring.get());
+        s.npend_serial = r.serial.load(std::memory_order_relaxed);
+        g_glued.fetch_add(1, std::memory_order_relaxed);
+        return RAD_OK;
+    }
     if (Z.prev_slot >= 0) {
         const ZeDev::Ring& pr = Z.ring[(size_t)Z.prev_slot];
         if (pr.serial.load(std::memory_order_acquire) == Z.prev_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS)
@@ -1606,10 +1663,21 @@ void glue_disarm_check() {
  * runtime makes the Level Zero adapter create an event whose pool is never freed (MD16: 17,310 pools created, 0
  * destroyed, ~330 B kept a launch); recorded passes launch natively and keep nothing. Only kernel launches are
  * bridged; a stream's copies and events follow the glue's existing rule (glued while its last work is native). */
-bool glue_all_mode() {
-    static const bool on = [] { const char* v = std::getenv("RADIANCE_L0_GLUE_ALL"); return v && v[0] == '1'; }();
-    return on;
+/* =2 / =3 (run 189): the same, with the mover's transfer streams on a list of their own (ZeDev::ximm). Under =1 every
+ * glued append waits on the device's previous one on one in-order list, so once the prefill stager's stream waited on
+ * a compute event (a native slot under glue-all) its expert copies joined the compute kernels' order: no overlap, the
+ * 20K prompt +4.0 % (B147 / B148). On their own list they wait on their own previous work, and on the compute stream's
+ * only where the stager asks (its event waits), as two runtime queues would. */
+int glue_all_level() {
+    static const int lv = [] {
+        const char* v = std::getenv("RADIANCE_L0_GLUE_ALL");
+        return v && v[0] >= '1' && v[0] <= '3' && !v[1] ? v[0] - '0' : 0;
+    }();
+    return lv;
 }
+bool glue_all_mode() { return glue_all_level() > 0; }
+/* The stream's glued work goes to the device's second list, in the stream's own order. */
+bool glue_xlist(const L0Stream& s) { return s.xfer && glue_all_level() >= 2 && zedev(s.dev).ximm; }
 std::atomic<int64_t> g_bridged{0};
 thread_local const void* t_glue_all_armed = nullptr;
 /* The bridge's device-side wait for the armed launch: the stream queue's last event (kept alive in the ring slot) and its
@@ -1621,6 +1689,8 @@ thread_local ze_event_handle_t t_bridge_ze = nullptr;
 bool glue_bridge(L0Stream& s) {
     if (!glue_mode() || !glue_all_mode() || recording()) return false;
     if (devs()[s.dev].cpu || s.gates.load() > 0 || s.gated.load()) return false;
+    /* =2 / 3: the transfer streams' few kernels stay on the runtime's queue (their copies go to their own list) */
+    if (s.xfer && glue_all_level() >= 2) return false;
     /* the device's native state is made on first use (a run with no tape -- the KL mode -- never made it: GA1) */
     if (!ze_ready(s.dev)) return false;
     const ZeDev& Z = zedev(s.dev);
@@ -1749,6 +1819,7 @@ int n_glue_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     L0Stream& s = S((RadStream)queue);
     if (!glue_on(s) && t_glue_all_armed != queue) return -1;   /* the glue's case, or a bridged stream (GLUE_ALL) */
     ZeDev& Z = zedev(s.dev);
+    if (glue_xlist(s) && Z.ximm_copy) return -1;   /* a copy engine's list runs no kernels: the plain launch, settled */
     NKernel& nk = nkernel(Z, *static_cast<const sycl::kernel*>(kernel->kernel));
     if (!nk.k) return -1;
     int i_lds = kernel->i_lds;
@@ -1831,6 +1902,13 @@ int copy_on(RadStream s, void* dst, const void* src, size_t bytes) {
     if (!native_on(S(s))) settle(S(s));   /* after a glued entry's enter (enter_g): the runtime copy follows the play */
     DbgWait dw(0);
     return guarded("rad_memcpy_async", [&] { Q(s).memcpy(dst, src, bytes); });
+}
+
+/* rad_stream_set_transfer: the mark glue_xlist reads (RADIANCE_L0_GLUE_ALL=2 / 3). */
+int z_stream_set_transfer(RadStream s) {
+    RAD_TRY(check_stream(s, "rad_stream_set_transfer"));
+    S(s).xfer = true;
+    return RAD_OK;
 }
 
 /* RADIANCE_L0_HOST_PREBIND=1 (the Intel port, owner note 84, run 88): rad_host_prebind. Run 87 found
@@ -2933,6 +3011,67 @@ int z_event_record(RadEvent ev, RadStream s) {
     return guarded("rad_event_record", [&] { real_record(e, S(s)); });
 }
 
+/* RADIANCE_L0_GLUE_ALL=2 / 3: a transfer stream's wait for an event recorded after native work. The device-side wait
+ * goes on the transfer list, behind the stream's own work -- its pending slot, or (its last work on the runtime's
+ * queue) that queue's barrier event, as glue_bridge -- and the compute list's previous append is left alone. */
+int xlist_wait(L0Stream& st, int zdev, int zslot, uint64_t zserial) {
+    ZeDev& Z = zedev(st.dev);
+    int slot;
+    uint64_t serial;
+    {
+        std::lock_guard<std::mutex> lk(Z.m);
+        ZeDev::Ring& r = ring_take(Z);
+        slot = (int)(&r - Z.ring.get());
+        serial = r.serial.load(std::memory_order_relaxed);
+    }
+    ze_event_handle_t ev = nullptr;
+    {   /* the source slot, under its own lock alone: still pending -> this slot is its consumer */
+        ZeDev& Y = zedev(zdev);
+        std::lock_guard<std::mutex> lk(Y.m);
+        ev = n_slot_event(zdev, zslot, zserial);
+        if (ev) Y.ring[(size_t)zslot].consumers.push_back(ZeDev::Consumer{st.dev, slot, serial});
+    }
+    if (!ev) return RAD_OK;   /* completed meanwhile: no wait (the taken slot stays unused) */
+    std::optional<sycl::event> keep;
+    ze_event_handle_t bridge = nullptr;
+    if (st.npend_slot < 0) {
+        try {
+            sycl::event b = st.q.ext_oneapi_submit_barrier();
+            if (b.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+                bridge = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(b);
+                keep = b;
+                st.q.ext_oneapi_prod();   /* the adapter's batch onto the device, or the native wait never ends (GA3) */
+            }
+        } catch (const sycl::exception& x) {
+            device_set_error("rad_event_wait: the transfer list's bridge failed: %s", x.what());
+            return RAD_E_DEVICE;
+        }
+    }
+    std::lock_guard<std::mutex> lk(Z.m);
+    ZeDev::Ring& r = Z.ring[(size_t)slot];
+    ze_event_handle_t waits[3];
+    uint32_t nw = 0;
+    waits[nw++] = ev;
+    if (bridge) waits[nw++] = bridge;
+    if (st.npend_slot >= 0 && st.npend_dev == st.dev && st.npend_slot != slot) {
+        const ZeDev::Ring& pr = Z.ring[(size_t)st.npend_slot];
+        if (pr.serial.load(std::memory_order_acquire) == st.npend_serial && zeEventQueryStatus(pr.ev) != ZE_RESULT_SUCCESS)
+            waits[nw++] = pr.ev;
+    }
+    ze_result_t rc = zeCommandListAppendWaitOnEvents(Z.ximm, nw, waits);
+    if (rc == ZE_RESULT_SUCCESS) rc = zeCommandListAppendSignalEvent(Z.ximm, r.ev);
+    if (rc != ZE_RESULT_SUCCESS) { device_set_error("rad_event_wait: the transfer list's wait failed (0x%x)", (unsigned)rc); return RAD_E_DEVICE; }
+    r.used = true;
+    r.keep.clear();
+    if (keep) r.keep.push_back(*keep);
+    r.kind = 1; r.tape = 0; r.from = r.to = -1; r.nlists = 0; r.nwaits = nw;
+    r.dep_dev = zdev; r.dep_slot = zslot; r.dep_serial = zserial;
+    st.npend_dev = st.dev;
+    st.npend_slot = slot;
+    st.npend_serial = serial;
+    return RAD_OK;
+}
+
 int z_event_wait(RadStream s, RadEvent ev) {
     if (!ev || !s) {
         device_set_error("rad_event_wait: null %s", ev ? "stream" : "event");
@@ -2977,6 +3116,7 @@ int z_event_wait(RadStream s, RadEvent ev) {
         L0Stream& st = S(s);
         ZeDev& Z = zedev(st.dev);
         if (!Z.ok || !Z.imm) { settle(st); n_slot_wait(zdev, zslot, zserial, "rad_event_wait without a native list"); return RAD_OK; }
+        if (glue_xlist(st) && !recording()) return xlist_wait(st, zdev, zslot, zserial);
         if (!Z.inorder) settle(st);   /* the glue (enter_g) left the stream's play pending: only an in-order list orders it */
         int slot;
         uint64_t serial;
@@ -3320,6 +3460,7 @@ DeviceBackend make_backend() {
     b.gate_open = z_gate_open;
     b.gate_room = z_gate_room;
     b.host_prebind = z_host_prebind;
+    b.stream_set_transfer = z_stream_set_transfer;
     b.tape_begin = z_tape_begin;
     b.tape_mark = z_tape_mark;
     b.tape_pause = z_tape_pause;
