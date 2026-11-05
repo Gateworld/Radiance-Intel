@@ -319,20 +319,6 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_fc_tile_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
   set_tests_properties(xe_fc_tile_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
-  target_link_libraries(xe_gram_accum_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
-  set_target_properties(xe_gram_accum_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-  add_dependencies(xe_gram_accum_test libxe)
-  # Run 112 (owner note 138): the decode GDN fold, fused against split -- output hashes and time a call. Not a ctest.
-  add_executable(xe_gdn_split_bench test/gdn_split_bench.cpp)
-  rad_l0_sycl(xe_gdn_split_bench)
-  target_include_directories(xe_gdn_split_bench PRIVATE ${CMAKE_SOURCE_DIR}/abi)
-  target_link_libraries(xe_gdn_split_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
-  set_target_properties(xe_gdn_split_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-  add_dependencies(xe_gdn_split_bench libxe)
-  # Run 101 (owner note 108 item 1): device timing of the decode GDN update at one rank's shape. Not a ctest.
-  add_executable(xe_gdn_decode_bench test/gdn_decode_bench.cpp)
-  rad_l0_sycl(xe_gdn_decode_bench)
-  target_include_directories(xe_gdn_decode_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
   # run 193 (owner note 191 item 2): the pair mode once (1 launch, 1 run) on the CPU device -- its three queue forms'
   # outputs compared byte for byte (the times mean nothing there)
   add_test(NAME xe_fc_tile_pair_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 1 1)
@@ -352,6 +338,20 @@ if(RAD_BUILD_TESTS)
   add_executable(xe_gram_accum_test test/gram_accum_test.cpp)
   rad_l0_sycl(xe_gram_accum_test)
   target_include_directories(xe_gram_accum_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_gram_accum_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_gram_accum_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_gram_accum_test libxe)
+  # Run 112 (owner note 138): the decode GDN fold, fused against split -- output hashes and time a call. Not a ctest.
+  add_executable(xe_gdn_split_bench test/gdn_split_bench.cpp)
+  rad_l0_sycl(xe_gdn_split_bench)
+  target_include_directories(xe_gdn_split_bench PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_gdn_split_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_gdn_split_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_gdn_split_bench libxe)
+  # Run 101 (owner note 108 item 1): device timing of the decode GDN update at one rank's shape. Not a ctest.
+  add_executable(xe_gdn_decode_bench test/gdn_decode_bench.cpp)
+  rad_l0_sycl(xe_gdn_decode_bench)
+  target_include_directories(xe_gdn_decode_bench PRIVATE ${CMAKE_SOURCE_DIR}/libr4d ${CMAKE_SOURCE_DIR}/abi
                              ${CMAKE_CURRENT_SOURCE_DIR}/compat)
   target_link_libraries(xe_gdn_decode_bench PRIVATE rad_abi ${CMAKE_DL_LIBS})
   set_target_properties(xe_gdn_decode_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
