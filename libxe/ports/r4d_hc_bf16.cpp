@@ -1234,11 +1234,16 @@ __host__ __device__ inline long hc_up_st_off(long rg, long lr) { return (rg * lr
  * first (hc runs of ipb consecutive rows, each run contiguous, so a wave reads 512 consecutive bytes a load),
  * issued before `d`'s and behind the same barrier. A thread's quarter row then comes from LDS: the same codes
  * and scale in the same order. */
+constexpr uint64_t kHcAbSpin = 1ull << 20;   /* the ticketed grid's wait (hc_v2_ab_kernel): ~0.2 s is a stuck one */
+/* The body (run 193, owner note 190: upstream 1.14's merge): the kernel below, or a B block of hc_v2_ab_kernel, which
+ * passes its role's block (bx, by), the kernel-scope LDS and, with WAIT, the ticketed grid's sync words: the block's
+ * W_up rows are staged first (ST), then it waits for every A block (the columns of `d` and the gains), then stages
+ * `d` -- only the issue order moves, the same values in the same order. */
 template <int RG, int F8, bool I8 = false, bool ST = false, bool S8 = false,   /* F8: 0 bf16, 1 E4M3 rows, 2 FP16 rows;
                                                                                S8: e4m3x4_s8 (V2 level 5) */
-          bool Q8D = false>   /* owner note 158 (run 127): int8 rows (F8 3) against `d` staged as int8, by DP4A */
-__global__ __launch_bounds__(kThreads)
-void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
+          bool Q8D = false,   /* owner note 158 (run 127): int8 rows (F8 3) against `d` staged as int8, by DP4A */
+          bool WAIT = false>
+__device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, long uld,
                       const unsigned short* __restrict__ dbuf,
                       const unsigned short* __restrict__ h, const float* __restrict__ w,
                       const float* __restrict__ scalein, const unsigned short* __restrict__ nbuf,
@@ -1246,16 +1251,15 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       float* __restrict__ qs, unsigned char* __restrict__ rq,
                       float* __restrict__ rqs, unsigned int* __restrict__ ctr,
                       long rows, long n, int hc, long lr, long hrow, long xrow,
-                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
-    XE_DYN_LDS(float, sd);                   /* [RG * lr], then with ST kUpRows rows of W_up */
-    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);   /* wave_dot_lds, one slot a wave */
-    XE_SHARED(unsigned short, s_u, RG * kUpRows);
+                      long qrow, long srow, long rqrow, long rsrow, float wadd, unsigned bx, unsigned by,
+                      float* sd, unsigned short (*s_stage)[kWave * 8], unsigned short* s_u, unsigned int& s_arrived,
+                      uint32_t* sync = nullptr, uint32_t wait_n = 0, uint32_t nb_all = 0) {
     const unsigned short* __restrict__ up = (const unsigned short*)upv;
-    const long r0 = (long)blockIdx.y * RG;
+    const long r0 = (long)by * RG;
     if (r0 >= rows) return;
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const int  ipb = kUpRows / hc;                  /* channels this workgroup owns */
-    const long i0  = (long)blockIdx.x * ipb;
+    const long i0  = (long)bx * ipb;
 
     unsigned char* const s_w = ST ? (unsigned char*)sd + hc_up_st_off(RG, lr) : nullptr;
     if constexpr (ST) {
@@ -1265,6 +1269,20 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
         for (long o = (long)tid * 16; o < (long)hc * run; o += kThreads * 16) {
             const long c = o / run;
             *(uint4*)(s_w + o) = *(const uint4*)(ub + c * n * uld + (o - c * run));
+        }
+    }
+    if constexpr (WAIT) {
+        /* every A block's `d` and gains published (a bounded spin; the error word on a spin-out), then the last B
+         * block past the wait clears the grid's counters for the next launch on the stream: every block has taken
+         * its ticket and every A block has finished by then */
+        if (!xe::persist_wait_flag(&sync[xe::kPersistWords], wait_n, sync, 3u, kHcAbSpin)) return;
+        if (tid == 0) {
+            xe::persist_aref past(sync[xe::kPersistWords + 1]);
+            if (past.fetch_add(1u) + 1u == nb_all) {
+                xe::persist_aref(sync[0]).store(0u);
+                xe::persist_aref(sync[xe::kPersistWords]).store(0u);
+                past.store(0u);
+            }
         }
     }
     if constexpr (Q8D) {
@@ -1352,8 +1370,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
     const int nb = kUpTB / ipb;
     __threadfence();
     __syncthreads();
-    XE_SHARED_VAR(unsigned int, s_arrived);
-    const unsigned slot = blockIdx.y * (unsigned)(n / kUpTB) + (unsigned)(i0 / kUpTB);
+    const unsigned slot = by * (unsigned)(n / kUpTB) + (unsigned)(i0 / kUpTB);
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL,
                                            __HIP_MEMORY_SCOPE_AGENT);
@@ -1388,6 +1405,26 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
         for (int j = 0; j < 4; ++j) v[j] = bf2f(xr[lane * 4 + j]);
         hc_rot_group(v, lane, rq + r * rqrow + base, rqs + r * rsrow + base / kUpTB);
     }
+}
+
+template <int RG, int F8, bool I8 = false, bool ST = false, bool S8 = false, bool Q8D = false>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
+                      const unsigned short* __restrict__ dbuf,
+                      const unsigned short* __restrict__ h, const float* __restrict__ w,
+                      const float* __restrict__ scalein, const unsigned short* __restrict__ nbuf,
+                      unsigned short* __restrict__ x, unsigned char* __restrict__ q,
+                      float* __restrict__ qs, unsigned char* __restrict__ rq,
+                      float* __restrict__ rqs, unsigned int* __restrict__ ctr,
+                      long rows, long n, int hc, long lr, long hrow, long xrow,
+                      long qrow, long srow, long rqrow, long rsrow, float wadd) {
+    XE_DYN_LDS(float, sd);                   /* [RG * lr], then with ST kUpRows rows of W_up */
+    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);   /* wave_dot_lds, one slot a wave */
+    XE_SHARED(unsigned short, s_u, RG * kUpRows);
+    XE_SHARED_VAR(unsigned int, s_arrived);
+    hc_up_mix_body<RG, F8, I8, ST, S8, Q8D>(upv, uld, dbuf, h, w, scalein, nbuf, x, q, qs, rq, rqs, ctr, rows, n, hc,
+                                            lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, blockIdx.x, blockIdx.y,
+                                            sd, s_stage, s_u, s_arrived);
 }
 
 /* Row group size: the row count, up to eight. RG is a template parameter so `acc[RG]` stays in
@@ -1909,6 +1946,64 @@ void hc_v2_down_ticket_kernel(const unsigned short* __restrict__ h, const float*
         }
     }
     xe::persist_exit_flags(sync, G, (uint32_t)rows);
+}
+
+/* ============================================================== upstream 1.14's merge, on this port's level 8 (run 193)
+ * Owner note 190 (Radiance 1.14, c896a87: "hc_read: kernels A and B as one grid at decode", 34.7 -> 25.2 us at 4 rows
+ * on upstream's card), RADIANCE_XE_HC_AB=1, opt-in. Level 8's decode chain is five launches a connection: the norm,
+ * the columns of `d` (hc_v2_down_rows<4>), the gains (hc_v2_down<2, S8>), the up mix (hc_up_mix<.., ST, S8>, `x`
+ * only) and the codes (hc_quant_rows). This grid replaces the middle three, upstream's way:
+ *   - roles by ticket: tickets below na_cols run four of the columns' 64-thread blocks (one a slice), the next hc x
+ *     rows the gains of (c, r) (each signals the A counter when done), the rest the up mix's blocks;
+ *   - an up-mix block stages its W_up rows into LDS FIRST, then waits for every A block, then reads `d`: its weight
+ *     traffic runs under the A blocks' latency-bound dots (what stage 1b, which had nothing to load before its
+ *     waits, lacked);
+ *   - every awaited block holds a lower ticket and never waits itself, so no co-residency is needed; the last
+ *     up-mix block past the wait clears the counters; a spin-out sets the error word (persist_wait_flag).
+ * The norm and the codes stay their own launches. Every block runs the body its own kernel runs, on the same values
+ * in the same order: bit-identical by construction (xe_hc_persist_cpu runs it against level 8, byte for byte). */
+bool xe_hc_ab_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_AB"); return v && v[0] == '1'; }();
+    return on;
+}
+
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_v2_ab_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
+                     unsigned short* __restrict__ dbuf, const unsigned short* __restrict__ injw,
+                     unsigned short* __restrict__ inj, long irow, const void* __restrict__ upv, long uld,
+                     const unsigned short* __restrict__ h, const float* __restrict__ w,
+                     const float* __restrict__ scale, unsigned short* __restrict__ x, long rows, long n, int hc,
+                     long HN, long lr, long hrow, long xrow, float wadd, uint32_t* __restrict__ sync,
+                     uint32_t na_cols, uint32_t na_all, uint32_t gxb, uint32_t nb_all) {
+    XE_DYN_LDS(float, sd);   /* the up mix's `d` and staged rows, or the gains' N */
+    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);
+    XE_SHARED(unsigned short, s_u, RG * kUpRows);
+    XE_SHARED_VAR(unsigned int, s_arrived);
+    const int tid = (int)threadIdx.x;
+    if (!xe::persist_clean(sync)) return;   /* an earlier spin-out: fail fast */
+    const uint32_t t = xe::persist_ticket(sync);
+    if (t < na_cols) {   /* A: four of the columns' blocks */
+        constexpr int kSlice = kWave * kV2RowCols, kSlices = kThreads / kSlice;
+        const long bxn = (lr + kV2RowCols - 1) / kV2RowCols, ncb = bxn * ((rows + 3) / 4);
+        const long vb = (long)t * kSlices + tid / kSlice;
+        if (vb < ncb) hc_v2_down_rows_body<4, false>(nbuf, downv, dld, dbuf, rows, hc, HN, lr, vb % bxn, vb / bxn,
+                                                     tid % kSlice);
+        xe::persist_signal(&sync[xe::kPersistWords]);
+        return;
+    }
+    if (t < na_all) {    /* A: the gains of (c, r) */
+        const long v = (long)(t - na_cols), r = v / hc;
+        hc_v2_gain_body(nbuf + r * HN, injw, inj, hc, HN, irow, (int)(v % hc), r, tid, s_stage[0],
+                        (unsigned short*)sd);
+        xe::persist_signal(&sync[xe::kPersistWords]);
+        return;
+    }
+    const uint32_t b = t - na_all;   /* B: the up mix, `x` only (the codes are hc_quant_rows') */
+    hc_up_mix_body<RG, 1, false, true, true, false, true>(upv, uld, dbuf, h, w, scale, nbuf, x, nullptr, nullptr,
+                                                          nullptr, nullptr, nullptr, rows, n, hc, lr, hrow, xrow, 0, 0,
+                                                          0, 0, wadd, b % gxb, b / gxb, sd, s_stage, s_u, s_arrived,
+                                                          sync, na_all, nb_all);
 }
 
 /* The launch's synchronisation words, one set a stream (two streams on a card must not share a counter), zeroed once
@@ -5038,6 +5133,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                    scale, nbuf, (unsigned short*)x->data,
                                    q ? (unsigned char*)q->data : nullptr,
                                    q ? (float*)qs->data : nullptr,
+    bool ab_done = false;   /* RADIANCE_XE_HC_AB's grid ran the columns, the gains and the up mix */
                                    rq ? (unsigned char*)rq->data : nullptr,
                                    rq ? (float*)rqs->data : nullptr, mctr, rows, n, (int)hc, lr,
                                    hrow, xrow, qrow, srow, rqrow, rsrow, wadd, v2 && xe_hc_v2_level() >= 2, s,
@@ -5053,6 +5149,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         R4D_EMIT(s, hc_mix_kernel<I8_>,                                                          \
                  dim3((unsigned)(n / kUpTB), (unsigned)rows),                                    \
                  dim3(kThreads), 0,                                                              \
+        uint32_t* ab_sync = nullptr;   /* RADIANCE_XE_HC_AB's grid (below) */
                  (const unsigned short*)h->data, (const float*)w->data, ubuf, scale,             \
                  (unsigned short*)x->data, q ? (unsigned char*)q->data : nullptr,                \
                  q ? (float*)qs->data : nullptr,                                                 \
@@ -5069,3 +5166,40 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
+        } else if (emit_rc == RAD_OK && s8d && xe_hc_v2_level() == 8 && rows > 1 && rows <= 8 && injw && inj &&
+                   wf == 1 && xe_hc_ab_on() && uld % 16 == 0 && (kUpRows % hc) == 0 && (n % (kUpRows / hc)) == 0 &&
+                   (kUpTB % (kUpRows / hc)) == 0 &&   /* the mix below is the qsplit form, so it is skipped */
+                   ((rows + hc_up_rg(rows, lr) - 1) / hc_up_rg(rows, lr)) * (n / kUpTB) <= (long long)kMaxMixCtr &&
+                   hc_up_st_off(hc_up_rg(rows, lr), lr) + kUpRows * uld <= 60 * 1024 &&
+                   (ab_sync = hc_persist_sync((hipStream_t)s)) != nullptr) {
+            /* RADIANCE_XE_HC_AB=1 (upstream 1.14's merge, owner note 190): the columns, the gains and the up mix as
+             * one ticketed grid (hc_v2_ab_kernel); the up mix's launch below is skipped, its codes still made */
+            const long rg = hc_up_rg(rows, lr), gy = (rows + rg - 1) / rg, gxb = n / (kUpRows / hc);
+            const long bxn = (lr + kV2RowCols - 1) / kV2RowCols, ncb = bxn * ((rows + 3) / 4);
+            const long na_cols = (ncb + 3) / 4, na_all = na_cols + hc * rows, nb_all = gxb * gy;
+            const unsigned lds = (unsigned)std::max<long>(hc_up_st_off(rg, lr) + kUpRows * uld, (long)glds);
+#define HC_AB(RG_)                                                                                                \
+            emit_rc = R4D_EMIT(s, hc_v2_ab_kernel<RG_>, dim3((unsigned)(na_all + nb_all)), dim3(kThreads), lds,       \
+                               (const unsigned short*)nbuf, (const void*)down->data, (long)dld, dbuf,                 \
+                               (const unsigned short*)injw->data, (unsigned short*)inj->data, (long)irow, up->data,   \
+                               (long)uld, (const unsigned short*)h->data, (const float*)w->data, scale,               \
+                               (unsigned short*)x->data, (long)rows, (long)n, (int)hc, (long)HN, (long)lr,            \
+                               (long)hrow, (long)xrow, wadd, ab_sync, (uint32_t)na_cols, (uint32_t)na_all,            \
+                               (uint32_t)gxb, (uint32_t)nb_all)
+            switch (rg) {
+                case 2: HC_AB(2); break;
+                case 3: HC_AB(3); break;
+                case 4: HC_AB(4); break;
+                case 5: HC_AB(5); break;
+                case 6: HC_AB(6); break;
+                case 7: HC_AB(7); break;
+                default: HC_AB(8); break;
+            }
+#undef HC_AB
+            ab_done = true;
+            static std::once_flag said;
+            std::call_once(said, [na_all, nb_all] {
+                std::fprintf(stderr, "[xe] hc_read's columns, gains and up mix as one ticketed grid (RADIANCE_XE_HC_AB=1, "
+                                     "%ld A and %ld B blocks at the first launch)\n", na_all, nb_all);
+            });
+        if (!ab_done)   /* else the up mix ran in RADIANCE_XE_HC_AB's grid */
