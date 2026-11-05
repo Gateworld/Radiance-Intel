@@ -408,4 +408,16 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_persist_cpu COMMAND xe_persist_test)
   set_tests_properties(xe_persist_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 300)
+  # ... and stage 1a: hc_read at a verify's rows with RADIANCE_XE_HC_PERSIST off and on (two processes: the switch is
+  # read once), the outputs compared byte for byte
+  add_executable(xe_hc_persist_test test/hc_persist_test.cpp)
+  rad_l0_sycl(xe_hc_persist_test)
+  target_include_directories(xe_hc_persist_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_hc_persist_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_hc_persist_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_hc_persist_test libxe)
+  add_test(NAME xe_hc_persist_cpu COMMAND sh -c
+    "RADIANCE_XE_HC_PERSIST=0 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_off.bin && RADIANCE_XE_HC_PERSIST=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_on.bin && cmp hc_persist_off.bin hc_persist_on.bin && echo 'hc_persist: bit-identical'")
+  set_tests_properties(xe_hc_persist_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8" TIMEOUT 600)
 endif()

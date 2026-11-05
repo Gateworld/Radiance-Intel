@@ -71,6 +71,8 @@
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_fwht.h"
+#include "xe_persist.h"   /* the megakernel's stage 1a (RADIANCE_XE_HC_PERSIST) */
+#include <vector>
 #include "r4d_hc_fp8.h"
 #include "r4d_q8.h"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the prefill products on the matrix units (owner note 102) */
@@ -1505,16 +1507,17 @@ constexpr int kV2Cols = kWaves;   // columns of W_down a workgroup owns: one a w
 /* kQ8 (owner note 158 stage 2, RADIANCE_XE_HC_I8=2): N also as int8, each 16 values rounded at their own max (the
  * max / 127 an f32 beside them, `nqs`), for the down product's DP4A dots; the bf16 N is the same values either way,
  * each thread writing 16 consecutive of them instead of every kThreads-th. */
+/* `c` / `r` / `tid`: the block's stream, row and the thread -- the launch's own (blockIdx, threadIdx) for the kernels
+ * below, a virtual block of a persistent work-group for hc_v2_down_persist_kernel (owner note 186 item 3b): the same
+ * values in the same order either way. */
 template <bool kQ8>
 __device__ __forceinline__ void hc_v2_norm_body(const unsigned short* __restrict__ h, const float* __restrict__ w,
                                                 unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
                                                 signed char* __restrict__ nq, float* __restrict__ nqs,
                                                 long rows, long n, int hc, long hrow, float eps, float wadd,
-                                                float* s_part, float& s_sc) {
-    const int  c = blockIdx.x;
-    const long r = blockIdx.y;
+                                                float* s_part, float& s_sc, int c, long r, int tid) {
     if (r >= rows || c >= hc) return;
-    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int  lane = tid & (kWave - 1), wave = tid / kWave;
     const unsigned short* hp = h + r * hrow;
     const long cb = (long)c * n;
 
@@ -1577,7 +1580,8 @@ void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __rest
                        long rows, long n, int hc, long hrow, float eps, float wadd) {
     XE_SHARED(float, s_part, kWaves);
     XE_SHARED_VAR(float, s_sc);
-    hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc);
+    hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc,
+                           (int)blockIdx.x, (long)blockIdx.y, (int)threadIdx.x);
 }
 __global__ __launch_bounds__(kThreads)
 void hc_v2_norm_q8_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -1586,7 +1590,8 @@ void hc_v2_norm_q8_kernel(const unsigned short* __restrict__ h, const float* __r
                           long rows, long n, int hc, long hrow, float eps, float wadd) {
     XE_SHARED(float, s_part, kWaves);
     XE_SHARED_VAR(float, s_sc);
-    hc_v2_norm_body<true>(h, w, nbuf, scaleout, nq, nqs, rows, n, hc, hrow, eps, wadd, s_part, s_sc);
+    hc_v2_norm_body<true>(h, w, nbuf, scaleout, nq, nqs, rows, n, hc, hrow, eps, wadd, s_part, s_sc,
+                          (int)blockIdx.x, (long)blockIdx.y, (int)threadIdx.x);
 }
 
 /* kPart (RADIANCE_XE_HC_V2=3, a timing split): 0 the columns and, in the last workgroup, the inject gains; 1 the
@@ -1599,6 +1604,35 @@ void hc_v2_norm_q8_kernel(const unsigned short* __restrict__ h, const float* __r
  * and the gain's weight row into 2 x HN bytes of dynamic LDS, half of each at a time, and wave 0 runs the same
  * wave_dot_lds over LDS, its sum carried across the halves. One wave walking the row from global memory took 18.6 us
  * (P31), 37.3 with eight loads in flight (P34). The same values in the same order. */
+/* One inject gain of the S8 form (gain `c` of row `r`, the work-group's thread `tid`): N and the gain's weight row
+ * through `s_nw` (2 x HN / 2 bf16 of dynamic LDS) in two halves, wave 0 carrying its sum across them. Shared by
+ * hc_v2_down_kernel<.., kS8> and the persistent form (owner note 186 item 3b) -- the same values in the same order. */
+__device__ __forceinline__ void hc_v2_gain_body(const unsigned short* __restrict__ sN,
+                                                const unsigned short* __restrict__ injw,
+                                                unsigned short* __restrict__ inj, int hc, long HN, long irow,
+                                                int c, long r, int tid, unsigned short* s_stage0,
+                                                unsigned short* s_nw) {
+    const int lane = tid & (kWave - 1), wave = tid / kWave;
+    const float inv_hc = 1.0f / (float)hc;
+    const unsigned short* wg = injw + (long)c * HN;
+    const long half = HN / 2;
+    float acc = 0.0f;
+    for (int p = 0; p < 2; ++p) {
+        if (p) __syncthreads();   /* wave 0 is done reading the first half */
+        for (long o = (long)tid * 8; o < half; o += (long)kThreads * 8) {
+            *(uint4*)(s_nw + o)        = *(const uint4*)(sN + p * half + o);
+            *(uint4*)(s_nw + half + o) = *(const uint4*)(wg + p * half + o);
+        }
+        __syncthreads();
+        if (wave == 0)
+            acc = wave_dot_lds<kDotU>((const unsigned short*)s_nw, (const unsigned short*)(s_nw + half), half,
+                                      lane, s_stage0, acc);
+    }
+    if (wave != 0) return;
+    acc = wave_sum(acc);
+    if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+}
+
 template <int kPart = 0, bool kS8 = false, bool kWI8 = false>   /* kWI8: int8 rows (RADIANCE_XE_HC_I8, run 125) */
 __global__ __launch_bounds__(kThreads)
 void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
@@ -1623,30 +1657,13 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
             return;
         }
         if (!injw || !inj) return;
-        const int c = (int)blockIdx.x;
         /* N and the gain's row, in two halves of HN / 2 each (2 x HN bytes of LDS: the launch checks that the half
          * is a whole number of wave_dot_lds steps). Both in LDS at once (40 KB, P37's 9.6 us alone) left one
          * workgroup an Xe core and the launch in two rounds (P36: 24.1 us against the columns' 12.6); the row alone
          * in LDS with N from global was slower still (P38: 37.1). Wave 0 carries its sum from the first half into
-         * the second: the one-pass chain. */
+         * the second: the one-pass chain (hc_v2_gain_body). */
         XE_DYN_LDS(unsigned short, s_nw);
-        const unsigned short* wg = injw + (long)c * HN;
-        const long half = HN / 2;
-        float acc = 0.0f;
-        for (int p = 0; p < 2; ++p) {
-            if (p) __syncthreads();   /* wave 0 is done reading the first half */
-            for (long o = (long)tid * 8; o < half; o += (long)kThreads * 8) {
-                *(uint4*)(s_nw + o)        = *(const uint4*)(sN + p * half + o);
-                *(uint4*)(s_nw + half + o) = *(const uint4*)(wg + p * half + o);
-            }
-            __syncthreads();
-            if (wave == 0)
-                acc = wave_dot_lds<kDotU>((const unsigned short*)s_nw, (const unsigned short*)(s_nw + half), half,
-                                          lane, s_stage[0], acc);
-        }
-        if (wave != 0) return;
-        acc = wave_sum(acc);
-        if (lane == 0) inj[r * irow + c] = f2bf(2.0f * sigmoidf_(acc * inv_hc));
+        hc_v2_gain_body(sN, injw, inj, hc, HN, irow, (int)blockIdx.x, r, tid, s_stage[0], s_nw);
         return;
     }
     if (kPart == 1 || (kPart == 0 && blockIdx.x != gridDim.x - 1)) {
@@ -1673,13 +1690,16 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
  * small ones, as many as level 5's grid holds over 4. Each row's sum is hc8_dot_down<.., S8>'s: level 5's bits. The
  * inject gains keep level 6's launch of their own. */
 constexpr int kV2RowCols = 2;   /* columns (waves) a workgroup */
+/* One workgroup of kWave x kV2RowCols threads (block (bx, by), thread `tid` of it): the kernel below, or a 64-thread
+ * slice of a persistent work-group (owner note 186 item 3b). No barrier: every return is a whole wave's. */
 template <int kRG, bool kWI8 = false>
-__global__ __launch_bounds__(kWave * kV2RowCols)
-void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
-                            unsigned short* __restrict__ dout, long rows, int hc, long HN, long lr) {
-    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
-    const long r0 = (long)blockIdx.y * kRG;
-    const long k = (long)blockIdx.x * kV2RowCols + wave;
+__device__ __forceinline__ void hc_v2_down_rows_body(const unsigned short* __restrict__ nbuf,
+                                                     const void* __restrict__ downv, long dld,
+                                                     unsigned short* __restrict__ dout, long rows, int hc, long HN,
+                                                     long lr, long bx, long by, int tid) {
+    const int lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = by * kRG;
+    const long k = bx * kV2RowCols + wave;
     if (k >= lr || r0 >= rows) return;
     const int nr = (int)(rows - r0 < kRG ? rows - r0 : kRG);
     const float inv_hc = 1.0f / (float)hc;
@@ -1691,6 +1711,13 @@ void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void*
         const float a = wave_sum(acc[i]);
         if (lane == 0) dout[(r0 + i) * lr + k] = f2bf(siluf_(a * inv_hc));
     }
+}
+template <int kRG, bool kWI8 = false>
+__global__ __launch_bounds__(kWave * kV2RowCols)
+void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
+                            unsigned short* __restrict__ dout, long rows, int hc, long HN, long lr) {
+    hc_v2_down_rows_body<kRG, kWI8>(nbuf, downv, dld, dout, rows, hc, HN, lr, (long)blockIdx.x, (long)blockIdx.y,
+                                    (int)threadIdx.x);
 }
 
 /* Owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): hc_v2_down_rows_kernel's grid and sums on int8 rows and int8 N by
@@ -1759,6 +1786,76 @@ void hc_v2_down_rows_g_kernel(const unsigned short* __restrict__ nbuf, const voi
 bool xe_hc_v2_rg() {
     static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_V2_RG"); return v && v[0] == '1'; }();
     return on;
+}
+
+/* ============================================================== the megakernel's stage 1a: hc_read's down half, persistent
+ * Intel port, run 188 (owner note 186 item 3b; briefs/2026-11-05-megakernel.md), RADIANCE_XE_HC_PERSIST=1, opt-in:
+ * level 8's three launches for a verify's rows -- hc_v2_norm, hc_v2_down_rows<4> (the columns) and hc_v2_down<2, S8>
+ * (the inject gains) -- as ONE launch of persist_groups() work-groups (one an Xe core, so all resident), in two phases:
+ *   0. the norm: a virtual block (stream c, row r) a whole work-group, hc x rows of them over the groups;
+ *   1. the columns: 64-thread slices (four a group) taking hc_v2_down_rows' blocks (bx, by); then, the group gathered,
+ *      the gains: a virtual block (c, r) a whole work-group, over its 2 x HN bytes of LDS.
+ * Between the phases a device-scope barrier (xe_persist.h: a bounded spin, an error word); at the end the last group
+ * zeroes the counter for the next launch. Every block runs the bodies the three kernels run (hc_v2_norm_body,
+ * hc_v2_down_rows_body, hc_v2_gain_body) on the same values in the same order: only which work-group runs it
+ * changes, so the result is bit-identical by construction (xe_hc_persist_cpu checks it: off and on, byte for byte). */
+bool xe_hc_persist_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_PERSIST"); return v && v[0] == '1'; }();
+    return on;
+}
+constexpr uint64_t kHcPersistSpin = 1ull << 20;   /* a barrier waits microseconds; ~0.2 s is a stuck one */
+
+template <bool kWI8>
+__global__ __launch_bounds__(kThreads)
+void hc_v2_down_persist_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                               unsigned short* __restrict__ nbuf, float* __restrict__ scaleout, long rows, long n,
+                               int hc, long hrow, float eps, float wadd, const void* __restrict__ downv, long dld,
+                               unsigned short* __restrict__ dout, long HN, long lr,
+                               const unsigned short* __restrict__ injw, unsigned short* __restrict__ inj, long irow,
+                               uint32_t* __restrict__ sync) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    XE_SHARED2(unsigned short, s_stage, kWaves, kWave * 8);
+    XE_DYN_LDS(unsigned short, s_nw);
+    const int  tid = (int)threadIdx.x;
+    const long G = (long)gridDim.x, g = (long)blockIdx.x;
+    /* phase 0: the norm */
+    for (long vb = g; vb < (long)hc * rows; vb += G) {
+        hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc,
+                               (int)(vb % hc), vb / hc, tid);
+        __syncthreads();   /* s_part / s_sc are the next block's */
+    }
+    if (!xe::persist_barrier_here(sync, (uint32_t)G, 0u, kHcPersistSpin)) return;
+    /* phase 1: the columns, 64-thread slices */
+    constexpr int kSlice = kWave * kV2RowCols, kSlices = kThreads / kSlice;
+    const long bxn = (lr + kV2RowCols - 1) / kV2RowCols, ncb = bxn * ((rows + 3) / 4);
+    for (long vb = g * kSlices + tid / kSlice; vb < ncb; vb += G * kSlices)
+        hc_v2_down_rows_body<4, kWI8>(nbuf, downv, dld, dout, rows, hc, HN, lr, vb % bxn, vb / bxn, tid % kSlice);
+    /* ... and the gains, a whole group a block */
+    if (injw && inj) {
+        __syncthreads();
+        for (long vb = g; vb < (long)hc * rows; vb += G) {
+            const long r = vb / hc;
+            hc_v2_gain_body(nbuf + r * HN, injw, inj, hc, HN, irow, (int)(vb % hc), r, tid, s_stage[0], s_nw);
+            __syncthreads();   /* wave 0 has read s_nw before the next block refills it */
+        }
+    }
+    xe::persist_exit_here(sync, (uint32_t)G);
+}
+
+/* The launch's synchronisation words, one set a stream (two streams on a card must not share a counter), zeroed once
+ * when made; the kernel leaves them zeroed for the next launch. */
+uint32_t* hc_persist_sync(hipStream_t s) {
+    static std::mutex m;
+    static std::vector<std::pair<const void*, uint32_t*>> v;
+    std::lock_guard<std::mutex> lk(m);
+    for (auto& e : v) if (e.first == (const void*)s) return e.second;
+    sycl::queue& q = *s;
+    uint32_t* p = sycl::malloc_device<uint32_t>(xe::kPersistWords, q);
+    if (!p) return nullptr;
+    sycl::queue(q.get_context(), q.get_device()).memset(p, 0, xe::kPersistWords * sizeof(uint32_t)).wait();
+    v.emplace_back((const void*)s, p);
+    return p;
 }
 
 /* Read once, in host code, at every call. RADIANCE_XE_HC_V2: 1 the norm and down product above, 2 also
@@ -4713,7 +4810,32 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                         && n % 16 == 0 && a->scratch_bytes >= fixed + hc_q8_bytes(HN);
         signed char* nq = nullptr;
         float* nqs = nullptr;
-        if (q8) {
+        /* RADIANCE_XE_HC_PERSIST=1 (the megakernel's stage 1a): the norm, level 8's columns and the gains as one
+         * persistent launch (hc_v2_down_persist_kernel); the q8 form and every other shape keep their launches */
+        bool persisted = false;
+        if (!q8 && s8d && xe_hc_v2_level() == 8 && rows > 1 && xe_hc_persist_on()) {
+            if (uint32_t* sy = hc_persist_sync((hipStream_t)s)) {
+                const unsigned G = xe::persist_groups(*(hipStream_t)s);
+                const unsigned plds = (injw && inj) ? glds : 0u;
+#define HC_PERSIST(W_)                                                                                            \
+                R4D_EMIT(s, hc_v2_down_persist_kernel<W_>, dim3(G), dim3(kThreads), plds,                        \
+                         (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows, (long)n, \
+                         (int)hc, (long)hrow, eps, wadd, (const void*)down->data, (long)dld, dbuf, (long)HN,     \
+                         (long)lr, injw ? (const unsigned short*)injw->data : nullptr,                           \
+                         inj ? (unsigned short*)inj->data : nullptr, (long)irow, sy)
+                emit_rc = wf == 3 ? HC_PERSIST(true) : HC_PERSIST(false);
+#undef HC_PERSIST
+                persisted = true;
+                static std::once_flag said;
+                std::call_once(said, [G] {
+                    std::fprintf(stderr, "[xe] hc_read's down half as one persistent launch (RADIANCE_XE_HC_PERSIST=1, "
+                                         "%u work-groups)\n", G);
+                });
+            }
+        }
+        if (persisted) {
+            /* done: the persistent launch ran the norm, the columns and the gains */
+        } else if (q8) {
             const uintptr_t qb = ((uintptr_t)a->scratch + (uintptr_t)(a->scratch_bytes - hc_q8_bytes(HN)) + 15u)
                                  & ~(uintptr_t)15u;
             nq = (signed char*)qb;
@@ -4733,7 +4855,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                  (long)rows, (int)hc, (long)HN, (long)lr, (long)irow)
 #define HC_V2_DOWN(P_, S8_, GX_, LDS_) \
         (wf == 3 ? HC_V2_DOWN_W(P_, S8_, GX_, LDS_, true) : HC_V2_DOWN_W(P_, S8_, GX_, LDS_, false))
-        if (emit_rc == RAD_OK && q8) {
+        if (persisted) {
+            /* the columns and the gains ran in the persistent launch */
+        } else if (emit_rc == RAD_OK && q8) {
             const dim3 qg((unsigned)((lr + kV2RowCols - 1) / kV2RowCols), (unsigned)(rows > 1 ? (rows + 3) / 4 : 1));
             if (rows > 1)
                 emit_rc = R4D_EMIT(s, hc_v2_down_rows_q8_kernel<4>, qg, dim3(kWave * kV2RowCols), 0u,

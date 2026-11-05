@@ -72,4 +72,25 @@ inline bool persist_barrier(const sycl::nd_item<D>& it, uint32_t* sync, uint32_t
     return bad == 0u;
 }
 
+/* The same for a kernel without an nd_item in hand (libxe's HIP-dialect ports): the work-item from SYCL's query. */
+inline bool persist_barrier_here(uint32_t* sync, uint32_t ngroups, uint32_t phase, uint64_t spin_max) {
+    return persist_barrier(sycl::ext::oneapi::this_work_item::get_nd_item<3>(), sync, ngroups, phase, spin_max);
+}
+
+/* At the kernel's end, after its last barrier: each group's thread 0 counts out in [3], and the last one zeroes the
+ * arrival counter and [3] -- every other group has passed its last barrier by then (it counted out after it), so no
+ * one reads the counter any more, and the next launch on the stream (a recorded pass's replay too) starts from 0
+ * without a host memset. After a spin-out nobody resets: the error stays for the host, and later launches fail fast. */
+inline void persist_exit_here(uint32_t* sync, uint32_t ngroups) {
+    using aref = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>;
+    const auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    if (it.get_local_linear_id() != 0) return;
+    aref out(sync[3]);
+    if (out.fetch_add(1u) == ngroups - 1u) {
+        aref(sync[0]).store(0u);
+        out.store(0u);
+    }
+}
+
 }  /* namespace xe */
