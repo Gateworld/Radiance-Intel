@@ -286,9 +286,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
-    /* A new request's text, so a new estimate. */
+    /* A new request's text, so a new estimate; under the adaptive window it starts at its depth by content (note 193). */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
+    s.adapt.init  = s.req ? s.req->spec_cap : 0;
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;

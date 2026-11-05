@@ -510,8 +510,11 @@ private:
      * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
      * rounds in serial_begin(). With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
-        const int w = draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
-        /* the request's own cap by content (Request::spec_cap, owner note 191 item 1), under either policy */
+        /* Under the adaptive window a request's depth by content (Request::spec_cap) is where its estimate starts
+         * (DraftAdapt::init, owner note 193), not a cap: the window then follows its acceptance. With the policy off it
+         * is the request's cap (owner note 191 item 1). */
+        if (draft_.adaptive()) return draft_.window_for(s.adapt);
+        const int w = draft_.next_depth();
         return s.req && s.req->spec_cap > 0 && s.req->spec_cap < w ? s.req->spec_cap : w;
     }
 

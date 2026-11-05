@@ -161,6 +161,8 @@ void DraftController::start(DraftAdapt& s) const {
         s.n[j] = 0;
     }
     s.depth = stop_of(s.a);
+    /* owner note 193: a request starts at its depth by content (DraftAdapt::init), then adapts */
+    if (s.init > 0 && s.init < s.depth) s.depth = s.init;
     s.held  = 0;
 }
 

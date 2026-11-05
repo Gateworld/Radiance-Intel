@@ -52,6 +52,9 @@ struct DraftAdapt {
     int32_t  held  = 0;                       /* verifies since `depth` last moved */
     float    a[RAD_SCHED_MAX_SPEC] = {};      /* conditional acceptance at each draft position */
     uint16_t n[RAD_SCHED_MAX_SPEC] = {};      /* verifies that evaluated each one, saturating */
+    /* A starting stop the caller sets before the first ask: the request's draft depth by content (Request::spec_cap,
+     * owner note 193), which the estimate then moves past the hold like any stop. 0: the policy's own (the prior). */
+    int32_t  init = 0;
 };
 
 class DraftController {

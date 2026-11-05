@@ -2329,6 +2329,37 @@ TEST(the_adaptive_window_follows_each_sequences_own_acceptance) {
     CHECK_EQ(c.window_for(summary), 6);
 }
 
+/* DraftAdapt::init (owner note 193): a request whose depth by content is 2 starts its adaptive window at 2, not at the
+ * prior's ceiling, and moves past the hold like any stop -- deeper on a text the head predicts. Without init the
+ * window starts where the prior puts it. */
+TEST(the_adaptive_window_starts_at_the_requests_depth_by_content_and_then_adapts) {
+    DraftController c = adaptive_controller(4);
+    DraftAdapt prose;
+    prose.init = 2;
+    CHECK_EQ(c.window_for(prose), 2);
+    DraftAdapt plain;
+    CHECK_EQ(c.window_for(plain), 4);
+    /* the head agrees almost always: past the hold the stop goes deeper than where it started */
+    Coin coin;
+    for (int t = 0; t < 200; ++t) {
+        const int d = c.window_for(prose);
+        int a = 0;
+        while (a < d && coin(0.97)) ++a;
+        c.adapt_observe(prose, d, a);
+    }
+    CHECK(c.window_for(prose) > 2);
+    /* and one the head rarely agrees on past the first draft comes down to 1 or 2 from the start of 2 */
+    DraftAdapt hard;
+    hard.init = 2;
+    for (int t = 0; t < 200; ++t) {
+        const int d = c.window_for(hard);
+        int a = 0;
+        while (a < d && coin(a == 0 ? 0.5 : 0.1)) ++a;
+        c.adapt_observe(hard, d, a);
+    }
+    CHECK(c.window_for(hard) <= 2);
+}
+
 /* A stop moves only past the hold: it is the sequence's share of the step's pass shape, and a
  * shape following every flicker of its estimate would re-record its passes for nothing
  * (runtime/ctx.h). It never goes below one draft, or the estimate could never recover. */
