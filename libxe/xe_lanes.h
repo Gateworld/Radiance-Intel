@@ -418,9 +418,18 @@ sycl::event launch_as(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, size_t lds
         new (vz) std::tuple<P...>(v);
         if (launch_native<decltype(kfn)>(q, g, b, lds, vz, sizeof v)) return sycl::event{};
     }
-    sycl::event ev = sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
-    if (launch_profile_on()) lp_ring().push(ev, typeid(kfn).name());
-    return ev;
+    /* No event unless the launch profile wants one (run 187, owner note 182): every submit_with_event made the
+     * Level Zero adapter create an event (urEnqueueKernelLaunch -> createEventAndAssociateQueue -> EventCreate) that
+     * was never given back on this in-order queue -- the host's anonymous memory grew ~28 KB a prefill position (MD12's
+     * heap profile: 98 % of the live heap at exit), while recorded decode passes, which submit nothing, stayed flat.
+     * No caller reads the returned event (R4D_EMIT and the HIP spellings discard it); ordering is the queue's. */
+    if (launch_profile_on()) {
+        sycl::event ev = sxe::submit_with_event(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
+        lp_ring().push(ev, typeid(kfn).name());
+        return ev;
+    }
+    sxe::submit(q, [&](sycl::handler& h) { sxe::nd_launch(h, cfg, kfn); });
+    return sycl::event{};
 #pragma clang diagnostic pop
 }
 inline void* dyn_lds() { return sxe::get_work_group_scratch_memory(); }
@@ -450,12 +459,18 @@ sycl::event launch_as_grf256(void (*)(P...), sycl::queue& q, dim3 g, dim3 b, con
         new (vz) std::tuple<P...>(v);
         if (launch_native<decltype(kfn)>(q, g, b, 0, vz, sizeof v)) return sycl::event{};
     }
-    sycl::event ev = q.submit([&](sycl::handler& h) {
+    auto cgf = [&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<3>(global, local),
                        sxe::properties{sycl::ext::intel::experimental::grf_size<256>}, kfn);
-    });
-    if (launch_profile_on()) lp_ring().push(ev, typeid(kfn).name());
-    return ev;
+    };
+    /* No event unless profiled, as in launch_as (run 187). */
+    if (launch_profile_on()) {
+        sycl::event ev = q.submit(cgf);
+        lp_ring().push(ev, typeid(kfn).name());
+        return ev;
+    }
+    sxe::submit(q, cgf);
+    return sycl::event{};
 }
 
 }  /* namespace xe */

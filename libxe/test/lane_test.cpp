@@ -48,7 +48,9 @@ const Case kCases[LANE_NCASES] = {
 
 template <auto K, class... A>
 void run_xe(sycl::queue& q, A... a) {
-    XE_LAUNCH(&q, K, dim3(LANE_GRID), dim3(LANE_BLOCK), 0, a...).wait_and_throw();
+    /* the launch returns no event unless profiled (run 187): wait on the queue */
+    XE_LAUNCH(&q, K, dim3(LANE_GRID), dim3(LANE_BLOCK), 0, a...);
+    q.wait_and_throw();
 }
 
 void run_case(sycl::queue& q, int c, const int* in, int* out, int* counter) {
