@@ -505,7 +505,9 @@ private:
      * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
      * rounds in serial_begin(). With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
-        return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        const int w = draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        /* the request's own cap by content (Request::spec_cap, owner note 191 item 1), under either policy */
+        return s.req && s.req->spec_cap > 0 && s.req->spec_cap < w ? s.req->spec_cap : w;
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()

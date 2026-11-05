@@ -1440,7 +1440,7 @@ const RadBatch* Scheduler::step() {
              * its acceptance of the head's drafts pays for. That estimate says nothing about the
              * n-gram fallback, so the fallback is held to the step's window, as deep as the head
              * drafts this step and no deeper. */
-            const int cap = draft_.adaptive() ? draft_cap(s) : depth;
+            const int cap = draft_cap(s);   /* `depth` with the policy off, less a request's own cap */
             bool ngram = false;
             if (ngram_stats_on()) {
                 if (!r.may_speculate) ++ngs_.gate_nospec;
@@ -1860,7 +1860,7 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     /* Under the adaptive window the rounds ran for the deepest sequence; this one verifies the
      * first of them up to its own window. That is the cap serial_begin used: nothing commits
      * between the two, and D is the cycle's (draft_cycle). */
-    if (draft_.adaptive() && n > 0) {
+    if (n > 0) {   /* also a request's own cap with the policy off (Request::spec_cap) */
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
@@ -2316,8 +2316,10 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * head pass over every drafting row, and a sequence that wants fewer verifies the first of
      * them (expect_draft, set_draft); a round past the deepest window drafts for nobody. Only a
      * row that will draft counts. With none, the rounds stay as they are, because round 0 is the
-     * history pass. The lookahead reservation below then matches the rounds that will run. */
-    if (may_draft && draft_.adaptive()) {
+     * history pass. The lookahead reservation below then matches the rounds that will run. With the policy off the
+     * same holds for a request's own cap (Request::spec_cap): a step whose drafting rows all cap at 2 runs 2 rounds;
+     * without caps every row's is the depth, which *rounds already is. */
+    if (may_draft) {
         int want = 0;
         for (const StepEntry& e : plan_.e) {
             if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;

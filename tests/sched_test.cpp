@@ -2633,6 +2633,56 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
 }
 
+/* Request::spec_cap (owner note 191 item 1, the draft depth by content): with the policy off, a request capped at 2
+ * under a depth of 3 verifies at most 2 drafts while an uncapped one verifies 3; the head's rounds follow the deepest
+ * drafting row (3 with both, 2 with the capped one alone); a step issued ahead is cut to the cap too. */
+TEST(a_requests_own_draft_cap_holds_its_window_and_the_rounds_follow_the_deepest) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 3;
+    f.prog.drafter.kind = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    CHECK_OK(f.start());
+    REQUIRE(!f.sch.draft().adaptive());
+
+    const uint64_t a = f.submit(160, 2000);
+    const uint64_t b = f.submit(160, 2000);
+    f.sch.find(a)->spec_cap = 2;
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[3] = { 21, 22, 23 };
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    CHECK_EQ(f.sch.find(a)->n_draft, 2);
+    CHECK_EQ(f.sch.find(b)->n_draft, 3);
+    const RadBatch* s = f.sch.step();
+    REQUIRE(s != nullptr);
+    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 2 : 3);
+    CHECK_EQ(s->n_tok, 3 + 4);
+    int rounds = 3;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 3);                      /* `b` drafts 3 deep */
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.n_spec; }));
+
+    /* `b` finishes; `a` alone: two rounds, and the step issued ahead verifies two */
+    f.sch.cancel(b);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    s = f.sch.step();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(s->n_spec, 2);
+    rounds = 3;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 2);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.expect_draft(a, 3);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 2);
+}
+
 /* A new sequence starts from the finished sequences, one vote each. Pooled verifies measure deep
  * positions almost only on texts good enough to reach them; here two texts the head predicts and
  * two it does not set the prior together. Until four have finished, the fixed prior applies. */

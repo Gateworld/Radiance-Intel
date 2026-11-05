@@ -709,6 +709,11 @@ struct Request {
      * when this is set. Written when the sampler starts the request
      * (Sampler::speculation_fixed); false until then. */
     bool                 speculation_fixed = false;
+    /* The deepest draft window this request may take, by its content; 0 for no cap (the deployment's depth). The
+     * server sets it (RADIANCE_DRAFT_DEPTH_PROSE: plain prose, no tools, no tool turns and no grammar, drafts that
+     * deep; owner note 191 item 1). The scheduler applies it wherever it caps a proposal (Scheduler::draft_cap). A
+     * cap changes only how many drafts are verified, never which tokens are emitted. */
+    int                  spec_cap = 0;
 
     /* A logits row at every prompt position, not only the last: each trunk step carrying this
      * prompt names all its tokens in `out_ids` after the sampler's rows, and the engine hands them

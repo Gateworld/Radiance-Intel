@@ -514,6 +514,19 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
              * tell reasoning from answer) gets none; the decoder and pump() cut instead. */
             rq.stop = r.stops_after.empty() ? r.stop : std::vector<std::string>{};
             rq.ignore_eos = r.ignore_eos;
+            /* RADIANCE_DRAFT_DEPTH_PROSE=N (Intel port, run 193, owner note 191 item 1; opt-in): plain prose -- no
+             * tools offered, no tool turn in the conversation, no grammar or response_format -- drafts at most N
+             * deep; the rest keep the deployment's depth. 11-03: depth 2 beat 3 by 4.2 % on the prose prompt and
+             * lost 3.5 % on the tool-heavy rotation. */
+            {
+                static const int prose_depth = [] {
+                    const char* v = std::getenv("RADIANCE_DRAFT_DEPTH_PROSE");
+                    const int n = (v && *v) ? std::atoi(v) : 0;
+                    return n > 0 ? n : 0;
+                }();
+                if (prose_depth > 0 && !r.tools_present && !r.tool_history && r.sp.grammar.empty())
+                    rq.spec_cap = prose_depth;
+            }
             rq.priority = r.priority;
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;

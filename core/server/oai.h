@@ -132,6 +132,9 @@ struct OaiRequest {
     bool want_logprobs = false;
 
     bool tools_present = false;
+    /* The conversation carries a tool turn: a `tool` message, or an assistant message with `tool_calls`. With
+     * tools_present and a grammar, what the draft depth by content (RADIANCE_DRAFT_DEPTH_PROSE) reads. */
+    bool tool_history = false;
     /* OpenAI's deprecated functions API: the request sent `functions`, so the reply carries its
      * call as `function_call` (one at most) and ends in finish_reason "function_call". */
     bool legacy_functions = false;

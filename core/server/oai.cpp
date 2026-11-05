@@ -1875,6 +1875,10 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     }
     if (messages.is_array()) {
         out->n_messages = (int)messages.size();
+        for (const auto& m : messages)
+            if (m.is_object() && m.contains("role") &&
+                (m.at("role") == "tool" || (m.at("role") == "assistant" && m.contains("tool_calls"))))
+                out->tool_history = true;
         for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
             if (!it->is_object() || !it->contains("role") || it->at("role") != "user") continue;
             const auto cit = it->find("content");
