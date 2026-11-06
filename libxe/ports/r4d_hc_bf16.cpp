@@ -1687,6 +1687,74 @@ void hc_v2_norm_kernel(const unsigned short* __restrict__ h, const float* __rest
     hc_v2_norm_body<false>(h, w, nbuf, scaleout, nullptr, nullptr, rows, n, hc, hrow, eps, wadd, s_part, s_sc,
                            (int)blockIdx.x, (long)blockIdx.y, (int)threadIdx.x);
 }
+/* hc_write folded into the next read's norm (run 206, owner notes 200 item 3 / 201 item 4: the fusion map's top pair,
+ * RADIANCE_HC_WRITE_FUSE). Work-group (c, r) first applies the previous connection's write to stream c of row r --
+ * h[c][i] = bf16(h[c][i] + inj[c] * y[i]), hc_write_kernel's expression -- stores it and sums its squares in
+ * hc_v2_norm_body's order (thread tid owns i = tid + k * kThreads, ascending), then finishes the norm as the body does,
+ * re-reading only the elements it wrote itself. The same bits as hc_write_kernel then hc_v2_norm_kernel. */
+__global__ __launch_bounds__(kThreads)
+void hc_v2_write_norm_kernel(unsigned short* __restrict__ h, const unsigned short* __restrict__ y,
+                             const unsigned short* __restrict__ injp, const float* __restrict__ w,
+                             unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
+                             long rows, long n, int hc, long hrow, long yrow, long irow, float eps, float wadd) {
+    XE_SHARED(float, s_part, kWaves);
+    XE_SHARED_VAR(float, s_sc);
+    const int c = (int)blockIdx.x, tid = (int)threadIdx.x;
+    const long r = (long)blockIdx.y;
+    if (r >= rows || c >= hc) return;
+    const int  lane = tid & (kWave - 1), wave = tid / kWave;
+    unsigned short* hp = h + r * hrow;
+    const unsigned short* yp = y + r * yrow;
+    const long cb = (long)c * n;
+    const float g = bf2f(injp[r * irow + c]);
+    float acc = 0.0f;
+    /* the norm body's prefetch depth (M307: one element at a time ran 9.9 us, latency-bound at hc x rows work-groups);
+     * the loads move, the values and the summation order do not */
+    constexpr int kPre = 8;
+    long i = tid;
+    for (; i + (long)(kPre - 1) * kThreads < n; i += (long)kPre * kThreads) {
+        unsigned short hv[kPre], yv[kPre];
+#pragma unroll
+        for (int p = 0; p < kPre; ++p) { hv[p] = hp[cb + i + (long)p * kThreads]; yv[p] = yp[i + (long)p * kThreads]; }
+#pragma unroll
+        for (int p = 0; p < kPre; ++p) {
+            const unsigned short o = f2bf(bf2f(hv[p]) + g * bf2f(yv[p]));
+            hp[cb + i + (long)p * kThreads] = o;
+            const float v = bf2f(o);
+            acc += v * v;
+        }
+    }
+    for (; i < n; i += kThreads) {
+        const unsigned short o = f2bf(bf2f(hp[cb + i]) + g * bf2f(yp[i]));
+        hp[cb + i] = o;
+        const float v = bf2f(o);
+        acc += v * v;
+    }
+    acc = wave_sum(acc);
+    if (lane == 0) s_part[wave] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int k = 0; k < kWaves; ++k) ss += s_part[k];
+        const float sc = __frsqrt_rn(ss / (float)n + eps);
+        s_sc = sc;
+        if (scaleout) scaleout[r * kHcMax + c] = sc;
+    }
+    __syncthreads();
+    const float sc = s_sc;
+    unsigned short* np = nbuf + r * (long)hc * n + cb;
+    for (long j = tid; j < n; j += kThreads) np[j] = f2bf(bf2f(hp[cb + j]) * sc * (w[cb + j] + wadd));
+}
+/* The write a fused hc_write_read row hands its read (xe_rad_hc_write_read): consumed by the plain norm's launch in
+ * r4d_rad_hc_read, or issued as hc_write_kernel ahead of any other form, before anything reads `h`. */
+struct HcPendingWrite {
+    const unsigned short* y = nullptr;
+    const unsigned short* inj = nullptr;
+    long yrow = 0, irow = 0;
+    bool on = false;
+};
+thread_local HcPendingWrite g_hcw;
+
 __global__ __launch_bounds__(kThreads)
 void hc_v2_norm_q8_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
                           unsigned short* __restrict__ nbuf, float* __restrict__ scaleout,
@@ -5123,6 +5191,22 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * per connection. So from kDecMinRows the products run tiled, 128 rows when there are enough
      * (prefill), else 32 or 64 with a K-split down product. Below kDecMinRows the per-row kernels
      * win. */
+    /* A fused hc_write_read (g_hcw): the write folds into the plain V2 norm below (hc_v2_write_norm_kernel); on any
+     * form that reads `h` some other way first (the matrix-unit prefill, the persistent / ticketed / NR forms, int8
+     * rows, the non-V2 kernel) the write runs here, as hc_write_kernel, before anything reads `h`. */
+    if (g_hcw.on) {
+        const bool pf_any = (wf == 1 && hc == 4) && xe_hc_pf_dpas_mode((hipStream_t)s) && rows >= kSrMinRows;
+        const bool plain = !pf_any && wf == 1 && xe_hc_v2_on() && !xe_hc_persist2_on() && !xe_hc_persist_on() &&
+                           !xe_hc_nr_on();
+        if (!plain) {
+            const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
+            g_hcw.on = false;
+            if (R4D_EMIT(s, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0, g_hcw.y, g_hcw.inj,
+                         (unsigned short*)h->data, (long)rows, (long)n, (int)hc, g_hcw.yrow, g_hcw.irow, (long)hrow) !=
+                RAD_OK)
+                return R4D_NO(RAD_E_DEVICE);
+        }
+    }
     bool fused = false;
     /* libxe: the tiled forms (hc_down_wide, PF2, the K-split down product) are bf16 WMMA, which the
      * port does not shim (their stubs return NaN: kbench caught it on the tiny model, hc_read_e4m3
@@ -5399,6 +5483,15 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
             emit_rc = R4D_EMIT(s, hc_v2_norm_q8_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
                                (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, nq, nqs, (long)rows,
                                (long)n, (int)hc, (long)hrow, eps, wadd);
+        } else if (g_hcw.on) {   /* the fused hc_write_read: the previous connection's write rides the norm */
+            g_hcw.on = false;
+            emit_rc = R4D_EMIT(s, hc_v2_write_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
+                               (unsigned short*)h->data, g_hcw.y, g_hcw.inj, (const float*)w->data, nbuf, scale,
+                               (long)rows, (long)n, (int)hc, (long)hrow, g_hcw.yrow, g_hcw.irow, eps, wadd);
+            static std::once_flag said;
+            std::call_once(said, [] {
+                std::fprintf(stderr, "[xe] hc_write folded into the next hc_read's norm (RADIANCE_HC_WRITE_FUSE=1)\n");
+            });
         } else {
             emit_rc = R4D_EMIT(s, hc_v2_norm_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0u,
                                (const unsigned short*)h->data, (const float*)w->data, nbuf, scale, (long)rows,
@@ -5612,3 +5705,32 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
+
+/* hc_write_read (run 206, RADIANCE_HC_WRITE_FUSE): one connection's write and the next one's read as one op --
+ * hc_read's operands, then the write's y and inj (the writing connection's block output and gains); `h` is the
+ * stream both act on. The write is handed to r4d_rad_hc_read (g_hcw), which folds it into its plain norm or issues
+ * it first; the read is otherwise exactly hc_read's, so the bytes are hc_write's then hc_read's. */
+enum { HCWR_Y = HCR_RS + 1, HCWR_INJ };
+extern "C" int xe_rad_hc_write_read(const RadArgs* a, RadStream s) {
+    const RadTensor* y   = r4d_opt(a, HCWR_Y);
+    const RadTensor* inj = r4d_opt(a, HCWR_INJ);
+    const RadTensor* h   = r4d_opt(a, HCR_H);
+    if (!y || !inj || !h) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(y, RAD_BF16); R4D_DT(inj, RAD_BF16); R4D_DT(h, RAD_BF16);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    long long yrows = 0, irows = 0;
+    const long long yrow = r4d_rows_pitch(y, n, &yrows);
+    const long long irow = r4d_rows_pitch(inj, hc, &irows);
+    if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
+    g_hcw.y = (const unsigned short*)y->data;
+    g_hcw.inj = (const unsigned short*)inj->data;
+    g_hcw.yrow = (long)yrow;
+    g_hcw.irow = (long)irow;
+    g_hcw.on = true;
+    const int rrc = r4d_rad_hc_read(a, s);
+    /* a read that returned before reaching either place has not written: refuse rather than leave `h` stale */
+    if (g_hcw.on) { g_hcw.on = false; return rrc != RAD_OK ? rrc : R4D_NO(RAD_E_STATE); }
+    return rrc;
+}

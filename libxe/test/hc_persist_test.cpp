@@ -8,6 +8,9 @@
  * compares the two files byte for byte: the persistent form must be bit-identical.
  *
  *   hc_persist_test LIBXE.so OUT.bin        RI_DEVICE=cpu for the CPU SYCL device
+ * RI_HCWR (run 206, RADIANCE_HC_WRITE_FUSE's row): 0 = libxe's hc_write row then the hc_read row, 1 = the fused
+ * hc_write_read row on the same inputs (a writing connection's y and gains); either also writes the updated stream h.
+ * ctest compares the two files byte for byte.
  */
 #include <sycl/sycl.hpp>
 
@@ -90,8 +93,11 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: hc_persist_test LIBXE.so OUT.bin\n"); return 2; }
     void* hx = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!hx) { std::printf("dlopen: %s\n", dlerror()); return 2; }
-    const RadKernelInfo* row = row_of(hx, "hc_read");
-    if (!row) { std::printf("libxe: no device row for hc_read\n"); return 2; }
+    const char* wrv = std::getenv("RI_HCWR");
+    const int wrm = wrv ? std::atoi(wrv) : -1;   /* -1: the read alone; 0: write then read; 1: the fused row */
+    const RadKernelInfo* row = row_of(hx, wrm == 1 ? "hc_write_read" : "hc_read");
+    const RadKernelInfo* wrow = wrm == 0 ? row_of(hx, "hc_write") : nullptr;
+    if (!row || (wrm == 0 && !wrow)) { std::printf("libxe: no device row for %s\n", wrm == 1 ? "hc_write_read" : "hc_read / hc_write"); return 2; }
     const char* dev = std::getenv("RI_DEVICE");
     const bool cpu = dev && !std::strcmp(dev, "cpu");
     sycl::queue q(cpu ? sycl::device(sycl::cpu_selector_v) : sycl::device(sycl::gpu_selector_v),
@@ -116,6 +122,12 @@ int main(int argc, char** argv) {
     std::memcpy(d_h, hh.data(), hh.size() * 2); std::memcpy(d_w, hw.data(), hw.size() * 4);
     std::memcpy(d_inj_w, hi.data(), hi.size() * 2);
     std::memcpy(d_down, hd.data(), hd.size()); std::memcpy(d_up, hu.data(), hu.size());
+    /* RI_HCWR: the writing connection's block output y [M, n] and gains [M, hc] */
+    std::vector<uint16_t> hy((size_t)(M * n)), hg((size_t)(M * hc));
+    for (int64_t i = 0; i < M * n; ++i) hy[(size_t)i] = bf16_of(1.5f * unit(14, (uint64_t)i));
+    for (int64_t i = 0; i < M * hc; ++i) hg[(size_t)i] = bf16_of(0.8f * unit(15, (uint64_t)i));
+    uint8_t* d_y = sh(hy.size() * 2); uint8_t* d_g = sh(hg.size() * 2);
+    std::memcpy(d_y, hy.data(), hy.size() * 2); std::memcpy(d_g, hg.data(), hg.size() * 2);
 
     RadParam pp[5]{};
     pp[0].key = "M"; pp[0].kind = RAD_P_INT; pp[0].ival = M;
@@ -128,7 +140,8 @@ int main(int argc, char** argv) {
     if (!f) { std::printf("cannot write %s\n", argv[2]); return 2; }
     int fails = 0;
     for (int64_t rows = 2; rows <= 4; ++rows) {
-        RadTensor t[11]{};
+        RadTensor t[13]{};
+        if (wrm >= 0) std::memcpy(d_h, hh.data(), hh.size() * 2);   /* each row count writes from the same stream */
         t[0] = tn(d_h, RAD_BF16, 2, rows, HN);
         t[1] = tn(d_w, RAD_F32, 1, HN);
         t[2] = tn(d_down, RAD_F8E4M3, 2, lr, HN);
@@ -136,7 +149,16 @@ int main(int argc, char** argv) {
         t[4] = tn(d_inj_w, RAD_BF16, 2, hc, HN);
         t[5] = tn(d_x, RAD_BF16, 2, rows, n);
         t[6] = tn(d_inj, RAD_BF16, 2, rows, hc);
-        RadArgs a{}; a.t = t; a.n_t = 11; a.p = pp; a.n_p = 5; a.world_size = 1;
+        t[11] = tn(d_y, RAD_BF16, 2, rows, n);
+        t[12] = tn(d_g, RAD_BF16, 2, rows, hc);
+        RadArgs a{}; a.t = t; a.n_t = wrm == 1 ? 13 : 11; a.p = pp; a.n_p = 5; a.world_size = 1;
+        if (wrm == 0) {   /* hc_write's operands: y, inj, h */
+            RadTensor tw[3] = { t[11], t[12], t[0] };
+            RadArgs aw{}; aw.t = tw; aw.n_t = 3; aw.p = pp; aw.n_p = 3; aw.world_size = 1;
+            const int wrc = wrow->launch(&aw, (RadStream)&q);
+            q.wait_and_throw();
+            if (wrc != RAD_OK) { std::printf("hc_persist_test: hc_write rc %d\n", wrc); ++fails; continue; }
+        }
         const int64_t sb = row->scratch ? row->scratch(&a) : 0;
         uint8_t* scratch = sb > 0 ? sh((size_t)sb) : nullptr;
         if (scratch) std::memset(scratch, 0, (size_t)sb);
@@ -150,6 +172,7 @@ int main(int argc, char** argv) {
         std::fwrite(d_x, 2, (size_t)(rows * n), f);
         std::fwrite(d_inj, 2, (size_t)(rows * hc), f);
         if (scratch) std::fwrite(scratch, 2, (size_t)(rows * lr), f);   /* dbuf: the down product, at the scratch's start */
+        if (wrm >= 0) std::fwrite(d_h, 2, (size_t)(rows * HN), f);      /* RI_HCWR: the written stream */
         /* the values are live: some x and some gain non-zero */
         int nz = 0;
         for (int64_t i = 0; i < rows * n; ++i) nz += ((uint16_t*)d_x)[i] != 0;

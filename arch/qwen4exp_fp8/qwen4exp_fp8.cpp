@@ -1081,6 +1081,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 pre, (long long)l);
         RAD_ARCH_TRY(lay.hc_mix.declare(b, nm, g, nm.f("blk.%lld.attn_hc", (long long)l),
                                         m.hccfg, hw, mixs));
+        /* run 206 (RADIANCE_HC_WRITE_FUSE=1): the previous layer's feed-forward write and this read as one op */
+        if (l > 0) RAD_ARCH_TRY(lay.hc_mix.declare_write_read(b, m.layers[(size_t)l - 1].hc_ffn));
 
         /* `Src::norm = nullptr` is the blocks' "input already normed and quantised" mode, and
          * `add_out = false` stops them adding into the stream; the connection's write half does
@@ -1173,6 +1175,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.moecfg.expert_rot) { fcfg.rotate = 1; fw.rq = m.a_hr.q; fw.rs = m.a_hr.s; }
         RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, g, nm.f("blk.%lld.ffn_hc", (long long)l),
                                         fcfg, fw, ffns));
+        /* run 206 (RADIANCE_HC_WRITE_FUSE=1): the mixer's write and this read as one op */
+        RAD_ARCH_TRY(lay.hc_ffn.declare_write_read(b, lay.hc_mix));
 
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
@@ -1650,11 +1654,18 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
+    /* run 206 (RADIANCE_HC_WRITE_FUSE=1): a connection's write and the next read as one op (HyperConn::write_read)
+     * where nothing runs between them -- no residual debug, no control vector on the layer, no PLE before the next
+     * layer's read; `read_done`: the previous layer's fused op already read this layer's mixer input */
+    const bool dbg = dbg_resid_on();
+    bool read_done = false;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
+        const Layer* nx = li + 1 < (int64_t)m.layers.size() ? &m.layers[(size_t)li + 1] : nullptr;
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        if (!read_done) l.hc_mix.read_pieces(c, T);
+        read_done = false;
         /* Owner note 139 stage 0 (RADIANCE_XP_GUESS): the next routed layer's guess from this layer's mixer
          * input too, ahead of the one the MoE block makes from its router input. The core scores both. */
         static const bool xg = [] { const char* e = std::getenv("RADIANCE_XP_GUESS"); return e && e[0] && e[0] != '0'; }();
@@ -1665,14 +1676,23 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
         else        l.gdn.step(c, batch);
-        l.hc_mix.write(c, T, 0, T);
-        dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        if (!dbg && l.hc_ffn.fuses_write(l.hc_mix, T, T)) {
+            l.hc_ffn.write_read(c, T, 0, T, l.hc_mix);
+        } else {
+            l.hc_mix.write(c, T, 0, T);
+            dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
+            l.hc_ffn.read_pieces(c, T);
+        }
         l.mlp.step(c, batch);
-        l.hc_ffn.write(c, T, 0, T);
-        /* The request's control vector, on the stream the write just finished. */
-        l.proj.step(c, batch, 0, T);
-        dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
+        if (!dbg && nx && li + 1 != m.ple_layer && !l.proj.steered() && nx->hc_mix.fuses_write(l.hc_ffn, T, T)) {
+            nx->hc_mix.write_read(c, T, 0, T, l.hc_ffn);
+            read_done = true;
+        } else {
+            l.hc_ffn.write(c, T, 0, T);
+            /* The request's control vector, on the stream the write just finished. */
+            l.proj.step(c, batch, 0, T);
+            dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
+        }
     }
 }
 

@@ -35,8 +35,16 @@
 
 #include "rad_fp8.h"
 
+#include <cstdlib>   /* std::getenv: RADIANCE_HC_WRITE_FUSE (HyperConn::declare_write_read) */
+
 namespace rad {
 namespace arch {
+
+/* RADIANCE_HC_WRITE_FUSE=1 (Intel port, run 206): a connection's write folded into the next read (hc_write_read) */
+inline bool hc_write_fuse_on() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_HC_WRITE_FUSE"); return e && e[0] == '1'; }();
+    return on;
+}
 
 /* Initialises the wide stream with hc identical copies of the embedding, one launch per step.
  * Separate from the embedding lookup, whose output width is n_embd. The copies diverge at the
@@ -133,6 +141,22 @@ struct HyperConn {
     GatherSrc  gsrc{};
     rad_op     op_ar_gather_write = 0, op_ar_gather_write6 = 0;
     int64_t    gather_rows = 0, gather_rows6 = 0;
+
+    /* Intel port, run 206 (owner notes 200 item 3 / 201 item 4, the fusion map; RADIANCE_HC_WRITE_FUSE=1): the
+     * previous connection's write and this read as one op (`hc_write_read`), declared by declare_write_read() over
+     * this read's own parameters and weights; 0 when the flag is off or no library serves it, and then the two ops
+     * are emitted exactly as before. `wr_y` / `wr_inj` are the writing connection's block output and gains. */
+    rad_op     op_write_read = 0;
+    rad_buf    wr_y = 0, wr_inj = 0;
+    int  declare_write_read(RadBuilder* b, const HyperConn& prev);
+    /* Whether this step's prev.write + this read run as the one op: prev takes the plain write (no folded
+     * collective or gather) and the read is one piece. */
+    bool fuses_write(const HyperConn& prev, int64_t T, int64_t rows) const {
+        return op_write_read && prev.op_write && !prev.takes_ar(T) && !prev.takes_gather(T) &&
+               (c.read_rows <= 0 || rows <= c.read_rows);
+    }
+    /* prev.write then this read over rows [r0, r0 + rows): one op where fuses_write holds, the two otherwise */
+    void write_read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, const HyperConn& prev) const;
 
     int64_t hn() const { return c.hc * g.n_embd; }
     /* The reducing write for this step's wire, or 0 when that wire has no fused form (then the
@@ -280,7 +304,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
          * takes_ar() always answers no. At four ranks only the exact form exists, declared over the
          * decode and verify rows. `wire` 0 is stated, not omitted, because rows constrain it. */
         const int64_t ar_rows = ar_exact_write_rows(g);
-        if (c.reduce && ar_rows >= 1)
+        /* run 206: under RADIANCE_HC_WRITE_FUSE the write stays plain (the block issues its own all-reduce, the same
+         * kernel), so the next read can take it (declare_write_read); the folded forms are not declared */
+        if (c.reduce && ar_rows >= 1 && !hc_write_fuse_on())
             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
                                 RAD_PARAMS(RAD_RANGE("M", 1, ar_rows), RAD_INT("n", g.n_embd),
                                            RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
@@ -363,6 +389,59 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                                       fp8_blocks(g.n_embd)) : RAD_NONE,
                 c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
                 c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
+}
+
+inline int HyperConn::declare_write_read(RadBuilder* b, const HyperConn& prev) {
+    if (!hc_write_fuse_on() || !op_read || !prev.op_write || !prev.c.inject || prev.w.h != w.h || prev.c.hc != c.hc ||
+        prev.g.n_embd != g.n_embd || !prev.w.x.x || !prev.w.inj)
+        return RAD_OK;
+    const rad_weight wts[4] = { w_norm, w_down, w_up, w_inj };
+    const int n_wts = c.inject ? 4 : 3;
+    /* the read's own parameters (declare), and its band */
+    const rad_op op = RAD_OP(b, "hc_write_read",
+                  RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows > 0 && c.read_rows < g.max_tok
+                                                   ? c.read_rows : g.max_tok),
+                             RAD_INT("n", g.n_embd),
+                             RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                             RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                             RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                             RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                             RAD_INT("rotate", c.rotate ? 1 : 0),
+                             RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16")),
+                  wts, n_wts);
+    if (!op) return RAD_OK;   /* unresolved: the two ops stay */
+    rad_buf wr[7] = { w.h, w.x.x, 0, 0, 0, 0, 0 };
+    int n_wr = 2;
+    if (c.inject) wr[n_wr++] = w.inj;
+    if (c.quant)  { wr[n_wr++] = c.codes_i8 ? w.x.q8 : w.x.q; wr[n_wr++] = c.codes_i8 ? w.x.s8 : w.x.s; }
+    if (c.rotate) { wr[n_wr++] = w.rq;  wr[n_wr++] = w.rs; }
+    const rad_buf rd[3] = { w.h, prev.w.x.x, prev.w.inj };
+    RAD_ARCH_TRY(rad_op_reads (b, op, rd, 3));
+    RAD_ARCH_TRY(rad_op_writes(b, op, wr, n_wr));
+    op_write_read = op;
+    wr_y = prev.w.x.x;
+    wr_inj = prev.w.inj;
+    return RAD_OK;
+}
+
+inline void HyperConn::write_read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, const HyperConn& prev) const {
+    if (!fuses_write(prev, T, rows)) {   /* the callers check first; this keeps the pair's order regardless */
+        prev.write(c_, T, r0, rows);
+        read(c_, T, r0, rows);
+        return;
+    }
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_write_read, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                brow_slice(wr_y, r0, rows, g.n_embd), brow_slice(wr_inj, r0, rows, c.hc));
 }
 
 /* ================================================================== the control-vector projection

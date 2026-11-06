@@ -32,6 +32,7 @@
 #include "ports/all_rows.inc"
 #undef XE_ROWS_CONSTRAINTS
 
+extern "C" int xe_rad_hc_write_read(const RadArgs* a, RadStream s);   /* ports/r4d_hc_bf16.cpp, run 206 */
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -200,6 +201,19 @@ static const RadKernelInfo kKernels[] = {
   ROW(cXeArGHcW2Host), NOTUNE,
   xe_ar2_host_init, xe_ar2_fini, xe_rad_ar_gather_hc_write_2rank_host, xe_ar_gather_hc_write_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
 #include "ports/all_rows.inc"
+/* run 206 (owner notes 200 item 3 / 201 item 4, the fusion map's top pair): one connection's hc_write folded into
+ * the next connection's hc_read -- the architecture declares it under RADIANCE_HC_WRITE_FUSE=1; hc_read_e4m3's
+ * constraints, scratch and weight layout (the read's own weights), its schema below */
+{ "xe_hc_write_read_e4m3", "hc_write_read", "norm",
+  "hc_write (h[s] += inj[s] * y) and the next hc_read in one op: the write rides the read's norm launch "
+  "(hc_v2_write_norm_kernel) on the plain V2 form, and runs as hc_write first on any other form",
+  "hc_read_e4m3's shapes; y and inj the writing connection's [M, n] and [M, hc]",
+  "as hc_read_e4m3, plus bf16 y and inj in",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcReadE4m3), NOTUNE,
+  nullptr, nullptr, xe_rad_hc_write_read, r4d_rad_hc_read_scratch,
+  xe_hc_layout_e4m3, xe_hc_relayout_e4m3,
+  nullptr, xe_hc_unrelayout_e4m3 },
 { "xe_gram_accum", "gram_accum", "quant",
   "h += x^T x over an E4M3 activation, in f32 -- the Gram matrix a GPTQ packer needs (libr4d's unit, ported)",
   "n a multiple of 4 and group 128 (a 64-wide output tile lies inside one scale group); any M; the accumulator "
@@ -361,7 +375,33 @@ static const RadOperandSpec oXeArGatherHcWrite[] = {
     { "shared", RAD_OPD_IN, 1 },   { "shared_gate", RAD_OPD_IN, 1 },
     { "y", RAD_OPD_INOUT, 0 },     { "inj", RAD_OPD_IN, 0 },       { "h", RAD_OPD_INOUT, 0 },
 };
+/* hc_write_read (run 206): hc_read's params and operands (libr4d's pHcRead / oHcRead, field for field), `h` read and
+ * written, then the writing connection's y and inj */
+#define P_F64(k)   { (k), RAD_P_F64, RAD_REQUIRED }
+#define P_F64O(k)  { (k), RAD_P_F64, RAD_OPTIONAL }
+static const RadParamSpec pXeHcWriteRead[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
+    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
+};
+static const RadOperandSpec oXeHcWriteRead[] = {
+    { "h",        RAD_OPD_INOUT,  0 },
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "mix_down", RAD_OPD_WEIGHT, 0 },
+    { "mix_up",   RAD_OPD_WEIGHT, 0 },
+    { "inject_w", RAD_OPD_WEIGHT, 1 },
+    { "x",        RAD_OPD_OUT,    0 },
+    { "inj",      RAD_OPD_OUT,    1 },
+    { "q",        RAD_OPD_OUT,    1 },
+    { "scale",    RAD_OPD_OUT,    1 },
+    { "rq",       RAD_OPD_OUT,    1 },
+    { "rscale",   RAD_OPD_OUT,    1 },
+    { "y_write",  RAD_OPD_IN,     0 },
+    { "inj_write", RAD_OPD_IN,    0 },
+};
 static const RadOpSchema kSchemas[] = {
+    { "hc_write_read", ROW(pXeHcWriteRead), ROW(oXeHcWriteRead),
+      "hc_write (h[s] += inj_write[s] * y_write, into the unnormed stream) and then hc_read on the same stream, as "
+      "one op: the bytes of the two ops in that order" },
     { "ar_hc_write", ROW(pXeArHcWrite), ROW(oXeArHcWrite),
       "libr4d's fused all-reduce + gated residual write; declared here so the op is known and "
       "unresolved on the Intel build, where the architecture then emits all_reduce + hc_write" },
