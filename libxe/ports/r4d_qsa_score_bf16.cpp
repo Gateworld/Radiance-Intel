@@ -401,11 +401,19 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
     /* Dims per lane (n / 32) are a template parameter: as a runtime value the dot is a rolled loop
      * and the block key a runtime-indexed array in scratch. The instantiations cover every n and
      * head count the checks admit (n % 32 == 0, n <= 256, heads <= 8). */
+    /* run 208 (owner note 204 item 1, RADIANCE_XE_QSA_GRF=1): the same kernel with the large register file -- at 128 GRF
+     * IGC 2.42.6 spills 182 of qsa_score<4,4>'s variables to scratch (igcdump-a204). Its grid grows with the context
+     * (nbg), so halving the threads a core may cost more than the spills at long contexts: measured, opt-in. The same
+     * code, so the same bits; the CPU device takes the plain launch; lds is 0. */
+    static const bool qsa_grf = [] { const char* e = std::getenv("RADIANCE_XE_QSA_GRF"); return e && e[0] == '1'; }();
+#define RAD_QSA_ARGS (const __hip_bfloat16*)q, (const __hip_bfloat16*)bk, (const int32_t*)bt,   \
+                     (const int32_t*)cu, (const int32_t*)nc,                                    \
+                     (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld
 #define RAD_QSA_GO(V, H)                                                                       \
-    emit_rc = R4D_EMIT(stream, (qsa_score_kernel<V, H>), dim3(nbg, nmg), dim3(kThreads), 0,      \
-                       (const __hip_bfloat16*)q, (const __hip_bfloat16*)bk, (const int32_t*)bt, \
-                       (const int32_t*)cu, (const int32_t*)nc,                                  \
-                       (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld)
+    emit_rc = qsa_grf                                                                          \
+        ? (XE_LAUNCH_GGL_GRF256((qsa_score_kernel<V, H>), dim3(nbg, nmg), dim3(kThreads), 0,   \
+                                stream, RAD_QSA_ARGS), 0)                                      \
+        : R4D_EMIT(stream, (qsa_score_kernel<V, H>), dim3(nbg, nmg), dim3(kThreads), 0, RAD_QSA_ARGS)
 #define RAD_QSA_HEADS(V)                                        \
     switch (heads) {                                            \
         case 1: RAD_QSA_GO(V, 1); break;                        \
@@ -431,6 +439,7 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
     }
 #undef RAD_QSA_HEADS
 #undef RAD_QSA_GO
+#undef RAD_QSA_ARGS
     return emit_rc;
 }
 

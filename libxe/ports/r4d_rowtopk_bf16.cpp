@@ -57,6 +57,7 @@
 #include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 #define R4D_TOPK_WAVE  32
 #define R4D_TOPK_PT2   32      // stage 2: >= R, so a lane can hold the whole answer
@@ -284,10 +285,19 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
     return R4D_NO(RAD_E_SHAPE);
   const int CH  = rowtopk_chunk_width(N, NCH);
   const int nch = (N + CH - 1) / CH;
-#define R4D_TK_S1(PT) emit_rc = R4D_EMIT(stream, (r4d_rowtopk_stage1_kernel<PT>),         \
-                        dim3((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M),                        \
-                        dim3(R4D_TOPK_WAVE * R4D_TOPK_WPB), 0,                                   \
-                        (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH)
+  /* run 208 (owner note 204 item 1, RADIANCE_XE_TOPK_GRF=1): both stages with the large register file -- at 128 GRF
+   * IGC 2.42.6 spills stage 1<8>'s 131 and stage 2's 194 variables to scratch (igcdump-a204, m3/isa_hist.py); stage 2
+   * is one wave a row. The same code, so the same bits; the CPU device takes the plain launch. lds is 0 in both. */
+  static const bool tk_grf = [] { const char* e = std::getenv("RADIANCE_XE_TOPK_GRF"); return e && e[0] == '1'; }();
+#define R4D_TK_S1_ARGS (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH
+#define R4D_TK_S1(PT) emit_rc = tk_grf                                                                  \
+        ? (XE_LAUNCH_GGL_GRF256((r4d_rowtopk_stage1_kernel<PT>),                                        \
+                                dim3((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M),                       \
+                                dim3(R4D_TOPK_WAVE * R4D_TOPK_WPB), 0, stream, R4D_TK_S1_ARGS), 0)      \
+        : R4D_EMIT(stream, (r4d_rowtopk_stage1_kernel<PT>),                                             \
+                   dim3((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M),                                    \
+                   dim3(R4D_TOPK_WAVE * R4D_TOPK_WPB), 0,                                               \
+                   (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH)
   switch (PT1) {
     case 2: R4D_TK_S1(2); break;
     case 4: R4D_TK_S1(4); break;
@@ -296,7 +306,12 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
     default: return R4D_NO(RAD_E_INVAL);
   }
 #undef R4D_TK_S1
+#undef R4D_TK_S1_ARGS
   if (emit_rc != RAD_OK) return emit_rc;
+  if (tk_grf)
+    return (XE_LAUNCH_GGL_GRF256((r4d_rowtopk_stage2_kernel), dim3(M), dim3(R4D_TOPK_WAVE), 0, stream,
+                                 (const unsigned long long*)partial, (float*)outv, (int*)outi,
+                                 (float*)outp, off, R, nch * RC), RAD_OK);
   return R4D_EMIT(stream, (r4d_rowtopk_stage2_kernel), dim3(M),
                   dim3(R4D_TOPK_WAVE), 0,
                   (const unsigned long long*)partial, (float*)outv, (int*)outi,
