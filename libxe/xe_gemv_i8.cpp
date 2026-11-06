@@ -35,7 +35,7 @@
 
 namespace {
 
-constexpr int kRowsPerWG = 8;
+[[maybe_unused]] constexpr int kRowsPerWG = 8;   /* the default of xe::gemv_rows_wg() (run 207) */
 constexpr int kMaxM = 4;   /* activation rows a weight pass serves; more rows loop the launch */
 
 /* NX (RADIANCE_XE_GEMV_NX=1, run 102, owner note 109 item 2): the five cross-lane steps (the group's three int32
@@ -56,7 +56,7 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
                       const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                       uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
     const int lane = (int)threadIdx.x & 31;
-    const int n = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);
+    const int n = (int)blockIdx.x * ((int)blockDim.x >> 5) + ((int)threadIdx.x >> 5);   /* xe::gemv_rows_wg() */
     const int G = K / 128;
     const int chunk = lane & 7, gsub = lane >> 3;
     float acc[MB];
@@ -279,7 +279,8 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         m_start = blocks * kDpasRT;
         if (m_start >= M) return;
     }
-    const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+    const int rw = xe::gemv_rows_wg();   /* run 207: RADIANCE_XE_GEMV_WG (note 203 item 2) */
+    const dim3 grid((unsigned)((N + rw - 1) / rw)), block(32 * rw);
     for (int m0 = m_start; m0 < M; m0 += kMaxM) {
         const int mb = M - m0 < kMaxM ? M - m0 : kMaxM;
         const int8_t* am = a + (size_t)m0 * a_ld;

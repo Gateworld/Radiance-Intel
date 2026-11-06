@@ -125,6 +125,16 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_bf16_cpu COMMAND xe_gemv_bf16_test)
   set_tests_properties(xe_gemv_bf16_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
+  # Run 207 (owner note 203 item 2): both GEMVs at every other rows-a-work-group choice (RADIANCE_XE_GEMV_WG), whose
+  # small cases' N (33, 40, 77, 130, 200 ...) leave a partial last work-group at each
+  foreach(_wg 4 16 32)
+    add_test(NAME xe_gemv_i8_wg${_wg}_cpu COMMAND xe_gemv_i8_test)
+    set_tests_properties(xe_gemv_i8_wg${_wg}_cpu PROPERTIES LABELS "xe"
+      ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_WG=${_wg}" TIMEOUT 600)
+    add_test(NAME xe_gemv_bf16_wg${_wg}_cpu COMMAND xe_gemv_bf16_test)
+    set_tests_properties(xe_gemv_bf16_wg${_wg}_cpu PROPERTIES LABELS "xe"
+      ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_WG=${_wg}" TIMEOUT 900)
+  endforeach()
   # Milestone 3 (the brief's #11): moe_gemm at bf16, the decode GEMV and the WMMA form, against a double reference.
   add_executable(xe_moe_bf16_test test/moe_bf16_test.cpp)
   rad_l0_sycl(xe_moe_bf16_test)

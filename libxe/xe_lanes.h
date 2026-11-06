@@ -750,6 +750,17 @@ inline xe_v8s load_tr_b128(const void* p) {
     }
     return r;
 }
+/* Run 207 (owner note 203 item 2): the GEMVs' rows a work-group (one row a sub-group, so the arithmetic is the
+ * same whatever the count) from RADIANCE_XE_GEMV_WG = 4, 8 (the default), 16 or 32; the kernels read it back as
+ * blockDim.x / 32. */
+inline int gemv_rows_wg() {
+    static const int r = [] {
+        const char* e = std::getenv("RADIANCE_XE_GEMV_WG");
+        const int v = e ? std::atoi(e) : 8;
+        return (v == 4 || v == 16 || v == 32) ? v : 8;
+    }();
+    return r;
+}
 }  // namespace xe
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) (xe::load_tr_b128((const void*)(p)))
 #define R4D_DYN_LDS(type, name) XE_DYN_LDS(type, name)

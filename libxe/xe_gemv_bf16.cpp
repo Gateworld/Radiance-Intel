@@ -38,7 +38,7 @@ template <bool A_F32, bool Y_F32, int MB>
 void gemv_bf16_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
                       void* __restrict__ y, long y_ld, int N, int K, int M) {
     const int lane = (int)threadIdx.x & 31;
-    const int n = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);
+    const int n = (int)blockIdx.x * ((int)blockDim.x >> 5) + ((int)threadIdx.x >> 5);   /* xe::gemv_rows_wg() */
     const bool live = n < N;
     const uint16_t* brow = b + (size_t)(live ? n : 0) * b_ld;
     float acc[MB];
@@ -109,7 +109,7 @@ template <bool A_F32, bool Y_F32, int MB>
 void gemv_bf16_pair_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
                            void* __restrict__ y, long y_ld, int N, int K, int M, GvPair p) {
     const int lane = (int)threadIdx.x & 31;
-    const int nn = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);
+    const int nn = (int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5);   /* 8 rows: no CPU row test (run 207) */
     const bool second = nn >= N;
     const int n = second ? nn - N : nn;
     const bool live = second ? n < (int)p.n2 : true;
@@ -287,7 +287,8 @@ void launch(sycl::queue* q, const void* a, long a_ld, const uint16_t* b, long b_
         m_start = blocks * kBfRT;
         if (m_start >= M) return;
     }
-    const dim3 grid((unsigned)((N + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
+    const int rw = xe::gemv_rows_wg();   /* run 207: RADIANCE_XE_GEMV_WG (note 203 item 2) */
+    const dim3 grid((unsigned)((N + rw - 1) / rw)), block(32 * rw);
     const size_t ae = A_F32 ? 4 : 2, ye = Y_F32 ? 4 : 2;
     for (int m0 = m_start; m0 < M; m0 += kMaxM) {
         const int mb = M - m0 < kMaxM ? M - m0 : kMaxM;
@@ -353,6 +354,7 @@ int gemv_pair(const RadTensor* A, const RadTensor* B, const RadTensor* Y, long l
         sycl::queue* q = (sycl::queue*)s;
         GvPair p;
         p.b2 = (const uint16_t*)B2->data; p.y2 = Y2->data; p.b2_ld = (long)b2_ld; p.y2_ld = (long)y2_ld; p.n2 = (long)N2;
+        /* run 207: pinned at 8 rows whatever RADIANCE_XE_GEMV_WG says (the pair has no bit-exact CPU row test) */
         const dim3 grid((unsigned)((N + N2 + kRowsPerWG - 1) / kRowsPerWG)), block(32 * kRowsPerWG);
         const bool af = A->dtype == RAD_F32, yf = Y->dtype == RAD_F32;
         const uint16_t* b = (const uint16_t*)B->data;
