@@ -26,9 +26,16 @@
  * row parity) reads 256 contiguous bytes instead of 16 pieces in 8 rows (t1b_off); the arithmetic is T1's.
  *
  *   xe_fc_tile_probe LIBXE.so [LAUNCHES=48] [RUNS=5]   LAUNCHES 0: the byte check only (the CPU device's ctest)
+ * E1 / E1b (run 206, owner note 202 A.4, down's form only, GPU only): the same arithmetic as an ESIMD kernel over today's
+ * codes (byte b: elements 2b, 2b + 1) and T1's table and scale factor. An ESIMD thread owns 16 columns as SIMD lanes and
+ * up to 4 rows; the pair table sits in registers (256 x 16 bits, a code byte -> two levels by register-indirect select),
+ * the int32 dot by dp4a, and each column keeps today's two partial sums (the even and the odd 64-K groups, in order),
+ * added at the end. E1 read a group's codes by 16-lane gathers (P99: slower; dropped), E1b by one transposed 2D block load
+ * (16 rows x 8 dwords); E2 = E1b with the cheaper decode (DEC2), timed at 8 / 16 / 32 threads a work-group.
  * RESULT lines: per launch us (host wall over LAUNCHES back-to-back launches, the median of RUNS), today's and T1's.
  */
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 
 #include "xe_lanes.h"
 #include "rad_abi.h"
@@ -283,6 +290,160 @@ void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0,
 #undef T1F
 }
 
+/* ---- E1 / E1b (see the header): one class's entries for the ESIMD form -- today's codes [n, k/2] at w_off of entry
+ * e >> 1, T1's pair table and scale factor, today's scales */
+namespace es = sycl::ext::intel::esimd;
+struct ECls {
+    const uint8_t* wbase;
+    uint64_t wstride;
+    const uint8_t* tbase;
+    uint64_t tstride;
+    const uint8_t* sbase;
+    uint64_t sstride;
+    uint32_t w_off, tab_off, smul_off, s_off, n, w_ld;
+};
+
+/* One thread's 16 columns n0.. of rows i .. i + rn - 1 over one class of G 64-K groups (s_ld = G). */
+/* DEC2 (E2): the code bytes taken as indices by byte regions of the loaded dwords (no shifts / masks) and two pair
+ * tables, the second pre-shifted by 16 (a level dword = one or of two selects). zero (always 0, a kernel argument):
+ * each product goes through an integer xor with it before the add, so the backend cannot fuse the multiply and the
+ * add into a mad (P99: E1's 1-2 differing outputs a case, all at near-cancelling sums). */
+template <int G, bool B2D, bool DEC2>
+ESIMD_INLINE void e1_cols(const ECls& c, uint32_t eh, uint32_t i, uint32_t rn, const uint32_t (&tokr)[kMT],
+                          const bool (&liver)[kMT], uint32_t n0, const int8_t* A, const float* As, uint16_t* Y,
+                          uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t zero) {
+    const uint8_t* we = c.wbase + (uint64_t)eh * c.wstride + c.w_off;
+    const uint8_t* te = c.tbase + (uint64_t)eh * c.tstride;
+    /* the pair table: the low 16 bits of T1's words = level(low code) | level(high code) << 8 */
+    es::simd<uint16_t, 256> P;
+    es::simd<uint32_t, 256> P0, P1;   /* DEC2 */
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        es::simd<uint32_t, 64> t = es::block_load<uint32_t, 64>((const uint32_t*)(te + c.tab_off) + 64 * b);
+        if constexpr (DEC2) {
+            P0.select<64, 1>(64 * b) = t & 0xffffu;
+            P1.select<64, 1>(64 * b) = t << 16;
+        } else {
+            P.select<64, 1>(64 * b) = t.bit_cast_view<uint16_t>().select<64, 2>(0);
+        }
+    }
+    const float smul = *(const float*)(te + c.smul_off);
+    /* the 16 rows' scales are 16 x G contiguous bytes: sbr[g] = e4m3_to_f32(scale) * smul, as the scalar form */
+    es::simd<uint32_t, 4 * G> sw =
+        es::block_load<uint32_t, 4 * G>((const uint32_t*)(c.sbase + (uint64_t)eh * c.sstride + c.s_off + (size_t)n0 * G));
+    es::simd<float, 16> sbr[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const es::simd<uint8_t, 16> v8 = sw.template bit_cast_view<uint8_t>().template select<16, G>(g);
+        const es::simd<uint32_t, 16> v = v8;
+        const es::simd<uint32_t, 16> s = (v & 0x80u) << 24, ex = (v >> 3) & 15u, m = v & 7u;
+        es::simd<float, 16> mf = es::simd<float, 16>(m) * 0.001953125f;
+        es::simd<uint32_t, 16> r = s | ((ex + 120u) << 23) | (m << 20);
+        r.merge(s | mf.template bit_cast_view<uint32_t>(), ex == 0u);
+        r.merge(s | 0x7fc00000u, (v & 0x7fu) == 0x7fu);   /* ex 15 and m 7 */
+        sbr[g] = r.template bit_cast_view<float>() * smul;
+    }
+    es::simd<float, 16> acc[2][kMT];
+#pragma unroll
+    for (int q = 0; q < kMT; ++q) { acc[0][q] = 0.0f; acc[1][q] = 0.0f; }
+    es::simd<uint32_t, 16> rowo(0u, c.w_ld);
+    rowo += n0 * c.w_ld;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        es::simd<uint32_t, 128> cw;   /* [dword w of the group's 32 code bytes][column] */
+        if constexpr (B2D) {
+            cw = es::load_2d<uint32_t, 8, 16, 1, true>((const uint32_t*)we, c.w_ld - 1u, c.n - 1u, c.w_ld - 1u, g * 8,
+                                                       (int)n0);
+        } else {
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                cw.select<16, 1>(16 * w) = es::gather<uint32_t, 16>((const uint32_t*)we, rowo + (uint32_t)(32 * g + 4 * w));
+        }
+        es::simd<int32_t, 16> lv[16];   /* levels of elements 4d .. 4d + 3 of the group, packed, a column a lane */
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if constexpr (DEC2) {
+                auto cb = cw.bit_cast_view<uint8_t>();   /* byte b of dword (w, column) at 64 w + 4 column + b */
+                const es::simd<uint16_t, 16> i0 = es::simd<uint8_t, 16>(cb.select<16, 4>(64 * w));
+                const es::simd<uint16_t, 16> i1 = es::simd<uint8_t, 16>(cb.select<16, 4>(64 * w + 1));
+                const es::simd<uint16_t, 16> i2 = es::simd<uint8_t, 16>(cb.select<16, 4>(64 * w + 2));
+                const es::simd<uint16_t, 16> i3 = es::simd<uint8_t, 16>(cb.select<16, 4>(64 * w + 3));
+                lv[2 * w] = es::simd<int32_t, 16>(P0.iselect(i0) | P1.iselect(i1));
+                lv[2 * w + 1] = es::simd<int32_t, 16>(P0.iselect(i2) | P1.iselect(i3));
+            } else {
+                const es::simd<uint32_t, 16> d = cw.select<16, 1>(16 * w);
+                const es::simd<uint32_t, 16> p0 = P.iselect(es::simd<uint16_t, 16>(d & 255u));
+                const es::simd<uint32_t, 16> p1 = P.iselect(es::simd<uint16_t, 16>((d >> 8) & 255u));
+                const es::simd<uint32_t, 16> p2 = P.iselect(es::simd<uint16_t, 16>((d >> 16) & 255u));
+                const es::simd<uint32_t, 16> p3 = P.iselect(es::simd<uint16_t, 16>(d >> 24));
+                lv[2 * w] = es::simd<int32_t, 16>(p0 | (p1 << 16));
+                lv[2 * w + 1] = es::simd<int32_t, 16>(p2 | (p3 << 16));
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) {
+            if ((uint32_t)q >= rn) break;
+            if (!liver[q]) continue;   /* written as 0 below, as the scalar form's dead rows */
+            const float asc = As[(size_t)tokr[q] * as_ld + (uint32_t)g / 2u];
+            const es::simd<int32_t, 16> av = es::block_load<int32_t, 16>((const int32_t*)(A + (size_t)tokr[q] * a_ld) + 16 * g);
+            es::simd<int32_t, 16> s = 0;
+#pragma unroll
+            for (int x = 0; x < 16; ++x) s = es::dp4a<int32_t>(s, lv[x], es::simd<int32_t, 16>((int32_t)av[x]));
+            const es::simd<float, 16> fs = s;
+            const es::simd<float, 16> p = fs * asc;
+            es::simd<float, 16> m = p * sbr[g];
+            es::simd<uint32_t, 16> mb = m.bit_cast_view<uint32_t>();
+            mb ^= zero;   /* no mad: the add takes the rounded product */
+            const es::simd<float, 16> mr = mb.bit_cast_view<float>();
+            acc[g & 1][q] += mr;
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < kMT; ++q) {
+        if ((uint32_t)q >= rn) break;
+        es::simd<float, 16> v = acc[0][q] + acc[1][q];
+        const es::simd<uint32_t, 16> u = v.bit_cast_view<uint32_t>();
+        es::simd<uint32_t, 16> h = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+        h.merge((u >> 16) | 0x40u, (u & 0x7fffffffu) > 0x7f800000u);
+        es::simd<uint16_t, 16> o = h;
+        if (!liver[q]) o = 0;
+        es::block_store<uint16_t, 16>(Y + (size_t)(i + q) * y_ld + n0, o);
+    }
+}
+
+/* down's shape only (parts 1, both classes N columns, K = 64 G0 / 64 G1): grid T x N / 16 threads, LW a work-group */
+template <int G0, int G1, bool B2D, bool DEC2>
+void e1_launch(sycl::queue& q, const int8_t* A, const float* As, const ECls& c0, const ECls& c1, const int32_t* sorted,
+               const int32_t* off, uint16_t* Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t a_ld, uint32_t as_ld,
+               uint32_t y_ld, uint32_t a_rows, uint32_t lw, uint32_t zero) {
+    q.parallel_for(sycl::nd_range<2>({ (size_t)T, (size_t)N / 16 }, { 1, (size_t)lw }),
+                   [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+        const uint32_t i = (uint32_t)it.get_global_id(0), n0 = (uint32_t)it.get_global_id(1) * 16u;
+        const int32_t flat = sorted[i];
+        if (flat < 0) {
+            es::block_store<uint16_t, 16>(Y + (size_t)i * y_ld + n0, es::simd<uint16_t, 16>(0));
+            return;
+        }
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        const uint32_t e = lo, first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % kMT != 0) return;
+        const uint32_t rn = (last - i) < (uint32_t)kMT ? (last - i) : (uint32_t)kMT;
+        uint32_t tokr[kMT];
+        bool liver[kMT];
+#pragma unroll
+        for (int qq = 0; qq < kMT; ++qq) {
+            tokr[qq] = i + (uint32_t)qq;   /* sorted rows */
+            liver[qq] = (uint32_t)qq < rn && sorted[i + qq] >= 0 && i + (uint32_t)qq < a_rows;
+        }
+        if (e & 1u) e1_cols<G1, B2D, DEC2>(c1, e >> 1, i, rn, tokr, liver, n0, A, As, Y, a_ld, as_ld, y_ld, zero);
+        else e1_cols<G0, B2D, DEC2>(c0, e >> 1, i, rn, tokr, liver, n0, A, As, Y, a_ld, as_ld, y_ld, zero);
+    });
+}
+
 /* ---- inputs, as moe_i4i8_test.cpp's format C cases build them */
 uint32_t h32(uint64_t a, uint64_t b) {
     uint64_t x = a * 0x9e3779b97f4a7c15ull ^ (b + 0x632be59bd9b4e019ull);
@@ -436,6 +597,10 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     uint8_t* dy1 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
     uint8_t* dy2 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
     q.memset(dy2, kPat, ybytes + 2 * kCanary);
+    uint8_t* dy3 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
+    uint8_t* dy4 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
+    q.memset(dy3, kPat, ybytes + 2 * kCanary);
+    q.memset(dy4, kPat, ybytes + 2 * kCanary);
     q.memcpy(da, a.data(), a.size());
     q.memcpy(das, as.data(), as.size() * 4);
     q.memcpy(dso, sorted.data(), sorted.size() * 4);
@@ -484,13 +649,50 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     };
     auto t1 = [&]() { return t1f(tc, dy1, false); };
     auto t1b = [&]() { return t1f(tcb, dy2, true); };
+    /* E1 / E1b: down's shape on a GPU (the ESIMD form has no CPU device) */
+    bool e1on = gl && q.get_device().is_gpu() && sh.parts == 1 && sh.N == sh.N1 && Kcl[0] == 384 && Kcl[1] == 256;
+    const char* lwv = std::getenv("RI_E1_LW");
+    const uint32_t e1lw = lwv ? (uint32_t)std::atoi(lwv) : 16u;
+    ECls ec[2];
+    for (int c = 0; c < 2; ++c)
+        ec[c] = ECls{ dw[c], went[c], dtw[c], tent[c], dws[c], sent[c], (uint32_t)p0, (uint32_t)ttab[c], (uint32_t)tsm[c],
+                      (uint32_t)p0, (uint32_t)Ncl[c], (uint32_t)(Kcl[c] / 2) };
+    /* run 206 after P99: the gather form (E1) lost to the 2D load; dy3 now holds E2 (2D + DEC2), dy4 E1b */
+    uint32_t lw_now = e1lw;
+    auto e1f = [&](uint8_t* dy, bool dec2) {
+        uint16_t* y = (uint16_t*)(dy + kCanary);
+        if (dec2)
+            e1_launch<6, 4, true, true>(q, da, das, ec[0], ec[1], dso, doff, y, (uint32_t)T, (uint32_t)Nmax,
+                                        (uint32_t)n_expert, (uint32_t)Kmax, (uint32_t)(Kmax / 128), (uint32_t)Nmax,
+                                        (uint32_t)AR, lw_now, 0u);
+        else
+            e1_launch<6, 4, true, false>(q, da, das, ec[0], ec[1], dso, doff, y, (uint32_t)T, (uint32_t)Nmax,
+                                         (uint32_t)n_expert, (uint32_t)Kmax, (uint32_t)(Kmax / 128), (uint32_t)Nmax,
+                                         (uint32_t)AR, lw_now, 0u);
+        return 0;
+    };
+    auto e1 = [&]() { return e1f(dy3, true); };
+    auto e1b = [&]() { return e1f(dy4, false); };
     const int rc = today();
     t1();
     if (gl) t1b();
     q.wait_and_throw();
+    if (e1on) {
+        try {
+            e1();
+            e1b();
+            q.wait_and_throw();
+        } catch (const std::exception& x) {
+            std::printf("E1: %s\n", x.what());
+            e1on = false;
+        }
+    }
     std::vector<uint8_t> h0(ybytes + 2 * kCanary), h1(ybytes + 2 * kCanary), h2(ybytes + 2 * kCanary);
+    std::vector<uint8_t> h3(ybytes + 2 * kCanary), h4(ybytes + 2 * kCanary);
     q.memcpy(h0.data(), dy0, h0.size());
     q.memcpy(h1.data(), dy1, h1.size());
+    q.memcpy(h3.data(), dy3, h3.size());
+    q.memcpy(h4.data(), dy4, h4.size());
     q.memcpy(h2.data(), dy2, h2.size()).wait();
     /* one form's output against today's: differing outputs, the first of them, broken canaries */
     auto cmp = [&](const std::vector<uint8_t>& hx, size_t* first) {
@@ -520,6 +722,20 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                 gl ? (diff2 ? "; T1b DIFFERS" : "; T1b bit-identical") : "", nonzero, canary ? "intact" : "BROKEN");
     if (diff) std::printf("  T1's first difference at output %zu (row %zu, column %zu)\n", f1, f1 / Nmax, f1 % Nmax);
     if (diff2) std::printf("  T1b: %zu differ, the first at output %zu (row %zu, column %zu)\n", diff2, f2, f2 / Nmax, f2 % Nmax);
+    bool e1bad = false;
+    if (e1on) {
+        size_t f3 = 0, f4 = 0;
+        const size_t d3 = cmp(h3, &f3), d4 = cmp(h4, &f4);
+        const bool c3 = canary_ok(h3), c4 = canary_ok(h4);
+        std::printf("E1 %s tokens %d (LW %u): E2 %zu of %zu outputs differ%s, E1b %zu differ%s; canaries %s\n", sh.name, tokens,
+                    e1lw, d3, ybytes / 2, d3 ? "" : " (bit-identical)", d4, d4 ? "" : " (bit-identical)",
+                    c3 && c4 ? "intact" : "BROKEN");
+        if (d3) std::printf("  E2's first difference at output %zu (row %zu, column %zu): %04x vs today %04x\n", f3, f3 / Nmax,
+                            f3 % Nmax, ((const uint16_t*)(h3.data() + kCanary))[f3], ((const uint16_t*)(h0.data() + kCanary))[f3]);
+        if (d4) std::printf("  E1b's first difference at output %zu (row %zu, column %zu): %04x vs today %04x\n", f4, f4 / Nmax,
+                            f4 % Nmax, ((const uint16_t*)(h4.data() + kCanary))[f4], ((const uint16_t*)(h0.data() + kCanary))[f4]);
+        e1bad = d3 || d4 || !c3 || !c4;
+    }
     bool pair_bad = false;   /* RI_PAIR: a form's outputs differed, or a call failed */
     if (ok && launches > 0) {
         auto time = [&](auto&& f) {
@@ -541,6 +757,18 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                     tokens, u0, u0b, u1, 100.0 * u1 / base);
         if (gl) std::printf("; T1b %.1f us -> %.0f %%", u2, 100.0 * u2 / base);
         std::printf("\n");
+        /* E1 timed even when it differs (its speed says whether the exact form is worth the work) */
+        if (e1on) {
+            for (uint32_t lw : { 8u, 16u, 32u }) {   /* the work-group size, 160 column blocks */
+                lw_now = lw;
+                const double u3 = time(e1), u4 = time(e1b), u0c = time(today);
+                const double b2 = std::min(base, u0c);
+                std::printf("RESULT-E1 %s tokens %d (LW %u): today %.1f us (re-timed %.1f), E2 %.1f us -> %.0f %%, E1b %.1f us "
+                            "-> %.0f %%%s\n", sh.name, tokens, lw, base, u0c, u3, 100.0 * u3 / b2, u4, 100.0 * u4 / b2,
+                            e1bad ? " (OUTPUTS DIFFER)" : "");
+            }
+            lw_now = e1lw;
+        }
         /* RI_PAIR=1 (run 193, owner note 191 item 2: independent kernels side by side, briefs/2026-11-05-concurrency.md),
          * gate_up's shape at 4 tokens: today's routed-expert GEMM beside a shared-expert-shaped int8 GEMV (libxe's
          * xe_rad_gemm_i8a8_gemv, N 1280 x K 2560, the same 4 activation rows), timed as a pair in three forms -- one
@@ -620,8 +848,8 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
         if (dtbw[c]) sycl::free(dtbw[c], q);
     }
     sycl::free(da, q); sycl::free(das, q); sycl::free(dso, q); sycl::free(doff, q); sycl::free(dy0, q); sycl::free(dy1, q);
-    sycl::free(dy2, q);
-    return ok && !pair_bad;
+    sycl::free(dy2, q); sycl::free(dy3, q); sycl::free(dy4, q);
+    return ok && !pair_bad && !e1bad;
 }
 
 }  // namespace
