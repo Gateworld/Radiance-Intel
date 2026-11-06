@@ -14,6 +14,7 @@
 #include "../plugin/spechub/spechub.h"   /* the MTP coupling's shape hooks (owner note 47 item 2) */
 
 #include <cstdint>
+#include <cstdlib>   /* std::getenv: RADIANCE_XE_GATE_QUANT */
 
 /* libr4d/r4d_rows.cpp's row helpers, verbatim */
 #define ROW(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
@@ -33,6 +34,8 @@
 #undef XE_ROWS_CONSTRAINTS
 
 extern "C" int xe_rad_hc_write_read(const RadArgs* a, RadStream s);   /* ports/r4d_hc_bf16.cpp, run 206 */
+extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream s);  /* ports/r4d_fused_quant_fp8.cpp, run 206 */
+static const RadConstraint cXeGateQuant[] = { C_DIV("n", 4), C_EQ("group", 128), C_IN("dtype", "bf16") };
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -337,8 +340,25 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cXeAttnQsa), NOTUNE,
   nullptr, nullptr, xe_rad_attn_qsa_fmha, xe_rad_attn_qsa_fmha_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* run 206 (the fusion map's pair 4, RADIANCE_XE_GATE_QUANT=1; LAST, listed only under the flag with its schema below):
+ * libr4d's gate_quant_fp8 row, its port's adapter -- the gated attention's sigmoid, mul and quantiser as one pass, the
+ * sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does; without the schema the architecture
+ * keeps the three ops */
+{ "gate_quant_fp8", "gate_quant_fp8", "quant",
+  "an elementwise gated product and the activation quantiser in one pass, with the gate in its own operand",
+  "n a multiple of 4; gate and x both [M][n], their own pitches; group 128",
+  "bf16 in, E4M3 or int8 codes with an f32 scale per (row, 128 columns), an optional bf16 out; the codes over the "
+  "bf16-rounded product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGateQuant), NOTUNE,
+  nullptr, nullptr, r4d_rad_gate_quant_fp8, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+/* RADIANCE_XE_GATE_QUANT=1 (run 206): the last row and the last own schema are listed */
+static bool xe_gate_quant_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GATE_QUANT"); return e && e[0] == '1'; }();
+    return v;
+}
 
 static const RadPluginInfo kInfo = {
     RAD_PLUGIN_KERNEL,
@@ -398,6 +418,14 @@ static const RadOperandSpec oXeHcWriteRead[] = {
     { "y_write",  RAD_OPD_IN,     0 },
     { "inj_write", RAD_OPD_IN,    0 },
 };
+/* gate_quant_fp8 (run 206, pair 4): libr4d's pGateQuantFp8 / oGateQuantFp8, field for field */
+static const RadParamSpec pXeGateQuant[] = {
+    P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"), P_STRO("act"),
+};
+static const RadOperandSpec oXeGateQuant[] = {
+    { "gate", RAD_OPD_IN, 0 }, { "x", RAD_OPD_IN, 0 }, { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
+    { "out_bf16", RAD_OPD_OUT, 1 },
+};
 static const RadOpSchema kSchemas[] = {
     { "hc_write_read", ROW(pXeHcWriteRead), ROW(oXeHcWriteRead),
       "hc_write (h[s] += inj_write[s] * y_write, into the unnormed stream) and then hc_read on the same stream, as "
@@ -407,18 +435,22 @@ static const RadOpSchema kSchemas[] = {
       "unresolved on the Intel build, where the architecture then emits all_reduce + hc_write" },
     { "ar_gather_hc_write", ROW(pXeArGatherHcWrite), ROW(oXeArGatherHcWrite),
       "libr4d's fused moe_gather + all-reduce + hc_write; declared, not served (see ar_hc_write)" },
+    /* LAST: listed only under RADIANCE_XE_GATE_QUANT=1 (the architecture asks rad_op_declared first) */
+    { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
+      "the same, with the gate in its own operand rather than packed beside x." },
 };
 static const int kNumSchemas = (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
+static int own_schemas() { return kNumSchemas - (xe_gate_quant_on() ? 0 : 1); }
 /* libxe's own schemas, then the MTP coupling's two (plugin/spechub/spechub.cpp, compiled into libxe): the loader
  * refuses a row whose op no loaded plugin declares a schema for, and the service's kernel list is libxe:libref
  * without the spechub plugin; two plugins declaring the same schema is accepted when they agree (loader.cpp,
  * schema_same), which these do, being the same definition. */
-extern "C" int rad_kernel_schema_count(void) { return kNumSchemas + rad_spechub_schema_count(); }
+extern "C" int rad_kernel_schema_count(void) { return own_schemas() + rad_spechub_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
-    if (i >= 0 && i < kNumSchemas) return &kSchemas[i];
-    return rad_spechub_schema_at(i - kNumSchemas);
+    if (i >= 0 && i < own_schemas()) return &kSchemas[i];
+    return rad_spechub_schema_at(i - own_schemas());
 }
-extern "C" int rad_kernel_count(void) { return kNumKernels; }
+extern "C" int rad_kernel_count(void) { return kNumKernels - (xe_gate_quant_on() ? 0 : 1); }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
-    return (i >= 0 && i < kNumKernels) ? &kKernels[i] : nullptr;
+    return (i >= 0 && i < rad_kernel_count()) ? &kKernels[i] : nullptr;
 }

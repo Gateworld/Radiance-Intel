@@ -435,6 +435,18 @@ if(RAD_BUILD_TESTS)
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 300)
   # ... and stage 1a: hc_read at a verify's rows with RADIANCE_XE_HC_PERSIST off and on (two processes: the switch is
   # read once), the outputs compared byte for byte
+  # run 206 (the fusion map's pair 4): the gated attention's sigmoid + mul + quant_act_i8g against the gate_quant_fp8
+  # row (RADIANCE_XE_GATE_QUANT=1), byte for byte
+  add_executable(xe_gate_quant_test test/gate_quant_test.cpp)
+  rad_l0_sycl(xe_gate_quant_test)
+  target_include_directories(xe_gate_quant_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_gate_quant_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_gate_quant_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_gate_quant_test libxe)
+  add_test(NAME xe_gate_quant_cpu COMMAND sh -c
+    "RI_GQ=0 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq0.bin && RADIANCE_XE_GATE_QUANT=1 RI_GQ=1 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq1.bin && cmp gq0.bin gq1.bin && echo 'gate_quant_fp8 (pair 4): bit-identical'")
+  set_tests_properties(xe_gate_quant_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_executable(xe_hc_persist_test test/hc_persist_test.cpp)
   rad_l0_sycl(xe_hc_persist_test)
   target_include_directories(xe_hc_persist_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
