@@ -5,6 +5,9 @@
  *   RI_GQ=0  libxe's sigmoid row (the gate into a bf16 buffer), mul (x *= gate, in place), quant_act_i8g (int8
  *            codes and f32 scales a 128-column group) -- the three ops the architecture emits today;
  *   RI_GQ=1  libxe's gate_quant_fp8 row (listed under RADIANCE_XE_GATE_QUANT=1), int8 codes, x written in place.
+ *   RI_GQ=2  (run 207, pair 2) libxe's silu_mul row over a [gate|up] operand into a bf16 buffer, then
+ *            had_quant_act_i8g into int8 codes -- the routed experts' pair at format B / C (rad_block_moe_fp8.h);
+ *   RI_GQ=3  libxe's gated_had_quant_i8g row (listed under RADIANCE_XE_GATED_HAD=1) on the same operand.
  * Writes the codes, the scales and the bf16 product to OUT; ctest compares the two files byte for byte.
  *
  *   gate_quant_test LIBXE.so OUT.bin        RI_DEVICE=cpu for the CPU SYCL device
@@ -85,7 +88,36 @@ int main(int argc, char** argv) {
     std::memcpy(d_g, hg.data(), hg.size() * 2); std::memcpy(d_x, hxv.data(), hxv.size() * 2);
     std::memset(d_q, 0, (size_t)(R * n)); std::memset(d_s, 0, (size_t)(R * G * 4));
     int rc = RAD_OK;
-    if (mode == 1) {
+    /* pair 2's operand: [R][2n], the gate then the up half (d_g's values, then d_x's) */
+    uint8_t* d_gu = sh((size_t)(R * 2 * n * 2));
+    for (int64_t r = 0; r < R; ++r) {
+        std::memcpy(d_gu + (size_t)(r * 2 * n) * 2, hg.data() + r * n, (size_t)n * 2);
+        std::memcpy(d_gu + (size_t)(r * 2 * n + n) * 2, hxv.data() + r * n, (size_t)n * 2);
+    }
+    if (mode == 2 || mode == 3) {
+        RadParam p[5] = { pint("M", R), pint("n", n), pint("group", 128), pstr("dtype", "bf16"), pstr("act", "silu") };
+        if (mode == 3) {
+            const RadKernelInfo* row = row_of(hx, "gated_had_quant_i8g");
+            if (!row) { std::printf("gate_quant_test: no gated_had_quant_i8g row (RADIANCE_XE_GATED_HAD=1?)\n"); return 2; }
+            RadTensor t[4] = { tn(d_gu, RAD_BF16, R, 2 * n), tn(d_q, RAD_I8, R, n), tn(d_s, RAD_F32, R, G),
+                               tn(d_x, RAD_BF16, R, n) };
+            RadArgs a{}; a.t = t; a.n_t = 4; a.p = p; a.n_p = 5; a.world_size = 1;
+            rc = row->launch(&a, (RadStream)&q);
+            std::printf("gate_quant_test: %s rc %d\n", row->name, rc);
+        } else {
+            const RadKernelInfo* rs = row_of(hx, "silu_mul");
+            const RadKernelInfo* rq = row_of(hx, "had_quant_act_i8g");
+            if (!rs || !rq) { std::printf("gate_quant_test: a chain row is missing\n"); return 2; }
+            RadTensor ts[2] = { tn(d_gu, RAD_BF16, R, 2 * n), tn(d_x, RAD_BF16, R, n) };
+            RadParam ps[3] = { pint("M", R), pint("n", n), pstr("dtype", "bf16") };
+            RadArgs as{}; as.t = ts; as.n_t = 2; as.p = ps; as.n_p = 3; as.world_size = 1;
+            rc |= rs->launch(&as, (RadStream)&q);
+            RadTensor tq[3] = { tn(d_x, RAD_BF16, R, n), tn(d_q, RAD_I8, R, n), tn(d_s, RAD_F32, R, G) };
+            RadArgs aq{}; aq.t = tq; aq.n_t = 3; aq.p = p; aq.n_p = 4; aq.world_size = 1;
+            rc |= rq->launch(&aq, (RadStream)&q);
+            std::printf("gate_quant_test: %s + %s rc %d\n", rs->name, rq->name, rc);
+        }
+    } else if (mode == 1) {
         const RadKernelInfo* row = row_of(hx, "gate_quant_fp8");
         if (!row) { std::printf("gate_quant_test: no gate_quant_fp8 row (RADIANCE_XE_GATE_QUANT=1?)\n"); return 2; }
         RadTensor t[5] = { tn(d_g, RAD_BF16, R, n), tn(d_x, RAD_BF16, R, n), tn(d_q, RAD_I8, R, n),

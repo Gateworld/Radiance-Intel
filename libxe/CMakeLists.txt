@@ -444,7 +444,7 @@ if(RAD_BUILD_TESTS)
   set_target_properties(xe_gate_quant_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_gate_quant_test libxe)
   add_test(NAME xe_gate_quant_cpu COMMAND sh -c
-    "RI_GQ=0 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq0.bin && RADIANCE_XE_GATE_QUANT=1 RI_GQ=1 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq1.bin && cmp gq0.bin gq1.bin && echo 'gate_quant_fp8 (pair 4): bit-identical'")
+    "RI_GQ=0 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq0.bin && RADIANCE_XE_GATE_QUANT=1 RI_GQ=1 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq1.bin && cmp gq0.bin gq1.bin && echo 'gate_quant_fp8 (pair 4): bit-identical' && RI_GQ=2 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq2.bin && RADIANCE_XE_GATED_HAD=1 RI_GQ=3 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq3.bin && cmp gq2.bin gq3.bin && echo 'gated_had_quant_i8g (pair 2): bit-identical'")
   set_tests_properties(xe_gate_quant_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_executable(xe_hc_persist_test test/hc_persist_test.cpp)

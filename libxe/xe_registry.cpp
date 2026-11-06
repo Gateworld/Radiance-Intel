@@ -36,6 +36,8 @@
 extern "C" int xe_rad_hc_write_read(const RadArgs* a, RadStream s);   /* ports/r4d_hc_bf16.cpp, run 206 */
 extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream s);  /* ports/r4d_fused_quant_fp8.cpp, run 206 */
 static const RadConstraint cXeGateQuant[] = { C_DIV("n", 4), C_EQ("group", 128), C_IN("dtype", "bf16") };
+extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream s);  /* ports/r4d_fused_quant_fp8.cpp */
+static const RadConstraint cXeGatedHad[] = { C_DIV("n", 128), C_EQ("group", 128), C_IN("dtype", "bf16") };
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -340,10 +342,18 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cXeAttnQsa), NOTUNE,
   nullptr, nullptr, xe_rad_attn_qsa_fmha, xe_rad_attn_qsa_fmha_scratch, nullptr, nullptr, nullptr, nullptr, nullptr },
-/* run 206 (the fusion map's pair 4, RADIANCE_XE_GATE_QUANT=1; LAST, listed only under the flag with its schema below):
- * libr4d's gate_quant_fp8 row, its port's adapter -- the gated attention's sigmoid, mul and quantiser as one pass, the
- * sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does; without the schema the architecture
- * keeps the three ops */
+};
+static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+
+/* The fusion map's pairs that are libr4d's own fused ops (runs 206-207): each row, and its schema below, is listed only
+ * under its flag -- the architecture asks rad_op_declared first, so without the flag it keeps today's ops. Same order
+ * here and in kFlaggedSchemas. */
+static bool env_on(const char* k) { const char* e = std::getenv(k); return e && e[0] == '1'; }
+static bool xe_gate_quant_on() { static const bool v = env_on("RADIANCE_XE_GATE_QUANT"); return v; }
+static bool xe_gated_had_on() { static const bool v = env_on("RADIANCE_XE_GATED_HAD"); return v; }
+static const RadKernelInfo kFlagged[] = {
+/* pair 4 (RADIANCE_XE_GATE_QUANT=1): libr4d's gate_quant_fp8, its port's adapter -- the gated attention's sigmoid, mul
+ * and quantiser as one pass, the sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does */
 { "gate_quant_fp8", "gate_quant_fp8", "quant",
   "an elementwise gated product and the activation quantiser in one pass, with the gate in its own operand",
   "n a multiple of 4; gate and x both [M][n], their own pitches; group 128",
@@ -352,12 +362,30 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGateQuant), NOTUNE,
   nullptr, nullptr, r4d_rad_gate_quant_fp8, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* pair 2 (RADIANCE_XE_GATED_HAD=1, run 207): libr4d's gated_had_quant_i8g, its port's adapter -- format B / C's routed
+ * experts' silu x up (bf16-rounded), the 128-wide Hadamard and the int8 quantiser in one pass, for the
+ * silu_mul + had_quant_act_i8g pair the MoE block emits today (rad_block_moe_fp8.h, op_egq8) */
+{ "gated_had_quant_i8g", "gated_had_quant_i8g", "quant",
+  "an elementwise gated product, a 128-wide Hadamard along n and the int8 activation quantiser in one pass",
+  "n a multiple of 128; the gated operand [M][2n], gate then up; group 128",
+  "bf16 in, int8 codes with an f32 scale per (row, 128 columns), an optional bf16 out (unrotated); the codes over the "
+  "rotated bf16-rounded product -- had_quant_act_i8g's",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGatedHad), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
-static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
-/* RADIANCE_XE_GATE_QUANT=1 (run 206): the last row and the last own schema are listed */
-static bool xe_gate_quant_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GATE_QUANT"); return e && e[0] == '1'; }();
-    return v;
+static bool flagged_on(int j) { return j == 0 ? xe_gate_quant_on() : xe_gated_had_on(); }
+static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
+/* the j-th listed flagged entry (counting only those on), or -1 */
+static int flagged_index(int j) {
+    for (int k = 0; k < kNumFlagged; ++k)
+        if (flagged_on(k) && j-- == 0) return k;
+    return -1;
+}
+static int flagged_count() {
+    int c = 0;
+    for (int k = 0; k < kNumFlagged; ++k) c += flagged_on(k) ? 1 : 0;
+    return c;
 }
 
 static const RadPluginInfo kInfo = {
@@ -435,22 +463,44 @@ static const RadOpSchema kSchemas[] = {
       "unresolved on the Intel build, where the architecture then emits all_reduce + hc_write" },
     { "ar_gather_hc_write", ROW(pXeArGatherHcWrite), ROW(oXeArGatherHcWrite),
       "libr4d's fused moe_gather + all-reduce + hc_write; declared, not served (see ar_hc_write)" },
-    /* LAST: listed only under RADIANCE_XE_GATE_QUANT=1 (the architecture asks rad_op_declared first) */
-    { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
-      "the same, with the gate in its own operand rather than packed beside x." },
 };
 static const int kNumSchemas = (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
-static int own_schemas() { return kNumSchemas - (xe_gate_quant_on() ? 0 : 1); }
+/* gated_had_quant_i8g (run 207, pair 2): libr4d's pGatedQuantFp8 / oGatedQuantFp8, field for field */
+static const RadParamSpec pXeGatedHad[] = {
+    P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"), P_STRO("act"),
+};
+static const RadOperandSpec oXeGatedHad[] = {
+    { "gate_up", RAD_OPD_IN, 0 }, { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 }, { "out_bf16", RAD_OPD_OUT, 1 },
+};
+/* kFlagged's schemas, in its order; listed under the same flags */
+static const RadOpSchema kFlaggedSchemas[] = {
+    { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
+      "the same, with the gate in its own operand rather than packed beside x." },
+    { "gated_had_quant_i8g", ROW(pXeGatedHad), ROW(oXeGatedHad),
+      "gated_had_quant_fp8 at int8 codes: silu(a)*b or sigmoid(a)*b, a `group`-wide Hadamard, then int8 codes at "
+      "amax / 127 (the bf16 out unrotated)." },
+};
+static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");
+static int own_schemas() { return kNumSchemas + flagged_count(); }
+static const RadOpSchema* own_schema_at(int i) {
+    if (i < kNumSchemas) return &kSchemas[i];
+    const int k = flagged_index(i - kNumSchemas);
+    return k >= 0 ? &kFlaggedSchemas[k] : nullptr;
+}
 /* libxe's own schemas, then the MTP coupling's two (plugin/spechub/spechub.cpp, compiled into libxe): the loader
  * refuses a row whose op no loaded plugin declares a schema for, and the service's kernel list is libxe:libref
  * without the spechub plugin; two plugins declaring the same schema is accepted when they agree (loader.cpp,
  * schema_same), which these do, being the same definition. */
 extern "C" int rad_kernel_schema_count(void) { return own_schemas() + rad_spechub_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
-    if (i >= 0 && i < own_schemas()) return &kSchemas[i];
+    if (i < 0) return nullptr;
+    if (i < own_schemas()) return own_schema_at(i);
     return rad_spechub_schema_at(i - own_schemas());
 }
-extern "C" int rad_kernel_count(void) { return kNumKernels - (xe_gate_quant_on() ? 0 : 1); }
+extern "C" int rad_kernel_count(void) { return kNumKernels + flagged_count(); }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
-    return (i >= 0 && i < rad_kernel_count()) ? &kKernels[i] : nullptr;
+    if (i < 0 || i >= rad_kernel_count()) return nullptr;
+    if (i < kNumKernels) return &kKernels[i];
+    const int k = flagged_index(i - kNumKernels);
+    return k >= 0 ? &kFlagged[k] : nullptr;
 }

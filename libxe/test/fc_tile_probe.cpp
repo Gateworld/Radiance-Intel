@@ -96,7 +96,28 @@ inline uint32_t t1b_off(uint32_t row, uint32_t jc, uint32_t cpr) {
 /* ---- T1: moe_i4i8_run_kernel<UPL, LPR, R, GL, FC = true> with the repacked reads (see the header); TB: T1b's code
  * order. The tail skip is left out: the probe's experts are all resident, as the skip's own off-device test would
  * find. */
-template <int UPL, int LPR, int R, bool GL, bool TB = false>
+/* T1c (run 207, owner yes on note 202's T1c): one 16-lane sub-group block read a (unit, chunk, row parity) piece --
+ * lane l's 16 bytes as dwords l, 16 + l, 32 + l, 48 + l of the piece (the read's striped order; t1c_off) -- in place
+ * of 16 lanes' own 16-byte loads (A.3: the weight loads' send queue, ~39 % of down's stalls, U2). */
+inline uint4 sg_read4(const uint8_t* p) {
+#ifdef __SYCL_DEVICE_ONLY__
+    typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+    auto gp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::yes>(
+        (const uint32_t*)p);
+    const u32x4 v = __spirv_SubgroupBlockReadINTEL<u32x4>(gp.get_decorated());
+    return uint4{ v.x, v.y, v.z, v.w };
+#else
+    (void)p;
+    return uint4{ 0, 0, 0, 0 };
+#endif
+}
+/* T1c's byte offset of dword k of row `row`'s chunk `jc`: T1b's piece, its 16 lanes' dwords striped */
+inline uint32_t t1c_off(uint32_t row, uint32_t jc, uint32_t cpr, uint32_t k) {
+    const uint32_t r = row & 1u, tl = (row & 15u) >> 1, ch = jc & 1u, wv = jc >> 1, l = wv & 1u, u = wv >> 1;
+    return (row >> 4) * (16u * cpr * 16u) + (((u * 2u + ch) * 2u + r) * 256u) + (k * 16u + tl * 2u + l) * 4u;
+}
+
+template <int UPL, int LPR, int R, bool GL, bool TB = false, bool TC = false>
 void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, TCls c0, TCls c1,
                    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -182,10 +203,34 @@ void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, T
                 const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) + (uint32_t)ch : (uint32_t)l + (uint32_t)u * LPR;
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
-                    const size_t o = TB ? (size_t)t1b_off(rowr[r], jc, CPR) : (size_t)rowr[r] * c.w_ld + jc * 16u;
-                    w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + o) : uint4{0, 0, 0, 0};
+                    if constexpr (TC) {
+                        /* the piece is the sub-group's: its first lane's chunk decides the read for all (the probe's
+                         * shapes keep a unit's liveness uniform across the two lanes of a team) */
+                        const uint32_t jc0 = 2u * ((uint32_t)u * LPR) + (uint32_t)ch;
+                        /* the piece's base: its row block and parity, lane 0's chunk, dword 0 */
+                        const uint32_t brow = (rowr[r] & ~15u) | (rowr[r] & 1u);
+                        const uint4 v = jc0 < CPR ? sg_read4(we + (size_t)t1c_off(brow, jc0, CPR, 0))
+                                                  : uint4{ 0, 0, 0, 0 };
+                        w[u][r][ch] = (jc < CPR && rowok[r]) ? v : uint4{ 0, 0, 0, 0 };
+                    } else {
+                        const size_t o = TB ? (size_t)t1b_off(rowr[r], jc, CPR) : (size_t)rowr[r] * c.w_ld + jc * 16u;
+                        w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + o) : uint4{0, 0, 0, 0};
+                    }
                 }
             }
+        /* TC: every scale this lane reads, issued before the decode (more loads in flight; the same values) */
+        float sbr_all[TC ? UPL : 1][R];
+        if constexpr (TC) {
+#pragma unroll
+            for (int u = 0; u < UPL; ++u) {
+                const uint32_t jc = 2u * ((uint32_t)l + (uint32_t)u * LPR);
+                const bool live = jc < CPR;
+                const uint32_t g = live ? jc / 2u : 0u;
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    sbr_all[u][r] = rowok[r] && live ? e4m3_to_f32(se8[(size_t)rowr[r] * c.s_ld + g]) * smul : 0.0f;
+            }
+        }
 #pragma unroll
         for (int u = 0; u < UPL; ++u) {
             const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) : (uint32_t)l + (uint32_t)u * LPR;
@@ -194,7 +239,8 @@ void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, T
             float sbr[R];
 #pragma unroll
             for (int r = 0; r < R; ++r)
-                sbr[r] = rowok[r] && live ? e4m3_to_f32(se8[(size_t)rowr[r] * c.s_ld + g]) * smul : 0.0f;
+                sbr[r] = TC ? sbr_all[TC ? u : 0][r]
+                            : (rowok[r] && live ? e4m3_to_f32(se8[(size_t)rowr[r] * c.s_ld + g]) * smul : 0.0f);
             uint32_t lv[R][CH][8];
 #pragma unroll
             for (int r = 0; r < R; ++r)
@@ -264,17 +310,21 @@ void t1_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, T
 void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0, const TCls& c1, const int32_t* sorted,
                const int32_t* off, uint16_t* Y, uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k,
                uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, bool a_sorted, uint32_t parts, uint32_t M,
-               bool tb = false) {
+               bool tb = false, bool tc = false) {
     const bool gl = K <= 512;
     const int lpr = gl ? 2 : 16, rpt = gl ? 2 : 1;
     const int upl = gl ? (int)((K / 64 + lpr - 1) / lpr) : (int)((K / 32 + lpr - 1) / lpr);
     const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
     const dim3 grid((N + cpw - 1) / cpw, T), block(kWG);
-#define T1F(U, L, R, G, B)                                                                                     \
-    XE_LAUNCH_SG(16, &q, (t1_run_kernel<U, L, R, G, B>), grid, block, 0, A, As, c0, c1, sorted, off, Y, T, N,  \
+#define T1G(U, L, R, G, B, C)                                                                                  \
+    XE_LAUNCH_SG(16, &q, (t1_run_kernel<U, L, R, G, B, C>), grid, block, 0, A, As, c0, c1, sorted, off, Y, T, N, \
                  n_expert, top_k, a_ld, as_ld, y_ld, a_sorted ? 1u : 0u, parts, M)
+#define T1F(U, L, R, G, B) T1G(U, L, R, G, B, false)
 #define T1(U, L, R, G) T1F(U, L, R, G, false)
-    if (gl && tb) switch (upl) {
+    if (gl && tc) switch (upl) {   /* T1c (run 207) */
+        case 2: T1G(2, 2, 2, true, false, true); break;
+        default: T1G(3, 2, 2, true, false, true); break;
+    } else if (gl && tb) switch (upl) {
         case 2: T1F(2, 2, 2, true, true); break;
         default: T1F(3, 2, 2, true, true); break;
     } else if (gl) switch (upl) {
@@ -290,6 +340,7 @@ void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0,
     }
 #undef T1
 #undef T1F
+#undef T1G
 }
 
 /* ---- T2 (run 206, the supervisor's order: gate_up's activation staging reused): T1's arithmetic for gate_up's form
@@ -743,12 +794,32 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                         std::memcpy(dst + t1b_off((uint32_t)row, jc, cpr), src + (size_t)row * rb + jc * 16u, 16);
             }
         }
+    /* T1c (run 207): T1's entries with the codes in T1b's pieces, each piece's 16 lanes' dwords striped (t1c_off) */
+    std::vector<uint8_t> tcw[2];
+    if (gl)
+        for (int c = 0; c < 2; ++c) {
+            const uint32_t cpr = (uint32_t)Kcl[c] / 32u;
+            tcw[c] = tw[c];
+            const size_t rb = (size_t)Kcl[c] / 2;
+            for (int e = 0; e < ne[c]; ++e) {
+                const uint8_t* src = &tw[c][(size_t)e * tent[c]];
+                uint8_t* dst = &tcw[c][(size_t)e * tent[c]];
+                for (int row = 0; row < Ncl[c]; ++row)
+                    for (uint32_t jc = 0; jc < cpr; ++jc)
+                        for (uint32_t k = 0; k < 4; ++k)
+                            std::memcpy(dst + t1c_off((uint32_t)row, jc, cpr, k), src + (size_t)row * rb + jc * 16u + k * 4u, 4);
+            }
+        }
     /* device buffers */
     const size_t ybytes = (size_t)T * Nmax * 2;
     int8_t* da = sycl::malloc_device<int8_t>(a.size(), q);
     float* das = sycl::malloc_device<float>(as.size(), q);
-    uint8_t *dw[2], *dws[2], *dtw[2], *dtbw[2] = { nullptr, nullptr };
+    uint8_t *dw[2], *dws[2], *dtw[2], *dtbw[2] = { nullptr, nullptr }, *dtcw[2] = { nullptr, nullptr };
     for (int c = 0; c < 2; ++c) {
+        if (gl) {
+            dtcw[c] = sycl::malloc_device<uint8_t>(tcw[c].size() + 64, q);
+            q.memcpy(dtcw[c], tcw[c].data(), tcw[c].size());
+        }
         dw[c] = sycl::malloc_device<uint8_t>(w[c].size() + 64, q);
         dws[c] = sycl::malloc_device<uint8_t>(wsb[c].size() + 64, q);
         dtw[c] = sycl::malloc_device<uint8_t>(tw[c].size() + 64, q);
@@ -770,6 +841,8 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     uint8_t* dy4 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);
     q.memset(dy3, kPat, ybytes + 2 * kCanary);
     q.memset(dy4, kPat, ybytes + 2 * kCanary);
+    uint8_t* dy5 = sycl::malloc_device<uint8_t>(ybytes + 2 * kCanary, q);   /* T1c */
+    q.memset(dy5, kPat, ybytes + 2 * kCanary);
     q.memcpy(da, a.data(), a.size());
     q.memcpy(das, as.data(), as.size() * 4);
     q.memcpy(dso, sorted.data(), sorted.size() * 4);
@@ -810,14 +883,17 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     TCls tcb[2] = { tc[0], tc[1] };
     for (int c = 0; c < 2; ++c) tcb[c].base = dtbw[c];
     auto today = [&]() { return fn(&args, (RadStream)&q); };
-    auto t1f = [&](const TCls* cls, uint8_t* dy, bool tb) {
+    TCls tcc[2] = { tc[0], tc[1] };   /* T1c */
+    for (int c = 0; c < 2; ++c) tcc[c].base = dtcw[c];
+    auto t1f = [&](const TCls* cls, uint8_t* dy, bool tb, bool tcf = false) {
         t1_launch(q, da, das, cls[0], cls[1], dso, doff, (uint16_t*)(dy + kCanary), (uint32_t)T, (uint32_t)Nmax,
                   (uint32_t)Kmax, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)Kmax, (uint32_t)(Kmax / 128),
-                  (uint32_t)Nmax, sh.sorted_a, (uint32_t)sh.parts, (uint32_t)AR, tb);
+                  (uint32_t)Nmax, sh.sorted_a, (uint32_t)sh.parts, (uint32_t)AR, tb, tcf);
         return 0;
     };
     auto t1 = [&]() { return t1f(tc, dy1, false); };
     auto t1b = [&]() { return t1f(tcb, dy2, true); };
+    auto t1c = [&]() { return t1f(tcc, dy5, false, true); };
     /* E1 / E1b: down's shape on a GPU (the ESIMD form has no CPU device) */
     bool e1on = gl && q.get_device().is_gpu() && sh.parts == 1 && sh.N == sh.N1 && Kcl[0] == 384 && Kcl[1] == 256;
     const char* lwv = std::getenv("RI_E1_LW");
@@ -844,7 +920,7 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     auto e1b = [&]() { return e1f(dy4, false); };
     const int rc = today();
     t1();
-    if (gl) t1b();
+    if (gl) { t1b(); t1c(); }
     q.wait_and_throw();
     if (e1on) {
         try {
@@ -857,7 +933,8 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
         }
     }
     std::vector<uint8_t> h0(ybytes + 2 * kCanary), h1(ybytes + 2 * kCanary), h2(ybytes + 2 * kCanary);
-    std::vector<uint8_t> h3(ybytes + 2 * kCanary), h4(ybytes + 2 * kCanary);
+    std::vector<uint8_t> h3(ybytes + 2 * kCanary), h4(ybytes + 2 * kCanary), h5(ybytes + 2 * kCanary);
+    q.memcpy(h5.data(), dy5, h5.size());
     q.memcpy(h0.data(), dy0, h0.size());
     q.memcpy(h1.data(), dy1, h1.size());
     q.memcpy(h3.data(), dy3, h3.size());
@@ -881,14 +958,18 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     };
     size_t nonzero = 0;
     for (size_t i = 0; i < ybytes; i += 2) nonzero += h0[kCanary + i] != 0 || h0[kCanary + i + 1] != 0;
-    size_t f1 = 0, f2 = 0;
-    const size_t diff = cmp(h1, &f1), diff2 = gl ? cmp(h2, &f2) : 0;
-    const bool canary = canary_ok(h0) && canary_ok(h1) && (!gl || canary_ok(h2));
-    const bool ok = rc == RAD_OK && canary && diff == 0 && diff2 == 0 && nonzero > 0;
+    size_t f1 = 0, f2 = 0, f5 = 0;
+    const size_t diff = cmp(h1, &f1), diff2 = gl ? cmp(h2, &f2) : 0, diff5 = gl ? cmp(h5, &f5) : 0;
+    const bool canary = canary_ok(h0) && canary_ok(h1) && (!gl || (canary_ok(h2) && canary_ok(h5)));
+    const bool ok = rc == RAD_OK && canary && diff == 0 && diff2 == 0 && diff5 == 0 && nonzero > 0;
+    if (diff5) std::printf("  T1c's first difference at output %zu (row %zu, column %zu)\n", f5, f5 / Nmax, f5 % Nmax);
     std::printf("%s %s tokens %d: T %d over %d experts, N %d/%d K %d/%d -- today rc %d; T1: %zu of %zu outputs differ%s"
                 "%s; %zu nonzero; canaries %s\n", ok ? "PASS" : "FAIL", sh.name, tokens, T, pool_n, sh.N, sh.N1, sh.K,
                 sh.K1, rc, diff, ybytes / 2, diff ? "" : " (bit-identical)",
-                gl ? (diff2 ? "; T1b DIFFERS" : "; T1b bit-identical") : "", nonzero, canary ? "intact" : "BROKEN");
+                gl ? (diff2 ? "; T1b DIFFERS" : diff5 ? "; T1b bit-identical; T1c DIFFERS"
+                                                      : "; T1b bit-identical; T1c bit-identical")
+                   : "",
+                nonzero, canary ? "intact" : "BROKEN");
     if (diff) std::printf("  T1's first difference at output %zu (row %zu, column %zu)\n", f1, f1 / Nmax, f1 % Nmax);
     if (diff2) std::printf("  T1b: %zu differ, the first at output %zu (row %zu, column %zu)\n", diff2, f2, f2 / Nmax, f2 % Nmax);
     bool e1bad = false;
@@ -961,11 +1042,12 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
             }
             return median(per);
         };
-        const double u0 = time(today), u1 = time(t1), u2 = gl ? time(t1b) : 0.0, u0b = time(today);
+        const double u0 = time(today), u1 = time(t1), u2 = gl ? time(t1b) : 0.0, u5 = gl ? time(t1c) : 0.0,
+                     u0b = time(today);
         const double base = std::min(u0, u0b);
         std::printf("RESULT %s tokens %d: today %.1f us (re-timed %.1f), T1 %.1f us a launch -> %.0f %% of today", sh.name,
                     tokens, u0, u0b, u1, 100.0 * u1 / base);
-        if (gl) std::printf("; T1b %.1f us -> %.0f %%", u2, 100.0 * u2 / base);
+        if (gl) std::printf("; T1b %.1f us -> %.0f %%; T1c %.1f us -> %.0f %%", u2, 100.0 * u2 / base, u5, 100.0 * u5 / base);
         std::printf("\n");
         /* E1 timed even when it differs (its speed says whether the exact form is worth the work) */
         if (e1on) {
@@ -1056,9 +1138,10 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     for (int c = 0; c < 2; ++c) {
         sycl::free(dw[c], q); sycl::free(dws[c], q); sycl::free(dtw[c], q);
         if (dtbw[c]) sycl::free(dtbw[c], q);
+        if (dtcw[c]) sycl::free(dtcw[c], q);
     }
     sycl::free(da, q); sycl::free(das, q); sycl::free(dso, q); sycl::free(doff, q); sycl::free(dy0, q); sycl::free(dy1, q);
-    sycl::free(dy2, q); sycl::free(dy3, q); sycl::free(dy4, q);
+    sycl::free(dy2, q); sycl::free(dy3, q); sycl::free(dy4, q); sycl::free(dy5, q);
     return ok && !pair_bad && !e1bad && !t2bad;
 }
 

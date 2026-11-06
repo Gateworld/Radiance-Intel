@@ -364,6 +364,10 @@ struct MoeFP8 {
     /* Format B (Config::expert_i8): the down input's rotation and int8 quantiser over the bf16 silu
      * product; op_hq is then the gate_up input's, into the int8 pair. */
     rad_op op_eq8 = 0;
+    /* Intel port, run 207 (the fusion map's pair 2): the silu product, the rotation and the int8 quantiser as one
+     * `gated_had_quant_i8g` where a loaded library declares it (libxe under RADIANCE_XE_GATED_HAD=1); then gq_exp and
+     * op_eq8 are not declared. The same codes: the product rounded to bf16 before the rotation, as the pair's buffer. */
+    rad_op op_egq8 = 0;
     /* The caller's read writes the rotated pair (HyperConn::Config::rotate), so this block declares
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
@@ -1183,6 +1187,23 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (c.expert_i8 || c.expert_c8) {
         /* Format B (and C): the silu product into the bf16 plane (the bf16 experts' form of the gated
          * quantiser), then the rotation and the int8 quantiser over it. */
+        /* not under calibration: its Gram accumulators read the bf16 product (`w.eff.x`), which the one op does not
+         * write */
+        /* and only under the flag: libr4d declares the op on every build, and without the flag the ops are today's */
+        static const bool gh_on = [] { const char* e = std::getenv("RADIANCE_XE_GATED_HAD"); return e && e[0] == '1'; }();
+        if (gh_on && c.swiglu_limit <= 0 && !c.calib && rad_op_declared(b, "gated_had_quant_i8g")) {
+            op_egq8 = RAD_OP(b, "gated_had_quant_i8g",
+                             RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k), RAD_INT("n", c.n_ff_exp),
+                                        RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
+                                        RAD_STR("act", "silu")),
+                             RAD_NOWEIGHTS);
+            if (op_egq8) {
+                const rad_buf wr[2] = { w.eff.q8, w.eff.s8 };
+                RAD_ARCH_TRY(rad_op_reads (b, op_egq8, &w.egu, 1));
+                RAD_ARCH_TRY(rad_op_writes(b, op_egq8, wr, 2));
+            }
+        }
+        if (!op_egq8) {
         Geom gx = g;
         gx.w_bf16 = true;
         RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
@@ -1193,6 +1214,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                        RAD_NOWEIGHTS),
                    {w.eff.x}, {w.eff.q8, w.eff.s8});
         if (!op_eq8) return RAD_E_INVAL;
+        }
     } else {
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
                                 false, rot, c.swiglu_limit));
@@ -1770,7 +1792,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
-    gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (op_egq8)   /* run 207: the product, rotation and int8 quantiser as one op */
+        RAD_ISSUE_N(c_, op_egq8, rows * k, brows(w.egu, rows * k), brows(w.eff.q8, rows * k),
+                    brows(w.eff.s8, rows * k), RAD_NONE);
+    else
+        gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (op_eq8)   /* format B: the bf16 silu product rotated and quantised to int8 */
         RAD_ISSUE_N(c_, op_eq8, rows * k, brows(w.eff.x, rows * k), brows(w.eff.q8, rows * k),
                     brows(w.eff.s8, rows * k));
