@@ -1459,7 +1459,9 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
     }
 }
 
-template <int RG, int F8, bool I8 = false, bool ST = false, bool S8 = false, bool Q8D = false>
+/* D16 (run 206): RADIANCE_XE_HC_D16 as a template argument -- as the runtime `d16` (run 205, image 251) its dead branch
+ * cost the default instance +4 % a launch (M300: 32.9 us vs 31.5); `d16` stays in the signature, unread. */
+template <int RG, int F8, bool I8 = false, bool ST = false, bool S8 = false, bool Q8D = false, bool D16 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                       const unsigned short* __restrict__ dbuf,
@@ -1476,7 +1478,8 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
     XE_SHARED_VAR(unsigned int, s_arrived);
     hc_up_mix_body<RG, F8, I8, ST, S8, Q8D>(upv, uld, dbuf, h, w, scalein, nbuf, x, q, qs, rq, rqs, ctr, rows, n, hc,
                                             lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd, blockIdx.x, blockIdx.y,
-                                            sd, s_stage, s_u, s_arrived, nullptr, 0u, 0u, d16 != 0);
+                                            sd, s_stage, s_u, s_arrived, nullptr, 0u, 0u, D16);
+    (void)d16;
 }
 /* RADIANCE_XE_HC_D16=1 (run 205, owner note 201 item 1): the up mix's `d` staged as bf16 (hc8_dot_up16) */
 bool xe_hc_d16_on() {
@@ -1545,13 +1548,19 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
     const unsigned lds = (unsigned)(st ? hc_up_st_off(rg, lr) + kUpRows * uld : rg * lr * sizeof(float));
     const void* upp = up->data;
 #define HC_UPMIX_CASE4(RG_, F8_, I8_, ST_, S8_) HC_UPMIX_CASE5(RG_, F8_, I8_, ST_, S8_, false)
-#define HC_UPMIX_CASE5(RG_, F8_, I8_, ST_, S8_, Q_)                                             \
-    emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_, ST_, S8_, Q_>), grid, dim3(kThreads), lds, \
+#define HC_UPMIX_EMIT(RG_, F8_, I8_, ST_, S8_, Q_, D_)                                          \
+    emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_, ST_, S8_, Q_, D_>), grid, dim3(kThreads), lds, \
                        upp, uld, dbuf, h, w, scale, nbuf, x, q, qs, rq, rqs, ctr, (long)rows,      \
                        (long)n,                                                                   \
                        hc,                                                                        \
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
-                       (long)rsrow, wadd, (xe_hc_d16_on() && (F8_) != 0 && !(Q_)) ? 1 : 0)
+                       (long)rsrow, wadd, (D_) ? 1 : 0)
+#define HC_UPMIX_CASE5(RG_, F8_, I8_, ST_, S8_, Q_)                                             \
+    do {                                                                                          \
+        if (xe_hc_d16_on() && (F8_) != 0 && !(Q_))                                                \
+            HC_UPMIX_EMIT(RG_, F8_, I8_, ST_, S8_, Q_, ((F8_) != 0 && !(Q_)));                    \
+        else HC_UPMIX_EMIT(RG_, F8_, I8_, ST_, S8_, Q_, false);                                   \
+    } while (0)
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
     do { /* st with one-byte rows (f8 1 or 3), s8 with E4M3 only: no other staged instantiations */ \
         if (s8) HC_UPMIX_CASE4(RG_, F8_, I8_, (F8_ == 1), (F8_ == 1));                           \
@@ -1575,6 +1584,7 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, int f8, bool i
 #undef HC_UPMIX_CASE3
 #undef HC_UPMIX_CASE4
 #undef HC_UPMIX_CASE5
+#undef HC_UPMIX_EMIT
     return emit_rc;
 }
 

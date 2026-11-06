@@ -979,6 +979,14 @@ std::string nprof_short(const std::string* s) {
     if (nm.size() > 56) nm.resize(56);
     return nm;
 }
+/* RADIANCE_L0_NTAPE_EDGES=1 (Intel port, run 206, owner notes 200 item 3 / 201 item 4: the fusion map), with the
+ * profiler on: every idle gap INSIDE a play is charged to its boundary, the kernel that ended -> the kernel that started
+ * next, so the table names the decode step's adjacent pairs and what each boundary costs. Profiling only. */
+bool ntape_edges() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_NTAPE_EDGES"); return e && e[0] == '1'; }();
+    return v;
+}
+std::unordered_map<std::string, NProfAcc>& nprof_edges() { static std::unordered_map<std::string, NProfAcc> m; return m; }
 ZeDev& zedev(int d) { static ZeDev z[kMaxDevices]; return z[d]; }
 using AppendFn = ze_result_t (*)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t,
                                  uint32_t, ze_event_handle_t*);
@@ -1293,7 +1301,14 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, ui
                 tl.busy += (b - a) & mask;
                 if (k > 0) {
                     const uint64_t g = (a - prev_end) & mask;
-                    if (g <= half) { tl.inner += g; ++tl.inner_n; }
+                    if (g <= half) {
+                        tl.inner += g; ++tl.inner_n;
+                        if (ntape_edges()) {
+                            NProfAcc& e = nprof_edges()[nprof_short(p.names[k - 1]) + " -> " + nprof_short(p.names[k])];
+                            e.ticks += g;
+                            e.count += 1;
+                        }
+                    }
                 }
                 prev_end = b;
             }
@@ -1314,6 +1329,18 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, ui
                 if (nm.size() > 96) nm.resize(96);
                 RAD_INFO("  %6.1f%%  %8.1f ms  %8llu x  %7.1f us  %s", 100.0 * a.ticks / (tot ? tot : 1), a.ticks * Z.timer_ns * 1e-6,
                          (unsigned long long)a.count, a.count ? a.ticks * Z.timer_ns * 1e-3 / a.count : 0.0, nm.c_str());
+            }
+            if (ntape_edges()) {   /* the boundaries inside plays, by pair, the most frequent first */
+                std::vector<std::pair<std::string, NProfAcc>> ed(nprof_edges().begin(), nprof_edges().end());
+                std::sort(ed.begin(), ed.end(), [](const auto& x, const auto& y) { return x.second.count > y.second.count; });
+                uint64_t et = 0, en = 0;
+                for (const auto& r : ed) { et += r.second.ticks; en += r.second.count; }
+                RAD_INFO("l0 tape edges inside plays: %zu pairs, %llu boundaries, %.1f ms idle; the top 40 by count:", ed.size(),
+                         (unsigned long long)en, et * Z.timer_ns * 1e-6);
+                for (size_t i = 0; i < ed.size() && i < 40; ++i)
+                    RAD_INFO("  edge %8llu x  %6.2f us  %8.1f ms  %s", (unsigned long long)ed[i].second.count,
+                             ed[i].second.count ? ed[i].second.ticks * Z.timer_ns * 1e-3 / ed[i].second.count : 0.0,
+                             ed[i].second.ticks * Z.timer_ns * 1e-6, ed[i].first.c_str());
             }
             /* the timeline, a device at a time, over the plays harvested since the last print */
             for (auto& kv : ntimeline()) {

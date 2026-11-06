@@ -179,7 +179,10 @@ constexpr uint32_t kMaxK = 4096;
  * (ref_moe.cpp) rounds to int8 integers at the entry's amax, nearbyint(level * 127 / amax), moving amax / 127 into
  * the weight scale: e4m3(scale) * (scale.1 * (amax / 127)). The work-group builds a 256-entry table, a code byte
  * (low code, high code) to its two int8 levels (the probe's C-lds), and the sums need no -8 sum(a) term. */
-template <int UPL, int LPR, int R, bool GL, bool FC = false>
+/* SEL (run 206): RADIANCE_XE_I4I8_RUN_SEL's select-chain decode as a template argument -- as a runtime one (run 205,
+ * image 253) its dead branch cost the default instance +9-11 % a launch (M300 vs M292: gate_up 115 -> 125 us, down
+ * 66.8 -> 74.2); `sel` stays in the signature, unread. */
+template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -328,8 +331,9 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
      * decode as one SLM gather a code byte (194 load.slm.d32 in down's ISA, 100 in gate_up's); the same rounding as the
      * table above, so the same integers */
     uint32_t pk[4] = { 0u, 0u, 0u, 0u };
-    if constexpr (FC) {
-        if (sel && e >= 0) {
+    (void)sel;
+    if constexpr (FC && SEL) {
+        if (e >= 0) {
             const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, (uint32_t)e >> 1) + c.t_off);
             float amax = 0.0f;
 #pragma unroll
@@ -409,7 +413,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 #pragma unroll
                         for (int x = 0; x < 4; ++x) {   /* a code byte (low code, high code) to its two levels */
                             uint32_t lo8 = 0, hi8 = 0;
-                            if (sel) {
+                            if constexpr (SEL) {
 #pragma unroll
                                 for (int bb = 0; bb < 4; ++bb) {
                                     const uint32_t by = (d[x] >> (8 * bb)) & 255u, c0 = by & 15u, c1 = by >> 4;
@@ -1167,6 +1171,8 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
     do {                                                                                                     \
         if (run_grf()) xe::launch_as_grf256<&moe_i4i8_run_kernel<U, L, R, G, F>, 16>(                        \
                            &moe_i4i8_run_kernel<U, L, R, G, F>, *qq, grid, block, XE_I4I8_RUN_ARGS);         \
+        else if ((F) && run_sel())                                                                           \
+            XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F, (F)>), grid, block, 0, XE_I4I8_RUN_ARGS); \
         else XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, XE_I4I8_RUN_ARGS);   \
     } while (0)
 #define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
