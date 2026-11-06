@@ -1189,9 +1189,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * quantiser), then the rotation and the int8 quantiser over it. */
         /* not under calibration: its Gram accumulators read the bf16 product (`w.eff.x`), which the one op does not
          * write */
-        /* and only under the flag: libr4d declares the op on every build, and without the flag the ops are today's */
+        /* and only under RADIANCE_XE_GATED_HAD=1 on the Intel build (libxe declares hc_write_read; libr4d declares
+         * gated_had_quant_i8g on every build): opt-in in the architecture -- the Intel test images set it in their
+         * environment (run 207, the owner's default for them) -- so every other build and the architecture tests
+         * declare what they did */
         static const bool gh_on = [] { const char* e = std::getenv("RADIANCE_XE_GATED_HAD"); return e && e[0] == '1'; }();
-        if (gh_on && c.swiglu_limit <= 0 && !c.calib && rad_op_declared(b, "gated_had_quant_i8g")) {
+        if (gh_on && c.swiglu_limit <= 0 && !c.calib && rad_op_declared(b, "hc_write_read") &&
+            rad_op_declared(b, "gated_had_quant_i8g")) {
             op_egq8 = RAD_OP(b, "gated_had_quant_i8g",
                              RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k), RAD_INT("n", c.n_ff_exp),
                                         RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),

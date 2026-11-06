@@ -460,6 +460,8 @@ if(RAD_BUILD_TESTS)
   # run 189 (owner note 187): =2 is stage 1b (work by ticket, per-row flags); three runs of the row test. GPC=1: one
   # group a compute unit, as =1's (the build container's 4 CPUs time-slice 32 groups, and a descheduled holder of a
   # unit lets a waiter's bounded spin run out -- correct, then a fail-fast run, but not the bytes this compares)
+  # run 207: GU and D16 are the defaults now; the base runs pin them off so every form is compared with the plain path
+  # (the forms' own runs set =1 on their command, which overrides)
   set_tests_properties(xe_hc_persist_cpu PROPERTIES LABELS "xe"
-    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8" TIMEOUT 1200)
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8;RADIANCE_XE_HC_GU=0;RADIANCE_XE_HC_D16=0" TIMEOUT 1200)
 endif()

@@ -348,7 +348,8 @@ static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 /* The fusion map's pairs that are libr4d's own fused ops (runs 206-207): each row, and its schema below, is listed only
  * under its flag -- the architecture asks rad_op_declared first, so without the flag it keeps today's ops. Same order
  * here and in kFlaggedSchemas. */
-static bool env_on(const char* k) { const char* e = std::getenv(k); return e && e[0] == '1'; }
+/* the default since run 207 (owner, note 202: the fusion map's exact group); =0 opts out */
+static bool env_on(const char* k) { const char* e = std::getenv(k); return !(e && e[0] == '0'); }
 static bool xe_gate_quant_on() { static const bool v = env_on("RADIANCE_XE_GATE_QUANT"); return v; }
 static bool xe_gated_had_on() { static const bool v = env_on("RADIANCE_XE_GATED_HAD"); return v; }
 static const RadKernelInfo kFlagged[] = {

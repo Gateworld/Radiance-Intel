@@ -40,11 +40,15 @@
 namespace rad {
 namespace arch {
 
-/* RADIANCE_HC_WRITE_FUSE=1 (Intel port, run 206): a connection's write folded into the next read (hc_write_read) */
+/* RADIANCE_HC_WRITE_FUSE=1 (Intel port, run 206): a connection's write folded into the next read (hc_write_read), and
+ * only where a loaded library declares hc_write_read (libxe). Opt-in in the architecture: the Intel test images set it
+ * in their environment (images/m1rt, run 207, the owner's default for them), so every other build and the
+ * architecture tests declare what they did. */
 inline bool hc_write_fuse_on() {
     static const bool on = [] { const char* e = std::getenv("RADIANCE_HC_WRITE_FUSE"); return e && e[0] == '1'; }();
     return on;
 }
+inline bool hc_write_fuse_on(RadBuilder* b) { return hc_write_fuse_on() && rad_op_declared(b, "hc_write_read"); }
 
 /* Initialises the wide stream with hc identical copies of the embedding, one launch per step.
  * Separate from the embedding lookup, whose output width is n_embd. The copies diverge at the
@@ -306,7 +310,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         const int64_t ar_rows = ar_exact_write_rows(g);
         /* run 206: under RADIANCE_HC_WRITE_FUSE the write stays plain (the block issues its own all-reduce, the same
          * kernel), so the next read can take it (declare_write_read); the folded forms are not declared */
-        if (c.reduce && ar_rows >= 1 && !hc_write_fuse_on())
+        if (c.reduce && ar_rows >= 1 && !hc_write_fuse_on(b))
             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
                                 RAD_PARAMS(RAD_RANGE("M", 1, ar_rows), RAD_INT("n", g.n_embd),
                                            RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
@@ -392,7 +396,7 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
 }
 
 inline int HyperConn::declare_write_read(RadBuilder* b, const HyperConn& prev) {
-    if (!hc_write_fuse_on() || !op_read || !prev.op_write || !prev.c.inject || prev.w.h != w.h || prev.c.hc != c.hc ||
+    if (!hc_write_fuse_on(b) || !op_read || !prev.op_write || !prev.c.inject || prev.w.h != w.h || prev.c.hc != c.hc ||
         prev.g.n_embd != g.n_embd || !prev.w.x.x || !prev.w.inj)
         return RAD_OK;
     const rad_weight wts[4] = { w_norm, w_down, w_up, w_inj };

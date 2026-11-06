@@ -1481,9 +1481,10 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
                                             sd, s_stage, s_u, s_arrived, nullptr, 0u, 0u, D16);
     (void)d16;
 }
-/* RADIANCE_XE_HC_D16=1 (run 205, owner note 201 item 1): the up mix's `d` staged as bf16 (hc8_dot_up16) */
+/* RADIANCE_XE_HC_D16 (run 205, owner note 201 item 1): the up mix's `d` staged as bf16 (hc8_dot_up16). The default since
+ * run 207 (owner, note 202: the fusion map's exact group, H141 +1.7 % median); =0 opts out. */
 bool xe_hc_d16_on() {
-    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_D16"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_D16"); return !(v && v[0] == '0'); }();
     return on;
 }
 
@@ -2254,8 +2255,9 @@ void hc_v2_gu_kernel(const unsigned short* __restrict__ nbuf, const unsigned sho
                                                            0, 0, wadd, b % gxb, b / gxb, sd, s_stage, s_u, s_arrived,
                                                            nullptr, 0u, 0u, d16 != 0);   /* RADIANCE_XE_HC_D16 too */
 }
+/* the default since run 207 (the fusion map's exact group); RADIANCE_XE_HC_GU=0 opts out */
 bool xe_hc_gu_on() {
-    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_GU"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_GU"); return !(v && v[0] == '0'); }();
     return on;
 }
 
