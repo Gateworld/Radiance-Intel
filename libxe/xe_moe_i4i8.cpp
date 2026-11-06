@@ -184,7 +184,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows,
-                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats) {
+                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound) {
     XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
     /* each group's activation sum (exact); FC, which needs none: the 256-entry table, a byte -> two levels (bits).
      * (A separate FC-only array, declared and unused in format B's instantiation, crashed the CPU device: run 116.) */
@@ -196,7 +196,11 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
     if (i >= T) return;
     const int32_t flat = sorted[i];
     int32_t e = -1;
-    if (flat >= 0) {
+    /* bound (run 202, RADIANCE_XE_I4I8_RUN_BOUND=1; run 108's MX_BOUND for this form): a row at or past off[n_expert]
+     * is not this GEMM's -- the protected experts' live rows sort there, and unbounded such a row can lead a run of
+     * expert n_expert - 1 with rn = off[n_expert] - i wrapped to kMT (the wrong weights, up to 3 rows past T); bounded
+     * it is a padding row, zeroed, as the arch expects ("zeroed their sorted rows as past its live count") */
+    if (flat >= 0 && !(bound && i >= (uint32_t)off[n_expert])) {
         uint32_t lo = 0, hi = n_expert;
         while (lo + 1 < hi) {
             const uint32_t mid = (lo + hi) / 2;
@@ -466,6 +470,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 constexpr int kDWaves = 8, kDThreads = 16 * kDWaves, kDRows = 8 * kDWaves, kDCols = 64;
 constexpr int kDTileB = 8 * 16 * 4;   /* one packed B tile: 32 k x 16 n int8 */
+constexpr uint32_t kMapTailI4 = 0xffffffffu;   /* a block map entry of padding rows (owner note 195) */
 
 /* Run 171: the work-group's shape is a template -- W sub-groups of RT rows each. <8, 8> is the form since run 164
  * (64 rows); <8, 16> (RADIANCE_XE_I4I8_DPAS_ROWS=16, launched with the large register file) gives a sub-group two
@@ -482,7 +487,8 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
                             const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                             uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                             uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
-                            const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png) {
+                            const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png,
+                            const uint32_t* __restrict__ map) {
     constexpr int kW = W, kT = 16 * W, kR = RT * W;  /* sub-groups, threads, rows a work-group */
     constexpr int kJ = 64 / W;                         /* B words a sub-group a group: 8 at W = 8 */
     constexpr int kRT = RT / 8;                        /* 8-row A tiles a sub-group */
@@ -491,26 +497,56 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     XE_SHARED(int8_t, sA, kR * 64);              /* the run's rows x this group's 64 K */
     XE_SHARED(int32_t, sC, kW * 8 * 16);         /* one 8 x 16 int32 tile a sub-group */
     const int tid = (int)threadIdx.x, wave = tid / 16, lane = tid % 16;
-    const uint32_t i = blockIdx.y, nb = blockIdx.x, n0 = nb * (uint32_t)kDCols;
-    if (i >= T || n0 >= N) return;
-    const int32_t flat0 = sorted[i];
+    const uint32_t nb = blockIdx.x, n0 = nb * (uint32_t)kDCols;
+    if (n0 >= N) return;
+    uint32_t i = 0, rn = 0;
     int32_t e = -1;
-    if (flat0 >= 0) {
-        uint32_t lo = 0, hi = n_expert;
-        while (lo + 1 < hi) {
-            const uint32_t mid = (lo + hi) / 2;
-            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+    if (map) {
+        /* owner note 195 (run 202, RADIANCE_XE_I4I8_DPAS_MAP=1): blockIdx.y is a map entry -- an (expert, block start)
+         * from moe_i4i8_map_kernel, or a tail block of padding rows -- so only the blocks that compute are launched,
+         * not one work-group a sorted row that looks itself up and leaves unless it starts a block (63 in 64 did) */
+        const uint32_t y = blockIdx.y;
+        if (y >= map[0]) return;
+        i = map[2 + 2 * y];
+        if (map[1 + 2 * y] == kMapTailI4) {   /* padding rows i .. i + kR: their zeros, as the run form writes them */
+            for (uint32_t r = i; r < i + (uint32_t)kR && r < T; ++r)
+                for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kT)
+                    Y[(size_t)r * y_ld + n] = 0;
+            return;
         }
-        e = (int32_t)lo;
+        e = (int32_t)map[1 + 2 * y];
+        const uint32_t last = (uint32_t)off[e + 1];
+        rn = (last - i) < (uint32_t)kR ? (last - i) : (uint32_t)kR;
+    } else {
+        i = blockIdx.y;
+        if (i >= T) return;
+        const int32_t flat0 = sorted[i];
+        /* slmc == 6 (run 202, a test): a row past this call's live count is a padding row, as the map treats it. Without
+         * it a row there whose slot is real (the protected experts' rows, which follow the regular ones in the sort)
+         * searches to the last regular expert, and rn = last - i wraps to kR: a block of the wrong expert's weights,
+         * written up to kR - 1 rows past it */
+        if (slmc == 6u && i >= (uint32_t)off[n_expert]) {
+            for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kT)
+                Y[(size_t)i * y_ld + n] = 0;
+            return;
+        }
+        if (flat0 >= 0) {
+            uint32_t lo = 0, hi = n_expert;
+            while (lo + 1 < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+            }
+            e = (int32_t)lo;
+        }
+        if (e < 0) {   /* a padding row: its zeros over this work-group's columns, as the run form writes them */
+            for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kT)
+                Y[(size_t)i * y_ld + n] = 0;
+            return;
+        }
+        const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % (uint32_t)kR != 0) return;
+        rn = (last - i) < (uint32_t)kR ? (last - i) : (uint32_t)kR;
     }
-    if (e < 0) {   /* a padding row: its zeros over this work-group's columns, as the run form writes them */
-        for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kT)
-            Y[(size_t)i * y_ld + n] = 0;
-        return;
-    }
-    const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
-    if ((i - first) % (uint32_t)kR != 0) return;
-    const uint32_t rn = (last - i) < (uint32_t)kR ? (last - i) : (uint32_t)kR;
     const ICls& c = (e & 1) ? c1 : c0;
     const uint32_t fy = N / parts, fcw = c.n / parts, K = c.k;
     const uint32_t entry = (uint32_t)e >> 1;
@@ -733,16 +769,59 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                           uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                           uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
-                          const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png) {
+                          const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png, const uint32_t* __restrict__ map) {
     moe_i4i8_dpas_kernel_t<8, 8>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
-                                 parts, a_rows, slmc, pre, pnb, png);
+                                 parts, a_rows, slmc, pre, pnb, png, map);
 }
 void moe_i4i8_dpas_kernel_rt16(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                                const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                                uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                                uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc) {
     moe_i4i8_dpas_kernel_t<8, 16>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
-                                  parts, a_rows, slmc, nullptr, 0u, 0u);
+                                  parts, a_rows, slmc, nullptr, 0u, 0u, nullptr);
+}
+
+/* Owner note 195 (run 202): the DPAS form's block map. B150's 7K profile put this GEMM at 42 % of the prefill's device
+ * time, 7.6 ms a launch, on a grid of one work-group a sorted row and column block: at a 4,096-row chunk (top-10,
+ * 40,960 sorted rows) down's grid is ~1.3 M work-groups, of which only the ~1,150 block starts a column compute -- the
+ * rest read their row, binary-search the offsets and leave. One work-group writes the blocks instead, as r4d_moe.cpp's
+ * moe_blockmap_kernel does for the bf16 form: map[0] = the count, then (expert, first row) a block of FM rows in
+ * expert order, then the padding tail (kMapTailI4, first row) in blocks of FM. Every block the row grid computed is an
+ * entry with the same first row and row count, so each output is the same arithmetic on the same operands: the bits
+ * do not change. The cap is moe_i4i8_map_cap(): one block an expert plus one a FM rows, the tail's, and one. */
+long long moe_i4i8_map_cap(long long T, long long n_expert, long long FM) { return n_expert + (T + FM - 1) / FM + 1; }
+int64_t moe_i4i8_map_bytes(long long T, long long n_expert, long long FM) {
+    return (int64_t)(1 + 2 * moe_i4i8_map_cap(T, n_expert, FM)) * (int64_t)sizeof(uint32_t);
+}
+constexpr int kMapThreads = 256;
+void moe_i4i8_map_kernel(const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
+                         uint32_t* __restrict__ map) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t live = (uint32_t)off[n_expert];
+    uint32_t carry = 0;
+    /* the experts in tiles of 256, an exclusive scan of their block counts a tile; each thread writes its expert's
+     * entries from its base (integer sums: the order does not matter) */
+    for (uint32_t b = 0; b < n_expert; b += (uint32_t)kMapThreads) {
+        const uint32_t e = b + tid;
+        const uint32_t lo = e < n_expert ? (uint32_t)off[e] : 0u;
+        const uint32_t run = e < n_expert ? (uint32_t)off[e + 1] - lo : 0u;
+        const uint32_t cnt = (run + FM - 1) / FM;
+        const uint32_t base = carry + sycl::exclusive_scan_over_group(xe::wg(), cnt, sycl::plus<uint32_t>());
+        uint32_t o = base;
+        for (uint32_t r = 0; r < run && o < cap; r += FM, ++o) {
+            map[1 + 2 * o] = e;
+            map[2 + 2 * o] = lo + r;
+        }
+        carry += sycl::reduce_over_group(xe::wg(), cnt, sycl::plus<uint32_t>());
+    }
+    if (tid == 0) {
+        uint32_t o = carry;
+        for (uint32_t r = live; r < T && o < cap; r += FM, ++o) {
+            map[1 + 2 * o] = kMapTailI4;
+            map[2 + 2 * o] = r;
+        }
+        map[0] = o < cap ? o : cap;   /* the count, clamped to the grid */
+    }
 }
 
 /* Run 175 (owner note 176 item 3): the decode once a call -- one work-group of the DPAS kernel's shape (8 sub-groups
@@ -832,8 +911,27 @@ bool dpas_pre() {
 int64_t pre_bytes(long long n_expert, long long N, long long K) {
     return (int64_t)n_expert * ((N + kDCols - 1) / kDCols) * (K / 64) * 4096;
 }
+/* RADIANCE_XE_I4I8_DPAS_MAP (run 202, owner note 195): the DPAS form launched over its blocks (moe_i4i8_map_kernel)
+ * instead of one work-group a sorted row -- THE DEFAULT (=0 the row grid, for comparisons). The map sits in the op's
+ * scratch after the pre-decoded words (if any), at a 256-byte boundary; a scratch too small for it leaves the row grid
+ * in place. B151 / B152 (image 241): the 7K first token 5.08 -> 4.57 s, the 20K 10.44 -> 9.59. Its bits are the row
+ * grid's with the wrapped-leader blocks zeroed (B154 = B151, SLMC=6 below; KMAP1 at the floor over 54,722 positions),
+ * as note 126 made the matrix form's fix (MX_COMPACT) the default for the same bug. */
+bool dpas_map() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_MAP"); return !(s && *s == '0'); }();
+    return v;
+}
+int64_t map_offset(long long n_expert, long long N, long long K) {
+    return dpas_pre() ? (pre_bytes(n_expert, N, K) + 255) / 256 * 256 : 0;
+}
 #endif
 
+/* RADIANCE_XE_I4I8_RUN_BOUND (run 202): the run form's rows at or past the call's live count zeroed (the kernel's
+ * `bound`) -- THE DEFAULT (=0 the unbounded rule, for comparisons); M283: the M-pair's texts identical */
+bool run_bound() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_RUN_BOUND"); return !(s && *s == '0'); }();
+    return v;
+}
 /* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
 bool plain_forced() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
@@ -948,6 +1046,28 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                     }
                 }
             }
+            /* run 202 (owner note 195): the blocks' map, then the GEMM over its entries (RADIANCE_XE_I4I8_DPAS_MAP=1) */
+            const uint32_t* map = nullptr;
+            dim3 mgrid = grid;
+            if (dpas_map() && !rt16) {
+                const long long moff = map_offset(n_expert, N, K);
+                if (a->scratch && a->scratch_bytes >= moff + moe_i4i8_map_bytes(T, n_expert, kDRows)) {
+                    uint32_t* m = (uint32_t*)((char*)a->scratch + moff);
+                    const uint32_t cap = (uint32_t)moe_i4i8_map_cap(T, n_expert, kDRows);
+                    XE_LAUNCH(qq, moe_i4i8_map_kernel, dim3(1), dim3(kMapThreads), 0, (const int32_t*)off->data,
+                              (uint32_t)n_expert, (uint32_t)T, (uint32_t)kDRows, cap, m);
+                    map = m;
+                    mgrid = dim3(pnb, cap);
+                } else {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "[xe] moe_gemm_q: RADIANCE_XE_I4I8_DPAS_MAP=1 but the scratch is %lld bytes of "
+                                     "the %lld it needs; the row grid\n", (long long)a->scratch_bytes,
+                                     (long long)(moff + moe_i4i8_map_bytes(T, n_expert, kDRows)));
+                    }
+                }
+            }
             if (rt16)
                 xe::launch_as_grf256<moe_i4i8_dpas_kernel_rt16, 16>(
                     moe_i4i8_dpas_kernel_rt16, *qq, grid, block, (const int8_t*)Aq->data, (const float*)As->data,
@@ -955,10 +1075,11 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                     (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
                     (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc());
             else
-                XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, grid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
+                XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, mgrid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
                              cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
                              (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png);
+                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png,
+                             map);
             return RAD_OK;
         }
 #endif
@@ -998,7 +1119,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
                  (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, \
-                 sk_cfg, sk_stats)
+                 sk_cfg, sk_stats, run_bound() ? 1u : 0u)
 #define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
             if (gl) switch (upl) {
                 case 1: XE_I4I8_RUN(1, 2, 2, true); break;
@@ -1039,14 +1160,19 @@ extern "C" int xe_rad_moe_gemm_w4nl_i8(const RadArgs* a, RadStream s) { return m
 /* The scratch hook (declare time, from the geometry; run 175): the pre-decoded words when RADIANCE_XE_I4I8_DPAS_PRE=1,
  * none otherwise -- n_expert x N x K bytes for the wider class */
 extern "C" int64_t xe_rad_moe_gemm_w4nl_i8_scratch(const RadArgs* a) {
-    if (!dpas_pre()) return 0;
+    if (!dpas_pre() && !dpas_map()) return 0;
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
     long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
     const long long N1 = r4d_geti_or(a, "N_odd", N), K1 = r4d_geti_or(a, "K_odd", K);
     if (N1 > N) N = N1;
     if (K1 > K) K = K1;
     if (n_expert <= 0 || N <= 0 || K <= 0) return 0;
-    return pre_bytes(n_expert, N, K);
+    if (!dpas_map()) return pre_bytes(n_expert, N, K);
+    /* run 202: the block map after the words, for the call's routed rows (M x top_k at the declared M, as r4d_moe.cpp's
+     * hook counts them; the launcher checks what it was handed) */
+    const long long T = r4d_geti_or(a, "M", 0) * r4d_geti_or(a, "top_k", 0);
+    if (T <= 0) return dpas_pre() ? pre_bytes(n_expert, N, K) : 0;
+    return map_offset(n_expert, N, K) + moe_i4i8_map_bytes(T, n_expert, kDRows);
 }
 
 /* The tail skip's instance, one a rank (every resolved instance of the row shares it): the flag read, the address

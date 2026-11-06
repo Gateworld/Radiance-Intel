@@ -888,8 +888,17 @@ struct NKernel {
     uint32_t nargs = 0;
     bool own = false;                  /* created here (else the runtime's handle, shared) */
     bool lds_told = false;             /* the local-memory argument refused a size once (said once) */
+    bool coop_told = false;            /* RADIANCE_L0_COOP_QUERY: its cooperative cap logged (once) */
     std::string name;                  /* the kernel's function name (the tape audit's message) */
 };
+/* RADIANCE_L0_COOP_QUERY=1 (run 202, owner note 196 item 1): log the queue groups' cooperative flag at bring-up and,
+ * at the first recorded launch of each kernel whose work-groups wait on others of the same launch (hc merge's
+ * hc_v2_ab, megakernel 1a / 1b's persist / ticket kernels), zeKernelSuggestMaxCooperativeGroupCount at the launch's
+ * block against the groups it launches. A diagnostic only: nothing is launched differently. */
+static bool coop_query() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_L0_COOP_QUERY"); return s && *s == '1'; }();
+    return v;
+}
 struct ZeDev {
     bool tried = false, ok = false;
     std::string why;
@@ -1046,6 +1055,19 @@ bool ze_ready(int d) {
         Z.imm = nullptr;
         if (zeCommandListCreateImmediate(Z.ctx, Z.dev, &qd, &Z.imm) != ZE_RESULT_SUCCESS) { Z.why = "zeCommandListCreateImmediate failed"; return false; }
         RAD_WARN("l0 tape: the driver refused an in-order immediate list on device %d; plays are ordered by their events alone", d);
+    }
+    if (coop_query()) {   /* owner note 196 item 1: which queue groups advertise cooperative kernels */
+        uint32_t ng = 0;
+        if (zeDeviceGetCommandQueueGroupProperties(Z.dev, &ng, nullptr) == ZE_RESULT_SUCCESS && ng) {
+            std::vector<ze_command_queue_group_properties_t> gp(ng, {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES, nullptr});
+            if (zeDeviceGetCommandQueueGroupProperties(Z.dev, &ng, gp.data()) == ZE_RESULT_SUCCESS)
+                for (uint32_t g = 0; g < ng; ++g)
+                    RAD_INFO("l0 coop query: device %d queue group %u: %u queues, flags 0x%x (compute %d, copy %d, cooperative %d)",
+                             d, g, gp[g].numQueues, (unsigned)gp[g].flags,
+                             (gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) ? 1 : 0,
+                             (gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) ? 1 : 0,
+                             (gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS) ? 1 : 0);
+        }
     }
     if (glue_all_level() >= 2) {
         /* RADIANCE_L0_GLUE_ALL=2: a copy-only queue group's list for the transfer streams, else (or =3) a second compute
@@ -1795,6 +1817,16 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     }
     rc = zeKernelSetGroupSize(nk.k, block[0], block[1], block[2]);
     if (rc != ZE_RESULT_SUCCESS) { n_stop("zeKernelSetGroupSize refused the block"); return -1; }
+    if (coop_query() && !nk.coop_told && (nk.name.find("hc_v2_ab") != std::string::npos ||
+                                          nk.name.find("persist") != std::string::npos ||
+                                          nk.name.find("ticket") != std::string::npos)) {
+        nk.coop_told = true;
+        uint32_t cap = 0;
+        const ze_result_t cr = zeKernelSuggestMaxCooperativeGroupCount(nk.k, &cap);
+        RAD_INFO("l0 coop query: %.80s block %u x %u x %u, launches %u x %u x %u = %llu groups; "
+                 "zeKernelSuggestMaxCooperativeGroupCount %u (0x%x)", nk.name.c_str(), block[0], block[1], block[2],
+                 grid[0], grid[1], grid[2], (unsigned long long)grid[0] * grid[1] * grid[2], cap, (unsigned)cr);
+    }
     n_sep(Z);
     ze_group_count_t gc{grid[0], grid[1], grid[2]};
     rc = zeCommandListAppendLaunchKernel(t_rec.nlist, nk.k, &gc, nullptr, 0, nullptr);
