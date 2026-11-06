@@ -19,6 +19,11 @@ list(APPEND XE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/xe_hc_f16_layout.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
+# Run 207 (owner note 203 item 1): the int8 dots by IGC's dp4a builtin on the card's pass alone (xe_dp4a.h); the
+# spir64 pass, which the CPU device JIT-compiles, keeps the portable form. Every target in this directory that
+# compiles these units (libxe and the CPU tests) gets the same flag.
+set_property(SOURCE xe_gemv_i8.cpp xe_gemv_w2a8.cpp xe_moe_i4i8.cpp ports/r4d_hc_bf16.cpp APPEND PROPERTY
+  COMPILE_OPTIONS -Xsycl-target-frontend=intel_gpu_bmg_g31 -DXE_DP4A_GPU=1)
 # Run 167 (owner note 168 item 1): the flash-attention form (fmha/xe_fmha256.cpp, used by xe_attn_qsa.cpp) is
 # sycl-tla's kernel (Intel's CUTLASS, BSD-3-Clause, header-only, pinned at 7b56b93 in third_party/sycl-tla beside
 # src/) with its mainloop copied under fmha/ and the page mask added; compiled only when that tree is present, with

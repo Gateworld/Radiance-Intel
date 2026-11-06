@@ -24,6 +24,7 @@
  * rounded to int8 -- see moe_i4i8_run_kernel's FC.
  */
 #include "xe_lanes.h"
+#include "xe_dp4a.h"   /* run 207: dp4 by IGC's dp4a builtin on the card */
 #include "r4d_args.h"
 #include "rad_planes.h"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the matrix-unit form (run 164) */
@@ -99,11 +100,7 @@ inline uint16_t to_bf16(float f) {
 /* sum of the four signed byte products, plus acc: DP4A's arithmetic. sycl/ext/oneapi/dot_product.hpp defines its
  * dot_acc out of line, so a second translation unit including it (xe_gemv_i8.cpp does) fails to link; IGC
  * recognises this form. */
-inline int32_t dp4(int32_t a, int32_t b, int32_t acc) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) acc += (int32_t)(int8_t)(a >> (8 * i)) * (int32_t)(int8_t)(b >> (8 * i));
-    return acc;
-}
+inline int32_t dp4(int32_t a, int32_t b, int32_t acc) { return xe_dp4a(a, b, acc); }   /* run 207: xe_dp4a.h */
 
 /* Eight activation bytes a0..a7 (lo = a0..a3, hi = a4..a7) as their even and odd lanes, to meet the codes of
  * elements 8d .. 8d + 7 (byte b: element 2b low nibble, 2b + 1 high). */

@@ -67,6 +67,7 @@
 #include <mutex>
 #include "r4d.h"
 #include "r4d_emit.h"
+#include "xe_dp4a.h"   /* run 207: hc_dp4 by IGC's dp4a builtin on the card */
 #include "r4d_gdn_args.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
@@ -328,9 +329,7 @@ __device__ __forceinline__ void hc8_dot_down_rows_s8(const unsigned short* __res
 /* Owner note 158 stage 2 (RADIANCE_XE_HC_I8=2): DP4A's arithmetic, the form IGC recognises (xe_moe_i4i8.cpp's dp4),
  * and sixteen int8 codes against sixteen int8 values of N by four of them. */
 __device__ __forceinline__ int32_t hc_dp4(uint32_t a, uint32_t b, int32_t acc) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) acc += (int32_t)(int8_t)(a >> (8 * i)) * (int32_t)(int8_t)(b >> (8 * i));
-    return acc;
+    return xe_dp4a((int32_t)a, (int32_t)b, acc);   /* run 207: xe_dp4a.h (IGC's dp4a builtin on the card) */
 }
 __device__ __forceinline__ int32_t hc_dp16(const uint4& a, const uint4& b) {
     return hc_dp4(a.w, b.w, hc_dp4(a.z, b.z, hc_dp4(a.y, b.y, hc_dp4(a.x, b.x, 0))));

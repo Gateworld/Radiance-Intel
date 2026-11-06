@@ -25,6 +25,7 @@
  * i8_step_pos(p), so activation quad q meets code byte sq(q) = q with bits 0 and 1 swapped.
  */
 #include "xe_lanes.h"
+#include "xe_dp4a.h"   /* run 207: w2_dp4 by IGC's dp4a builtin on the card */
 #include "r4d_args.h"
 #include "rad_planes.h"
 
@@ -115,11 +116,7 @@ void gemv_w2a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
  * sum, the same butterfly, the same float expression, the groups in the same order, so the same bytes. */
 /* The sum of the four signed byte products plus acc: DP4A's arithmetic, in the form IGC recognises (xe_moe_i4i8.cpp's
  * dp4; sycl's dot_acc is out of line and cannot be linked twice). */
-inline int32_t w2_dp4(int32_t a, int32_t b, int32_t acc) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) acc += (int32_t)(int8_t)(a >> (8 * i)) * (int32_t)(int8_t)(b >> (8 * i));
-    return acc;
-}
+inline int32_t w2_dp4(int32_t a, int32_t b, int32_t acc) { return xe_dp4a(a, b, acc); }   /* run 207: xe_dp4a.h */
 /* A code byte's four u2 codes (element k at bits 2k) spread to the four bytes of a word, byte k = code k: the codes
  * are 0..3, so as signed bytes they are the same values. */
 inline int32_t w2_spread(uint32_t cb) {

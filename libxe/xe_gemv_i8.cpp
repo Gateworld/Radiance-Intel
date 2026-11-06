@@ -31,6 +31,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "xe_dp4a.h"   /* run 207 (owner note 203 item 1): the GEMV's dot by IGC's dp4a builtin on the card */
+
 namespace {
 
 constexpr int kRowsPerWG = 8;
@@ -79,7 +81,7 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
                 /* the 4-way int8 dot (DP4A): the packed words whole, the same exact int32 sum (milestone 3) */
 #pragma unroll
                 for (int u = 0; u < 4; ++u)
-                    s = sycl::ext::oneapi::dot_acc((int32_t)wv[u], (int32_t)xv[u], s);
+                    s = xe_dp4a((int32_t)wv[u], (int32_t)xv[u], s);
             }
             /* the group's exact int32 sum over its 8 lanes */
             if constexpr (NX) { s += gv_xor_i<1>(s); s += gv_xor_i<2>(s); s += gv_xor_i<4>(s); }
