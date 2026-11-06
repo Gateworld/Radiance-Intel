@@ -2394,15 +2394,24 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
 
-#define R4D_RTS_L(OWN, NWV, ...)                                                                \
-    emit_rc = R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1),  \
-                       dim3((NWV) * kWave), 0,                                                  \
+/* run 207 (owner note 203 item 2, RADIANCE_XE_ROUTER_GRF=1): the same kernel with the large register file -- at 128 GRF
+ * IGC 2.42.6 spills 4736 bytes a thread of it to scratch (igcdump-moe-2426, m3/isa_hist.py); one work-group a launch,
+ * so the halved thread count a core costs it nothing. The same code, so the same bits. */
+#define R4D_RTS_ARGS                                                                            \
                        (const uint16_t*)lg->data, (int32_t*)ids->data,                          \
                        (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,         \
                        (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                    \
                        (uint32_t)n_local, (uint32_t)top_k,                                      \
                        (uint32_t)lg_ld, (int)norm, (int32_t)base, prot, lean_n, lean_margin,   \
-                       lean_rows)
+                       lean_rows
+#define R4D_RTS_L(OWN, NWV, ...)                                                                \
+    emit_rc = router_grf()                                                                      \
+        ? (XE_LAUNCH_GGL_GRF256((router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1), \
+                                dim3((NWV) * kWave), 0, stream, R4D_RTS_ARGS), 0)               \
+        : R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1),      \
+                   dim3((NWV) * kWave), 0, R4D_RTS_ARGS)
+    static const bool router_grf_on = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_GRF"); return e && e[0] == '1'; }();
+    auto router_grf = [] { return router_grf_on; };
     /* owner note 165 item 4 (run 174): RADIANCE_XE_ROUTE_LEAN=<n>,<margin>[,<rows>] -- lean_row above: the n
      * lowest picks, the probability margin, the largest call (rows) it applies to (16, the verify steps; a KL
      * replay in small prefill chunks names its chunk); unset = off, the code path never taken */
