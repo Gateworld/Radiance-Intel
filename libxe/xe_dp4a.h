@@ -6,14 +6,17 @@
  * sycl::ext::oneapi::dot_acc's char union) into dp4a, but rebuilds each packed operand byte by byte first: ~170 extra
  * movs in gemv_i8a8<1, 4, 1>, 24.6 -> 26.4 us a launch. On the card's AOT pass IGC's own builtin takes the packed words
  * as they are; the CPU device's JIT, which has no IGC builtins, keeps the portable form. Integer arithmetic: the same
- * exact sum either way. XE_DP4A_GPU comes from libxe's CMakeLists, given to the card target's frontend alone:
- * __SYCL_TARGET_INTEL_GPU_BMG_G31__ also reaches the spir64 pass, whose JIT then finds no __builtin_IB_dp4a_ss.
+ * exact sum either way. The spir64 pass is told apart by XE_DP4A_PORTABLE, which libxe's CMakeLists gives to that
+ * triple's frontend alone (-Xsycl-target-frontend=spir64): in the two-target build the CPU device's image also sees
+ * __SYCL_TARGET_INTEL_GPU_BMG_G31__ (its JIT then finds no __builtin_IB_dp4a_ss), and a define given to
+ * -Xsycl-target-frontend=intel_gpu_bmg_g31 reaches neither pass (run 207's macro probe and ISA dumps). A unit that
+ * includes this header and is missing from that list fails on the CPU device (every launch refused).
  */
 #pragma once
 
 #include <cstdint>
 
-#if defined(__SYCL_DEVICE_ONLY__) && defined(XE_DP4A_GPU)
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SYCL_TARGET_INTEL_GPU_BMG_G31__) && !defined(XE_DP4A_PORTABLE)
 extern "C" SYCL_EXTERNAL int __builtin_IB_dp4a_ss(int c, int a, int b) __attribute__((const));
 #define XE_DP4A_BUILTIN 1
 #endif

@@ -63,9 +63,16 @@ void gemv_bf16_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __r
 #pragma unroll
                 for (int e = 0; e < 8; ++e) s += ar[e] * wf[e];
             } else {
-                const uint16_t* ar = (const uint16_t*)a + (size_t)m * a_ld + (size_t)c * 8;
+                /* run 207 (owner note 203 item 1): the chunk's 8 activations in one 16-byte load (the entry checks
+                 * a % 16, a_ld % 8), split as the weights are; IGC 2.42.6 issues the eight 16-bit loads of
+                 * ld_bf16(ar, e) one by one where 2.28.4 paired them. The same values in the same order. */
+                const uint4 x = *(const uint4*)((const uint16_t*)a + (size_t)m * a_ld + (size_t)c * 8);
+                const unsigned xv[4] = {x.x, x.y, x.z, x.w};
 #pragma unroll
-                for (int e = 0; e < 8; ++e) s += ld_bf16(ar, e) * wf[e];
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned h = (e & 1) ? (xv[e >> 1] & 0xffff0000u) : (xv[e >> 1] << 16);
+                    s += __uint_as_float(h) * wf[e];
+                }
             }
             acc[m] += s;
         }
@@ -131,9 +138,14 @@ void gemv_bf16_pair_kernel(const void* __restrict__ a, long a_ld, const uint16_t
 #pragma unroll
                 for (int e = 0; e < 8; ++e) s += ar[e] * wf[e];
             } else {
-                const uint16_t* ar = (const uint16_t*)a + (size_t)m * a_ld + (size_t)c * 8;
+                /* run 207: one 16-byte load, as gemv_bf16_kernel's */
+                const uint4 x = *(const uint4*)((const uint16_t*)a + (size_t)m * a_ld + (size_t)c * 8);
+                const unsigned xv[4] = {x.x, x.y, x.z, x.w};
 #pragma unroll
-                for (int e = 0; e < 8; ++e) s += ld_bf16(ar, e) * wf[e];
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned h = (e & 1) ? (xv[e >> 1] & 0xffff0000u) : (xv[e >> 1] << 16);
+                    s += __uint_as_float(h) * wf[e];
+                }
             }
             acc[m] += s;
         }
