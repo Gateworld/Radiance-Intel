@@ -32,6 +32,8 @@
  * the int32 dot by dp4a, and each column keeps today's two partial sums (the even and the odd 64-K groups, in order),
  * added at the end. E1 read a group's codes by 16-lane gathers (P99: slower; dropped), E1b by one transposed 2D block load
  * (16 rows x 8 dwords); E2 = E1b with the cheaper decode (DEC2), timed at 8 / 16 / 32 threads a work-group.
+ * T2 (run 206, gate_up only): T1 with the rows' activations staged in LDS once a work-group and CB = 1 / 2 / 4 / 8
+ * column blocks a work-group (T2 and RESULT-T2 lines; the bytes on every device, the times on a card).
  * RESULT lines: per launch us (host wall over LAUNCHES back-to-back launches, the median of RUNS), today's and T1's.
  */
 #include <sycl/sycl.hpp>
@@ -288,6 +290,173 @@ void t1_launch(sycl::queue& q, const int8_t* A, const float* As, const TCls& c0,
     }
 #undef T1
 #undef T1F
+}
+
+/* ---- T2 (run 206, the supervisor's order: gate_up's activation staging reused): T1's arithmetic for gate_up's form
+ * (LPR 16, R 1, chunks of 32, the lane pair's xor), with the work-group's rows of activations staged in LDS ONCE (their
+ * natural order, 16-byte pieces) and CB column blocks a work-group -- one staging serves CB x 32 columns instead of 32.
+ * The sums, their order and the reduction are T1's (bit-identical to today). */
+template <int UPL, int CB>
+void t2_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, TCls c0, TCls c1,
+                   const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                   uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                   uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows) {
+    constexpr int LPR = 16;
+    XE_SHARED(float, s_g, 256);
+    XE_SHARED(uint4, s_a, kMT * 2560 / 16);   /* rn rows x K bytes (K <= 2560) */
+    const int tid = (int)threadIdx.x;
+    const uint32_t i = blockIdx.y;
+    if (i >= T) return;
+    const int32_t flat = sorted[i];
+    int32_t e = -1;
+    if (flat >= 0) {
+        uint32_t lo = 0, hi = n_expert;
+        while (lo + 1 < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+        }
+        e = (int32_t)lo;
+    }
+    uint32_t rn = 1;
+    if (e >= 0) {
+        const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+        if ((i - first) % kMT != 0) return;
+        rn = (last - i) < (uint32_t)kMT ? (last - i) : (uint32_t)kMT;
+    }
+    uint32_t tokr[kMT];
+    bool liver[kMT];
+#pragma unroll
+    for (int q = 0; q < kMT; ++q) {
+        tokr[q] = 0; liver[q] = false;
+        if (e >= 0 && (uint32_t)q < rn) {
+            const int32_t fq = sorted[i + q];
+            const uint32_t t = a_sorted ? i + q : (uint32_t)fq / top_k;
+            tokr[q] = t;
+            liver[q] = fq >= 0 && t < a_rows;
+        }
+    }
+    const TCls& c = (e >= 0 && (e & 1)) ? c1 : c0;
+    const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? c.k : 0u;
+    const uint8_t* ent = e >= 0 ? c.base + (uint64_t)((uint32_t)e >> 1) * c.stride : nullptr;
+    if (e >= 0 && tid < 256) s_g[tid] = __uint_as_float(((const uint32_t*)(ent + c.tab_off))[tid]);
+    const uint32_t pr = K / 16u;   /* 16-byte pieces a row */
+    if (e >= 0)
+        for (uint32_t x = (uint32_t)tid; x < rn * pr; x += (uint32_t)kWG) {
+            const uint32_t q = x / pr, p = x - q * pr;
+            bool lq = false;
+            uint32_t tq = 0;
+#pragma unroll
+            for (int z = 0; z < kMT; ++z)
+                if ((uint32_t)z == q) { lq = liver[z]; tq = tokr[z]; }
+            s_a[x] = lq ? ((const uint4*)(A + (size_t)tq * a_ld))[p] : uint4{0, 0, 0, 0};
+        }
+    __syncthreads();
+    const int team = tid / LPR, l = tid % LPR;
+    constexpr uint32_t cpw = (uint32_t)(kWG / LPR);
+    for (int cb = 0; cb < CB; ++cb) {
+        const uint32_t nb = blockIdx.x * (uint32_t)CB + (uint32_t)cb;
+        if (e >= 0) {
+            const uint32_t n0 = nb * cpw, n1 = n0 + cpw < N ? n0 + cpw : N;
+            const uint32_t a = fy ? n0 % fy : 0u;
+            const bool live = n0 < N && (n1 - n0 >= fy || a < fc || n0 + (fy - a) < n1);
+            if (!live) {
+                if (l == 0)
+                    for (int q = 0; q < kMT; ++q) {
+                        if ((uint32_t)q >= rn) break;
+                        const uint32_t n = n0 + (uint32_t)team;
+                        if (n < N) Y[(size_t)(i + q) * y_ld + n] = 0;
+                    }
+                continue;
+            }
+        }
+        float acc[kMT];
+        const uint32_t n = nb * cpw + (uint32_t)team;
+        const uint32_t pp = fy ? n / fy : 0u, j = n - pp * fy;
+        const bool rowok = e >= 0 && n < N && j < fc;
+        const uint32_t rowr = pp * fc + j;
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) acc[q] = 0.0f;
+        if (e >= 0) {
+            const uint32_t CPR = K / 32u;
+            const uint8_t* se8 = c.sbase + (uint64_t)((uint32_t)e >> 1) * c.sstride + c.s_off;
+            const float smul = *(const float*)(ent + c.smul_off);
+            uint4 w[UPL];
+#pragma unroll
+            for (int u = 0; u < UPL; ++u) {
+                const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
+                w[u] = (jc < CPR && rowok) ? *(const uint4*)(ent + (size_t)rowr * c.w_ld + jc * 16u) : uint4{0, 0, 0, 0};
+            }
+#pragma unroll
+            for (int u = 0; u < UPL; ++u) {
+                const uint32_t jc = (uint32_t)l + (uint32_t)u * LPR;
+                const bool live = jc < CPR;
+                const uint32_t g = live ? jc / 2u : 0u;
+                const float sbr = rowok && live ? e4m3_to_f32(se8[(size_t)rowr * c.s_ld + g]) * smul : 0.0f;
+                uint32_t lv[8];
+                const uint32_t d[4] = { w[u].x, w[u].y, w[u].z, w[u].w };
+#pragma unroll
+                for (int x = 0; x < 4; ++x) {
+                    uint32_t lo8 = 0, hi8 = 0;
+#pragma unroll
+                    for (int bb = 0; bb < 4; ++bb) {
+                        const uint32_t ev = __float_as_uint(s_g[(d[x] >> (8 * bb)) & 255u]);
+                        lo8 |= (ev & 255u) << (8 * bb);
+                        hi8 |= ((ev >> 8) & 255u) << (8 * bb);
+                    }
+                    lv[2 * x] = lo8;
+                    lv[2 * x + 1] = hi8;
+                }
+#pragma unroll
+                for (int q = 0; q < kMT; ++q) {
+                    if ((uint32_t)q >= rn) break;
+                    const bool rd = liver[q] && live;
+                    const float asc = rd ? As[(size_t)tokr[q] * as_ld + g / 2u] : 0.0f;
+                    uint32_t a[8];
+#pragma unroll
+                    for (int v = 0; v < 2; ++v) {
+                        const uint4 x = rd ? s_a[(uint32_t)q * pr + jc * 2u + (uint32_t)v] : uint4{0, 0, 0, 0};
+                        a[4 * v] = x.x; a[4 * v + 1] = x.y; a[4 * v + 2] = x.z; a[4 * v + 3] = x.w;
+                    }
+                    int32_t s = 0;
+#pragma unroll
+                    for (int x = 0; x < 4; ++x) {
+                        s = dp4((int32_t)lv[2 * x], (int32_t)a[2 * x], s);
+                        s = dp4((int32_t)lv[2 * x + 1], (int32_t)a[2 * x + 1], s);
+                    }
+                    float fs = (float)s;
+                    fs += __shfl_xor(fs, 1);   /* the group's other chunk */
+                    if ((l & 1) == 0 && rowok && live) acc[q] += (fs * asc) * sbr;
+                }
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < kMT; ++q) {
+            if ((uint32_t)q >= rn) break;
+            float v = acc[q];
+            v += __shfl_xor(v, 8);
+            v += __shfl_xor(v, 4);
+            v += __shfl_xor(v, 2);
+            v += __shfl_xor(v, 1);
+            if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok && liver[q] ? v : 0.0f);
+        }
+    }
+}
+
+/* gate_up's shape only (K 2560: UPL 5) */
+void t2_launch(sycl::queue& q, int cb, const int8_t* A, const float* As, const TCls& c0, const TCls& c1,
+               const int32_t* sorted, const int32_t* off, uint16_t* Y, uint32_t T, uint32_t N, uint32_t n_expert,
+               uint32_t top_k, uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, bool a_sorted, uint32_t parts, uint32_t M) {
+    const unsigned cpw = (unsigned)(kWG / 16), nbx = (N + cpw - 1) / cpw;
+#define T2(CB_)                                                                                                    \
+    XE_LAUNCH_SG(16, &q, (t2_run_kernel<5, CB_>), dim3((nbx + CB_ - 1) / CB_, T), dim3(kWG), 0, A, As, c0, c1,    \
+                 sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted ? 1u : 0u, parts, M)
+    switch (cb) {
+        case 1: T2(1); break;
+        case 2: T2(2); break;
+        case 4: T2(4); break;
+        default: T2(8); break;
+    }
+#undef T2
 }
 
 /* ---- E1 / E1b (see the header): one class's entries for the ESIMD form -- today's codes [n, k/2] at w_off of entry
@@ -736,6 +905,47 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                             f4 % Nmax, ((const uint16_t*)(h4.data() + kCanary))[f4], ((const uint16_t*)(h0.data() + kCanary))[f4]);
         e1bad = d3 || d4 || !c3 || !c4;
     }
+    /* T2 (gate_up's shape): CB column blocks a work-group over one staging; bytes always, times on a card */
+    bool t2bad = false;
+    if (!gl && ok && Kcl[0] == 2560 && Kcl[1] == 2560)
+        for (int cbv : { 1, 2, 4, 8 }) {
+            q.memset(dy2, kPat, ybytes + 2 * kCanary).wait();
+            auto t2 = [&]() {
+                t2_launch(q, cbv, da, das, tc[0], tc[1], dso, doff, (uint16_t*)(dy2 + kCanary), (uint32_t)T, (uint32_t)Nmax,
+                          (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)Kmax, (uint32_t)(Kmax / 128), (uint32_t)Nmax,
+                          sh.sorted_a, (uint32_t)sh.parts, (uint32_t)AR);
+                return 0;
+            };
+            t2();
+            q.wait_and_throw();
+            q.memcpy(h2.data(), dy2, h2.size()).wait();
+            size_t f5 = 0;
+            const size_t d5 = cmp(h2, &f5);
+            const bool c5 = canary_ok(h2);
+            t2bad |= d5 != 0 || !c5;
+            std::printf("T2 %s tokens %d CB %d: %zu of %zu outputs differ%s; canaries %s\n", sh.name, tokens, cbv, d5,
+                        ybytes / 2, d5 ? "" : " (bit-identical)", c5 ? "intact" : "BROKEN");
+            if (d5) std::printf("  T2's first difference at output %zu (row %zu, column %zu)\n", f5, f5 / Nmax, f5 % Nmax);
+            if (launches > 0 && !d5) {
+                auto tm = [&](auto&& fn2) {
+                    for (int z = 0; z < 3; ++z) fn2();
+                    q.wait();
+                    std::vector<double> per;
+                    for (int r = 0; r < runs; ++r) {
+                        const auto a0 = std::chrono::steady_clock::now();
+                        for (int z = 0; z < launches; ++z) fn2();
+                        q.wait();
+                        per.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a0)
+                                          .count() / launches);
+                    }
+                    return median(per);
+                };
+                const double ut = tm(today), u5 = tm(t2), u1b = tm(t1), ut2 = tm(today);
+                const double b5 = std::min(ut, ut2);
+                std::printf("RESULT-T2 %s tokens %d CB %d: today %.1f us (re-timed %.1f), T2 %.1f us -> %.0f %%, T1 %.1f us "
+                            "-> %.0f %%\n", sh.name, tokens, cbv, ut, ut2, u5, 100.0 * u5 / b5, u1b, 100.0 * u1b / b5);
+            }
+        }
     bool pair_bad = false;   /* RI_PAIR: a form's outputs differed, or a call failed */
     if (ok && launches > 0) {
         auto time = [&](auto&& f) {
@@ -849,7 +1059,7 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     }
     sycl::free(da, q); sycl::free(das, q); sycl::free(dso, q); sycl::free(doff, q); sycl::free(dy0, q); sycl::free(dy1, q);
     sycl::free(dy2, q); sycl::free(dy3, q); sycl::free(dy4, q);
-    return ok && !pair_bad && !e1bad;
+    return ok && !pair_bad && !e1bad && !t2bad;
 }
 
 }  // namespace
