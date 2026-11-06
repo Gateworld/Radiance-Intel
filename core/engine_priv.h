@@ -54,6 +54,12 @@ struct Engine::Rank {
      * because its bank holds an already-credited step (the layer did not route). Counting these
      * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
+    /* RADIANCE_EXPERT_STATS=FILE (run 203, owner note 191 item 3): each credited histogram of a decode-only step,
+     * summed by (layer, expert) -- the routing decode reads, which the heat engine's own ranking mixes with prefill's
+     * -- and written at shutdown by rank 0 for RADIANCE_EXPERT_PROFILE. `xs_kind[step & 255]` is set when a step is
+     * dispatched: 1 decode-only (every sequence a decode row), 0 otherwise. */
+    std::vector<int64_t> xs_decode;
+    int8_t xs_kind[256] = {};
     /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
     int unstaged_steps = 0;
     KVManager kv;

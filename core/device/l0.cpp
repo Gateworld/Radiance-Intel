@@ -1817,15 +1817,23 @@ int n_hook_launch(const void* queue, const RadL0RecKernel* kernel, const uint32_
     }
     rc = zeKernelSetGroupSize(nk.k, block[0], block[1], block[2]);
     if (rc != ZE_RESULT_SUCCESS) { n_stop("zeKernelSetGroupSize refused the block"); return -1; }
-    if (coop_query() && !nk.coop_told && (nk.name.find("hc_v2_ab") != std::string::npos ||
+    /* run 204 (owner note 198 item 1): the hc family's separate kernels too (up mix, down rows, gains, norm), and
+     * each kernel's Level Zero properties beside its cap -- the static half of the counters (SLM a group, private and
+     * spill bytes); the cap at the launch's block is the residency limit those set */
+    if (coop_query() && !nk.coop_told && (nk.name.find("hc_v2_") != std::string::npos ||
+                                          nk.name.find("hc_up_mix") != std::string::npos ||
                                           nk.name.find("persist") != std::string::npos ||
                                           nk.name.find("ticket") != std::string::npos)) {
         nk.coop_told = true;
         uint32_t cap = 0;
         const ze_result_t cr = zeKernelSuggestMaxCooperativeGroupCount(nk.k, &cap);
+        ze_kernel_properties_t kp{ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES, nullptr};
+        const bool pk = zeKernelGetProperties(nk.k, &kp) == ZE_RESULT_SUCCESS;
         RAD_INFO("l0 coop query: %.80s block %u x %u x %u, launches %u x %u x %u = %llu groups; "
-                 "zeKernelSuggestMaxCooperativeGroupCount %u (0x%x)", nk.name.c_str(), block[0], block[1], block[2],
-                 grid[0], grid[1], grid[2], (unsigned long long)grid[0] * grid[1] * grid[2], cap, (unsigned)cr);
+                 "zeKernelSuggestMaxCooperativeGroupCount %u (0x%x); local %u B (+%zu dynamic), private %u B, spill %u B, "
+                 "max sub-group %u", nk.name.c_str(), block[0], block[1], block[2], grid[0], grid[1], grid[2],
+                 (unsigned long long)grid[0] * grid[1] * grid[2], cap, (unsigned)cr, pk ? kp.localMemSize : 0u, lds,
+                 pk ? kp.privateMemSize : 0u, pk ? kp.spillMemSize : 0u, pk ? kp.maxSubgroupSize : 0u);
     }
     n_sep(Z);
     ze_group_count_t gc{grid[0], grid[1], grid[2]};

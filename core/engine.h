@@ -297,6 +297,12 @@ private:
      * by fail_loop(); read by the server watcher to stop HTTP and by serve() to return it. */
     std::atomic<int>              loop_status_{RAD_OK};
     int  fail_loop(int st);
+    /* Run 204 (owner note 197 item 1): the startup warm-up's sequence leaves its K / V in the cache's free blocks,
+     * and the MTP head's first draft reads 1 + n_spec slots of a new sequence's blocks before writing them. warmup()
+     * sets this once its request is reaped; the step loop, idle and on the thread that moves the loan, zeroes every
+     * paged group's unlent blocks (kv_reset_after_warmup) and clears it; warmup() waits for that before listening. */
+    std::atomic<bool>             kv_reset_pending_{false};
+    void kv_reset_after_warmup();
 
     /* This step's scored rows (Request::token_scores): a logits row and the result it fills.
      * Written by the scheduler thread while the ranks are parked, read by them during the step,

@@ -66,9 +66,9 @@ static const Flag g_flags[] = {
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
                                         "sequences decode, at most 64; 0 (default) lets every step\n"
                                         "carry a chunk" },
-    { "--startup-warmup",     "MODE",   "on (default) runs one synthetic request through a full prefill\n"
-                                        "chunk, a short tail and a few decode steps before the server\n"
-                                        "listens, so the first prompt pays no first launches; off skips it" },
+    { "--startup-warmup",     "MODE",   "on runs one synthetic request through a full prefill chunk, a\n"
+                                        "short tail and a few decode steps before the server listens, so\n"
+                                        "the first prompt pays no first launches; off (default) skips it" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"

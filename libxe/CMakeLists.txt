@@ -141,6 +141,12 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_i4i8_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_i4i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # run 205 (owner note 202 A.3): the run form's select-chain decode (RADIANCE_XE_I4I8_RUN_SEL=1) against the SLM
+  # table, every case's output bytes compared
+  add_test(NAME xe_moe_i4i8_sel_cpu COMMAND sh -c
+    "rm -f i4i8_tab.bin i4i8_sel.bin && RI_DUMP=i4i8_tab.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> > /dev/null && RADIANCE_XE_I4I8_RUN_SEL=1 RI_DUMP=i4i8_sel.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> > /dev/null && cmp i4i8_tab.bin i4i8_sel.bin && echo 'i4i8 run SEL: bit-identical'")
+  set_tests_properties(xe_moe_i4i8_sel_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
   # Run 169 (owner note 173 item 1): attn_qsa_fmha's checks and prep kernels on the CPU device with the operands in the
   # engine's forms (RADIANCE_XE_ATTN_QSA_PREP_ONLY=1: the flash-attention kernel itself is card-only).
   add_executable(xe_attn_qsa_test test/attn_qsa_test.cpp)
@@ -436,7 +442,7 @@ if(RAD_BUILD_TESTS)
   set_target_properties(xe_hc_persist_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_dependencies(xe_hc_persist_test libxe)
   add_test(NAME xe_hc_persist_cpu COMMAND sh -c
-    "RADIANCE_XE_HC_PERSIST=0 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_off.bin && RADIANCE_XE_HC_PERSIST=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_on.bin && cmp hc_persist_off.bin hc_persist_on.bin && echo 'hc_persist: bit-identical' && RADIANCE_XE_HC_PERSIST=2 RADIANCE_XE_HC_PERSIST_GPC=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_tk.bin && cmp hc_persist_off.bin hc_persist_tk.bin && echo 'hc_persist (stage 1b, ticketed): bit-identical' && RADIANCE_XE_HC_AB=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_ab.bin 2> hc_persist_ab.err && grep -q 'one ticketed grid' hc_persist_ab.err && cmp hc_persist_off.bin hc_persist_ab.bin && echo 'hc_read AB (upstream 1.14 merge): bit-identical'")
+    "RADIANCE_XE_HC_PERSIST=0 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_off.bin && RADIANCE_XE_HC_PERSIST=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_on.bin && cmp hc_persist_off.bin hc_persist_on.bin && echo 'hc_persist: bit-identical' && RADIANCE_XE_HC_PERSIST=2 RADIANCE_XE_HC_PERSIST_GPC=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_tk.bin && cmp hc_persist_off.bin hc_persist_tk.bin && echo 'hc_persist (stage 1b, ticketed): bit-identical' && RADIANCE_XE_HC_AB=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_ab.bin 2> hc_persist_ab.err && grep -q 'one ticketed grid' hc_persist_ab.err && cmp hc_persist_off.bin hc_persist_ab.bin && echo 'hc_read AB (upstream 1.14 merge): bit-identical' && RADIANCE_XE_HC_NR=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_nr.bin 2> hc_persist_nr.err && grep -q 'one shape-matched launch' hc_persist_nr.err && cmp hc_persist_off.bin hc_persist_nr.bin && echo 'hc_read NR (norm + columns, shape-matched): bit-identical' && RADIANCE_XE_HC_GU=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_gu.bin 2> hc_persist_gu.err && grep -q 'gains and up mix as one shape-matched launch' hc_persist_gu.err && cmp hc_persist_off.bin hc_persist_gu.bin && echo 'hc_read GU (gains + up mix, shape-matched): bit-identical' && RADIANCE_XE_HC_D16=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_d16.bin && cmp hc_persist_off.bin hc_persist_d16.bin && echo 'hc_read D16 (the up mix reads d as bf16): bit-identical' && RADIANCE_XE_HC_GU=1 RADIANCE_XE_HC_D16=1 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_persist_gud.bin && cmp hc_persist_off.bin hc_persist_gud.bin && echo 'hc_read GU + D16: bit-identical'")
   # run 193 (owner note 190): RADIANCE_XE_HC_AB=1 -- the columns, gains and up mix as one ticketed grid; the grep proves
   # the grid ran (it falls back silently where its shape conditions fail)
   # run 189 (owner note 187): =2 is stage 1b (work by ticket, per-row flags); three runs of the row test. GPC=1: one

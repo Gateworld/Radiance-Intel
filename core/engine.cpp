@@ -15,6 +15,9 @@
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+
+#include <cstdio>
+#include <cstdlib>
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -57,6 +60,30 @@ Engine::Readback::~Readback() {
     if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
 }
 
+/* RADIANCE_EXPERT_STATS=FILE (run 203, owner note 191 item 3): see Rank::xs_decode. Rank 0's tally is written
+ * ("layer expert count", decode-only steps): under tensor parallelism each rank holds a slice of every expert and
+ * scores the same routing, so one rank's rows are the model's. */
+static const char* xs_path() {
+    static const char* p = [] { const char* s = std::getenv("RADIANCE_EXPERT_STATS"); return s && *s ? s : nullptr; }();
+    return p;
+}
+static bool xs_on() { return xs_path() != nullptr; }
+static void xs_write(const std::vector<int64_t>& c, int32_t n_ex) {
+    if (!xs_on() || n_ex <= 0 || c.empty()) return;
+    FILE* f = std::fopen(xs_path(), "w");
+    if (!f) { RAD_WARN("RADIANCE_EXPERT_STATS %s: cannot write", xs_path()); return; }
+    std::fprintf(f, "# radiance-intel decode expert counts (RADIANCE_EXPERT_STATS): layer expert count\n");
+    int64_t total = 0;
+    for (size_t i = 0; i < c.size(); ++i) {
+        if (!c[i]) continue;
+        std::fprintf(f, "%zu %zu %lld\n", i / (size_t)n_ex, i % (size_t)n_ex, (long long)c[i]);
+        total += c[i];
+    }
+    std::fclose(f);
+    RAD_INFO("RADIANCE_EXPERT_STATS %s: %lld decode routings over %zu layers written", xs_path(), (long long)total,
+             c.size() / (size_t)n_ex);
+}
+
 Engine::~Engine() {
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
@@ -88,6 +115,7 @@ Engine::~Engine() {
                  (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
+        if (r->index == 0) xs_write(r->xs_decode, (int32_t)r->ctx.route_n_expert());
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
@@ -239,6 +267,11 @@ void Engine::tiering_dispatch(Rank& r, int step) {
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        if (xs_on() && r.xs_kind[r.ctx.last_histogram_step(hr.layer, hr.bank) & 255] == 1) {
+            const size_t base = (size_t)hr.layer * (size_t)n_ex;
+            if (r.xs_decode.size() < base + (size_t)n_ex) r.xs_decode.resize(base + (size_t)n_ex, 0);
+            for (int32_t e = 0; e < n_ex; ++e) r.xs_decode[base + (size_t)e] += (int64_t)hr.h[e] * (reps > 1 ? reps : 1);
+        }
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -324,7 +357,10 @@ void Engine::rank_loop(int index) {
                 }
             }
             /* Behind the pass, once a step: see tiering_dispatch. */
-            if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
+            if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) {
+                r.xs_kind[b->step & 255] = b->n_seq > 0 && b->n_seq_decode >= b->n_seq ? 1 : 0;
+                tiering_dispatch(r, b->step);
+            }
 
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
@@ -447,6 +483,11 @@ int Engine::step_loop() {
             if (sched_.has_deferred()) {
                 for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
                 sched_.release_deferred();
+            }
+            /* The warm-up's state, cleared before the loan can move again (Engine::kv_reset_pending_). */
+            if (kv_reset_pending_.load(std::memory_order_acquire)) {
+                kv_reset_after_warmup();
+                kv_reset_pending_.store(false, std::memory_order_release);
             }
             tier_tick();
             expire_tick(rad_mono_ns());

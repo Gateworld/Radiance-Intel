@@ -2283,30 +2283,47 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     bool may_draft = depth > 0;
     /* RADIANCE_SPEC_MAX_SEQS=N (milestone 3): draft only while at most N sequences decode. Past it the
      * step runs as the backed-off state does, which on the Intel port's two cards beat drafting from
-     * three users up (C2 against C3b). 0, the default, keeps the behaviour without the limit. */
+     * three users up (C2 against C3b). Run 205 (owner note 199): 3 by default -- the multi-user policy is
+     * capped at 3 and never drafts at 4+ (six drafting decoders faulted the cards); 0 removes the limit. */
     {
         static const int spec_max = [] {
             const char* v = std::getenv("RADIANCE_SPEC_MAX_SEQS");
-            const int n = (v && *v) ? std::atoi(v) : 0;
+            const int n = (v && *v) ? std::atoi(v) : 3;
             return n > 0 ? n : 0;
         }();
-        if (may_draft && spec_max > 0) {
-            int running = 0;
-            bool admission = false;         /* a prefill chunk shares the step: the switch holds */
+        /* RADIANCE_SPEC_MULTI_DEPTH=N (run 203, owner notes 185 / 186 item 1): the depth while 2+ sequences decode.
+         * Run 205 (owner note 199): 1 by default (C29: +17 % a user at 2, +6 % at 3, texts identical); 0 is off. */
+        static const int multi_depth = [] {
+            const char* v = std::getenv("RADIANCE_SPEC_MULTI_DEPTH");
+            const int n = (v && *v) ? std::atoi(v) : 1;
+            return n > 0 ? n : 0;
+        }();
+        int running = 0;
+        bool admission = false;             /* a prefill chunk shares the step: the switches hold */
+        if (may_draft && (spec_max > 0 || multi_depth > 0))
             for (const StepEntry& e : plan_.e) {
                 if (e.is_prefill) admission = true;
                 if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
                 const SchedReq& s = *reqs_[(size_t)e.slot];
                 if (s.req && s.req->state == ReqState::Running && s.running) ++running;
             }
-            /* Hysteresis (owner note 42): the switch flips only after two consecutive decode-only steps on
-             * the other side of the limit, never in a step that admits a request (C5: three users
-             * oscillated with every admission). */
-            if (!admission) {
-                const bool over = running > spec_max;
-                if (over == spec_gate_off_) spec_gate_streak_ = 0;
-                else if (++spec_gate_streak_ >= 2) { spec_gate_off_ = over; spec_gate_streak_ = 0; }
-            }
+        /* The multi-sequence depth flips as the gate does: two consecutive decode-only steps on the other side, never
+         * in a step that admits a request. One sequence alone drafts at the configured depth again. */
+        if (may_draft && multi_depth > 0 && !admission) {
+            const bool multi = running > 1;
+            if (multi == (multi_cap_ > 0)) multi_streak_ = 0;
+            else if (++multi_streak_ >= 2) { multi_cap_ = multi ? multi_depth : 0; multi_streak_ = 0; }
+        }
+        if (may_draft && spec_max > 0) {
+            /* Run 205 (owner note 199): over the limit the switch goes OFF AT ONCE, in any step -- drafting past the
+             * cap is what faulted the cards (six drafting decoders after a warm-up: C15 / C24 / C30), so not one
+             * step may draft there. Back ON keeps note 42's hysteresis: two consecutive decode-only steps under the
+             * limit, never in a step that admits a request (C5: three users oscillated with every admission). */
+            const bool over = running > spec_max;
+            if (over) { spec_gate_off_ = true; spec_gate_streak_ = 0; }
+            else if (spec_gate_off_ && !admission) {
+                if (++spec_gate_streak_ >= 2) { spec_gate_off_ = false; spec_gate_streak_ = 0; }
+            } else spec_gate_streak_ = 0;
             if (spec_gate_off_) may_draft = false;
         }
     }

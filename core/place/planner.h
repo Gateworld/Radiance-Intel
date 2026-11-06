@@ -281,6 +281,10 @@ struct PlannerInput {
     /* No card is visible and the device backend is host memory (device_is_host()), so a host
      * kernel can read the weights pool as well as the mapping. See mapped_unit(). */
     bool                  host_backend = false;
+    /* RADIANCE_EXPERT_PIN_TOP=F (run 203, owner note 191 item 3; upstream 1.14's --expert-pin-top): the hottest
+     * fraction F of the routed experts by `profile` that the strategy put in VRAM stay there -- marked unmovable,
+     * so the heat engine never demotes them. 0 = off. See Planner::pin_hot. */
+    float                 pin_top = 0.0f;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -312,6 +316,7 @@ private:
     bool host_kernel(const MoveUnit& mu) const;
     void build_units(const Program& prog, Plan* p);
     void pin_mapped(const Program& prog, Plan* p);
+    void pin_hot(Plan* p) const;
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
     int  pin_towers(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);

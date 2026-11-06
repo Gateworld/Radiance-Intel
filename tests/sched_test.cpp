@@ -3744,6 +3744,29 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
     CHECK_EQ(m.linear_cached_tokens, 256);
 }
 
+/* Run 205 (owner note 199): by default (RADIANCE_SPEC_MAX_SEQS 3) four decoding sequences draft nothing from the very
+ * first step -- the gate goes off at once over the cap, admitting step or not -- while three still draft. */
+TEST(four_decoders_never_draft_and_three_do_by_default) {
+    for (int n = 3; n <= 4; ++n) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64);
+        f.cfg.n_spec = 3;
+        f.prog.drafter.kind = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 3;
+        CHECK_OK(f.start());
+        for (int i = 0; i < n; ++i) f.submit(160, 2000);
+        /* until every prompt has been read: four prompts need more than one step's token budget */
+        for (int k = 0; k < 4; ++k) {
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain(11);
+        }
+        int rounds = 3;
+        Scheduler::SerialRow rows[8];
+        CHECK_EQ(f.sch.serial_begin(&rounds, rows, 8), n == 4 ? 0 : 3);
+        f.sch.serial_end(0);
+    }
+}
+
 /* A refused lookahead stops drafting, not the row: the history pass writes the draft head's K and
  * V for positions the sequence already holds, and a dropped row would leave them unwritten for
  * good, since the next step's history starts at its own context. */

@@ -472,6 +472,68 @@ TEST(planner_warm_starts_from_the_container_profile) {
     }
 }
 
+/* Run 203 (owner note 191 item 3): RADIANCE_EXPERT_PIN_TOP's planner side. Of eight experts, 5 / 6 / 7 lead the profile
+ * with distinct shares and begin resident; F = 0.25 is the hottest two, so 6 and 7 become unmovable and 5 (resident,
+ * the share just below the set) stays movable. Then the heat engine, which ranks movable units only, never offers a
+ * pinned unit for demotion however cold it runs. */
+TEST(pin_top_keeps_the_hottest_fraction_resident_and_unmovable) {
+    Fixture f;
+    std::vector<rad_weight> ex;
+    build_moe(f, 8, 1 * MiB, &ex);
+    std::vector<RadFileProfile> prof;
+    for (int e = 0; e < 8; ++e) prof.push_back(RadFileProfile{0, e, e >= 5 ? 0.1f * (float)(e - 2) : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 6;
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    in.pin_top = 0.25f;
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    int pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        if (mu.expert >= 6) { CHECK(mu.tier == Tier::VRAM); CHECK(!mu.movable); ++pinned; }
+        if (mu.expert == 5) { CHECK(mu.tier == Tier::VRAM); CHECK(mu.movable); }
+    }
+    CHECK_EQ(pinned, 2);
+
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(p, hp));
+    /* Every pooled expert runs hot; only expert 5 may leave to make room. */
+    const int32_t ids[5] = {0, 1, 2, 3, 4};
+    const int32_t counts[5] = {50, 50, 50, 50, 50};
+    for (int s = 0; s < 8; ++s) {
+        h.observe_ids(0, ids, counts, 5);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        for (const Swap& w : sw) {
+            CHECK(p.units[(size_t)w.demote].expert != 6);
+            CHECK(p.units[(size_t)w.demote].expert != 7);
+            h.abandon(w);
+        }
+    }
+}
+
+/* Without the switch nothing is pinned: the same plan, every resident expert movable. */
+TEST(pin_top_off_pins_nothing) {
+    Fixture f;
+    std::vector<rad_weight> ex;
+    build_moe(f, 8, 1 * MiB, &ex);
+    std::vector<RadFileProfile> prof;
+    for (int e = 0; e < 8; ++e) prof.push_back(RadFileProfile{0, e, e >= 5 ? 0.1f * (float)(e - 2) : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 6;
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::VRAM) CHECK(mu.movable);
+}
+
 TEST(planner_refuses_an_offload_strategy_with_no_budget) {
     /* Every pool is budgeted explicitly (spec §6). An offload strategy without a budget would
      * have to infer one, making benchmarks irreproducible. */

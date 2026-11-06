@@ -12,6 +12,7 @@
 #include "planner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -1028,6 +1029,38 @@ int Planner::pin_towers(const Config& cfg, Plan* p) const {
 }
 
 /* ------------------------------------------------------------------ plan */
+/* RADIANCE_EXPERT_PIN_TOP=F (run 203, owner note 191 item 3; upstream 1.14's --expert-pin-top): the hottest fraction F
+ * of the routed experts, ranked by the profile the planner was given (the container's, or RADIANCE_EXPERT_PROFILE's
+ * decode counts), stay resident -- marked unmovable, so the heat engine (which ranks movable units only) never
+ * demotes them and the decode-hot set never pays the host pool's link read. The hot set is the ceil(F * n)
+ * largest shares; a share equal to the one just below the set stays movable (only shares strictly above it pin).
+ * Runs after the strategy, which has already put the hottest units in VRAM; a hot unit the strategy left on the
+ * host stays there and is counted. Only placement changes: the same weights, the same arithmetic. */
+void Planner::pin_hot(Plan* p) const {
+    if (!(in_.pin_top > 0.0f)) return;
+    std::vector<float> shares;
+    for (const MoveUnit& mu : p->units)
+        if (mu.expert >= 0 && mu.tier != Tier::Mapped && !mu.host_forced) shares.push_back(mu.profile_share);
+    if (shares.empty()) return;
+    std::sort(shares.begin(), shares.end());
+    const size_t n = shares.size();
+    const size_t hot = std::min(n, (size_t)std::ceil((double)in_.pin_top * (double)n));
+    if (hot == 0) return;
+    const bool all = hot >= n;
+    const float below = all ? 0.0f : shares[n - hot - 1];
+    int64_t pinned = 0, left = 0;
+    for (MoveUnit& mu : p->units) {
+        if (mu.expert < 0 || mu.tier == Tier::Mapped || mu.host_forced) continue;
+        if (!all && !(mu.profile_share > below)) continue;
+        if (mu.tier != Tier::VRAM) { ++left; continue; }
+        mu.movable = false;
+        ++pinned;
+    }
+    RAD_INFO("placement: RADIANCE_EXPERT_PIN_TOP %.4g pins %lld of %zu routed experts resident (share above %.4g); "
+             "%lld of the hot set had no VRAM slot and stay where the strategy put them", (double)in_.pin_top,
+             (long long)pinned, n, (double)below, (long long)left);
+}
+
 int Planner::plan(Plan* out) {
     if (!out || !in_.program || !in_.config) return RAD_E_INVAL;
     const Program& prog = *in_.program;
@@ -1093,6 +1126,7 @@ int Planner::plan(Plan* out) {
     if (hrc >= 0) hrc = trc;
 
     int rc = assign(out);
+    if (rc >= 0) pin_hot(out);
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
     finish(prog, out);

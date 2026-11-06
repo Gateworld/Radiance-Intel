@@ -184,7 +184,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows,
-                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound) {
+                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound, uint32_t sel) {
     XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
     /* each group's activation sum (exact); FC, which needs none: the 256-entry table, a byte -> two levels (bits).
      * (A separate FC-only array, declared and unused in format B's instantiation, crashed the CPU device: run 116.) */
@@ -323,6 +323,24 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         }
     }
     __syncthreads();
+    /* sel (run 205, RADIANCE_XE_I4I8_RUN_SEL=1; owner note 202 A.3): the 16 int8 levels byte-packed in four registers,
+     * a code's level by a select chain, as the DPAS form decodes (run 166 / B92) -- the dump showed this kernel's code
+     * decode as one SLM gather a code byte (194 load.slm.d32 in down's ISA, 100 in gate_up's); the same rounding as the
+     * table above, so the same integers */
+    uint32_t pk[4] = { 0u, 0u, 0u, 0u };
+    if constexpr (FC) {
+        if (sel && e >= 0) {
+            const float* tab = (const float*)(entry_of(c.base, c.tab, c.stride, (uint32_t)e >> 1) + c.t_off);
+            float amax = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) amax = sycl::fmax(amax, sycl::fabs(tab[t]));
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int iv = amax > 0.0f ? (int)sycl::rint(tab[t] * 127.0f / amax) : (int)tab[t];
+                pk[t >> 2] |= ((uint32_t)iv & 255u) << (8 * (t & 3));
+            }
+        }
+    }
     const int team = tid / LPR, l = tid % LPR;
     float acc[kMT][R];
     uint32_t rowr[R];
@@ -391,11 +409,22 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 #pragma unroll
                         for (int x = 0; x < 4; ++x) {   /* a code byte (low code, high code) to its two levels */
                             uint32_t lo8 = 0, hi8 = 0;
+                            if (sel) {
+#pragma unroll
+                                for (int bb = 0; bb < 4; ++bb) {
+                                    const uint32_t by = (d[x] >> (8 * bb)) & 255u, c0 = by & 15u, c1 = by >> 4;
+                                    const uint32_t w0 = (c0 & 8u) ? ((c0 & 4u) ? pk[3] : pk[2]) : ((c0 & 4u) ? pk[1] : pk[0]);
+                                    const uint32_t w1 = (c1 & 8u) ? ((c1 & 4u) ? pk[3] : pk[2]) : ((c1 & 4u) ? pk[1] : pk[0]);
+                                    lo8 |= ((w0 >> (8u * (c0 & 3u))) & 255u) << (8 * bb);
+                                    hi8 |= ((w1 >> (8u * (c1 & 3u))) & 255u) << (8 * bb);
+                                }
+                            } else {
 #pragma unroll
                             for (int bb = 0; bb < 4; ++bb) {
                                 const uint32_t ev = __float_as_uint(s_g[(d[x] >> (8 * bb)) & 255u]);
                                 lo8 |= (ev & 255u) << (8 * bb);
                                 hi8 |= ((ev >> 8) & 255u) << (8 * bb);
+                            }
                             }
                             lv[r][ch][2 * x] = lo8;
                             lv[r][ch][2 * x + 1] = hi8;
@@ -932,6 +961,17 @@ bool run_bound() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_RUN_BOUND"); return !(s && *s == '0'); }();
     return v;
 }
+/* RADIANCE_XE_I4I8_RUN_SEL=1 (run 205, owner note 202 A.3): the run form decodes format C's codes by a register select
+ * chain instead of the SLM table (the kernel's `sel`); opt-in */
+bool run_sel() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_RUN_SEL"); return s && *s == '1'; }();
+    return v;
+}
+/* RADIANCE_XE_I4I8_RUN_GRF=1 (run 205, owner note 202 A.2): the run form launched with 256 GRF a thread; opt-in */
+bool run_grf() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_RUN_GRF"); return s && *s == '1'; }();
+    return v;
+}
 /* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
 bool plain_forced() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
@@ -1114,12 +1154,21 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
             const TskipInst* ti = fc ? (const TskipInst*)a->instance : nullptr;
             const uint64_t sk_cfg = ti ? ti->cfg : 0u;
             uint32_t* const sk_stats = ti && ti->cfg ? ti->stats : nullptr;
-#define XE_I4I8_RUN_F(U, L, R, G, F)                                                                         \
-    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, (const int8_t*)Aq->data,      \
+/* run 205 (owner note 202 A.2, RADIANCE_XE_I4I8_RUN_GRF=1): the run form with the large register file (256 GRF a thread;
+ * at 128 its format C instances spill -- 11 / 15 scratch lines in down's / gate_up's ISA, igcdump-fc2/); the same code,
+ * so the same bits. Static LDS only, as launch_as_grf256 requires. */
+#define XE_I4I8_RUN_ARGS                                                                                      \
+                 (const int8_t*)Aq->data,                                                                     \
                  (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,          \
                  (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, \
-                 sk_cfg, sk_stats, run_bound() ? 1u : 0u)
+                 sk_cfg, sk_stats, run_bound() ? 1u : 0u, run_sel() ? 1u : 0u
+#define XE_I4I8_RUN_F(U, L, R, G, F)                                                                         \
+    do {                                                                                                     \
+        if (run_grf()) xe::launch_as_grf256<&moe_i4i8_run_kernel<U, L, R, G, F>, 16>(                        \
+                           &moe_i4i8_run_kernel<U, L, R, G, F>, *qq, grid, block, XE_I4I8_RUN_ARGS);         \
+        else XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, XE_I4I8_RUN_ARGS);   \
+    } while (0)
 #define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
             if (gl) switch (upl) {
                 case 1: XE_I4I8_RUN(1, 2, 2, true); break;
@@ -1138,6 +1187,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
             }
 #undef XE_I4I8_RUN
 #undef XE_I4I8_RUN_F
+#undef XE_I4I8_RUN_ARGS
             return RAD_OK;
         }
         XE_LAUNCH(qq, moe_i4i8_kernel, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,

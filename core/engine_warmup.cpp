@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace rad {
@@ -70,6 +71,17 @@ int Engine::warmup() {
     const server::Finish f = sink->finish_reason();
     const int st = sink->status();
     sched_.reap(sink->id);
+    /* Run 204 (owner note 197 item 1): the request leaves its K / V in the blocks it freed, and a new sequence's
+     * blocks are not cleared when handed out; the MTP head's first draft reads 1 + n_spec slots past its position
+     * before the verify writes them, so a user given those blocks drafted against the warm-up's text (C14: 96 / 480
+     * drafts kept, 45.6 tok/s against 70.1; with six seats drafting, two card faults). The step loop zeroes the
+     * cache's unlent blocks while idle; listening waits for it. Even a refused warm-up may have touched blocks. */
+    kv_reset_pending_.store(true, std::memory_order_release);
+    while (kv_reset_pending_.load(std::memory_order_acquire)) {
+        const int ls = loop_status_.load(std::memory_order_acquire);
+        if (ls < 0) return ls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     if (f == server::Finish::Error || f == server::Finish::Cancelled) {
         RAD_WARN("startup warm-up: the request did not finish: %s", rad_strerror(st));
         return st < 0 ? st : RAD_E_STATE;
@@ -79,6 +91,49 @@ int Engine::warmup() {
              "tokens in %.2f s before listening (--startup-warmup off skips it)",
              (long long)want, (long long)chunk, (long long)tail, gen, s);
     return RAD_OK;
+}
+
+/* On the step loop's thread, idle (Engine::kv_reset_pending_): every rank's paged groups, each layer's stripe from
+ * block 0 up to the live mark, set to zero on the compute stream and waited for. The blocks above the mark are lent
+ * to the expert slab and hold expert units, so they are left alone; the loan moves only on this thread
+ * (loan_tick), after this returns, so a fill can only write over zeros. A group with blocks still held (indexed by
+ * the prefix cache) is skipped and said: its held blocks cannot be told from the free ones here. Recurrent state
+ * needs nothing: a slot is zeroed when it is handed out (state_clears). */
+void Engine::kv_reset_after_warmup() {
+    if (ranks_.empty()) return;
+    /* The warm-up's prompt may sit in the prefix cache, whose blocks are held: drop it first (no user prompt matches
+     * the synthetic text), so its blocks are free and cleared with the rest. */
+    const int64_t dropped = sched_.reset_prefix_cache();
+    if (dropped > 0) RAD_INFO("startup warm-up: %lld prefix-cache entries dropped", (long long)dropped);
+    const KVManager& lead = ranks_[0]->kv;
+    int64_t bytes = 0, groups = 0;
+    for (int32_t g = 0; g < lead.n_groups(); ++g) {
+        const KVGroupPlan* lp = lead.plan(g);
+        if (!lp || !lp->paged()) continue;
+        if (lead.held_blocks(g) > 0) {
+            RAD_WARN("startup warm-up: KV group %d still holds %lld blocks; its free blocks are not cleared", (int)g,
+                     (long long)lead.held_blocks(g));
+            continue;
+        }
+        const int64_t live = lead.live_blocks(g);
+        for (auto& rk : ranks_) {
+            const KVGroupPlan* gp = rk->kv.plan(g);
+            if (!gp || gp->zero || !gp->base || live <= 0) continue;
+            const int64_t n = live * gp->layer_bytes_per_block();
+            for (int64_t l = 0; l < gp->n_layers; ++l) {
+                char* p = (char*)gp->base + l * gp->layer_stride();
+                if (rad_memset_async(p, 0, n, rk->ctx.stream()) < 0) {
+                    RAD_WARN("startup warm-up: clearing KV group %d failed", (int)g);
+                    break;
+                }
+                bytes += n;
+            }
+        }
+        ++groups;
+    }
+    for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
+    RAD_INFO("startup warm-up: %lld paged KV groups' unlent blocks cleared (%lld MiB over the ranks), so no request "
+             "inherits the warm-up's K / V", (long long)groups, (long long)(bytes >> 20));
 }
 
 }  // namespace rad

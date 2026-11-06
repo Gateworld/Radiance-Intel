@@ -214,6 +214,10 @@ bool run_case(sycl::queue& q, LaunchFn fn, bool sorted_a, int tokens, int top_k,
     if (std::getenv("RI_VERBOSE")) std::printf("  host buffer\n");
     q.memcpy(hy.data(), dy, hy.size()).wait();
     if (std::getenv("RI_VERBOSE")) std::printf("  copied\n");
+    /* run 205: RI_DUMP=FILE appends every case's raw output bytes, so two forms' runs can be compared byte for byte */
+    if (const char* dp = std::getenv("RI_DUMP")) {
+        if (FILE* df = std::fopen(dp, "ab")) { std::fwrite(hy.data(), 1, hy.size(), df); std::fclose(df); }
+    }
     bool canary = true;
     for (size_t i = 0; i < kCanary; ++i) canary &= hy[i] == kPat && hy[kCanary + ybytes + i] == kPat;
     if (std::getenv("RI_VERBOSE")) std::printf("  canaries %d\n", (int)canary);
@@ -392,6 +396,9 @@ bool real_case(sycl::queue& q, LaunchFn fn, LaunchFn ref, const std::string& dir
     }
     std::vector<uint16_t> hy((size_t)T * N);
     q.memcpy(hy.data(), dy, hy.size() * 2).wait();
+    if (const char* dp = std::getenv("RI_DUMP")) {   /* run 205: as above */
+        if (FILE* df = std::fopen(dp, "ab")) { std::fwrite(hy.data(), 2, hy.size(), df); std::fclose(df); }
+    }
     double amax = 0.0;
     for (float v : yref) amax = std::max(amax, (double)std::fabs(v));
     if (std::getenv("RI_VERBOSE")) {

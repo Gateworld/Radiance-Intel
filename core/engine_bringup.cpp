@@ -54,6 +54,56 @@
 
 namespace rad {
 
+/* ================================================================== the decode profile (run 203) */
+/* Owner note 191 item 3, upstream 1.14's --expert-profile / --expert-pin-top on this port, behind environment
+ * switches. RADIANCE_EXPERT_PROFILE=FILE is a file RADIANCE_EXPERT_STATS wrote (Engine::xs_write: "layer expert
+ * count" lines of decode-only steps' routing, `#` comments): each expert's share of its layer's decode routing ranks
+ * it for the planner instead of the container's imatrix profile, which counts calibration (prefill) activations. An
+ * unreadable or empty file leaves the container's profile, with a warning. */
+static const std::vector<RadFileProfile>& decode_profile() {
+    static const std::vector<RadFileProfile> v = [] {
+        std::vector<RadFileProfile> out;
+        const char* path = std::getenv("RADIANCE_EXPERT_PROFILE");
+        if (!path || !*path) return out;
+        std::ifstream f(path);
+        if (!f) { RAD_WARN("RADIANCE_EXPERT_PROFILE %s: not readable; the container's profile ranks the experts", path); return out; }
+        std::map<int32_t, double> total;
+        std::vector<std::pair<std::pair<int32_t, int32_t>, double>> rows;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream is(line);
+            long long l = -1, e = -1;
+            double c = 0.0;
+            if (!(is >> l >> e >> c) || l < 0 || e < 0 || c < 0.0) continue;
+            rows.push_back({{(int32_t)l, (int32_t)e}, c});
+            total[(int32_t)l] += c;
+        }
+        for (const auto& r : rows) {
+            const double t = total[r.first.first];
+            RadFileProfile p{};
+            p.layer = r.first.first;
+            p.expert = r.first.second;
+            p.share = t > 0.0 ? (float)(r.second / t) : 0.0f;
+            out.push_back(p);
+        }
+        if (out.empty()) RAD_WARN("RADIANCE_EXPERT_PROFILE %s: no counts; the container's profile ranks the experts", path);
+        else RAD_INFO("RADIANCE_EXPERT_PROFILE %s: %zu (layer, expert) decode shares over %zu layers rank the experts",
+                      path, out.size(), total.size());
+        return out;
+    }();
+    return v;
+}
+/* RADIANCE_EXPERT_PIN_TOP=F (0 < F <= 1): the planner pins the hottest fraction F resident (Planner::pin_hot). */
+static float expert_pin_top() {
+    static const float v = [] {
+        const char* s = std::getenv("RADIANCE_EXPERT_PIN_TOP");
+        const float f = s ? std::strtof(s, nullptr) : 0.0f;
+        return f > 0.0f && f <= 1.0f ? f : 0.0f;
+    }();
+    return v;
+}
+
 /* ================================================================== the miss report */
 /* What did not resolve, in three classes reported differently:
  *
@@ -1793,6 +1843,13 @@ int Engine::plan() {
             in.profile   = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
         }
+        /* run 203 (owner note 191 item 3): a recorded decode profile ranks the experts instead of the container's
+         * prefill-heavy one, and RADIANCE_EXPERT_PIN_TOP pins its hottest fraction resident */
+        if (!decode_profile().empty()) {
+            in.profile   = decode_profile().data();
+            in.n_profile = (int64_t)decode_profile().size();
+        }
+        in.pin_top = expert_pin_top();
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
         Planner planner(in);
@@ -3630,7 +3687,14 @@ int Engine::start() {
      * (which a recall drains). Every rank lends its own pool, same geometry on every card; only a
      * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
      * from the top, since a group's top blocks are the top of every layer's stripe. */
+    /* RADIANCE_KV_LEND=0 (run 205, owner note 199 item 3): no loan -- the cache keeps every block, the slab holds only
+     * its own carve. The switch that separates the loan (and the expert units it places in KV blocks, which the MoE
+     * GEMM's weight tables then name) from the rest of the startup warm-up's leftovers, for the 6-drafting-user fault
+     * (C15 / C24 / C30 at 0x00008000fffe0000). */
+    static const bool kv_lend = [] { const char* v = std::getenv("RADIANCE_KV_LEND"); return !(v && v[0] == '0'); }();
+    if (!kv_lend) RAD_INFO("RADIANCE_KV_LEND=0: the KV cache lends no blocks to the expert slab");
     for (auto& r : ranks_) {
+        if (!kv_lend) break;
         if (!r->heat.enabled()) continue;
         RAD_TRY(rad_dev_set(r->device));
         std::vector<LoanStrip> strips;

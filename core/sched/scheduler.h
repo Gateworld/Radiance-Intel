@@ -497,6 +497,11 @@ private:
      * limit, on again after two under it; a step that admits a request leaves it as it is. */
     bool    spec_gate_off_ = false;
     int     spec_gate_streak_ = 0;
+    /* RADIANCE_SPEC_MULTI_DEPTH=N (run 203, owner notes 185 / 186 item 1): while two or more sequences decode, every
+     * sequence drafts at most N (draft_cap), switched with the gate's hysteresis in serial_begin(); 0 while one
+     * decodes. C17-C20: at depth 1, 2 users +24 % and 3 users +11 % a user against the gate, 1 user unchanged at 3. */
+    int     multi_cap_ = 0;
+    int     multi_streak_ = 0;
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -513,9 +518,14 @@ private:
         /* Under the adaptive window a request's depth by content (Request::spec_cap) is where its estimate starts
          * (DraftAdapt::init, owner note 193), not a cap: the window then follows its acceptance. With the policy off it
          * is the request's cap (owner note 191 item 1). */
-        if (draft_.adaptive()) return draft_.window_for(s.adapt);
-        const int w = draft_.next_depth();
-        return s.req && s.req->spec_cap > 0 && s.req->spec_cap < w ? s.req->spec_cap : w;
+        int w;
+        if (draft_.adaptive()) w = draft_.window_for(s.adapt);
+        else {
+            w = draft_.next_depth();
+            if (s.req && s.req->spec_cap > 0 && s.req->spec_cap < w) w = s.req->spec_cap;
+        }
+        /* RADIANCE_SPEC_MULTI_DEPTH: the depth while several sequences decode (multi_cap_) */
+        return multi_cap_ > 0 && w > multi_cap_ ? multi_cap_ : w;
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
