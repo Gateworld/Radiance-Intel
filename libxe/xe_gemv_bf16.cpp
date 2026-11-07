@@ -478,13 +478,87 @@ void logits_i8_rows_kernel(const uint16_t* __restrict__ x, long x_ld, const uint
     }
 }
 
+/* The split rows form (run 219, owner note 207 item A2, RADIANCE_XE_LOGITS_R=12): the rows form held a chunk's whole 16
+ * activation columns of MB rows (32 dwords) and each weight row's 16 decoded codes at once -- at SIMD32 past 128
+ * registers (2 KB of spill a thread under IGC 2.42.6). Here the chunk goes in two halves of 8 columns: a half's
+ * activation (16 dwords), then for each weight row its codes decoded as they are used. Every (row, activation row) sum
+ * still runs over the chunk's 16 products in e order (the first half's 8, then the second's, in one running sum), then
+ * takes the scale and joins the lane's sum where the rows form's does -- the same float operations in the same order,
+ * so its bytes. */
+template <int MB, int R>
+void logits_i8_rows_split_kernel(const uint16_t* __restrict__ x, long x_ld, const uint8_t* __restrict__ w, long w_ld,
+                                 float* __restrict__ y, long y_ld, int N, int K, int M) {
+    const int lane = (int)threadIdx.x & 31;
+    const int n0 = ((int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5)) * R;
+    float acc[R][MB];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < MB; ++m) acc[r][m] = 0.0f;
+    const int nchunk = K / 16;
+    for (int c = lane; c < nchunk && n0 < N; c += 32) {
+        float s[R][MB];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 0; m < MB; ++m) s[r][m] = 0.0f;
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            uint4 xq[MB];
+#pragma unroll
+            for (int m = 0; m < MB; ++m)
+                xq[m] = ((const uint4*)(x + (size_t)(m < M ? m : 0) * x_ld + (size_t)c * 16))[hf];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int n = n0 + r;
+                if (n >= N) break;   /* uniform over the sub-group */
+                const uint8_t* row = w + (size_t)n * w_ld;
+                const uint2 q = *(const uint2*)(row + (size_t)c * 16 + hf * 8);
+                const unsigned qv[2] = {q.x, q.y};
+#pragma unroll
+                for (int m = 0; m < MB; ++m) {
+                    if (m >= M) break;
+                    const unsigned xv[4] = {xq[m].x, xq[m].y, xq[m].z, xq[m].w};
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const float wf = (float)(int8_t)((qv[e >> 2] >> (8 * (e & 3))) & 0xffu);
+                        const unsigned h = (e & 1) ? (xv[e >> 1] & 0xffff0000u) : (xv[e >> 1] << 16);
+                        s[r][m] += __uint_as_float(h) * wf;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int n = n0 + r;
+            if (n >= N) break;
+            const float sc = ld_bf16((const uint16_t*)(w + (size_t)n * w_ld + K), c >> 3);
+#pragma unroll
+            for (int m = 0; m < MB; ++m) {
+                if (m >= M) break;
+                acc[r][m] += s[r][m] * sc;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n = n0 + r;
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            float v = acc[r][m];
+            for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
+            if (n < N && lane == 0 && m < M) y[(size_t)m * y_ld + n] = v;
+        }
+    }
+}
+
 /* RADIANCE_XE_LOGITS_R: the rows form at more than one row (owner note 151 C, run 123) -- the default R=2 since owner
- * note 155 (bit-identical); 4 the wider form, 0 the 4-row form. Read at every call (one a step), so a test can compare
- * the forms in one process. */
+ * note 155 (bit-identical); 4 the wider form, 12 the split form above at R=2 (run 219, opt-in until timed), 0 the 4-row
+ * form. Read at every call (one a step), so a test can compare the forms in one process. */
 int logits_rows() {
     const char* e = std::getenv("RADIANCE_XE_LOGITS_R");
     const int v = e ? std::atoi(e) : 2;
-    return v == 2 || v == 4 ? v : 0;
+    return v == 2 || v == 4 || v == 12 ? v : 0;
 }
 
 }  // namespace
@@ -518,8 +592,10 @@ extern "C" int xe_rad_logits_gemm_i8(const RadArgs* args, RadStream s) {
             const uint16_t* xm = (const uint16_t*)X->data + (size_t)m0 * x_ld;
             float* ym = (float*)Y->data + (size_t)m0 * y_ld;
             if (mb > 1 && rr > 0) {
-                const dim3 gr((unsigned)((V + kRowsPerWG * rr - 1) / (kRowsPerWG * rr)));
-                if (rr == 2) XE_LAUNCH(q, (logits_i8_rows_kernel<kMaxM, 2>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+                const int rw = rr == 12 ? 2 : rr;   /* 12: the split form at R=2 */
+                const dim3 gr((unsigned)((V + kRowsPerWG * rw - 1) / (kRowsPerWG * rw)));
+                if (rr == 12) XE_LAUNCH(q, (logits_i8_rows_split_kernel<kMaxM, 2>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
+                else if (rr == 2) XE_LAUNCH(q, (logits_i8_rows_kernel<kMaxM, 2>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
                 else XE_LAUNCH(q, (logits_i8_rows_kernel<kMaxM, 4>), gr, block, 0, xm, (long)x_ld, (const uint8_t*)W->data, (long)w_ld, ym, (long)y_ld, (int)V, (int)E, mb);
                 continue;
             }
