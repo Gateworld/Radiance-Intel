@@ -502,4 +502,10 @@ if(RAD_BUILD_TESTS)
   # (the forms' own runs set =1 on their command, which overrides)
   set_tests_properties(xe_hc_persist_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8;RADIANCE_XE_HC_GU=0;RADIANCE_XE_HC_D16=0" TIMEOUT 1200)
+  # run 212 (the decode desk list): RADIANCE_XE_HC_DCOLS=4 / 8, the plain columns launch at 4 / 8 columns a workgroup,
+  # against the 2-column default, byte for byte
+  add_test(NAME xe_hc_dcols_cpu COMMAND sh -c
+    "$<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_dcols2.bin && RADIANCE_XE_HC_DCOLS=4 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_dcols4.bin 2> hc_dcols4.err && grep -q 'columns at 4 a workgroup' hc_dcols4.err && cmp hc_dcols2.bin hc_dcols4.bin && echo 'hc_read columns, 4 a workgroup: bit-identical' && RADIANCE_XE_HC_DCOLS=8 $<TARGET_FILE:xe_hc_persist_test> $<TARGET_FILE:libxe> hc_dcols8.bin 2> hc_dcols8.err && grep -q 'columns at 8 a workgroup' hc_dcols8.err && cmp hc_dcols2.bin hc_dcols8.bin && echo 'hc_read columns, 8 a workgroup: bit-identical'")
+  set_tests_properties(xe_hc_dcols_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_HC_V2=8;RADIANCE_XE_HC_GU=0;RADIANCE_XE_HC_D16=0" TIMEOUT 1200)
 endif()

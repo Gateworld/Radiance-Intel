@@ -1864,14 +1864,16 @@ void hc_v2_down_kernel(const unsigned short* __restrict__ nbuf, const void* __re
 constexpr int kV2RowCols = 2;   /* columns (waves) a workgroup */
 /* One workgroup of kWave x kV2RowCols threads (block (bx, by), thread `tid` of it): the kernel below, or a 64-thread
  * slice of a persistent work-group (owner note 186 item 3b). No barrier: every return is a whole wave's. */
-template <int kRG, bool kWI8 = false>
+/* kCols (run 212, RADIANCE_XE_HC_DCOLS): the columns a workgroup of the plain launch; a column's sum is its wave's
+ * alone, so only which workgroup runs it changes. */
+template <int kRG, bool kWI8 = false, int kCols = kV2RowCols>
 __device__ __forceinline__ void hc_v2_down_rows_body(const unsigned short* __restrict__ nbuf,
                                                      const void* __restrict__ downv, long dld,
                                                      unsigned short* __restrict__ dout, long rows, int hc, long HN,
                                                      long lr, long bx, long by, int tid) {
     const int lane = tid & (kWave - 1), wave = tid / kWave;
     const long r0 = by * kRG;
-    const long k = bx * kV2RowCols + wave;
+    const long k = bx * kCols + wave;
     if (k >= lr || r0 >= rows) return;
     const int nr = (int)(rows - r0 < kRG ? rows - r0 : kRG);
     const float inv_hc = 1.0f / (float)hc;
@@ -1884,12 +1886,12 @@ __device__ __forceinline__ void hc_v2_down_rows_body(const unsigned short* __res
         if (lane == 0) dout[(r0 + i) * lr + k] = f2bf(siluf_(a * inv_hc));
     }
 }
-template <int kRG, bool kWI8 = false>
-__global__ __launch_bounds__(kWave * kV2RowCols)
+template <int kRG, bool kWI8 = false, int kCols = kV2RowCols>
+__global__ __launch_bounds__(kWave * kCols)
 void hc_v2_down_rows_kernel(const unsigned short* __restrict__ nbuf, const void* __restrict__ downv, long dld,
                             unsigned short* __restrict__ dout, long rows, int hc, long HN, long lr) {
-    hc_v2_down_rows_body<kRG, kWI8>(nbuf, downv, dld, dout, rows, hc, HN, lr, (long)blockIdx.x, (long)blockIdx.y,
-                                    (int)threadIdx.x);
+    hc_v2_down_rows_body<kRG, kWI8, kCols>(nbuf, downv, dld, dout, rows, hc, HN, lr, (long)blockIdx.x,
+                                           (long)blockIdx.y, (int)threadIdx.x);
 }
 
 /* Owner note 200 item 1a (run 205, RADIANCE_XE_HC_NR=1): the norm and the down product's columns as ONE shape-matched
@@ -2258,6 +2260,14 @@ void hc_v2_gu_kernel(const unsigned short* __restrict__ nbuf, const unsigned sho
 bool xe_hc_gu_on() {
     static const bool on = [] { const char* v = std::getenv("RADIANCE_XE_HC_GU"); return !(v && v[0] == '0'); }();
     return on;
+}
+/* RADIANCE_XE_HC_DCOLS=4 / 8 (run 212, the decode desk list, opt-in until timed): the plain level-8 columns launch
+ * at 4 or 8 columns (waves) a workgroup instead of 2 -- the 64-thread groups may be held by the Xe core's workgroup
+ * slots before its thread slots. The same bits (hc_v2_down_rows_body's kCols); else 2. */
+int xe_hc_dcols() {
+    static const int c = [] { const char* v = std::getenv("RADIANCE_XE_HC_DCOLS"); const int n = v ? std::atoi(v) : 2;
+                              return n == 4 || n == 8 ? n : 2; }();
+    return c;
 }
 
 /* The launch's synchronisation words, one set a stream (two streams on a card must not share a counter), zeroed once
@@ -5588,11 +5598,24 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                     std::fprintf(stderr, "[xe] hc_read's norm and columns as one shape-matched launch (RADIANCE_XE_HC_NR=1, "
                                          "%u norm units and %u column groups of 64 threads at the first launch)\n", ntask, ncol);
                 });
-            } else
-                emit_rc = R4D_EMIT(s, hc_v2_down_rows_kernel<4>,
-                                   dim3((unsigned)((lr + kV2RowCols - 1) / kV2RowCols), (unsigned)((rows + 3) / 4)),
-                                   dim3(kWave * kV2RowCols), 0u, (const unsigned short*)nbuf, (const void*)down->data,
-                                   (long)dld, dbuf, (long)rows, (int)hc, (long)HN, (long)lr);
+            } else {
+                const int dc = xe_hc_dcols();
+#define HC_DROWS(C_)                                                                                              \
+                emit_rc = R4D_EMIT(s, (hc_v2_down_rows_kernel<4, false, C_>),                                         \
+                                   dim3((unsigned)((lr + C_ - 1) / C_), (unsigned)((rows + 3) / 4)), dim3(kWave * C_), \
+                                   0u, (const unsigned short*)nbuf, (const void*)down->data, (long)dld, dbuf,         \
+                                   (long)rows, (int)hc, (long)HN, (long)lr)
+                if (dc == 8) HC_DROWS(8);
+                else if (dc == 4) HC_DROWS(4);
+                else HC_DROWS(kV2RowCols);
+#undef HC_DROWS
+                if (dc != kV2RowCols) {
+                    static std::once_flag said;
+                    std::call_once(said, [dc] {
+                        std::fprintf(stderr, "[xe] hc_read's columns at %d a workgroup (RADIANCE_XE_HC_DCOLS)\n", dc);
+                    });
+                }
+            }
             /* RADIANCE_XE_HC_GU=1 (owner note 200 item 1b): the gains and the up mix as one launch after the columns,
              * where the hc merge's up mix would apply (its shape conditions; the mix below is then skipped, its codes
              * still made by hc_quant_rows) */
