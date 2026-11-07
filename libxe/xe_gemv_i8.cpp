@@ -51,13 +51,16 @@ inline float gv_xor_f(float v) {
     return sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, MSK);
 }
 
-template <bool WS_BF16, int MB, bool NX = false>
+/* KC (run 209, owner note 206 item 1, RADIANCE_XE_GEMV_KC=1): the model's K as a compile-time constant (0: the
+ * runtime K), so IGC knows the group count -- the group loop's trip count and its g < G tests fold. The same groups in
+ * the same order, so the same bits. */
+template <bool WS_BF16, int MB, bool NX = false, int KC = 0>
 void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
                       const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                       uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
     const int lane = (int)threadIdx.x & 31;
     const int n = (int)blockIdx.x * ((int)blockDim.x >> 5) + ((int)threadIdx.x >> 5);   /* xe::gemv_rows_wg() */
-    const int G = K / 128;
+    const int G = (KC ? KC : K) / 128;
     const int chunk = lane & 7, gsub = lane >> 3;
     float acc[MB];
 #pragma unroll
@@ -303,11 +306,22 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
             continue;
         }
         static const bool nx = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_NX"); return e && e[0] == '1'; }();
-#define XE_GV(MB_, NX_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_>), grid, block, 0, am, a_ld, asm_, as_ld, b, b_ld, \
-                                  bs, bs_ld, ym, y_ld, N, K, mb)
-        if (mb == 1) { if (nx) XE_GV(1, true); else XE_GV(1, false); }
-        else { if (nx) XE_GV(kMaxM, true); else XE_GV(kMaxM, false); }
-#undef XE_GV
+        /* run 209 (owner note 206 item 1): the model's trunk K values (2560, 6144, 640) as compile-time instances of the
+         * NX form under RADIANCE_XE_GEMV_KC=1; any other K, or KC off, the runtime-K instance */
+        static const bool kc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_KC"); return e && e[0] == '1'; }();
+#define XE_GVK(MB_, NX_, KC_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_, KC_>), grid, block, 0, am, a_ld, asm_,   \
+                                        as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb)
+#define XE_GVX(MB_)                                                                                                 \
+        do {                                                                                                        \
+            if (kc && K == 2560) XE_GVK(MB_, true, 2560);                                                           \
+            else if (kc && K == 6144) XE_GVK(MB_, true, 6144);                                                      \
+            else if (kc && K == 640) XE_GVK(MB_, true, 640);                                                        \
+            else XE_GVK(MB_, true, 0);                                                                              \
+        } while (0)
+        if (mb == 1) { if (nx) XE_GVX(1); else XE_GVK(1, false, 0); }
+        else { if (nx) XE_GVX(kMaxM); else XE_GVK(kMaxM, false, 0); }
+#undef XE_GVX
+#undef XE_GVK
     }
 }
 

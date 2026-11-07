@@ -179,7 +179,10 @@ constexpr uint32_t kMaxK = 4096;
 /* SEL (run 206): RADIANCE_XE_I4I8_RUN_SEL's select-chain decode as a template argument -- as a runtime one (run 205,
  * image 253) its dead branch cost the default instance +9-11 % a launch (M300 vs M292: gate_up 115 -> 125 us, down
  * 66.8 -> 74.2); `sel` stays in the signature, unread. */
-template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false>
+/* KC (run 209, owner note 206 item 1, RADIANCE_XE_I4I8_KC=1): both classes' K as one compile-time constant (0: the
+ * runtime c.k) for the shapes where c0.k == c1.k (gate_up's 2560); a live row's loops then have a known trip count.
+ * The same reads and sums in the same order, so the same bits. */
+template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -228,7 +231,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
         }
     }
     const ICls& c = (e >= 0 && (e & 1)) ? c1 : c0;
-    const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? c.k : 0u;
+    const uint32_t fy = N / parts, fc = e >= 0 ? c.n / parts : 0u, K = e >= 0 ? (KC ? (uint32_t)KC : c.k) : 0u;
     /* The tail skip (TskipInst): the expert's table entry off the device, and a live row's rank at or past R, drops
      * the row; all of the run's live rows dropped skips the reads. Uniform over the work-group (one entry, one run). */
     bool all_skip = false;
@@ -973,6 +976,12 @@ bool run_grf() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_RUN_GRF"); return s && *s == '1'; }();
     return v;
 }
+/* RADIANCE_XE_I4I8_KC=1 (run 209, owner note 206 item 1): the run form's K-specialised instance where both classes'
+ * K is the model's 2560 (gate_up); opt-in */
+bool run_kc() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_KC"); return s && *s == '1'; }();
+    return v;
+}
 /* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
 bool plain_forced() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
@@ -1183,7 +1192,12 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                 case 2: XE_I4I8_RUN(2, 16, 1, false); break;
                 case 3: XE_I4I8_RUN(3, 16, 1, false); break;
                 case 4: XE_I4I8_RUN(4, 16, 1, false); break;
-                case 5: XE_I4I8_RUN(5, 16, 1, false); break;
+                case 5:   /* gate_up's instance; run 209: its K = 2560 form under RADIANCE_XE_I4I8_KC=1 */
+                    if (run_kc() && cl[0].k == 2560u && cl[1].k == 2560u && !run_grf() && !((XE_I4I8_FC != 0) && run_sel()))
+                        XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<5, 16, 1, false, (XE_I4I8_FC != 0), false, 2560>), grid,
+                                     block, 0, XE_I4I8_RUN_ARGS);
+                    else XE_I4I8_RUN(5, 16, 1, false);
+                    break;
                 case 6: XE_I4I8_RUN(6, 16, 1, false); break;
                 case 7: XE_I4I8_RUN(7, 16, 1, false); break;
                 default: XE_I4I8_RUN(8, 16, 1, false); break;

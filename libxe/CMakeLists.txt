@@ -127,6 +127,11 @@ if(RAD_BUILD_TESTS)
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
   # Run 207 (owner note 203 item 2): both GEMVs at every other rows-a-work-group choice (RADIANCE_XE_GEMV_WG), whose
   # small cases' N (33, 40, 77, 130, 200 ...) leave a partial last work-group at each
+  # Run 209 (owner note 206 item 1): the K-specialised NX instances (RADIANCE_XE_GEMV_KC=1); `full` adds the trunk's
+  # K 6144 / 2560 shapes to the small cases (K 640, 2560 and the odd ones on the runtime-K instance)
+  add_test(NAME xe_gemv_i8_kc_cpu COMMAND xe_gemv_i8_test full)
+  set_tests_properties(xe_gemv_i8_kc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_NX=1;RADIANCE_XE_GEMV_KC=1" TIMEOUT 1800)
   foreach(_wg 4 16 32)
     add_test(NAME xe_gemv_i8_wg${_wg}_cpu COMMAND xe_gemv_i8_test)
     set_tests_properties(xe_gemv_i8_wg${_wg}_cpu PROPERTIES LABELS "xe"
@@ -158,6 +163,9 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_i4i8_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
   set_tests_properties(xe_moe_i4i8_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  add_test(NAME xe_moe_i4i8_kc_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)   # run 209: RADIANCE_XE_I4I8_KC=1
+  set_tests_properties(xe_moe_i4i8_kc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_KC=1" TIMEOUT 600)
   # run 205 (owner note 202 A.3): the run form's select-chain decode (RADIANCE_XE_I4I8_RUN_SEL=1) against the SLM
   # table, every case's output bytes compared
   add_test(NAME xe_moe_i4i8_sel_cpu COMMAND sh -c
@@ -342,6 +350,11 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_fc_tile_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
   set_tests_properties(xe_fc_tile_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
+  # Run 209 (owner note 206 item 1): format C's K-specialised gate_up instance (RADIANCE_XE_I4I8_KC=1) against the
+  # probe's T1 bytes at gate_up's shape (K 2560 / 2560)
+  add_test(NAME xe_fc_tile_kc_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
+  set_tests_properties(xe_fc_tile_kc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_KC=1" TIMEOUT 1200)
   # run 193 (owner note 191 item 2): the pair mode once (1 launch, 1 run) on the CPU device -- its three queue forms'
   # outputs compared byte for byte (the times mean nothing there)
   add_test(NAME xe_fc_tile_pair_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 1 1)
