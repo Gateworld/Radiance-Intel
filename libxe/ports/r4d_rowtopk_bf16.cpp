@@ -288,7 +288,8 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   /* run 208 (owner note 204 item 1, RADIANCE_XE_TOPK_GRF=1): both stages with the large register file -- at 128 GRF
    * IGC 2.42.6 spills stage 1<8>'s 131 and stage 2's 194 variables to scratch (igcdump-a204, m3/isa_hist.py); stage 2
    * is one wave a row. The same code, so the same bits; the CPU device takes the plain launch. lds is 0 in both. */
-  static const bool tk_grf = [] { const char* e = std::getenv("RADIANCE_XE_TOPK_GRF"); return e && e[0] == '1'; }();
+  /* the default since run 212 (owner, H146 +2.6 % with the other three); RADIANCE_XE_TOPK_GRF=0 opts out */
+  static const bool tk_grf = [] { const char* e = std::getenv("RADIANCE_XE_TOPK_GRF"); return !(e && e[0] == '0'); }();
 #define R4D_TK_S1_ARGS (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH
 #define R4D_TK_S1(PT) emit_rc = tk_grf                                                                  \
         ? (XE_LAUNCH_GGL_GRF256((r4d_rowtopk_stage1_kernel<PT>),                                        \

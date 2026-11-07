@@ -2410,7 +2410,8 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
                                 dim3((NWV) * kWave), 0, stream, R4D_RTS_ARGS), 0)               \
         : R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1),      \
                    dim3((NWV) * kWave), 0, R4D_RTS_ARGS)
-    static const bool router_grf_on = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_GRF"); return e && e[0] == '1'; }();
+    /* the default since run 212 (owner, H146 +2.6 % with the other three); RADIANCE_XE_ROUTER_GRF=0 opts out */
+    static const bool router_grf_on = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_GRF"); return !(e && e[0] == '0'); }();
     auto router_grf = [] { return router_grf_on; };
     /* owner note 165 item 4 (run 174): RADIANCE_XE_ROUTE_LEAN=<n>,<margin>[,<rows>] -- lean_row above: the n
      * lowest picks, the probability margin, the largest call (rows) it applies to (16, the verify steps; a KL

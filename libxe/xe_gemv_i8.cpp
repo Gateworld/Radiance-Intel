@@ -314,7 +314,8 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         static const bool kc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_KC"); return e && e[0] == '1'; }();
         /* run 211 (owner note 206 item 2): the weight loads' LSC cache-control hint, RADIANCE_XE_GEMV_WCC = 2 (L1
          * uncached, L3 cached), 5 (L1 streaming, L3 uncached) or 6 (L1 streaming, L3 cached); else the default */
-        static const int wcc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_WCC"); return e ? std::atoi(e) : 0; }();
+        /* 5 the default since run 212 (owner, H146 +2.6 % with the three GRF launches); RADIANCE_XE_GEMV_WCC=0 opts out */
+        static const int wcc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_WCC"); return e ? std::atoi(e) : 5; }();
 #define XE_GVK(MB_, NX_, KC_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_, KC_>), grid, block, 0, am, a_ld, asm_,   \
                                         as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb)
 #define XE_GVW(MB_, WCC_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, true, 0, WCC_>), grid, block, 0, am, a_ld, asm_, \
