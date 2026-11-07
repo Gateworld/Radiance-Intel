@@ -181,10 +181,10 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
                 ok ? "PASS" : "FAIL", worst, canary ? "ok" : "BROKEN");
     if (reps) std::printf("    %.4f ms, %.1f GB/s of weight\n", ms, (double)joined.size() / (ms * 1e6) + (double)N * K / 4 / (ms * 1e6));
     /* run 123 (owner note 151 C): the rows form (RADIANCE_XE_W2A8_R=2 / 4) must give the same bytes; run 189 (owner
-     * note 183 item 1): and each with its quads by DP4A (RADIANCE_XE_W2A8_DP4=1) */
-    for (int fd : { 2, 4, 12, 14 }) {
-        const int form = fd % 10;
-        const bool d4 = fd >= 10;
+     * note 183 item 1): and each with its quads by DP4A (RADIANCE_XE_W2A8_DP4=1); run 212: and the wide form (=16) */
+    for (int fd : { 2, 4, 12, 14, 16 }) {
+        const int form = fd == 16 ? 16 : fd % 10;
+        const bool d4 = fd == 12 || fd == 14;
         char v[4];
         std::snprintf(v, sizeof v, "%d", form);
         setenv("RADIANCE_XE_W2A8_R", v, 1);
