@@ -340,8 +340,12 @@ struct W2Vocab {
     std::vector<W2VocabDev> dev;
 };
 /* The rank's rows: a sharded head (the architecture passes `vocab_off`, rad_block_mtp_hc.h) owns global rows
- * [off, off + N), so the list's ids in that range, less off; replicated, off 0 and every id must be < N. */
+ * [off, off + N), so the list's ids in that range, less off -- off 0 included (rank 0); replicated (off < 0: the
+ * parameter absent), every id must be < N. */
 const int32_t* w2a8_vocab(sycl::queue* q, int N, long long off, int* nl) {
+    const bool sharded = off >= 0;
+    const long long key = off;   /* the cache's: -1 replicated, else the shard's first row */
+    if (!sharded) off = 0;
     static std::mutex m;
     static W2Vocab v;
     const char* p = std::getenv("RADIANCE_XE_W2A8_VOCAB");
@@ -360,10 +364,10 @@ const int32_t* w2a8_vocab(sycl::queue* q, int N, long long off, int* nl) {
         std::fprintf(stderr, "[xe] w2a8 draft vocabulary %s: %zu ids%s\n", p, v.ids.size(),
                      v.ok ? "" : " -- unusable (empty or not ascending): the full head");
     }
-    if (!v.ok || (off == 0 && v.ids.back() >= N)) return nullptr;
+    if (!v.ok || (!sharded && v.ids.back() >= N)) return nullptr;
     const sycl::device d = q->get_device();
     for (auto& e : v.dev)
-        if (e.d == d && e.off == off && e.n == N) { *nl = e.nl; return e.rows; }
+        if (e.d == d && e.off == key && e.n == N) { *nl = e.nl; return e.rows; }
     std::vector<int32_t> loc;
     for (int32_t id : v.ids)
         if (id >= off && id < off + N) loc.push_back((int32_t)(id - off));
@@ -371,7 +375,7 @@ const int32_t* w2a8_vocab(sycl::queue* q, int N, long long off, int* nl) {
     int32_t* dp = sycl::malloc_device<int32_t>(loc.size(), *q);
     if (!dp) return nullptr;
     q->memcpy(dp, loc.data(), loc.size() * 4).wait();
-    v.dev.push_back(W2VocabDev{d, off, N, (int)loc.size(), dp});
+    v.dev.push_back(W2VocabDev{d, key, N, (int)loc.size(), dp});
     std::fprintf(stderr, "[xe] w2a8 draft vocabulary: %zu of the list's ids in rows [%lld, %lld) on this device\n",
                  loc.size(), off, off + N);
     *nl = (int)loc.size();
@@ -491,7 +495,7 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
               (const int32_t*)(R_), (int)(NL_))
                 int nl = 0;
                 const int32_t* vrows =
-                    rr == 16 ? w2a8_vocab(q, (int)N, r4d_geti_or(args, "vocab_off", 0), &nl) : nullptr;
+                    rr == 16 ? w2a8_vocab(q, (int)N, r4d_geti_or(args, "vocab_off", -1), &nl) : nullptr;
                 if (vrows) {
                     /* the draft vocabulary: every output -inf, then the listed rows over ceil(nl / 128) groups */
                     const long tot = (long)N * mb;

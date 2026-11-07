@@ -252,12 +252,14 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
         if (reps) std::printf(", %.4f ms\n", vms);
         /* the sharded head (rad_block_mtp_hc.h passes vocab_off): the same list as global ids at an offset of 1000,
          * with ids below the shard and past its end that this rank must ignore -- the same bytes */
-        const long long off = 1000;
-        std::vector<int32_t> gids = {5, 17};
+        /* run 219: and at offset 0 (a sharded head's rank 0), the list holding ids past N as well */
+        for (const long long off : { 1000LL, 0LL }) {
+        std::vector<int32_t> gids;
+        if (off) { gids.push_back(5); gids.push_back(17); }
         for (int32_t n : ids) gids.push_back((int32_t)(n + off));
         gids.push_back((int32_t)(off + N + 3));
         char gp[64];
-        std::snprintf(gp, sizeof gp, "/tmp/w2a8-vocab-g-%d-%d.ids", N, M);
+        std::snprintf(gp, sizeof gp, "/tmp/w2a8-vocab-g%lld-%d-%d.ids", off, N, M);
         FILE* g = std::fopen(gp, "wb");
         const bool gw = g && std::fwrite(gids.data(), 4, gids.size(), g) == gids.size();
         if (g) std::fclose(g);
@@ -277,9 +279,10 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
         ok &= gok;
         std::printf("    the same vocabulary as global ids, vocab_off %lld: %s\n", off,
                     gok ? "the same bytes" : "DIFFERS");
+        std::remove(gp);
+        }
         unsetenv("RADIANCE_XE_W2A8_VOCAB");
         std::remove(vp);
-        std::remove(gp);
     }
     unsetenv("RADIANCE_XE_W2A8_R");
     unsetenv("RADIANCE_XE_W2A8_DP4");
