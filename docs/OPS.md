@@ -696,7 +696,7 @@ may not have arrived.
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `vocab_off`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
@@ -738,7 +738,11 @@ linear (a rank's share of a weight whose rows do not divide among the ranks, iss
 libr4d's narrow fp8a8 and i8a8 kernels pick their K split from N alone, and the split sets the order
 K partials are summed in, so a slice given the whole width sums each output as the whole linear
 does and its outputs are the linear's to the bit. Absent, N. The host libraries never split K and
-ignore it. libr4d's kernels compute the same products in another order (split-K
+ignore it.
+
+`vocab_off` is a row-sharded product's first global row: the vocab-parallel 2-bit draft head passes
+it as its `row_topk` does. The product does not depend on it; libxe reads it to address a draft
+vocabulary of global ids (`RADIANCE_XE_W2A8_VOCAB`); every other library ignores it. Absent, 0. libr4d's kernels compute the same products in another order (split-K
 partials, the activation scale applied at the store); libavx folds the scales into its decoded rows,
 each product rounding once where libref rounds each group's sub-sum. A `b_scale` that is not joined
 at these grids has no zero to read and is refused (`RAD_E_DTYPE`). libref describes none of them

@@ -317,10 +317,12 @@ static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
-/* `split_n` is libr4d's (docs/OPS.md): ref never splits K, so it accepts and ignores it. */
+/* `split_n` is libr4d's (docs/OPS.md): ref never splits K, so it accepts and ignores it. `vocab_off`
+ * (run 219): a row-sharded product's first global row (the vocab-parallel draft head, as row_topk
+ * takes it); the product itself does not depend on it, so ref accepts and ignores it too. */
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                        P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                       P_INTO("split_n") };
+                                       P_INTO("split_n"), P_INTO("vocab_off") };
 /* The bias form has no parts (`pb1`/`pb2`); only the plain product supports them. */
 static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                            P_STR("dtype") };

@@ -797,6 +797,9 @@ static const RadParamSpec pGemmNtQ[] = {
     /* The width whose K split a row slice of a wider linear takes (docs/OPS.md); only the narrow
      * fp8a8 / i8a8 rows split K by N, and they read it. */
     { "split_n", RAD_P_INT, RAD_OPTIONAL },
+    /* A row-sharded product's first global row (the vocab-parallel draft head, as row_topk takes
+     * it; docs/OPS.md). The product does not depend on it; libr4d's rows ignore it. */
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand. RadLayout can declare aux streams beside a weight, but
