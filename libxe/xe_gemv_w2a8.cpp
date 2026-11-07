@@ -304,12 +304,12 @@ void gemv_w2a8_wide_kernel(const int8_t* __restrict__ a, long a_ld, const float*
     }
 }
 
-/* RADIANCE_XE_W2A8_R: the rows form (owner note 151 C, run 123) -- the default R=2 since owner note 155
- * (bit-identical); 4 the wider form, 16 the wide form above (run 212, opt-in until timed), 0 one row a sub-group.
- * Read at every call (a few a step), so a test can compare the forms in one process. */
+/* RADIANCE_XE_W2A8_R: 16 the wide form above, the default since run 218 (owner, H147 +3.1 %, M354 85.67 tok/s,
+ * bit-identical); 2 the rows form (owner note 151 C, run 123; the default from note 155 to run 218), 4 the wider rows
+ * form, 0 one row a sub-group. Read at every call (a few a step), so a test can compare the forms in one process. */
 int w2a8_rows() {
     const char* v = std::getenv("RADIANCE_XE_W2A8_R");
-    const int r = v ? std::atoi(v) : 2;
+    const int r = v ? std::atoi(v) : 16;
     return r == 2 || r == 4 || r == 16 ? r : 0;
 }
 /* RADIANCE_XE_W2A8_DP4=1 (owner note 183 item 1, opt-in until timed): the rows form's quads by DP4A (kD4 above). Read

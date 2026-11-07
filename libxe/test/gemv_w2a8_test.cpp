@@ -136,7 +136,7 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
     t[3].rank = 1; t[3].shape[0] = lay.bytes; t[3].stride[0] = 1;
     RadArgs args{};
     args.t = t; args.n_t = 6; args.p = p; args.n_p = 5;
-    setenv("RADIANCE_XE_W2A8_R", "0", 1);   /* the one-row form, the reference (unset is R=2 since owner note 155) */
+    setenv("RADIANCE_XE_W2A8_R", "0", 1);   /* the one-row form, the reference (unset is R=16 since run 218) */
     if (xe_rad_gemm_w2a8_gemv(&args, (RadStream)&q) != RAD_OK) { std::printf("  launch refused\n"); return {false, 0, 0}; }
     q.wait_and_throw();
     double ms = 0;
