@@ -32,6 +32,7 @@
 #include <cstring>
 
 #include "xe_dp4a.h"   /* run 207 (owner note 203 item 1): the GEMV's dot by IGC's dp4a builtin on the card */
+#include "xe_lsc.h"    /* run 211 (owner note 206 item 2): the weight loads' cache-control hints */
 
 namespace {
 
@@ -54,7 +55,9 @@ inline float gv_xor_f(float v) {
 /* KC (run 209, owner note 206 item 1, RADIANCE_XE_GEMV_KC=1): the model's K as a compile-time constant (0: the
  * runtime K), so IGC knows the group count -- the group loop's trip count and its g < G tests fold. The same groups in
  * the same order, so the same bits. */
-template <bool WS_BF16, int MB, bool NX = false, int KC = 0>
+/* WCC (run 211, owner note 206 item 2, RADIANCE_XE_GEMV_WCC=2 / 5 / 6): the weight row's 16-byte loads with an LSC
+ * cache-control hint (xe_lsc.h; the weights are read once a step); 0 the default policy. The same bytes. */
+template <bool WS_BF16, int MB, bool NX = false, int KC = 0, int WCC = 0>
 void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
                       const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                       uint16_t* __restrict__ y, long y_ld, int N, int K, int M) {
@@ -71,7 +74,7 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
         const int g = g0 + gsub;
         const bool gl = live && g < G;
         uint4 w = {0, 0, 0, 0};
-        if (gl) w = *(const uint4*)(brow + (size_t)g * 128 + chunk * 16);
+        if (gl) w = xe_ld16<WCC>(brow + (size_t)g * 128 + chunk * 16);
         float sb = 0.0f;
         if (gl) sb = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)bs)[(size_t)n * bs_ld + g] << 16)
                              : ((const float*)bs)[(size_t)n * bs_ld + g];
@@ -309,18 +312,27 @@ void launch(sycl::queue* q, const int8_t* a, long a_ld, const float* as, long as
         /* run 209 (owner note 206 item 1): the model's trunk K values (2560, 6144, 640) as compile-time instances of the
          * NX form under RADIANCE_XE_GEMV_KC=1; any other K, or KC off, the runtime-K instance */
         static const bool kc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_KC"); return e && e[0] == '1'; }();
+        /* run 211 (owner note 206 item 2): the weight loads' LSC cache-control hint, RADIANCE_XE_GEMV_WCC = 2 (L1
+         * uncached, L3 cached), 5 (L1 streaming, L3 uncached) or 6 (L1 streaming, L3 cached); else the default */
+        static const int wcc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_WCC"); return e ? std::atoi(e) : 0; }();
 #define XE_GVK(MB_, NX_, KC_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, NX_, KC_>), grid, block, 0, am, a_ld, asm_,   \
                                         as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb)
+#define XE_GVW(MB_, WCC_) XE_LAUNCH(q, (gemv_i8a8_kernel<WS_BF16, MB_, true, 0, WCC_>), grid, block, 0, am, a_ld, asm_, \
+                                    as_ld, b, b_ld, bs, bs_ld, ym, y_ld, N, K, mb)
 #define XE_GVX(MB_)                                                                                                 \
         do {                                                                                                        \
             if (kc && K == 2560) XE_GVK(MB_, true, 2560);                                                           \
             else if (kc && K == 6144) XE_GVK(MB_, true, 6144);                                                      \
             else if (kc && K == 640) XE_GVK(MB_, true, 640);                                                        \
+            else if (wcc == 2) XE_GVW(MB_, 2);                                                                      \
+            else if (wcc == 5) XE_GVW(MB_, 5);                                                                      \
+            else if (wcc == 6) XE_GVW(MB_, 6);                                                                      \
             else XE_GVK(MB_, true, 0);                                                                              \
         } while (0)
         if (mb == 1) { if (nx) XE_GVX(1); else XE_GVK(1, false, 0); }
         else { if (nx) XE_GVX(kMaxM); else XE_GVK(kMaxM, false, 0); }
 #undef XE_GVX
+#undef XE_GVW
 #undef XE_GVK
     }
 }

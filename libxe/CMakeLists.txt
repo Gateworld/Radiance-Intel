@@ -129,6 +129,11 @@ if(RAD_BUILD_TESTS)
   # small cases' N (33, 40, 77, 130, 200 ...) leave a partial last work-group at each
   # Run 209 (owner note 206 item 1): the K-specialised NX instances (RADIANCE_XE_GEMV_KC=1); `full` adds the trunk's
   # K 6144 / 2560 shapes to the small cases (K 640, 2560 and the odd ones on the runtime-K instance)
+  # Run 211 (owner note 206 item 2): the cache-hinted weight loads (RADIANCE_XE_GEMV_WCC; on the CPU the plain load,
+  # so this checks the dispatch) on the NX form
+  add_test(NAME xe_gemv_i8_wcc_cpu COMMAND xe_gemv_i8_test)
+  set_tests_properties(xe_gemv_i8_wcc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_NX=1;RADIANCE_XE_GEMV_WCC=5" TIMEOUT 600)
   add_test(NAME xe_gemv_i8_kc_cpu COMMAND xe_gemv_i8_test full)
   set_tests_properties(xe_gemv_i8_kc_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_NX=1;RADIANCE_XE_GEMV_KC=1" TIMEOUT 1800)
@@ -352,6 +357,9 @@ if(RAD_BUILD_TESTS)
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
   # Run 209 (owner note 206 item 1): format C's K-specialised gate_up instance (RADIANCE_XE_I4I8_KC=1) against the
   # probe's T1 bytes at gate_up's shape (K 2560 / 2560)
+  add_test(NAME xe_fc_tile_wcc_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)   # run 211: RADIANCE_XE_I4I8_WCC=5
+  set_tests_properties(xe_fc_tile_wcc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_WCC=5" TIMEOUT 1200)
   add_test(NAME xe_fc_tile_kc_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
   set_tests_properties(xe_fc_tile_kc_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_KC=1" TIMEOUT 1200)

@@ -25,6 +25,7 @@
  */
 #include "xe_lanes.h"
 #include "xe_dp4a.h"   /* run 207: dp4 by IGC's dp4a builtin on the card */
+#include "xe_lsc.h"    /* run 211 (owner note 206 item 2): the codes' cache-control hints */
 #include "r4d_args.h"
 #include "rad_planes.h"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>   /* the matrix-unit form (run 164) */
@@ -182,7 +183,9 @@ constexpr uint32_t kMaxK = 4096;
 /* KC (run 209, owner note 206 item 1, RADIANCE_XE_I4I8_KC=1): both classes' K as one compile-time constant (0: the
  * runtime c.k) for the shapes where c0.k == c1.k (gate_up's 2560); a live row's loops then have a known trip count.
  * The same reads and sums in the same order, so the same bits. */
-template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0>
+/* WCC (run 211, owner note 206 item 2, RADIANCE_XE_I4I8_WCC=2 / 5 / 6): the expert codes' 16-byte loads with an LSC
+ * cache-control hint (xe_lsc.h; the codes are read once a step); 0 the default policy. The same bytes. */
+template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0, int WCC = 0>
 void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -382,7 +385,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                 const uint32_t jc = GL ? 2u * ((uint32_t)l + (uint32_t)u * LPR) + (uint32_t)ch : (uint32_t)l + (uint32_t)u * LPR;
 #pragma unroll
                 for (int r = 0; r < R; ++r)
-                    w[u][r][ch] = (jc < CPR && rowok[r]) ? *(const uint4*)(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
+                    w[u][r][ch] = (jc < CPR && rowok[r]) ? xe_ld16<WCC>(we + (size_t)rowr[r] * c.w_ld + jc * 16u)
                                                          : uint4{0, 0, 0, 0};
             }
 #pragma unroll
@@ -982,6 +985,13 @@ bool run_kc() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_KC"); return s && *s == '1'; }();
     return v;
 }
+/* RADIANCE_XE_I4I8_WCC = 2 / 5 / 6 (run 211, owner note 206 item 2): the codes' LSC cache-control hint on the two
+ * decode instances (gate_up's run<5,16,1>, down's run<3,2,2>); else 0, the default policy; opt-in */
+int run_wcc() {
+    static const int v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_WCC"); const int w = s ? std::atoi(s) : 0;
+                              return (w == 2 || w == 5 || w == 6) ? w : 0; }();
+    return v;
+}
 /* RADIANCE_XE_I4I8_PLAIN=1: the plain form only (a sub-group an output), for A/B and as the reference form */
 bool plain_forced() {
     static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_PLAIN"); return s && *s == '1'; }();
@@ -1182,10 +1192,25 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
         else XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, F>), grid, block, 0, XE_I4I8_RUN_ARGS);   \
     } while (0)
 #define XE_I4I8_RUN(U, L, R, G) XE_I4I8_RUN_F(U, L, R, G, (XE_I4I8_FC != 0))
+/* run 211 (owner note 206 item 2): a decode instance with the codes' cache-control hint W, when RADIANCE_XE_I4I8_WCC
+ * asks for it and neither GRF nor SEL is on (their own instances keep the default policy) */
+#define XE_I4I8_WCC_OK (run_wcc() && !run_grf() && !((XE_I4I8_FC != 0) && run_sel()))
+#define XE_I4I8_RUN_W(U, L, R, G, W)                                                                          \
+    XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<U, L, R, G, (XE_I4I8_FC != 0), false, 0, W>), grid, block, 0,  \
+                 XE_I4I8_RUN_ARGS)
+#define XE_I4I8_RUN_WX(U, L, R, G)                                                                            \
+    do {                                                                                                      \
+        if (run_wcc() == 2) XE_I4I8_RUN_W(U, L, R, G, 2);                                                     \
+        else if (run_wcc() == 5) XE_I4I8_RUN_W(U, L, R, G, 5);                                                \
+        else XE_I4I8_RUN_W(U, L, R, G, 6);                                                                    \
+    } while (0)
             if (gl) switch (upl) {
                 case 1: XE_I4I8_RUN(1, 2, 2, true); break;
                 case 2: XE_I4I8_RUN(2, 2, 2, true); break;
-                case 3: XE_I4I8_RUN(3, 2, 2, true); break;
+                case 3:   /* down's instance; run 211: its cache-hinted forms under RADIANCE_XE_I4I8_WCC */
+                    if (XE_I4I8_WCC_OK) XE_I4I8_RUN_WX(3, 2, 2, true);
+                    else XE_I4I8_RUN(3, 2, 2, true);
+                    break;
                 default: XE_I4I8_RUN(4, 2, 2, true); break;
             } else switch (upl) {
                 case 1: XE_I4I8_RUN(1, 16, 1, false); break;
@@ -1196,6 +1221,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                     if (run_kc() && cl[0].k == 2560u && cl[1].k == 2560u && !run_grf() && !((XE_I4I8_FC != 0) && run_sel()))
                         XE_LAUNCH_SG(16, qq, (moe_i4i8_run_kernel<5, 16, 1, false, (XE_I4I8_FC != 0), false, 2560>), grid,
                                      block, 0, XE_I4I8_RUN_ARGS);
+                    else if (XE_I4I8_WCC_OK) XE_I4I8_RUN_WX(5, 16, 1, false);   /* run 211: the cache-hinted forms */
                     else XE_I4I8_RUN(5, 16, 1, false);
                     break;
                 case 6: XE_I4I8_RUN(6, 16, 1, false); break;
@@ -1203,6 +1229,9 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                 default: XE_I4I8_RUN(8, 16, 1, false); break;
             }
 #undef XE_I4I8_RUN
+#undef XE_I4I8_RUN_WX
+#undef XE_I4I8_RUN_W
+#undef XE_I4I8_WCC_OK
 #undef XE_I4I8_RUN_F
 #undef XE_I4I8_RUN_ARGS
             return RAD_OK;
