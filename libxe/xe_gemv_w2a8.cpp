@@ -327,13 +327,21 @@ void w2a8_fill_ninf_kernel(uint16_t* __restrict__ y, long y_ld, int N, int M) {
  * acceptance where the target's token is outside it (m3/vocab_cover.py: 99.98 % of a held-out corpus's top-1 inside
  * 32K). The list is read once and kept on each device the head runs on; an unreadable file, an id >= N or a list
  * out of order falls back to the full head. Only with the wide form (R=16). */
+struct W2VocabDev {
+    sycl::device d;
+    long long off;
+    int n, nl;
+    int32_t* rows;
+};
 struct W2Vocab {
     std::string path;
     std::vector<int32_t> ids;
     bool ok = false;
-    std::vector<std::pair<sycl::device, int32_t*>> dev;
+    std::vector<W2VocabDev> dev;
 };
-const int32_t* w2a8_vocab(sycl::queue* q, int N, int* nl) {
+/* The rank's rows: a sharded head (the architecture passes `vocab_off`, rad_block_mtp_hc.h) owns global rows
+ * [off, off + N), so the list's ids in that range, less off; replicated, off 0 and every id must be < N. */
+const int32_t* w2a8_vocab(sycl::queue* q, int N, long long off, int* nl) {
     static std::mutex m;
     static W2Vocab v;
     const char* p = std::getenv("RADIANCE_XE_W2A8_VOCAB");
@@ -352,15 +360,21 @@ const int32_t* w2a8_vocab(sycl::queue* q, int N, int* nl) {
         std::fprintf(stderr, "[xe] w2a8 draft vocabulary %s: %zu ids%s\n", p, v.ids.size(),
                      v.ok ? "" : " -- unusable (empty or not ascending): the full head");
     }
-    if (!v.ok || v.ids.back() >= N) return nullptr;
+    if (!v.ok || (off == 0 && v.ids.back() >= N)) return nullptr;
     const sycl::device d = q->get_device();
     for (auto& e : v.dev)
-        if (e.first == d) { *nl = (int)v.ids.size(); return e.second; }
-    int32_t* dp = sycl::malloc_device<int32_t>(v.ids.size(), *q);
+        if (e.d == d && e.off == off && e.n == N) { *nl = e.nl; return e.rows; }
+    std::vector<int32_t> loc;
+    for (int32_t id : v.ids)
+        if (id >= off && id < off + N) loc.push_back((int32_t)(id - off));
+    if (loc.empty()) return nullptr;
+    int32_t* dp = sycl::malloc_device<int32_t>(loc.size(), *q);
     if (!dp) return nullptr;
-    q->memcpy(dp, v.ids.data(), v.ids.size() * 4).wait();
-    v.dev.emplace_back(d, dp);
-    *nl = (int)v.ids.size();
+    q->memcpy(dp, loc.data(), loc.size() * 4).wait();
+    v.dev.push_back(W2VocabDev{d, off, N, (int)loc.size(), dp});
+    std::fprintf(stderr, "[xe] w2a8 draft vocabulary: %zu of the list's ids in rows [%lld, %lld) on this device\n",
+                 loc.size(), off, off + N);
+    *nl = (int)loc.size();
     return dp;
 }
 
@@ -476,7 +490,8 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
               (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld, (int)N, (int)K, mb, (uint32_t)RAD_U8, \
               (const int32_t*)(R_), (int)(NL_))
                 int nl = 0;
-                const int32_t* vrows = rr == 16 ? w2a8_vocab(q, (int)N, &nl) : nullptr;
+                const int32_t* vrows =
+                    rr == 16 ? w2a8_vocab(q, (int)N, r4d_geti_or(args, "vocab_off", 0), &nl) : nullptr;
                 if (vrows) {
                     /* the draft vocabulary: every output -inf, then the listed rows over ceil(nl / 128) groups */
                     const long tot = (long)N * mb;

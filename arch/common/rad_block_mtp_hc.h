@@ -360,12 +360,23 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {w.hout}, {w.dq, w.ds, w.dsum});
-        op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                      RAD_INT("N", hrows), RAD_INT("K", g.n_embd),
-                                      RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w2a8")),
-                           RAD_WEIGHTS(w_dh, w_dhs)),
-                       {w.dq, w.ds, w.dsum}, {w.dlog});
+        /* Sharded, the product is also told the rank's first row (`vocab_off`, as the top-R below), so a
+         * kernel that reads it can address global ids (libxe's draft vocabulary, owner note 207 A3a);
+         * kernels that don't ignore it. Replicated, the declaration is unchanged. */
+        op_dlogits = dh_shard
+            ? rw(b, RAD_OP(b, "gemm_nt_q",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                               RAD_INT("N", hrows), RAD_INT("K", g.n_embd),
+                               RAD_INT("group", MTP_W2_GROUP), RAD_INT("vocab_off", g.vocab_off),
+                               RAD_STR("dtype", "w2a8")),
+                    RAD_WEIGHTS(w_dh, w_dhs)),
+                 {w.dq, w.ds, w.dsum}, {w.dlog})
+            : rw(b, RAD_OP(b, "gemm_nt_q",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                               RAD_INT("N", hrows), RAD_INT("K", g.n_embd),
+                               RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w2a8")),
+                    RAD_WEIGHTS(w_dh, w_dhs)),
+                 {w.dq, w.ds, w.dsum}, {w.dlog});
         /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the
          * pair plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter
          * present with value 0 is a different declaration from an absent one. */

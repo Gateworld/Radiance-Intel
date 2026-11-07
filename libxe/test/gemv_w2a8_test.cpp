@@ -250,8 +250,36 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
                     vok ? "listed rows = the one-row form's bytes, the rest -inf" : "WRONG (bytes, -inf or canaries)",
                     reps ? "" : "\n");
         if (reps) std::printf(", %.4f ms\n", vms);
+        /* the sharded head (rad_block_mtp_hc.h passes vocab_off): the same list as global ids at an offset of 1000,
+         * with ids below the shard and past its end that this rank must ignore -- the same bytes */
+        const long long off = 1000;
+        std::vector<int32_t> gids = {5, 17};
+        for (int32_t n : ids) gids.push_back((int32_t)(n + off));
+        gids.push_back((int32_t)(off + N + 3));
+        char gp[64];
+        std::snprintf(gp, sizeof gp, "/tmp/w2a8-vocab-g-%d-%d.ids", N, M);
+        FILE* g = std::fopen(gp, "wb");
+        const bool gw = g && std::fwrite(gids.data(), 4, gids.size(), g) == gids.size();
+        if (g) std::fclose(g);
+        setenv("RADIANCE_XE_W2A8_VOCAB", gp, 1);
+        RadParam p6[6];
+        for (int k = 0; k < 5; ++k) p6[k] = p[k];
+        p6[5] = RadParam{};
+        p6[5].key = "vocab_off"; p6[5].kind = RAD_P_INT; p6[5].ival = off;
+        RadArgs args6 = args;
+        args6.p = p6; args6.n_p = 6;
+        q.memset(dyb, kPat, ybytes + 2 * kCanary).wait();
+        const bool grc = gw && xe_rad_gemm_w2a8_gemv(&args6, (RadStream)&q) == RAD_OK;
+        q.wait_and_throw();
+        std::vector<uint8_t> hg(ybytes + 2 * kCanary);
+        q.memcpy(hg.data(), dyb, hg.size()).wait();
+        const bool gok = grc && std::memcmp(hg.data(), hv.data(), hg.size()) == 0;
+        ok &= gok;
+        std::printf("    the same vocabulary as global ids, vocab_off %lld: %s\n", off,
+                    gok ? "the same bytes" : "DIFFERS");
         unsetenv("RADIANCE_XE_W2A8_VOCAB");
         std::remove(vp);
+        std::remove(gp);
     }
     unsetenv("RADIANCE_XE_W2A8_R");
     unsetenv("RADIANCE_XE_W2A8_DP4");

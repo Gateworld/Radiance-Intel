@@ -9180,12 +9180,14 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         int world, rank;
         uint64_t graph, steps;
     };
+    /* run 219 (owner note 207 A3a): at 2 and 4 ranks the sharded 2-bit draft head's gemm_nt_q also declares
+     * `vocab_off` (rad_block_mtp_hc.h), so those four pins moved; one rank (the replicated head) did not */
     const Case cases[] = {
         { "qwen4exp_fp8", 1, 0, 0x69452dc1ce68a97bull, 0x2336609a1b43619aull },
-        { "qwen4exp_fp8", 2, 0, 0x524c34b11c99b839ull, 0x015b49fbefdbadd3ull },
-        { "qwen4exp_fp8", 2, 1, 0x33288d8053f171ceull, 0xaf58ef06853789f7ull },
-        { "qwen4exp_fp8", 4, 0, 0x22f6ba6125e49a65ull, 0xc8e5cc7d7cf087b7ull },
-        { "qwen4exp_fp8", 4, 3, 0xbb2c59dc2026e70dull, 0xfa44d61b25895befull },
+        { "qwen4exp_fp8", 2, 0, 0xf09a89dfba87500full, 0x58b65f4af1a72fa1ull },
+        { "qwen4exp_fp8", 2, 1, 0x90a5ca5c3b74abecull, 0x0353108bc53adfcfull },
+        { "qwen4exp_fp8", 4, 0, 0x95dc8fdbf29f9f99ull, 0x27bc3169bc753437ull },
+        { "qwen4exp_fp8", 4, 3, 0x3a02e8e55009d0f6ull, 0xd0a266ae9435cdb7ull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
         { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
         { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
