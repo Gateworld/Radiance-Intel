@@ -987,6 +987,18 @@ bool ntape_edges() {
     return v;
 }
 std::unordered_map<std::string, NProfAcc>& nprof_edges() { static std::unordered_map<std::string, NProfAcc> m; return m; }
+/* RADIANCE_L0_NTAPE_PERDEV=1 (Intel port, run 220, owner note 207 item B7: the rank skew of the two cards' power caps),
+ * with the profiler on: the same kernel times kept per device as well, and each device's total and its top kernels --
+ * the all-reduce among them -- reported after the merged table. A rank that waits for its peer spends the wait inside
+ * the all-reduce kernel, so the two devices' all-reduce times differ by the skew. Profiling only. */
+bool ntape_perdev() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_L0_NTAPE_PERDEV"); return e && e[0] == '1'; }();
+    return v;
+}
+std::unordered_map<std::string, NProfAcc>& nprof_dev_acc(int d) {
+    static std::unordered_map<std::string, NProfAcc> m[kMaxDevices];
+    return m[d];
+}
 ZeDev& zedev(int d) { static ZeDev z[kMaxDevices]; return z[d]; }
 using AppendFn = ze_result_t (*)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t,
                                  uint32_t, ze_event_handle_t*);
@@ -1291,6 +1303,11 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, ui
             NProfAcc& acc = nprof_acc()[nm];
             acc.ticks += d;
             acc.count += 1;
+            if (ntape_perdev()) {
+                NProfAcc& da = nprof_dev_acc((int)(&Z - &zedev(0)))[nm];
+                da.ticks += d;
+                da.count += 1;
+            }
         }
         if (p.n > 0) {   /* the timeline: this play's span, its inner gaps */
             NTimeline& tl = ntimeline()[&Z];
@@ -1329,6 +1346,23 @@ void n_prof_harvest(ZeDev& Z, ze_command_list_handle_t l, bool played_before, ui
                 if (nm.size() > 96) nm.resize(96);
                 RAD_INFO("  %6.1f%%  %8.1f ms  %8llu x  %7.1f us  %s", 100.0 * a.ticks / (tot ? tot : 1), a.ticks * Z.timer_ns * 1e-6,
                          (unsigned long long)a.count, a.count ? a.ticks * Z.timer_ns * 1e-3 / a.count : 0.0, nm.c_str());
+            }
+            if (ntape_perdev()) {   /* each device's total and top 8 (the all-reduce's wait is in its kernel's time) */
+                for (int dv = 0; dv < kMaxDevices; ++dv) {
+                    const auto& dm = nprof_dev_acc(dv);
+                    if (dm.empty()) continue;
+                    std::vector<std::pair<std::string, NProfAcc>> dr(dm.begin(), dm.end());
+                    std::sort(dr.begin(), dr.end(), [](const auto& x, const auto& y) { return x.second.ticks > y.second.ticks; });
+                    uint64_t dt = 0;
+                    for (const auto& r : dr) dt += r.second.ticks;
+                    RAD_INFO("l0 tape profile, device %d: %.1f ms of device time; the top 8:", dv, dt * Z.timer_ns * 1e-6);
+                    for (size_t i = 0; i < dr.size() && i < 8; ++i) {
+                        const NProfAcc& a = dr[i].second;
+                        RAD_INFO("  dev %d  %8.1f ms  %8llu x  %7.1f us  %s", dv, a.ticks * Z.timer_ns * 1e-6,
+                                 (unsigned long long)a.count, a.count ? a.ticks * Z.timer_ns * 1e-3 / a.count : 0.0,
+                                 nprof_short(&dr[i].first).c_str());
+                    }
+                }
             }
             if (ntape_edges()) {   /* the boundaries inside plays, by pair, the most frequent first */
                 std::vector<std::pair<std::string, NProfAcc>> ed(nprof_edges().begin(), nprof_edges().end());
