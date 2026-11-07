@@ -31,8 +31,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -228,14 +233,17 @@ void gemv_w2a8_rows_kernel(const int8_t* __restrict__ a, long a_ld, const float*
  * activation. The order is the one-row form's: the exact int32 group sum (one join, xor 1), the same float
  * expression, and the group terms added into four accumulators by g mod 4 in ascending g -- the one-row form's
  * lanes 0 / 8 / 16 / 24 -- joined (A0 + A1) + (A2 + A3) as its butterfly does. So the same bytes. */
-template <int MB>
+/* LIST (run 219, owner note 207 item A3a, RADIANCE_XE_W2A8_VOCAB): the row slot i < NL computes output row rows[i]
+ * (the draft vocabulary's ids, ascending) instead of row i, with the same arithmetic -- so a listed row's bytes are
+ * the full head's; the launch fills the others with -inf first. */
+template <int MB, bool LIST = false>
 void gemv_w2a8_wide_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as,
                            const float* __restrict__ asum, long mpad, const uint8_t* __restrict__ b,
                            const uint8_t* __restrict__ bs, uint16_t* __restrict__ y, long y_ld, int N, int K, int M,
-                           uint32_t dt_u8) {
+                           uint32_t dt_u8, const int32_t* __restrict__ rows, int NL) {
     const int lane = (int)threadIdx.x & 31;
     const int half = lane & 1;
-    const int n = ((int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5)) * 16 + (lane >> 1);
+    const int i = ((int)blockIdx.x * kRowsPerWG + ((int)threadIdx.x >> 5)) * 16 + (lane >> 1);
     const int G = K / 128;
     const RadPlanesEntry* e = (const RadPlanesEntry*)(bs + sizeof(RadPlanesHeader));
     const uint8_t* sp = bs + e[0].offset;
@@ -243,7 +251,8 @@ void gemv_w2a8_wide_kernel(const int8_t* __restrict__ a, long a_ld, const float*
     const uint8_t* zp = bs + e[1].offset;
     const long z_rb = (long)e[1].row_bytes;
     const bool z8 = e[1].dtype == dt_u8;
-    const bool live = n < N;
+    const bool live = LIST ? i < NL : i < N;
+    const int n = LIST ? (live ? rows[i] : 0) : i;
     const uint8_t* brow = b + (size_t)(live ? n : 0) * (size_t)(K / 4) + half * 16;
     float acc[MB][4];
 #pragma unroll
@@ -302,6 +311,57 @@ void gemv_w2a8_wide_kernel(const int8_t* __restrict__ a, long a_ld, const float*
                                                                                  : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
         }
     }
+}
+
+/* The listed form's first launch: every output of the call's rows -inf (bf16 0xFF80), so an unlisted id never wins
+ * the draft's argmax (row_topk at R=1 on these logits). */
+void w2a8_fill_ninf_kernel(uint16_t* __restrict__ y, long y_ld, int N, int M) {
+    const long t = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (t >= (long)N * M) return;
+    y[(t / N) * y_ld + t % N] = 0xFF80u;
+}
+
+/* RADIANCE_XE_W2A8_VOCAB=FILE (run 219, owner note 207 item A3a, opt-in): the draft head computes only the ids in
+ * FILE (int32 little-endian, ascending, unique: m3/vocab_cover.py --write) and leaves the rest -inf. Exact for the
+ * served texts by construction -- the verify decides every token; a draft limited to the list can only lose
+ * acceptance where the target's token is outside it (m3/vocab_cover.py: 99.98 % of a held-out corpus's top-1 inside
+ * 32K). The list is read once and kept on each device the head runs on; an unreadable file, an id >= N or a list
+ * out of order falls back to the full head. Only with the wide form (R=16). */
+struct W2Vocab {
+    std::string path;
+    std::vector<int32_t> ids;
+    bool ok = false;
+    std::vector<std::pair<sycl::device, int32_t*>> dev;
+};
+const int32_t* w2a8_vocab(sycl::queue* q, int N, int* nl) {
+    static std::mutex m;
+    static W2Vocab v;
+    const char* p = std::getenv("RADIANCE_XE_W2A8_VOCAB");
+    if (!p || !*p) return nullptr;
+    std::lock_guard<std::mutex> lk(m);
+    if (v.path != p) {   /* a new file (the test switches): read it again; the old device copies stay allocated */
+        v = W2Vocab{};
+        v.path = p;
+        if (FILE* f = std::fopen(p, "rb")) {
+            int32_t x;
+            while (std::fread(&x, 4, 1, f) == 1) v.ids.push_back(x);
+            std::fclose(f);
+        }
+        v.ok = !v.ids.empty() && v.ids[0] >= 0;
+        for (size_t k = 1; v.ok && k < v.ids.size(); ++k) v.ok = v.ids[k] > v.ids[k - 1];
+        std::fprintf(stderr, "[xe] w2a8 draft vocabulary %s: %zu ids%s\n", p, v.ids.size(),
+                     v.ok ? "" : " -- unusable (empty or not ascending): the full head");
+    }
+    if (!v.ok || v.ids.back() >= N) return nullptr;
+    const sycl::device d = q->get_device();
+    for (auto& e : v.dev)
+        if (e.first == d) { *nl = (int)v.ids.size(); return e.second; }
+    int32_t* dp = sycl::malloc_device<int32_t>(v.ids.size(), *q);
+    if (!dp) return nullptr;
+    q->memcpy(dp, v.ids.data(), v.ids.size() * 4).wait();
+    v.dev.emplace_back(d, dp);
+    *nl = (int)v.ids.size();
+    return dp;
 }
 
 /* RADIANCE_XE_W2A8_R: 16 the wide form above, the default since run 218 (owner, H147 +3.1 %, M354 85.67 tok/s,
@@ -411,11 +471,21 @@ extern "C" int xe_rad_gemm_w2a8_gemv(const RadArgs* args, RadStream s) {
 #define XE_W2R(MB_, R_, D_) XE_LAUNCH(q, (gemv_w2a8_rows_kernel<MB_, R_, D_>), gr, block, 0, am, (long)a_ld, asm_, \
                                       sm, (long)mpad, (const uint8_t*)B->data, (const uint8_t*)BS->data, ym,     \
                                       (long)y_ld, (int)N, (int)K, mb, (uint32_t)RAD_U8)
-#define XE_W2W(MB_) XE_LAUNCH(q, (gemv_w2a8_wide_kernel<MB_>), gr, block, 0, am, (long)a_ld, asm_, sm, (long)mpad, \
-                              (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld, (int)N, (int)K, mb,   \
-                              (uint32_t)RAD_U8)
-                if (rr == 16) {
-                    if (mb == 1) XE_W2W(1); else XE_W2W(kMaxM);
+#define XE_W2W(MB_, L_, G_, R_, NL_)                                                                               \
+    XE_LAUNCH(q, (gemv_w2a8_wide_kernel<MB_, L_>), G_, block, 0, am, (long)a_ld, asm_, sm, (long)mpad,            \
+              (const uint8_t*)B->data, (const uint8_t*)BS->data, ym, (long)y_ld, (int)N, (int)K, mb, (uint32_t)RAD_U8, \
+              (const int32_t*)(R_), (int)(NL_))
+                int nl = 0;
+                const int32_t* vrows = rr == 16 ? w2a8_vocab(q, (int)N, &nl) : nullptr;
+                if (vrows) {
+                    /* the draft vocabulary: every output -inf, then the listed rows over ceil(nl / 128) groups */
+                    const long tot = (long)N * mb;
+                    XE_LAUNCH(q, w2a8_fill_ninf_kernel, dim3((unsigned)((tot + 255) / 256)), dim3(256), 0, ym,
+                              (long)y_ld, (int)N, mb);
+                    const dim3 gl((unsigned)((nl + kRowsPerWG * 16 - 1) / (kRowsPerWG * 16)));
+                    if (mb == 1) XE_W2W(1, true, gl, vrows, nl); else XE_W2W(kMaxM, true, gl, vrows, nl);
+                } else if (rr == 16) {
+                    if (mb == 1) XE_W2W(1, false, gr, nullptr, 0); else XE_W2W(kMaxM, false, gr, nullptr, 0);
                 } else if (d4) {
                     if (mb == 1) { if (rr == 2) XE_W2R(1, 2, true); else XE_W2R(1, 4, true); }
                     else { if (rr == 2) XE_W2R(kMaxM, 2, true); else XE_W2R(kMaxM, 4, true); }

@@ -207,6 +207,52 @@ Result run_case(sycl::queue& q, int M, int N, int K, bool z8, uint64_t seed, int
                     same ? "=" : "DIFFERS FROM", reps ? "" : "\n");
         if (reps) std::printf(", %.4f ms\n", fms);
     }
+    /* run 219 (owner note 207 item A3a): the wide form over a draft vocabulary (RADIANCE_XE_W2A8_VOCAB) -- every
+     * third row and the last; listed rows must be the one-row form's bytes, the others -inf (0xFF80) */
+    {
+        char vp[64];
+        std::snprintf(vp, sizeof vp, "/tmp/w2a8-vocab-%d-%d.ids", N, M);
+        std::vector<int32_t> ids;
+        for (int n = 0; n < N; n += 3) ids.push_back(n);
+        if (ids.back() != N - 1) ids.push_back(N - 1);
+        FILE* f = std::fopen(vp, "wb");
+        const bool wrote = f && std::fwrite(ids.data(), 4, ids.size(), f) == ids.size();
+        if (f) std::fclose(f);
+        setenv("RADIANCE_XE_W2A8_R", "16", 1);
+        unsetenv("RADIANCE_XE_W2A8_DP4");
+        setenv("RADIANCE_XE_W2A8_VOCAB", vp, 1);
+        q.memset(dyb, kPat, ybytes + 2 * kCanary).wait();
+        const bool rc = wrote && xe_rad_gemm_w2a8_gemv(&args, (RadStream)&q) == RAD_OK;
+        q.wait_and_throw();
+        double vms = 0;
+        if (reps > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r) xe_rad_gemm_w2a8_gemv(&args, (RadStream)&q);
+            q.wait_and_throw();
+            vms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        }
+        std::vector<uint8_t> hv(ybytes + 2 * kCanary);
+        q.memcpy(hv.data(), dyb, hv.size()).wait();
+        bool vok = rc;
+        for (size_t c = 0; c < kCanary; ++c) vok &= hv[c] == kPat && hv[kCanary + ybytes + c] == kPat;
+        std::vector<char> listed((size_t)N, 0);
+        for (int32_t n : ids) listed[(size_t)n] = 1;
+        for (int m = 0; m < M && vok; ++m)
+            for (int n = 0; n < N && vok; ++n) {
+                const size_t o = kCanary + ((size_t)m * N + n) * 2;
+                uint16_t got, want;
+                std::memcpy(&got, &hv[o], 2);
+                std::memcpy(&want, &hy[o], 2);
+                vok &= listed[(size_t)n] ? got == want : got == 0xFF80u;
+            }
+        ok &= vok;
+        std::printf("    wide form, draft vocabulary of %zu / %d rows: %s%s", ids.size(), N,
+                    vok ? "listed rows = the one-row form's bytes, the rest -inf" : "WRONG (bytes, -inf or canaries)",
+                    reps ? "" : "\n");
+        if (reps) std::printf(", %.4f ms\n", vms);
+        unsetenv("RADIANCE_XE_W2A8_VOCAB");
+        std::remove(vp);
+    }
     unsetenv("RADIANCE_XE_W2A8_R");
     unsetenv("RADIANCE_XE_W2A8_DP4");
     sycl::free(da, q); sycl::free(db, q); sycl::free(das, q); sycl::free(dsum, q); sycl::free(dbs, q); sycl::free(dyb, q);
