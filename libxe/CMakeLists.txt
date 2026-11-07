@@ -53,6 +53,19 @@ if(EXISTS ${_tla}/include/cutlass/cutlass.h)
 else()
   message(STATUS "libxe: no third_party/sycl-tla -- attn_qsa_fmha unsupported")
 endif()
+# Run 261 (owner note 209; the supervisor's fix approved 21:20 11-07): hc_read's prefill matrix-unit kernels as their
+# own module, kernels/xe/libxe_hcpf.so, so the image takes this one unit from the IGC 2.28.4 tree (2.42.6's build of
+# them hangs the first prefill chunk). r4d_hc_bf16.cpp loads it beside itself at the first >= 64-row chunk. libxe's
+# flags and includes, and rad_l0k as libxe links it: the module's launches resolve the same recorder hooks.
+add_library(xe_hcpf MODULE ${CMAKE_CURRENT_SOURCE_DIR}/hcpf/xe_hcpf.cpp)
+set_target_properties(xe_hcpf PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/radiance_home/kernels/xe
+                      PREFIX "lib" OUTPUT_NAME xe_hcpf)
+rad_l0_sycl(xe_hcpf)
+target_include_directories(xe_hcpf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                           ${CMAKE_SOURCE_DIR}/libr4d)
+target_compile_options(xe_hcpf PRIVATE -ffp-contract=off -Wno-unused-function -Wno-unused-const-variable)
+target_link_libraries(xe_hcpf PRIVATE rad_abi rad_l0k)
+add_dependencies(libxe xe_hcpf)
 # ports/ are libr4d units behind the shim: <hip/hip_runtime.h> resolves to compat/ (the shim), a
 # header edited for Xe2 to its copy in ports/ (beside the unit), and the rest to libr4d's own.
 target_include_directories(libxe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}

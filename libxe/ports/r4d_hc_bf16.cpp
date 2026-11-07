@@ -65,6 +65,9 @@
 #include <type_traits>
 #include <cstdlib>
 #include <mutex>
+#include <cstdio>
+#include <string>
+#include <dlfcn.h>   /* run 261: RADIANCE_XE_HC_PF_MOD loads xe/libxe_hcpf.so */
 #include "r4d.h"
 #include "r4d_emit.h"
 #include "xe_dp4a.h"   /* run 207: hc_dp4 by IGC's dp4a builtin on the card */
@@ -109,8 +112,8 @@ constexpr int kUpTB    = 128;    // CHANNELS a workgroup owns -- and one fp8 sca
 constexpr int kFp8Grp  = 128;
 constexpr int kDotU    = 4;      // 512-byte loads a wave keeps in flight over a long weight row
 
-__device__ __forceinline__ float sigmoidf_(float v) { return 1.0f / (1.0f + __expf(-v)); }
-__device__ __forceinline__ float siluf_(float v)    { return v * sigmoidf_(v); }
+/* run 261: sigmoidf_, siluf_, hc_h2f, e4m3x4_s8, kS8Scale and hcpf:: in one text with the prefill module */
+#include "../hcpf/xe_hcpf_dev.h"
 __device__ __forceinline__ float nbf(float v)       { return bf2f(f2bf(v)); }
 
 /* bf16 in whole registers. gfx12's compiler holds a 16-bit value in a register half: shorts written
@@ -181,9 +184,7 @@ constexpr long kHc8Step = kWave * 16;
  * FP16 at load (RADIANCE_XE_HC_F16=1, xe_hc_layout_e4m3 below): every E4M3 value is exact in FP16, so the f32
  * a code decodes to is the same either way, and only the loads change -- 2 bytes a code, the f32 group scales
  * after the 2K bytes of codes. W16 selects that form in the two dots below. */
-__device__ __forceinline__ float hc_h2f(uint32_t b) {
-    return (float)sycl::bit_cast<sycl::half>((uint16_t)(b & 0xffffu));
-}
+/* hc_h2f: hcpf/xe_hcpf_dev.h (run 261) */
 /* Eight FP16 codes, a uint4 of them, to f32 in order: the f32 e4m3x8 gives for the same E4M3 codes. */
 __device__ __forceinline__ void f16x8(const uint4& v, float* f) {
     const uint32_t w[4] = { v.x, v.y, v.z, v.w };
@@ -208,20 +209,7 @@ __device__ __forceinline__ HcCodes16<W16> hc_load16(const unsigned char* __restr
     else { c.a = *(const uint4*)(wr + e); }
     return c;
 }
-/* Intel port, run 98 (owner notes 66 / 99, RADIANCE_XE_HC_V2=5): four E4M3 codes as their values times 2^-8, by
- * the hardware's FP16 conversion. A code's low seven bits shifted left by seven are an FP16 bit pattern whose value
- * is the code's times 2^-8 -- normals and subnormals alike, since FP16's exponent bias exceeds E4M3's by 8 and its
- * subnormals cover E4M3's -- and the sign goes to bit 15. About four operations a code against e4m3_to_f32's ~13
- * (xe_lanes.h emulates v_cvt_pk_f32_fp8). The caller multiplies the group scale by 2^8 instead: every product and
- * partial sum is then the original times an exact power of two, so the scaled dot gives the same bits. The NaN code
- * (S1111111) reads as +-480 here, not NaN; quantised weights never hold it. */
-__device__ __forceinline__ void e4m3x4_s8(uint32_t w, float* f) {
-    const uint32_t a = w & 0x00ff00ffu, b = (w >> 8) & 0x00ff00ffu;     /* bytes 0 / 2 and 1 / 3, one a half */
-    const uint32_t ha = ((a & 0x007f007fu) << 7) | ((a & 0x00800080u) << 8);
-    const uint32_t hb = ((b & 0x007f007fu) << 7) | ((b & 0x00800080u) << 8);
-    f[0] = hc_h2f(ha); f[1] = hc_h2f(hb); f[2] = hc_h2f(ha >> 16); f[3] = hc_h2f(hb >> 16);
-}
-constexpr float kS8Scale = 256.0f;   /* the factor the S8 form leaves to the group scale */
+/* e4m3x4_s8 (run 98's four-codes-by-FP16 decode) and kS8Scale: hcpf/xe_hcpf_dev.h (run 261) */
 
 /* Intel port, run 125 (owner note 158, RADIANCE_XE_HC_I8=1): WI8 reads the codes as int8 -- each E4M3 group rounded to
  * int8 at its own max at load, the max / 127 moved into the group's scale (xe_hc_relayout_e4m3) -- so a code's value
@@ -2325,133 +2313,13 @@ bool xe_hc_v2_on() { return xe_hc_v2_level() >= 1; }
  *                codes by hc_quant_rows after it (V2 level 4's split).
  *
  * Not bit-identical to the per-row kernels: f32 sums in the matrix unit's order over bf16 weights rounded after the
- * scale, a tolerance check (as upstream's prefill forms against its decode ones). K is a multiple of 64. */
-namespace hcpf {
-namespace jm = sycl::ext::oneapi::experimental::matrix;
-constexpr int kSG = 16, kWv = 8, kThr = kSG * kWv;   /* 128 */
-constexpr int kRT = 8 * kWv;                         /* 64 rows a work-group */
-constexpr int kNT = 64;                              /* 64 columns: four 16-column tiles */
-constexpr int kAP = 64 + 8;                          /* the A stage's row pitch in bf16 */
-}  // namespace hcpf
-constexpr long kPfMinRows = hcpf::kRT;
-
-template <int kMode>
-void hc_pf_dpas_kernel(const unsigned short* __restrict__ A, long K,                 /* [rows, K] bf16, pitch K */
-                       const unsigned char* __restrict__ W, long wld, long grp,      /* E4M3 rows, scales after K */
-                       long nw, const unsigned short* __restrict__ injw,             /* kMode 0: hc bf16 rows of K */
-                       int hc, long rows, long n,
-                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj, long irow,
-                       const unsigned short* __restrict__ nbuf, unsigned short* __restrict__ x, long xrow) {
-    using namespace hcpf;
-    XE_SHARED(uint16_t, sA, kRT * kAP);       /* 64 rows x 64 k bf16, pitch 72 */
-    XE_SHARED(uint32_t, sB, 4 * 4 * 128);     /* [k step 4][n tile 4][packed 8 x 16 words] */
-    XE_SHARED(float, sC, kWv * 8 * 16);       /* one 8 x 16 f32 tile a sub-group */
-    XE_SHARED(uint16_t, sU, kMode == 1 ? kRT * kNT : 1);   /* kMode 1: bf16(sigmoid(u)), [64 rows][64 columns] */
-    const int  tid = (int)threadIdx.x, wave = tid / kSG, lane = tid % kSG;
-    const long m0 = (long)blockIdx.y * kRT;
-    const int  ipb = kNT / hc;                                /* kMode 1: channels a work-group owns */
-    const long i0  = (long)blockIdx.x * ipb;
-    const long n0  = (long)blockIdx.x * kNT;
-    /* the weight row behind a column of the tile: kMode 0 column n0 + c (E4M3 below nw, inject rows to nw + hc,
-     * else none), kMode 1 hc_up_mix's (stream c / ipb, channel i0 + c % ipb) */
-    auto wrow = [&](int c) -> long {
-        if constexpr (kMode == 1) return (long)(c / ipb) * n + i0 + c % ipb;
-        else return n0 + c;
-    };
-    sycl::sub_group sg = xe::sg();
-    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::a, 8, 16, jm::layout::row_major> Am;
-    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm;
-    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
-    auto lptr = [](auto* p) {
-        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
-    };
-#pragma unroll
-    for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
-    for (long k0 = 0; k0 < K; k0 += 64) {
-        xe::syncthreads();                                    /* the previous group's stages are consumed */
-        /* the rows: 64 x 64 k, eight bf16 a thread a load (zeros past `rows`) */
-        for (int idx = tid; idx < kRT * 8; idx += kThr) {
-            const int  r = idx / 8, kc = (idx % 8) * 8;
-            const long m = m0 + r;
-            uint4 v = {0u, 0u, 0u, 0u};
-            if (m < rows) v = *(const uint4*)(A + m * K + k0 + kc);
-            *(uint4*)(sA + r * kAP + kc) = v;
-        }
-        /* the weight rows: 64 columns x 64 k, eight codes a thread a load, packed */
-        for (int idx = tid; idx < kNT * 8; idx += kThr) {
-            const int  c = idx / 8, kc = (idx % 8) * 8;
-            const long j = wrow(c), kk = k0 + kc;
-            uint32_t wv[4] = {0u, 0u, 0u, 0u};
-            if (j < nw) {
-                const unsigned char* wr = W + j * wld;
-                const uint2 cd = *(const uint2*)(wr + kk);
-                const float sc = ((const float*)(wr + K))[kk / grp] * kS8Scale;
-                float f[8];
-                e4m3x4_s8(cd.x, f);
-                e4m3x4_s8(cd.y, f + 4);
-#pragma unroll
-                for (int p = 0; p < 4; ++p)
-                    wv[p] = (uint32_t)f2bf(f[2 * p] * sc) | ((uint32_t)f2bf(f[2 * p + 1] * sc) << 16);
-            } else if (kMode == 0 && injw && j < nw + hc) {
-                const uint4 v = *(const uint4*)(injw + (j - nw) * K + kk);
-                wv[0] = v.x; wv[1] = v.y; wv[2] = v.z; wv[3] = v.w;
-            }
-#pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                const int k2 = kc / 2 + p, step = k2 / 8, kw = k2 % 8;
-                sB[((step * 4 + c / 16) * 8 + kw) * 16 + (c % 16)] = wv[p];
-            }
-        }
-        xe::syncthreads();
-#pragma unroll
-        for (int step = 0; step < 4; ++step) {
-            jm::joint_matrix_load(sg, Am, lptr((sycl::ext::oneapi::bfloat16*)(sA + wave * 8 * kAP + step * 16)), (size_t)kAP);
-#pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                jm::joint_matrix_load(sg, Bm, lptr((sycl::ext::oneapi::bfloat16*)(sB + (step * 4 + t) * 128)), 32);
-                jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
-            }
-        }
-    }
-    /* the tiles out: lane = column, 8 rows a lane */
-    const float inv_hc = 1.0f / (float)hc;
-    float* sCw = sC + wave * 128;
-#pragma unroll
-    for (int t = 0; t < 4; ++t) {
-        jm::joint_matrix_store(sg, Cm[t], lptr(sCw), 16, jm::layout::row_major);
-        xe::wave_barrier();
-        const int c = t * 16 + lane;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int  rl = wave * 8 + e;
-            const long m  = m0 + rl;
-            const float v = sCw[e * 16 + lane];
-            if constexpr (kMode == 1) {
-                sU[rl * kNT + c] = f2bf(sigmoidf_(v));
-            } else if (m < rows) {
-                const long j = n0 + c;
-                if (j < nw) dout[m * nw + j] = f2bf(siluf_(v * inv_hc));
-                else if (inj && j < nw + hc) inj[m * irow + (j - nw)] = f2bf(2.0f * sigmoidf_(v * inv_hc));
-            }
-        }
-        xe::wave_barrier();
-    }
-    if constexpr (kMode == 1) {
-        xe::syncthreads();
-        for (int idx = tid; idx < kRT * ipb; idx += kThr) {
-            const int  rl = idx / ipb, ii = idx - rl * ipb;
-            const long m  = m0 + rl;
-            if (m >= rows) continue;
-            const long i = i0 + ii;
-            float acc = 0.0f;
-            for (int c = 0; c < hc; ++c)
-                acc += bf2f(sU[rl * kNT + c * ipb + ii]) * bf2f(nbuf[m * (long)hc * n + (long)c * n + i]);
-            acc *= inv_hc;
-            x[m * xrow + i] = f2bf(acc);
-        }
-    }
-}
-
+ * scale, a tolerance check (as upstream's prefill forms against its decode ones). K is a multiple of 64.
+ *
+ * Run 261 (owner note 209; the supervisor's fix approved 21:20 11-07): the two kernels (hc_pf_dpas_kernel<0> / <1>)
+ * MOVED unchanged to libxe/hcpf/xe_hcpf.cpp, a module of their own (kernels/xe/libxe_hcpf.so), so the image builds them
+ * with IGC 2.28.4 while the rest of libxe takes 2.42.6: 2.42.6's build of these two hangs the first prefill chunk
+ * (B158 / B160 / B167; pinned by B172), 2.28.4's does not (B169). The launch below calls the module's xe_hcpf_run;
+ * hcpf:: and the helpers both units use are hcpf/xe_hcpf_dev.h. */
 /* ============================================================== hc_read at the verify's rows on the matrix units
  *
  * Intel port, run 100 (owner note 105 item 3, RADIANCE_XE_HC_PF_DPAS=2: these from 2 rows, the forms above from 64).
@@ -2609,6 +2477,42 @@ int xe_hc_pf_dpas_mode(hipStream_t q) {
     return want && q->get_device().is_gpu() ? want : 0;
 }
 bool xe_hc_pf_dpas_on(hipStream_t q) { return xe_hc_pf_dpas_mode(q) >= 1; }
+
+/* Run 261 (owner note 209; the supervisor's fix approved 21:20 11-07): the prefill matrix-unit kernels
+ * (hc_pf_dpas_kernel<0> / <1>) live in their own module, xe/libxe_hcpf.so beside this library (libxe/hcpf/xe_hcpf.cpp:
+ * the same text), so the image builds that one unit with IGC 2.28.4 -- 2.42.6's build of them hangs the first prefill
+ * chunk (B158 / B160 / B167; pinned by B172), 2.28.4's does not (B169). The module loads once, at the first chunk, as
+ * xe_attn_qsa.cpp loads libxe_fmha.so (RADIANCE_XE_HC_PF_MOD_PATH: another file); without it, or if it refuses, a
+ * >= 64-row chunk takes the per-row kernels below (as PF_DPAS=0: slower, never a hang). */
+typedef int (*xe_hcpf_run_fn)(int mode, void* stream, unsigned gx, unsigned gy, const unsigned short* A, long K,
+                              const unsigned char* W, long wld, long grp, long nw, const unsigned short* injw, int hc,
+                              long rows, long n, unsigned short* dout, unsigned short* inj, long irow,
+                              const unsigned short* nbuf, unsigned short* x, long xrow);
+xe_hcpf_run_fn xe_hcpf_fn() {
+    static const xe_hcpf_run_fn fn = []() -> xe_hcpf_run_fn {
+        Dl_info di;
+        std::string path = "xe/libxe_hcpf.so";
+        if (dladdr((void*)&xe_hcpf_fn, &di) && di.dli_fname) {
+            const std::string self = di.dli_fname;
+            const size_t cut = self.rfind('/');
+            if (cut != std::string::npos) path = self.substr(0, cut + 1) + "xe/libxe_hcpf.so";
+        }
+        /* RADIANCE_XE_HC_PF_MOD_PATH: the module from that file instead (a test step's folder) */
+        if (const char* p = std::getenv("RADIANCE_XE_HC_PF_MOD_PATH"); p && *p) path = p;
+        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            std::fprintf(stderr, "[xe] hc_read PF module: no %s (%s) -- prefill rows take the per-row kernels\n",
+                         path.c_str(), dlerror());
+            return nullptr;
+        }
+        void* s = dlsym(h, "xe_hcpf_run");
+        if (!s) std::fprintf(stderr, "[xe] hc_read PF module: %s has no xe_hcpf_run -- the per-row kernels\n",
+                             path.c_str());
+        else std::fprintf(stderr, "[xe] hc_read PF module: %s\n", path.c_str());
+        return (xe_hcpf_run_fn)s;
+    }();
+    return fn;
+}
 
 /* ============================================================== hc_read, kernel B2
  *
@@ -5335,7 +5239,11 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* owner note 102: prefill chunks (kPfMinRows rows on) take both products on the matrix units, hc_pf_dpas_kernel;
      * a shape it does not take keeps the per-row kernels below */
     const int pfm = (wf == 1 && hc == 4) ? xe_hc_pf_dpas_mode((hipStream_t)s) : 0;
-    if (pfm && rows >= (pfm == 2 ? kSrMinRows : kPfMinRows)) {
+    /* run 261: the 64-row products come from libxe_hcpf.so; without the module those rows skip this branch for the
+     * per-row kernels (the 2-63-row forms, mode 2, are this unit's) */
+    const xe_hcpf_run_fn pf_mod = (pfm && rows >= kPfMinRows) ? xe_hcpf_fn() : nullptr;
+    const bool pf_blocked = pfm && rows >= kPfMinRows && !pf_mod;
+    if (pfm && rows >= (pfm == 2 ? kSrMinRows : kPfMinRows) && !pf_blocked) {
         const bool fold = injw && inj;
         const bool small = rows < kPfMinRows;   /* note 105 item 3: hc_sr_* (RADIANCE_XE_HC_PF_DPAS=2) */
         const bool fits = (HN % 64) == 0 && (lr % 64) == 0 && (n % (hcpf::kNT / hc)) == 0 && (dld % 8) == 0
@@ -5369,19 +5277,22 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
                 return (int)hipGetLastError();
             }
-            (void)XE_LAUNCH_SG(hcpf::kSG, (hipStream_t)s, (hc_pf_dpas_kernel<0>),
-                               dim3((unsigned)((ncol + hcpf::kNT - 1) / hcpf::kNT), gy), dim3(hcpf::kThr), 0,
-                               (const unsigned short*)nbuf, (long)HN, (const unsigned char*)down->data, (long)dld,
-                               (long)r4d_hc8::kDownGroup, (long)lr,
-                               fold ? (const unsigned short*)injw->data : (const unsigned short*)nullptr, (int)hc,
-                               (long)rows, (long)n, dbuf, fold ? (unsigned short*)inj->data : (unsigned short*)nullptr,
-                               (long)irow, (const unsigned short*)nullptr, (unsigned short*)nullptr, (long)0);
-            (void)XE_LAUNCH_SG(hcpf::kSG, (hipStream_t)s, (hc_pf_dpas_kernel<1>),
-                               dim3((unsigned)(n / (hcpf::kNT / hc)), gy), dim3(hcpf::kThr), 0,
-                               (const unsigned short*)dbuf, (long)lr, (const unsigned char*)up->data, (long)uld,
-                               (long)r4d_hc8::up_group(lr), (long)HN, (const unsigned short*)nullptr, (int)hc,
-                               (long)rows, (long)n, (unsigned short*)nullptr, (unsigned short*)nullptr, (long)0,
-                               (const unsigned short*)nbuf, (unsigned short*)x->data, (long)xrow);
+            {   /* run 261: the two launches (as before, the arguments in the same order) from libxe_hcpf.so */
+                const int r0 = pf_mod(0, (void*)(hipStream_t)s, (unsigned)((ncol + hcpf::kNT - 1) / hcpf::kNT), gy,
+                                      (const unsigned short*)nbuf, (long)HN, (const unsigned char*)down->data,
+                                      (long)dld, (long)r4d_hc8::kDownGroup, (long)lr,
+                                      fold ? (const unsigned short*)injw->data : (const unsigned short*)nullptr,
+                                      (int)hc, (long)rows, (long)n, dbuf,
+                                      fold ? (unsigned short*)inj->data : (unsigned short*)nullptr, (long)irow,
+                                      (const unsigned short*)nullptr, (unsigned short*)nullptr, (long)0);
+                const int r1 = r0 != 0 ? r0 :
+                    pf_mod(1, (void*)(hipStream_t)s, (unsigned)(n / (hcpf::kNT / hc)), gy,
+                           (const unsigned short*)dbuf, (long)lr, (const unsigned char*)up->data, (long)uld,
+                           (long)r4d_hc8::up_group(lr), (long)HN, (const unsigned short*)nullptr, (int)hc, (long)rows,
+                           (long)n, (unsigned short*)nullptr, (unsigned short*)nullptr, (long)0,
+                           (const unsigned short*)nbuf, (unsigned short*)x->data, (long)xrow);
+                if (r1 != 0) return R4D_NO(RAD_E_DEVICE);
+            }
             hc_quant_rows_launch(i8, (const unsigned short*)x->data, q ? (unsigned char*)q->data : nullptr,
                                  q ? (float*)qs->data : nullptr, rq ? (unsigned char*)rq->data : nullptr,
                                  rq ? (float*)rqs->data : nullptr, (long)rows, (long)n, (long)xrow, (long)qrow,
