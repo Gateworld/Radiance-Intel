@@ -384,6 +384,28 @@ TEST(startup_warmup_is_off_by_default_and_takes_on_or_off) {
     CHECK_EQ(parse({ "--startup-warmup", "1" }, &c), RAD_E_INVAL);
 }
 
+/* RADIANCE_STARTUP_WARMUP (the Intel port, run 263): an image's default for the switch -- on or off -- that the
+ * command line still overrides; anything else is refused like the flag's own bad value. */
+TEST(startup_warmup_env_sets_the_default_and_the_flag_overrides_it) {
+    setenv("RADIANCE_STARTUP_WARMUP", "on", 1);
+    Config e;
+    CHECK_EQ(parse({}, &e), RAD_OK);
+    CHECK(e.startup_warmup);
+    Config f;
+    CHECK_EQ(parse({ "--startup-warmup", "off" }, &f), RAD_OK);
+    CHECK(!f.startup_warmup);
+    setenv("RADIANCE_STARTUP_WARMUP", "off", 1);
+    Config g;
+    CHECK_EQ(parse({ "--startup-warmup", "on" }, &g), RAD_OK);
+    CHECK(g.startup_warmup);
+    setenv("RADIANCE_STARTUP_WARMUP", "maybe", 1);
+    CHECK_EQ(parse_fresh({}), RAD_E_INVAL);
+    unsetenv("RADIANCE_STARTUP_WARMUP");
+    Config h;
+    CHECK_EQ(parse({}, &h), RAD_OK);
+    CHECK(!h.startup_warmup);
+}
+
 /* --prefill-interleave is a step count, off by default and at most 64. */
 TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     Config d;

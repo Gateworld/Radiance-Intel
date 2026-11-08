@@ -419,6 +419,15 @@ int config_parse(int argc, char** argv, Config* c) {
         return argv[++i];
     };
 
+    /* RADIANCE_STARTUP_WARMUP=on|off (the Intel port, run 263): an image's default for --startup-warmup, the way the
+     * Intel runtime images carry their architecture-level folds in ENV (Containerfile.neo2640; the owner's word of
+     * 2026-11-07 after B176 / C37). The command line below overrides it; the core's own default stays as declared. */
+    if (const char* w = std::getenv("RADIANCE_STARTUP_WARMUP"); w && *w) {
+        if      (!std::strcmp(w, "on"))  c->startup_warmup = true;
+        else if (!std::strcmp(w, "off")) c->startup_warmup = false;
+        else { RAD_ERR("RADIANCE_STARTUP_WARMUP takes on or off, not '%s'", w); return RAD_E_INVAL; }
+    }
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         const char* v = nullptr;
