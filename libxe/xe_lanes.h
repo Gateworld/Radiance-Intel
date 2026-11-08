@@ -288,6 +288,18 @@ template <class T> inline T atomic_cas(T* p, T expect, T v) {
 }
 
 inline void syncthreads()        { sycl::group_barrier(wg()); }
+/* Run 263 (owner note 210's V2 expert kernel, from upstream's AMD form: lds_barrier): a work-group barrier that orders
+ * SHARED memory only -- the SPIR-V control barrier with WorkgroupMemory semantics and no CrossWorkgroupMemory, so a
+ * thread's outstanding global loads (a prefetch for the next pass) are not waited for at it. The threads exchange
+ * nothing but shared memory between such barriers; global data crosses threads only through the stores after one. */
+inline void syncthreads_slm() {
+#ifdef __SYCL_DEVICE_ONLY__
+    __spirv_ControlBarrier(__spv::Scope::Workgroup, __spv::Scope::Workgroup,
+                           __spv::MemorySemanticsMask::SequentiallyConsistent | __spv::MemorySemanticsMask::WorkgroupMemory);
+#else
+    sycl::group_barrier(wg());   /* the host pass only declares the SPIR-V builtin for the device */
+#endif
+}
 inline int  syncthreads_or(int p) { return sycl::any_of_group(wg(), p != 0) ? 1 : 0; }
 inline void wave_barrier()       { sycl::group_barrier(sg()); }
 

@@ -370,6 +370,15 @@ if(RAD_BUILD_TESTS)
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
   # Run 209 (owner note 206 item 1): format C's K-specialised gate_up instance (RADIANCE_XE_I4I8_KC=1) against the
   # probe's T1 bytes at gate_up's shape (K 2560 / 2560)
+  # Run 212: format C down's decode instance at 1 and 4 columns a team (RADIANCE_XE_I4I8_DOWN_R) against T1's bytes
+  foreach(_r 1 4)
+    add_test(NAME xe_fc_tile_downr${_r}_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)
+    set_tests_properties(xe_fc_tile_downr${_r}_cpu PROPERTIES LABELS "xe"
+      ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_DOWN_R=${_r}" TIMEOUT 1200)
+    add_test(NAME xe_moe_i4i8_downr${_r}_cpu COMMAND xe_moe_i4i8_test $<TARGET_FILE:libxe>)
+    set_tests_properties(xe_moe_i4i8_downr${_r}_cpu PROPERTIES LABELS "xe"
+      ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_DOWN_R=${_r}" TIMEOUT 600)
+  endforeach()
   add_test(NAME xe_fc_tile_wcc_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)   # run 211: RADIANCE_XE_I4I8_WCC=5
   set_tests_properties(xe_fc_tile_wcc_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_WCC=5" TIMEOUT 1200)

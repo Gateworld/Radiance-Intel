@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>   /* run 262: RADIANCE_XE_I4I8_HIST's host copy of the sort offsets */
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -518,7 +519,17 @@ constexpr uint32_t kMapTailI4 = 0xffffffffu;   /* a block map entry of padding r
  * 64-K group) at pre[((e * pnb + nb) * png + g) * 1024 + ...], the same words this kernel's staging computes -- and
  * the staging copies them instead of loading and decoding the codes: the shared tiles hold the same bytes, so the
  * bits are this form's. */
-template <int W, int RT>
+/* Run 263 (owner note 210, stage 3; the supervisor's approval of 2026-11-07 23:2x; the AMD form read from upstream
+ * 1.17.0's moe_gemm_q_kernel): V2 = the same prologue, tiles, products and fold, with the K loop restructured as
+ * upstream's -- a PASS of 128 K (two 64-K groups) a barrier pair instead of one group; the next pass's A pieces, code
+ * bytes and scales prefetched into REGISTERS between this pass's shared-memory stores and the second barrier, so the
+ * global latency sits under the MMAs instead of before the stores; the barriers order shared memory only
+ * (xe::syncthreads_slm, upstream's lds_barrier: a full barrier waits for the prefetch); a sub-group whose eight rows
+ * are all past the run skips the MMAs and the fold (upstream's SK; it still stages and meets the barriers); and the
+ * row scales (one per 128 K) loaded once a pass instead of once a group. The int32 group sums are the same exact
+ * sums, folded as `acc += (sum x ar) x sb` in ascending g (g0 then g1 of a pass), so the bytes are the <8, 8> form's.
+ * K must be a multiple of 128 (2560 / 384 / 256 are); RADIANCE_XE_I4I8_DPAS_V2=1 selects it (opt-in, the probe). */
+template <int W, int RT, bool V2 = false>
 void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                             const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                             uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -529,9 +540,13 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     constexpr int kJ = 64 / W;                         /* B words a sub-group a group: 8 at W = 8 */
     constexpr int kRT = RT / 8;                        /* 8-row A tiles a sub-group */
     constexpr int kSw = kR * 64 / 16 / kT;             /* A sweeps a group: 16-byte pieces a thread */
+    static_assert(!V2 || (W == 8 && RT == 8), "V2 is the <8, 8> form's loop");
     XE_SHARED(int8_t, sB, 2 * 4 * kDTileB);      /* [step 2][tile 4][packed 32 x 16]: one 64-K group */
     XE_SHARED(int8_t, sA, kR * 64);              /* the run's rows x this group's 64 K */
     XE_SHARED(int32_t, sC, kW * 8 * 16);         /* one 8 x 16 int32 tile a sub-group */
+    /* V2: the pass's second group beside the first (sA / sB hold group g0, these g1), and the pass's scales */
+    XE_SHARED(int8_t, sB1, V2 ? 2 * 4 * kDTileB : 1);
+    XE_SHARED(int8_t, sA1, V2 ? kR * 64 : 1);
     const int tid = (int)threadIdx.x, wave = tid / 16, lane = tid % 16;
     const uint32_t nb = blockIdx.x, n0 = nb * (uint32_t)kDCols;
     if (n0 >= N) return;
@@ -694,6 +709,90 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     /* the pre-decoded words of this expert and column block (run 175), and this lane's first word in a group's 1024 */
     const uint32_t* pblk = pre ? pre + ((size_t)e * pnb + nb) * (size_t)png * 1024u : nullptr;
     const uint32_t pw0 = (uint32_t)((bstep * 4 + bt) * 128 + jbase * 16 + lane);
+    if constexpr (V2) {
+        /* ---- the V2 loop: passes of two groups, the next pass prefetched into registers across the MMAs ---- */
+        const uint32_t np = ng / 2u;
+        const bool wdead = (uint32_t)(wave * RT) >= rn;   /* SK: this sub-group's eight rows are all past the run */
+        /* the prefetch registers: pass p + 1's A pieces, code bytes and column scales for both groups, and its row
+         * scales (one a row a pass); loaded for pass 0 here, then at each pass's top for the next */
+        uint4 pv[2][kSw];
+        uint32_t pcw[2][4];
+        uint8_t psr[2][4];
+        float par[8];
+        auto issue = [&](uint32_t p) {
+#pragma unroll
+            for (int gi = 0; gi < 2; ++gi) {
+                const uint32_t g = 2u * p + (uint32_t)gi;
+#pragma unroll
+                for (int sw = 0; sw < kSw; ++sw) {
+                    uint4 z = {0, 0, 0, 0};
+                    pv[gi][sw] = trow[sw] != ~0u ? *(const uint4*)(A + (size_t)trow[sw] * a_ld + (size_t)g * 64u + apiece) : z;
+                }
+                pcw[gi][0] = 0u; pcw[gi][1] = 0u; pcw[gi][2] = 0u; pcw[gi][3] = 0u;
+                if (cbase) __builtin_memcpy(pcw[gi], cbase + (size_t)g * 32u, kJ * 2);
+#pragma unroll
+                for (int t = 0; t < 4; ++t) psr[gi][t] = rowok[t] ? se8[(size_t)rowr[t] * c.s_ld + g] : (uint8_t)0;
+            }
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+                par[q] = liver[q] ? As[(size_t)tokr[q] * as_ld + p] : 0.0f;   /* per 128 K: g / 2 == p */
+        };
+        if (np) issue(0u);
+        for (uint32_t p = 0; p < np; ++p) {
+            xe::syncthreads_slm();                        /* the previous pass's tiles are consumed */
+            /* this pass's tiles from the registers: the A rows and the decoded B words of both groups */
+            uint8_t sr2[2][4];
+            float ar2[8];
+#pragma unroll
+            for (int gi = 0; gi < 2; ++gi) {
+                int8_t* sAg = gi ? sA1 : sA;
+                uint32_t* sBwg = (uint32_t*)(gi ? sB1 : sB);
+#pragma unroll
+                for (int sw = 0; sw < kSw; ++sw) {
+                    const int q = sw * (kT / 4) + tid / 4, piece = tid % 4;
+                    *(uint4*)(sAg + q * 64 + piece * 16) = pv[gi][sw];
+                }
+#pragma unroll
+                for (int j = 0; j < kJ; ++j) {
+                    const uint32_t b2 = (pcw[gi][j >> 1] >> (16 * (j & 1))) & 0xffffu;
+                    const uint32_t b0 = b2 & 255u, b1 = b2 >> 8;
+                    const uint32_t l0 = lvl(b0 & 15u), l1 = lvl(b0 >> 4), l2 = lvl(b1 & 15u), l3 = lvl(b1 >> 4);
+                    const uint32_t w = rowok[bt] ? (l0 | (l1 << 8) | (l2 << 16) | (l3 << 24)) : 0u;
+                    sBwg[(bstep * 4 + bt) * 128 + (jbase + j) * 16 + lane] = w;
+                }
+#pragma unroll
+                for (int t = 0; t < 4; ++t) sr2[gi][t] = psr[gi][t];
+            }
+#pragma unroll
+            for (int q = 0; q < 8; ++q) ar2[q] = par[q];
+            if (p + 1u < np) issue(p + 1u);               /* the next pass's loads, in flight across the MMAs */
+            xe::syncthreads_slm();                        /* the stores are visible */
+            if (wdead) continue;
+#pragma unroll
+            for (int gi = 0; gi < 2; ++gi) {              /* g0 then g1: ascending g, as the fold requires */
+                const int8_t* sAg = gi ? sA1 : sA;
+                const int8_t* sBg = gi ? sB1 : sB;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, C[0][t], 0);
+#pragma unroll
+                for (int step = 0; step < 2; ++step) {
+                    jm::joint_matrix_load(sg, Am[0], lptr(sAg + (wave * RT) * 64 + step * 32), 64);
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        jm::joint_matrix_load(sg, Bt, lptr(sBg + (step * 4 + t) * kDTileB), 64);
+                        jm::joint_matrix_mad(sg, C[0][t], Am[0], Bt, C[0][t]);
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const float sb = rowok[t] ? e4m3_to_f32(sr2[gi][t]) * smul : 0.0f;
+                    auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, C[0][t]);
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) acc[0][t][q] += ((float)(int32_t)wd[q] * ar2[q]) * sb;
+                }
+            }
+        }
+    } else
     for (uint32_t g = 0; g < ng; ++g) {
         __syncthreads();                                  /* the previous group's tiles are consumed */
         /* the group's loads, all in flight together (B118: exact, neutral) */
@@ -801,6 +900,15 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
 }
 
 /* the two shapes as plain kernels for the launch (the body is the template above, inlined) */
+/* run 263: the V2 loop on the <8, 8> shape (RADIANCE_XE_I4I8_DPAS_V2=1) */
+void moe_i4i8_dpas_v2_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                             const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                             uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                             uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
+                             const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png, const uint32_t* __restrict__ map) {
+    moe_i4i8_dpas_kernel_t<8, 8, true>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
+                                       parts, a_rows, slmc, pre, pnb, png, map);
+}
 void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                           uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -960,6 +1068,21 @@ bool dpas_map() {
 int64_t map_offset(long long n_expert, long long N, long long K) {
     return dpas_pre() ? (pre_bytes(n_expert, N, K) + 255) / 256 * 256 : 0;
 }
+/* RADIANCE_XE_I4I8_DPAS_GRF=1 (run 257, owner note 209 item 4): the 64-row DPAS form under the large register file
+ * (launch_as_grf256, as the rt16 form). At 128 GRF its ISA spills 120 GRF variables under IGC 2.42.6 (168 under
+ * 2.28.4; igcdump-fc2426 / -fc228); the arithmetic and its order are the kernel's own either way, so the bits are the
+ * same -- only the register allocation and the work-groups resident a core change; opt-in */
+bool dpas_grf() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_GRF"); return s && *s == '1'; }();
+    return v;
+}
+/* RADIANCE_XE_I4I8_DPAS_V2=1 (run 263, owner note 210 stage 3, the probe): the <8, 8> form's loop restructured as
+ * upstream's AMD kernel's (128-K passes, the next pass prefetched into registers across the MMAs, shared-memory-only
+ * barriers, dead sub-groups skipping the MMAs, the row scales once a pass); the same bytes; K % 128 == 0; opt-in */
+bool dpas_v2() {
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DPAS_V2"); return s && *s == '1'; }();
+    return v;
+}
 #endif
 
 /* RADIANCE_XE_I4I8_RUN_BOUND (run 202): the run form's rows at or past the call's live count zeroed (the kernel's
@@ -987,6 +1110,12 @@ bool run_kc() {
 }
 /* RADIANCE_XE_I4I8_WCC = 2 / 5 / 6 (run 211, owner note 206 item 2): the codes' LSC cache-control hint on the two
  * decode instances (gate_up's run<5,16,1>, down's run<3,2,2>); else 0, the default policy; opt-in */
+/* RADIANCE_XE_I4I8_DOWN_R = 1 / 4 (run 212): down's decode instance with that many columns a team; else 2, today's */
+int run_down_r() {
+    static const int v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_DOWN_R"); const int r = s ? std::atoi(s) : 2;
+                              return (r == 1 || r == 4) ? r : 2; }();
+    return v;
+}
 int run_wcc() {
     static const int v = [] { const char* s = std::getenv("RADIANCE_XE_I4I8_WCC"); const int w = s ? std::atoi(s) : 0;
                               return (w == 2 || w == 5 || w == 6) ? w : 0; }();
@@ -1087,6 +1216,35 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
         /* the matrix-unit form at prefill (owner note 168 item 2): the same bits as the run form, from 64-row tiles */
         if (fc && dpas_on() && T >= dpas_min_rows() && K % 64 == 0) {
             const bool rt16 = dpas_rows() == 16;
+            /* RADIANCE_XE_I4I8_HIST=1 (run 262, owner note 210 item 1; the supervisor's approval): the routing histogram
+             * of each prefill launch, one line on stderr -- the sort's run lengths (off[e + 1] - off[e]) in buckets, the
+             * 64-row blocks the DPAS form launches over them and the rows those blocks pad. Read-only (a blocking copy
+             * of the offsets to the host before the launch), so the numbers the kernel computes are unchanged; off by
+             * default -- the copy's wait costs the issue thread ~0.1 ms a launch. */
+            static const bool hist = [] { const char* v = std::getenv("RADIANCE_XE_I4I8_HIST"); return v && *v == '1'; }();
+            if (hist && n_expert > 0 && n_expert <= 4096) {
+                std::vector<int32_t> ho((size_t)n_expert + 1);
+                qq->memcpy(ho.data(), off->data, ho.size() * sizeof(int32_t)).wait();
+                long long bucket[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   /* 0, 1-7, 8-15, 16-31, 32-63, 64-127, 128-255, 256-511, 512+ */
+                long long blocks = 0, rows = 0, maxl = 0;
+                for (long long e = 0; e < n_expert; ++e) {
+                    const long long l = (long long)ho[(size_t)e + 1] - ho[(size_t)e];
+                    if (l <= 0) { ++bucket[0]; continue; }
+                    int b = 1;
+                    for (long long t = 8; t <= 512 && l >= t; t *= 2) ++b;
+                    ++bucket[b];
+                    blocks += (l + kDRows - 1) / kDRows;
+                    rows += l;
+                    if (l > maxl) maxl = l;
+                }
+                std::fprintf(stderr, "[xe] i4i8 hist: T %lld live %lld N %lld K %lld experts %lld (0 rows %lld, 1-7 %lld, 8-15 %lld, "
+                             "16-31 %lld, 32-63 %lld, 64-127 %lld, 128-255 %lld, 256-511 %lld, 512+ %lld, max %lld) "
+                             "64-row blocks %lld, padded rows %lld (%.1f%% of the blocks' rows)\n",
+                             (long long)T, (long long)ho[(size_t)n_expert], (long long)N, (long long)K, (long long)n_expert,
+                             bucket[0], bucket[1], bucket[2], bucket[3], bucket[4], bucket[5], bucket[6], bucket[7], bucket[8],
+                             maxl, blocks, blocks * kDRows - rows,
+                             blocks > 0 ? 100.0 * (double)(blocks * kDRows - rows) / (double)(blocks * kDRows) : 0.0);
+            }
             const dim3 grid((unsigned)((N + kDCols - 1) / kDCols), (unsigned)T), block(kDThreads);
             /* run 175: the decode once a call (RADIANCE_XE_I4I8_DPAS_PRE=1), into the declared scratch */
             const uint32_t* pre = nullptr;
@@ -1134,6 +1292,27 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                     cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
                     (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
                     (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc());
+            else if (dpas_v2() && K % 128u == 0u && !dpas_pre() && dpas_grf())
+                /* run 264: V2 under the large register file (RADIANCE_XE_I4I8_DPAS_GRF=1 with _V2=1) -- at 128 GRF the
+                 * V2 loop spills 7.2 KB a thread (igcdump-fc2426v2: the prefetch registers live across the MMAs; today's
+                 * kernel 2.0 KB), so the probe times both files; the same bits either way */
+                xe::launch_as_grf256<moe_i4i8_dpas_v2_kernel, 16>(
+                    moe_i4i8_dpas_v2_kernel, *qq, mgrid, block, (const int8_t*)Aq->data, (const float*)As->data,
+                    cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                    (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                    (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png, map);
+            else if (dpas_v2() && K % 128u == 0u && !dpas_pre())   /* run 263: the V2 loop (the probe) */
+                XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_v2_kernel, mgrid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
+                             cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                             (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png,
+                             map);
+            else if (dpas_grf())   /* run 257: the same kernel and arguments under the large register file */
+                xe::launch_as_grf256<moe_i4i8_dpas_kernel, 16>(
+                    moe_i4i8_dpas_kernel, *qq, mgrid, block, (const int8_t*)Aq->data, (const float*)As->data,
+                    cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                    (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                    (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png, map);
             else
                 XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, mgrid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
                              cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
@@ -1149,8 +1328,12 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
              * one column a team -- the probe's best gate_up mapping (L16R1), and at two columns IGC 2.41.5 spills
              * ~259 bytes of <5, 16, 2> (run 114) */
             const bool gl = K <= 512;
-            const int lpr = gl ? 2 : 16, rpt = gl ? 2 : 1;
+            const int lpr = gl ? 2 : 16;
             const int upl = gl ? (int)((K / 64 + lpr - 1) / lpr) : (int)((K / 32 + lpr - 1) / lpr);
+            /* run 212 (owner note 201 / 206, RADIANCE_XE_I4I8_DOWN_R = 1 / 4): down's columns a team for its decode
+             * instance (upl 3); a column's sums and their join are R's alone (lane l's units, then xor 1), so any R
+             * gives the same bits -- only the work-groups' count and each lane's live codes change */
+            const int rpt = gl ? ((upl == 3 && !run_grf() && !run_wcc()) ? run_down_r() : 2) : 1;
             const unsigned cpw = (unsigned)((kWG / lpr) * rpt);
             const dim3 grid((unsigned)((N + cpw - 1) / cpw), (unsigned)T), block(kWG);
             /* RADIANCE_XE_I4I8_TRACE=1 (run 116): each distinct launch geometry once, on stderr -- the engine's own
@@ -1209,6 +1392,8 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                 case 2: XE_I4I8_RUN(2, 2, 2, true); break;
                 case 3:   /* down's instance; run 211: its cache-hinted forms under RADIANCE_XE_I4I8_WCC */
                     if (XE_I4I8_WCC_OK) XE_I4I8_RUN_WX(3, 2, 2, true);
+                    else if (rpt == 1) XE_I4I8_RUN(3, 2, 1, true);   /* run 212: RADIANCE_XE_I4I8_DOWN_R */
+                    else if (rpt == 4) XE_I4I8_RUN(3, 2, 4, true);
                     else XE_I4I8_RUN(3, 2, 2, true);
                     break;
                 default: XE_I4I8_RUN(4, 2, 2, true); break;
