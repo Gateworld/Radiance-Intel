@@ -205,39 +205,61 @@ void gemm_bf16_dpas_kernel(const void* __restrict__ a, long a_ld, const uint16_t
 #pragma unroll
     for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
     const int G = (K + 63) / 64;
+    /* Run 266 (V3b, with gemm_i8a8_dpas_kernel's): the two stages below were rolled loops of 16 iterations a thread,
+     * each a gather and the shared-memory store that waits for it -- 32 global latencies in series a group (the ISA).
+     * A thread's 16 words of each stage are rows (columns) sr + 4 i at one k pair, compile-time shapes of those
+     * loops: the 32 words load together, then store together. A row past M, a column past N or a k past K reads the
+     * last valid one (valid memory) and keeps the zero the guard produced. The same words at the same places. */
+    const int sr = tid / 32, kp = (tid % 32) * 2;   /* this thread's A words: rows sr + 4 i at the k pair kp */
+    const int k2 = tid % 32, bstep = k2 / 8, bkw = k2 % 8;   /* its B words: columns sr + 4 i at the k pair 2 k2 */
     for (int g = 0; g < G; ++g) {
         const int k0 = g * 64;
         xe::syncthreads();                                  /* the previous group's stages are consumed */
         /* the activation rows: 64 rows x 64 k, two k a word (zeros past K or past M) */
-        for (int idx = tid; idx < kBfRT * 32; idx += kBfThreads) {   /* 2048 words: 16 a thread */
-            const int r = idx / 32, kp = (idx % 32) * 2, mm = m0 + r, kk = k0 + kp;
-            uint32_t w = 0;
-            if (mm < M) {
-                uint16_t lo = 0, hi = 0;
+        uint32_t wa[16];
+        {
+            const int kk = k0 + kp;
+            const int kc0 = kk < K ? kk : K - 1, kc1 = kk + 1 < K ? kk + 1 : K - 1;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int mm = m0 + sr + 4 * i, mc = mm < M ? mm : M - 1;
+                uint16_t lo, hi;
                 if constexpr (A_F32) {
-                    const float* ar = (const float*)a + (size_t)mm * a_ld;
-                    if (kk < K) lo = to_bf16(ar[kk]);
-                    if (kk + 1 < K) hi = to_bf16(ar[kk + 1]);
+                    const float* ar = (const float*)a + (size_t)mc * a_ld;
+                    const float f0 = ar[kc0], f1 = ar[kc1];
+                    lo = kk < K ? to_bf16(f0) : (uint16_t)0;
+                    hi = kk + 1 < K ? to_bf16(f1) : (uint16_t)0;
                 } else {
-                    const uint16_t* ar = (const uint16_t*)a + (size_t)mm * a_ld;
-                    if (kk < K) lo = ar[kk];
-                    if (kk + 1 < K) hi = ar[kk + 1];
+                    const uint16_t* ar = (const uint16_t*)a + (size_t)mc * a_ld;
+                    const uint16_t v0 = ar[kc0], v1 = ar[kc1];
+                    lo = kk < K ? v0 : (uint16_t)0;
+                    hi = kk + 1 < K ? v1 : (uint16_t)0;
                 }
-                w = (uint32_t)lo | ((uint32_t)hi << 16);
+                const uint32_t w = (uint32_t)lo | ((uint32_t)hi << 16);
+                wa[i] = mm < M ? w : 0u;
             }
-            *(uint32_t*)(sA + r * kBfAP + kp) = w;
         }
         /* the weight rows: 64 n x 64 k, packed (word (k2, n)); zeros past N or K */
-        for (int idx = tid; idx < kBfNT * 32; idx += kBfThreads) {   /* 2048 words: 16 a thread */
-            const int n = idx / 32, k2 = idx % 32, nn = n0 + n, kk = k0 + 2 * k2;
-            uint32_t w = 0;
-            if (nn < N) {
-                const uint16_t* br = b + (size_t)nn * b_ld;
-                const uint16_t lo = kk < K ? br[kk] : (uint16_t)0, hi = kk + 1 < K ? br[kk + 1] : (uint16_t)0;
-                w = (uint32_t)lo | ((uint32_t)hi << 16);
+        uint32_t wb[16];
+        {
+            const int kk = k0 + 2 * k2;
+            const int kc0 = kk < K ? kk : K - 1, kc1 = kk + 1 < K ? kk + 1 : K - 1;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int nn = n0 + sr + 4 * i, nc = nn < N ? nn : N - 1;
+                const uint16_t* br = b + (size_t)nc * b_ld;
+                const uint16_t v0 = br[kc0], v1 = br[kc1];
+                const uint16_t lo = kk < K ? v0 : (uint16_t)0, hi = kk + 1 < K ? v1 : (uint16_t)0;
+                const uint32_t w = (uint32_t)lo | ((uint32_t)hi << 16);
+                wb[i] = nn < N ? w : 0u;
             }
-            const int step = k2 / 8, kw = k2 % 8;
-            sB[((step * 4 + n / 16) * 8 + kw) * 16 + (n % 16)] = w;
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) *(uint32_t*)(sA + (sr + 4 * i) * kBfAP + kp) = wa[i];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int n = sr + 4 * i;
+            sB[((bstep * 4 + n / 16) * 8 + bkw) * 16 + (n % 16)] = wb[i];
         }
         xe::syncthreads();
 #pragma unroll

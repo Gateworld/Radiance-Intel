@@ -197,7 +197,6 @@ void gemm_i8a8_dpas_kernel(const int8_t* __restrict__ a, long a_ld, const float*
                            const int8_t* __restrict__ b, long b_ld, const void* __restrict__ bs, long bs_ld,
                            uint16_t* __restrict__ y, long y_ld, int N, int K) {
     XE_SHARED(int8_t, sB, 4 * 4 * kDpasTileB);          /* [step 4][n tile 4][packed 32 x 16]: one 128-K group */
-    XE_SHARED(int32_t, sC, kDpasWaves * 8 * 16);        /* one 8 x 16 int32 tile a sub-group */
     const int tid = (int)threadIdx.x, wave = tid / kDpasSG, lane = tid % kDpasSG;
     const int m0 = (int)blockIdx.y * kDpasRT + wave * 8;   /* always a full 8-row tile: the launcher's blocks */
     const int n0 = (int)blockIdx.x * kDpasNT;
@@ -214,20 +213,32 @@ void gemm_i8a8_dpas_kernel(const int8_t* __restrict__ a, long a_ld, const float*
     const int8_t* arow = a + (size_t)m0 * a_ld;
     const float* asg = as + (size_t)m0 * as_ld;
     uint32_t* sBw = (uint32_t*)sB;
-    int32_t* sCw = sC + wave * 128;
     auto gptr = [](const int8_t* p) {
         return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
     };
     auto lptr = [](auto* p) {
         return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
     };
+    /* Run 266 (V3b, after the expert kernel's V3): the staging below was a rolled loop of 16 iterations a thread, each
+     * one weight-word gather and the shared-memory store that waits for it -- sixteen global latencies in series a
+     * group (the ISA: load.ugm.d32.a64 -> store.slm.d32.a32 {I@1} -> jmpi). The 16 words are this thread's rows
+     * nb + 4 i at word k4 (compile-time shapes of that loop), so they load together and store together; a column past
+     * N reads column N - 1 (valid memory) and stores the zero the guard produced. The same words at the same places. */
+    const int k4 = tid % 32, nb = tid / 32;
+    const int8_t* bk = b + (size_t)4 * k4;   /* this thread's word of every weight row */
     for (int g = 0; g < G; ++g) {
         xe::syncthreads();                                  /* the previous group's tiles are consumed */
-        for (int idx = tid; idx < kDpasNT * 32; idx += kDpasThreads) {   /* 2048 words: 16 a thread */
-            const int n = idx / 32, k4 = idx % 32, nn = n0 + n;
-            uint32_t w = 0;
-            if (nn < N) w = *(const uint32_t*)(b + (size_t)nn * b_ld + (size_t)g * 128 + 4 * k4);
-            sBw[((k4 / 8) * 4 + n / 16) * 128 + (k4 % 8) * 16 + (n % 16)] = w;
+        uint32_t w[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int nn = n0 + nb + 4 * i, nc = nn < N ? nn : N - 1;
+            const uint32_t v = *(const uint32_t*)(bk + (size_t)nc * b_ld + (size_t)g * 128);
+            w[i] = nn < N ? v : 0u;
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int n = nb + 4 * i;
+            sBw[((k4 / 8) * 4 + n / 16) * 128 + (k4 % 8) * 16 + (n % 16)] = w[i];
         }
         xe::syncthreads();
 #pragma unroll
@@ -241,18 +252,24 @@ void gemm_i8a8_dpas_kernel(const int8_t* __restrict__ a, long a_ld, const float*
                 jm::joint_matrix_mad(sg, C[t], A, Bt, C[t]);   /* the toolchain's form: D = A * B + C */
             }
         }
-        /* the group's exact sums, scaled: lane = column, 8 rows a lane */
+        /* the group's exact sums, scaled: lane = column, 8 rows a lane. V3b: from the accumulator's own work-item data
+         * (the tile laid out lane = column, element e = row e -- what joint_matrix_store wrote and sCw[e * 16 + lane]
+         * read back; the expert kernel's run-170 cut), so no store, no read-back, no wave barriers; and the 8 row
+         * scales once a group (the barriers had fenced them, so they were gathered again for every tile: 33 a group).
+         * A column past N reads column N - 1 and takes the zero scale the guard gave it. The same values, the same
+         * (sum x a_scale) x b_scale in the same t, e order. */
+        float ar[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) ar[e] = asg[(size_t)e * as_ld + g];
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            jm::joint_matrix_store(sg, C[t], lptr(sCw), 16, jm::layout::row_major);
-            xe::wave_barrier();
-            const int nn = n0 + t * 16 + lane;
-            float sb = 0.0f;
-            if (nn < N) sb = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)bs)[(size_t)nn * bs_ld + g] << 16)
-                                     : ((const float*)bs)[(size_t)nn * bs_ld + g];
+            const int nn = n0 + t * 16 + lane, nc = nn < N ? nn : N - 1;
+            const float sbv = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)bs)[(size_t)nc * bs_ld + g] << 16)
+                                      : ((const float*)bs)[(size_t)nc * bs_ld + g];
+            const float sb = nn < N ? sbv : 0.0f;
+            auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, C[t]);
 #pragma unroll
-            for (int e = 0; e < 8; ++e) acc[t][e] += ((float)sCw[e * 16 + lane] * asg[(size_t)e * as_ld + g]) * sb;
-            xe::wave_barrier();
+            for (int e = 0; e < 8; ++e) acc[t][e] += ((float)(int32_t)wd[e] * ar[e]) * sb;
         }
     }
 #pragma unroll
