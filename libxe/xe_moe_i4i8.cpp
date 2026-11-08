@@ -507,6 +507,9 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 constexpr int kDWaves = 8, kDThreads = 16 * kDWaves, kDRows = 8 * kDWaves, kDCols = 64;
 constexpr int kDTileB = 8 * 16 * 4;   /* one packed B tile: 32 k x 16 n int8 */
+/* run 265 (V3): four dwords at 4-byte alignment, so a group's 16 code bytes load as one vector message */
+typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));
+typedef u32x4_t __attribute__((aligned(4))) u32x4a4;
 constexpr uint32_t kMapTailI4 = 0xffffffffu;   /* a block map entry of padding rows (owner note 195) */
 
 /* Run 171: the work-group's shape is a template -- W sub-groups of RT rows each. <8, 8> is the form since run 164
@@ -529,7 +532,17 @@ constexpr uint32_t kMapTailI4 = 0xffffffffu;   /* a block map entry of padding r
  * row scales (one per 128 K) loaded once a pass instead of once a group. The int32 group sums are the same exact
  * sums, folded as `acc += (sum x ar) x sb` in ascending g (g0 then g1 of a pass), so the bytes are the <8, 8> form's.
  * K must be a multiple of 128 (2560 / 384 / 256 are); RADIANCE_XE_I4I8_DPAS_V2=1 selects it (opt-in, the probe). */
-template <int W, int RT, bool V2 = false>
+/* Run 265 (V3, the supervisor's approval of 01:1x UTC 11-08): the probe found V2 exact and slower both ways, and the IGC
+ * dumps said why -- the <8, 8> loop body is 1,453 instructions a thread a 64-K group for its 8 DPAS (the AMD production
+ * kernel: 404 per 128 K for 16), half of it the branches around predicated loads (160 divergent blocks a group: a
+ * dead row's A piece, a dead column's codes and scale byte, a dead row's activation scale, each an if / else of
+ * zeros), the runtime test switches (slmc) and the pre-decoded path inside the unrolled loops, and 64-bit address
+ * arithmetic redone every group. kDbg = false is the LEAN instance, the default kernel: those switches are compile-time
+ * off (the dbg instance keeps them for the tests), every load is unconditional from a clamped valid address (row 0 /
+ * column 0 of the same buffers for a dead lane) with the dead lane's value selected to zero afterwards -- the operand
+ * the branch produced -- and the per-lane bases are formed once before the loop. The same loads of the live lanes,
+ * the same arithmetic in the same order: the bits are the <8, 8> form's. */
+template <int W, int RT, bool V2 = false, bool kDbg = true>
 void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                             const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                             uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
@@ -541,6 +554,7 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     constexpr int kRT = RT / 8;                        /* 8-row A tiles a sub-group */
     constexpr int kSw = kR * 64 / 16 / kT;             /* A sweeps a group: 16-byte pieces a thread */
     static_assert(!V2 || (W == 8 && RT == 8), "V2 is the <8, 8> form's loop");
+    static_assert(kDbg || (!V2 && W == 8 && RT == 8), "the lean instance is the <8, 8> form");
     XE_SHARED(int8_t, sB, 2 * 4 * kDTileB);      /* [step 2][tile 4][packed 32 x 16]: one 64-K group */
     XE_SHARED(int8_t, sA, kR * 64);              /* the run's rows x this group's 64 K */
     XE_SHARED(int32_t, sC, kW * 8 * 16);         /* one 8 x 16 int32 tile a sub-group */
@@ -576,7 +590,7 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
          * it a row there whose slot is real (the protected experts' rows, which follow the regular ones in the sort)
          * searches to the last regular expert, and rn = last - i wraps to kR: a block of the wrong expert's weights,
          * written up to kR - 1 rows past it */
-        if (slmc == 6u && i >= (uint32_t)off[n_expert]) {
+        if (kDbg && slmc == 6u && i >= (uint32_t)off[n_expert]) {
             for (uint32_t n = n0 + (uint32_t)tid; n < n0 + (uint32_t)kDCols && n < N; n += (uint32_t)kT)
                 Y[(size_t)i * y_ld + n] = 0;
             return;
@@ -616,18 +630,26 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
     /* the 16 levels gathered once into four byte-packed words (B92: a per-code shuffle is lowered through the
      * load/store path -- 7.4e10 cache accesses, +20 % a launch -- so the per-code lookup is a select chain) */
     sycl::sub_group sg = xe::sg();
-    uint32_t pk[4] = {0u, 0u, 0u, 0u};
+    /* run 265 (V3): the four words as four scalars, NOT an array. LLVM folds a select between two elements of an array
+     * into one load at a selected index, which leaves the table in private memory: the dump showed every code's lookup
+     * as a private-memory gather inside a goto / join region (32 gathers and 64 branch regions a thread a group, the
+     * decode's whole cost). Four scalars leave nothing to fold: the selects stay register selects. The same levels. */
+    auto pkw = [&](int k) {
+        uint32_t w = 0u;
 #pragma unroll
-    for (int k = 0; k < 4; ++k)
-#pragma unroll
-        for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+        for (int j = 0; j < 4; ++j) w |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+        return w;
+    };
+    const uint32_t pk0 = pkw(0), pk1 = pkw(1), pk2 = pkw(2), pk3 = pkw(3);
     /* slmc == 2 (run 170, test only -- WRONG numbers): the level decode skipped (lvl(c) = c), to time its share;
      * == 3: the scaling's loads skipped (acc += C); == 4: the B staging skipped (stale shared memory); == 5: the
      * MMAs and their tile loads skipped (C stays 0) -- the pipeline's shares by ablation, every one wrong by design */
-    const bool nodec = slmc == 2u, noscale = slmc == 3u, nostage = slmc == 4u, nomma = slmc == 5u;
+    const bool nodec = kDbg && slmc == 2u, noscale = kDbg && slmc == 3u, nostage = kDbg && slmc == 4u,
+               nomma = kDbg && slmc == 5u;
     auto lvl = [&](uint32_t cc) -> uint32_t {
         if (nodec) return cc;
-        const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
+        const uint32_t lo = (cc & 4u) ? pk1 : pk0, hi = (cc & 4u) ? pk3 : pk2;
+        const uint32_t d = (cc & 8u) ? hi : lo;
         return (d >> (8u * (cc & 3u))) & 255u;
     };
     const float s1 = *(const float*)(se8 - c.s_off + c.s1_off);
@@ -701,13 +723,29 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
         }
     }
     const size_t apiece = (size_t)(tid % 4) * 16u;
+    /* V3 (the lean loop): this thread's A piece bases, activation-scale row offsets and scale-byte rows, formed once
+     * before the loop. A dead lane reads row 0 / column 0 of the same buffer (valid memory: the call has a row and the
+     * expert a column) and the loop replaces the value with the zero the old branch produced. */
+    [[maybe_unused]] const int8_t* arow[kSw];   /* unused by the V2 loop */
+#pragma unroll
+    for (int sw = 0; sw < kSw; ++sw) arow[sw] = A + (size_t)(trow[sw] != ~0u ? trow[sw] : 0u) * a_ld + apiece;
+    [[maybe_unused]] uint32_t aoff[RT];         /* the lean instance's */
+#pragma unroll
+    for (int q = 0; q < RT; ++q) aoff[q] = (liver[q] ? tokr[q] : 0u) * as_ld;
+    [[maybe_unused]] const uint8_t* srow[4];    /* unused by the V2 loop */
+#pragma unroll
+    for (int t = 0; t < 4; ++t) srow[t] = se8 + (size_t)(rowok[t] ? rowr[t] : 0u) * c.s_ld;
     /* this sub-group's B tile, step and word range: W = 8 -> (w / 2, w % 2, words 0-7); W = 16 -> sub-groups w and
      * w + 8 share (tile, step) and take words 0-3 / 4-7 (code bytes 0-7 / 8-15 of the step's 16) */
     const int bt = (wave & 7) >> 1, bstep = wave & 1, jbase = (wave >> 3) * kJ;
-    const uint8_t* cbase = (rowok[bt] && !nostage && !pre)
-        ? we + (size_t)rowr[bt] * c.w_ld + (size_t)bstep * 16u + (size_t)jbase * 2u : nullptr;
+    const uint8_t* cbase;
+    if constexpr (kDbg)
+        cbase = (rowok[bt] && !nostage && !pre)
+            ? we + (size_t)rowr[bt] * c.w_ld + (size_t)bstep * 16u + (size_t)jbase * 2u : nullptr;
+    else   /* V3: always a valid row of codes; a dead column's words are zeroed at the store (rowok) */
+        cbase = we + (size_t)(rowok[bt] ? rowr[bt] : 0u) * c.w_ld + (size_t)bstep * 16u + (size_t)jbase * 2u;
     /* the pre-decoded words of this expert and column block (run 175), and this lane's first word in a group's 1024 */
-    const uint32_t* pblk = pre ? pre + ((size_t)e * pnb + nb) * (size_t)png * 1024u : nullptr;
+    const uint32_t* pblk = (kDbg && pre) ? pre + ((size_t)e * pnb + nb) * (size_t)png * 1024u : nullptr;
     const uint32_t pw0 = (uint32_t)((bstep * 4 + bt) * 128 + jbase * 16 + lane);
     if constexpr (V2) {
         /* ---- the V2 loop: passes of two groups, the next pass prefetched into registers across the MMAs ---- */
@@ -801,13 +839,26 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
         uint8_t sr[4];
 #pragma unroll
         for (int sw = 0; sw < kSw; ++sw) {
-            uint4 z = {0, 0, 0, 0};
-            v[sw] = trow[sw] != ~0u ? *(const uint4*)(A + (size_t)trow[sw] * a_ld + (size_t)g * 64u + apiece) : z;
+            /* V3: the load is unconditional (row 0 when the row is dead) and the dead lane's piece is masked to the
+             * zero the old if / else produced -- an and, not a branch region */
+            const uint4 vv = *(const uint4*)(arow[sw] + (size_t)g * 64u);
+            const uint32_t m = trow[sw] != ~0u ? ~0u : 0u;
+            v[sw].x = vv.x & m; v[sw].y = vv.y & m; v[sw].z = vv.z & m; v[sw].w = vv.w & m;
         }
-        cw[0] = 0u; cw[1] = 0u; cw[2] = 0u; cw[3] = 0u;
-        if (cbase) __builtin_memcpy(cw, cbase + (size_t)g * 32u, kJ * 2);
+        if constexpr (kDbg) {
+            cw[0] = 0u; cw[1] = 0u; cw[2] = 0u; cw[3] = 0u;
+            if (cbase) __builtin_memcpy(cw, cbase + (size_t)g * 32u, kJ * 2);
+        } else {
+            /* V3: the group's 16 code bytes as one 4-byte-aligned vector load (the memcpy above is four dword gathers);
+             * a dead column reads column 0 and stores zero words below */
+            const u32x4a4 cv = *(const u32x4a4*)(cbase + (size_t)g * 32u);
+            cw[0] = cv[0]; cw[1] = cv[1]; cw[2] = cv[2]; cw[3] = cv[3];
+        }
 #pragma unroll
-        for (int t = 0; t < 4; ++t) sr[t] = rowok[t] ? se8[(size_t)rowr[t] * c.s_ld + g] : (uint8_t)0;
+        for (int t = 0; t < 4; ++t) {
+            const uint8_t sv = srow[t][g];   /* V3: unconditional, column 0 when the column is dead */
+            sr[t] = rowok[t] ? sv : (uint8_t)0;
+        }
         /* the A tile: kR rows x 64 bytes as kSw sweeps, a thread's 16 bytes at (sweep * kT * 16 + tid * 16): a
          * sub-group's 16 stores are one 256-byte run (run 166: the old row / half split put lanes 32 bytes apart,
          * two to a bank) */
@@ -819,7 +870,7 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
         /* the B tiles: 64 columns x 16 words of 4 levels; word (step, tile, k4 % 8, n % 16) as the trunk's layout.
          * A lane is one column: its row's code bytes for its words decode to kJ words, stored as 16 consecutive
          * words a sub-group (the old lanes were 64 bytes apart, four to a bank). */
-        if (pblk && !nostage) {
+        if (kDbg && pblk && !nostage) {
             /* run 175: the words decoded once a call (moe_i4i8_dec_kernel), copied at the same positions */
             const uint32_t* pg = pblk + (size_t)g * 1024u + pw0;
 #pragma unroll
@@ -865,12 +916,19 @@ void moe_i4i8_dpas_kernel_t(const int8_t* __restrict__ A, const float* __restric
         for (int r = 0; r < kRT; ++r) {
             float ar[8];   /* this row tile's activation scales (per 128 K) */
 #pragma unroll
-            for (int q = 0; q < 8; ++q)
-                ar[q] = (!noscale && liver[r * 8 + q]) ? As[(size_t)tokr[r * 8 + q] * as_ld + g / 2u] : (noscale ? 1.0f : 0.0f);
+            for (int q = 0; q < 8; ++q) {
+                if constexpr (kDbg) {
+                    ar[q] = (!noscale && liver[r * 8 + q]) ? As[(size_t)tokr[r * 8 + q] * as_ld + g / 2u]
+                                                            : (noscale ? 1.0f : 0.0f);
+                } else {
+                    const float av = As[(size_t)aoff[r * 8 + q] + g / 2u];   /* V3: unconditional, row 0 when dead */
+                    ar[q] = liver[r * 8 + q] ? av : 0.0f;
+                }
+            }
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 const float sb = noscale ? 1.0f : (rowok[t] ? e4m3_to_f32(sr[t]) * smul : 0.0f);
-                if (slmc == 1u) {
+                if (kDbg && slmc == 1u) {
                     jm::joint_matrix_store(sg, C[r][t], lptr(sCw), 16, jm::layout::row_major);
                     xe::wave_barrier();
 #pragma unroll
@@ -914,8 +972,19 @@ void moe_i4i8_dpas_kernel(const int8_t* __restrict__ A, const float* __restrict_
                           uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                           uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
                           const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png, const uint32_t* __restrict__ map) {
-    moe_i4i8_dpas_kernel_t<8, 8>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_sorted,
-                                 parts, a_rows, slmc, pre, pnb, png, map);
+    /* run 265 (V3): the lean instance -- no runtime switches, no pre-decoded path, unconditional loads */
+    moe_i4i8_dpas_kernel_t<8, 8, false, false>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld,
+                                               a_sorted, parts, a_rows, 0u, nullptr, 0u, 0u, map);
+}
+/* the <8, 8> form with the runtime switches (the test modes RADIANCE_XE_I4I8_DPAS_SLMC and the pre-decoded path): the
+ * kernel every step before run 265 ran */
+void moe_i4i8_dpas_dbg_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                              const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                              uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                              uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows, uint32_t slmc,
+                              const uint32_t* __restrict__ pre, uint32_t pnb, uint32_t png, const uint32_t* __restrict__ map) {
+    moe_i4i8_dpas_kernel_t<8, 8, false, true>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k, a_ld, as_ld, y_ld,
+                                              a_sorted, parts, a_rows, slmc, pre, pnb, png, map);
 }
 void moe_i4i8_dpas_kernel_rt16(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                                const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
@@ -1307,18 +1376,35 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                              (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
                              (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png,
                              map);
-            else if (dpas_grf())   /* run 257: the same kernel and arguments under the large register file */
-                xe::launch_as_grf256<moe_i4i8_dpas_kernel, 16>(
-                    moe_i4i8_dpas_kernel, *qq, mgrid, block, (const int8_t*)Aq->data, (const float*)As->data,
-                    cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
-                    (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                    (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png, map);
-            else
-                XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, mgrid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
-                             cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
-                             (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
-                             (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png,
-                             map);
+            else {
+                /* run 265 (V3): the lean instance is the default kernel; the dbg instance (the runtime switches, the
+                 * kernel of every step before run 265) serves the test modes (RADIANCE_XE_I4I8_DPAS_SLMC != 0) and the
+                 * pre-decoded path (RADIANCE_XE_I4I8_DPAS_PRE=1) */
+                const bool dbg = dpas_slmc() != 0u || pre != nullptr;
+                if (dpas_grf() && dbg)   /* run 257: the same kernel and arguments under the large register file */
+                    xe::launch_as_grf256<moe_i4i8_dpas_dbg_kernel, 16>(
+                        moe_i4i8_dpas_dbg_kernel, *qq, mgrid, block, (const int8_t*)Aq->data, (const float*)As->data,
+                        cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                        (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                        (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, dpas_slmc(), pre, pnb, png, map);
+                else if (dpas_grf())
+                    xe::launch_as_grf256<moe_i4i8_dpas_kernel, 16>(
+                        moe_i4i8_dpas_kernel, *qq, mgrid, block, (const int8_t*)Aq->data, (const float*)As->data,
+                        cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                        (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                        (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, 0u, nullptr, 0u, 0u, map);
+                else if (dbg)
+                    XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_dbg_kernel, mgrid, block, 0, (const int8_t*)Aq->data,
+                                 (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data,
+                                 (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                 (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts,
+                                 (uint32_t)M, dpas_slmc(), pre, pnb, png, map);
+                else
+                    XE_LAUNCH_SG(16, qq, moe_i4i8_dpas_kernel, mgrid, block, 0, (const int8_t*)Aq->data, (const float*)As->data,
+                                 cl[0], cl[1], (const int32_t*)sorted->data, (const int32_t*)off->data, (uint16_t*)Y->data,
+                                 (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                                 (uint32_t)y_ld, a_sorted ? 1u : 0u, (uint32_t)parts, (uint32_t)M, 0u, nullptr, 0u, 0u, map);
+            }
             return RAD_OK;
         }
 #endif
