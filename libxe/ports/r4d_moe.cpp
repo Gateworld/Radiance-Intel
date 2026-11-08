@@ -54,6 +54,16 @@
 
 #include <hip/hip_bf16.h>
 
+/* run 267 (owner lever #3): the protected experts' bf16 GEMM on the matrix units, xe_moe_bf16_dpas.cpp (weak: the
+ * cpuprobe library builds this unit alone) */
+extern "C" __attribute__((weak)) int xe_moe_bf16_dpas_on();
+extern "C" __attribute__((weak)) int xe_moe_bf16_dpas_launch(void* stream, const uint16_t* A, const void* const* Wt,
+                                                             size_t w_s0, const int32_t* sorted, const int32_t* off,
+                                                             uint16_t* Y, uint32_t T, uint32_t N, uint32_t K,
+                                                             uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
+                                                             uint32_t a_ld, uint32_t w_ld, uint32_t y_ld, void* scratch,
+                                                             size_t scratch_bytes);
+
 #include <cstdlib>
 
 #include <algorithm>
@@ -3310,6 +3320,18 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
                            (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
                            (uint32_t)a_ld, (uint32_t)w_ld, (uint32_t)y_ld, nullptr);
     } else {
+        /* run 267 (owner lever #3, OPT-IN RADIANCE_XE_MOE_BF16_DPAS=1): the matrix-unit form (xe_moe_bf16_dpas.cpp),
+         * not bit-identical to the WMMA forms below (note 149's bar, never the default by this code). When it declines
+         * (its guards) the WMMA forms run; with the switch unset nothing is called and the dispatch is the old one. The
+         * symbols are weak: the cpuprobe library of this unit alone has none. */
+        const bool mu = xe_moe_bf16_dpas_on && xe_moe_bf16_dpas_launch && xe_moe_bf16_dpas_on() &&
+                        xe_moe_bf16_dpas_launch(stream, (const uint16_t*)A->data, tab, w_s0, (const int32_t*)sorted->data,
+                                                (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N,
+                                                (uint32_t)K, (uint32_t)n_expert, (uint32_t)top_k,
+                                                (uint32_t)(a_sorted ? 1 : 0), (uint32_t)a_ld, (uint32_t)w_ld,
+                                                (uint32_t)y_ld, a->scratch, (size_t)a->scratch_bytes) == 0;
+        if (mu) emit_rc = RAD_OK;
+        if (!mu) {
         const long long cap = r4d_blockmap_cap(T, n_expert, kPrefillRows);
         uint32_t* map = (form != 3 && n_expert <= (long long)kMaxExpert && a->scratch &&
                          a->scratch_bytes >= r4d_blockmap_bytes(cap))
@@ -3338,6 +3360,7 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
         else      emit_rc = wide_n ? R4D_MOE16(false, kPrefillCols / 16, 4, nyw)
                                    : R4D_MOE16(false, 4, 2, ny);
 #undef R4D_MOE16
+        }   /* !mu */
     }
     if (emit_rc != RAD_OK) return emit_rc;
     R4D_MOE_CHK();

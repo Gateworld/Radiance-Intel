@@ -138,6 +138,18 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gemv_bf16_cpu COMMAND xe_gemv_bf16_test)
   set_tests_properties(xe_gemv_bf16_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 900)
+  # Run 267 (owner lever #3): the protected experts' bf16 GEMM on the matrix units (xe_moe_bf16_dpas.cpp) against the
+  # WMMA form's arithmetic on the host -- the ulp report on a GPU (the card probe), the launcher's guards on the CPU
+  add_executable(xe_moe_bf16_dpas_test test/moe_bf16_dpas_test.cpp xe_moe_bf16_dpas.cpp)
+  rad_l0_sycl(xe_moe_bf16_dpas_test)
+  target_include_directories(xe_moe_bf16_dpas_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/libr4d)
+  target_compile_options(xe_moe_bf16_dpas_test PRIVATE -ffp-contract=off)
+  target_link_libraries(xe_moe_bf16_dpas_test PRIVATE rad_abi)
+  set_target_properties(xe_moe_bf16_dpas_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_moe_bf16_dpas_cpu COMMAND xe_moe_bf16_dpas_test)
+  set_tests_properties(xe_moe_bf16_dpas_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   # Run 207 (owner note 203 item 2): both GEMVs at every other rows-a-work-group choice (RADIANCE_XE_GEMV_WG), whose
   # small cases' N (33, 40, 77, 130, 200 ...) leave a partial last work-group at each
   # Run 209 (owner note 206 item 1): the K-specialised NX instances (RADIANCE_XE_GEMV_KC=1); `full` adds the trunk's
