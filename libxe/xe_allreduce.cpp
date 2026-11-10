@@ -642,6 +642,17 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
         /* proto 6: the bandwidth form for a message of ar_bw_min_bytes() or more (its 1x payload always fits a
          * parity's slot), the LL form 5 below it */
         const bool bw = ar_proto() == 6 && bytes >= ar_bw_min_bytes() && n32 + 6u * kMaxBlocks <= slot_words;   /* the payload + the control tail fit */
+        /* run 271 (the coordinator, owner note 212 item 3c): form 0 is the only form whose every thread polls a flag
+         * (TQ7-9: 8,192 pollers cost a streaming kernel 2x); with the slots sized as build() sizes them the LL form or
+         * the bandwidth form takes every message (B192: only <5> and <6> launches). Should a slot or ceiling change ever
+         * send a message to form 0 under the LL protocols, say so once (the first message's size and the slot) and
+         * count it; the dispatch itself is unchanged. */
+        if (!bw && !ll && ar_proto() >= 4) {
+            static std::atomic<uint32_t> form0_under_ll{0};
+            if (form0_under_ll.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                std::fprintf(stderr, "[xe] all-reduce: form 0 (the all-thread flag poll) dispatched under RADIANCE_XE_AR_PROTO=%d for a %llu-byte message (slot %u bytes, bw_min %llu): neither the LL nor the bandwidth form fit -- see logs/run271-light-poll-design.md\n",
+                             ar_proto(), (unsigned long long)bytes, (unsigned)in->slot_bytes, (unsigned long long)ar_bw_min_bytes());
+        }
 #define XE_AR(DT, HW_) do { if (bw) XE_ARP(DT, HW_, 6); else if (!ll) XE_ARP(DT, HW_, 0); else if (ar_proto() >= 5) XE_ARP(DT, HW_, 5); else XE_ARP(DT, HW_, 4); } while (0)
         if (hw && in->dtype == 0) XE_AR(0, true);
         else switch (in->dtype) { case 0: XE_AR(0, false); break; case 1: XE_AR(1, false); break; default: XE_AR(2, false); break; }
