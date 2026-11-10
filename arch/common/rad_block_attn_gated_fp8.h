@@ -108,6 +108,9 @@ struct AttnGatedFP8 {
     LinearFP8  qg{}, kp{}, vp{}, o{};
     NormQuantFP8 nq_h{};
 
+    /* Intel port, run 274 (pair 5): the q|gate, k and v projections as one `gemm_nt_q_x3` launch at decode rows,
+     * where a loaded library declares it and the three are the plain int8 form over the norm's own codes. */
+    rad_op     op_qkv3 = 0;
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
     rad_op     op_fused_kv = 0;                              /* the same with kv_store folded in */
     int64_t    fused_rows = 0;                               /* widest T the fused ops take */
@@ -246,6 +249,18 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
                             0, {}, kv_span_lo, kv_span_hi));
+    /* run 274 (pair 5): the three as one launch -- only when all three are the int8 form fed by the norm's codes with
+     * no quantiser of their own between them (asserted here, the coordinator's condition); unresolved, the step issues
+     * the three as today. */
+    if (qg.i8 && kp.i8 && vp.i8 && !qg.op_q && !kp.op_q && !vp.op_q && w.h.q8_fed &&
+        rad_op_declared(b, "gemm_nt_q_x3")) {
+        op_qkv3 = rw(b, RAD_OP(b, "gemm_nt_q_x3",
+                       RAD_PARAMS(RAD_RANGE("M", 1, kGemvMultiRows), RAD_INT("K", g.n_embd),
+                                  RAD_INT("N1", qg.N), RAD_INT("N2", kp.N), RAD_INT("N3", vp.N),
+                                  RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8")),
+                       RAD_WEIGHTS(qg.w, qg.ws, kp.w, kp.ws, vp.w, vp.ws)),
+                   {w.h.q8, w.h.s8}, {w.qg, w.k, w.v});
+    }
 
     /* The fused prologue (qk norms + rope + q|gate split) is a probe; the four unfused ops below
      * are declared either way and run when it does not resolve. Its schema takes a precomputed
@@ -512,9 +527,16 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
+    if (op_qkv3 && T <= kGemvMultiRows) {   /* run 274 (pair 5): the three projections in one launch */
+        RAD_ISSUE_N(c, op_qkv3, T, brows(w.h.q8, T), brows(w.h.s8, T),
+                    RAD_W(qg.w), RAD_W(qg.ws), brows(w.qg, T),
+                    RAD_W(kp.w), RAD_W(kp.ws), brows(w.k, T),
+                    RAD_W(vp.w), RAD_W(vp.ws), brows(w.v, T));
+    } else {
     qg.step(c, w.h, w.qg, T);
     kp.step(c, w.h, w.k,  T);
     vp.step(c, w.h, w.v,  T);
+    }
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per

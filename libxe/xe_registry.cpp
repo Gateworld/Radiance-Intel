@@ -58,6 +58,12 @@ extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* a, RadStream
 static const RadConstraint cXeRouterGemmQuant[] = { C_DIV("K", 8), C_GE("M", 1), C_LE("M", 16), C_GE("n_expert", 257),
                                                     C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
                                                     C_IN("dtype", "bf16"), C_DIV("n", 128), C_EQ("group", 128) };
+/* run 274 (pairs 4 / 5 of the decode step's adjacent launches): several projections of one activation in one GEMV
+ * launch (xe_gemv_i8.cpp); decode rows only (the GEMV path; the matrix-unit forms serve the prefill chunks) */
+extern "C" int xe_rad_gemm_nt_q_x3(const RadArgs* a, RadStream s);          /* xe_gemv_i8.cpp */
+extern "C" int xe_rad_gemm_nt_q_bf16_pair(const RadArgs* a, RadStream s);   /* xe_gemv_i8.cpp */
+static const RadConstraint cXeGemvMulti[] = { C_GE("M", 1), C_LE("M", 32), C_DIV("K", 128), C_EQ("group", 128),
+                                              C_IN("dtype", "i8a8") };
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -387,6 +393,11 @@ static bool xe_router_quant_pair_on() {
     static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_QUANT_PAIR"); return e && e[0] == '1'; }();
     return v;
 }
+/* run 274 (pairs 4 / 5): the paired GEMV launches; opt-in, =1 lists them */
+static bool xe_gemv_multi_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_MULTI"); return e && e[0] == '1'; }();
+    return v;
+}
 static const RadKernelInfo kFlagged[] = {
 /* pair 4 (RADIANCE_XE_GATE_QUANT=1): libr4d's gate_quant_fp8, its port's adapter -- the gated attention's sigmoid, mul
  * and quantiser as one pass, the sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does */
@@ -459,10 +470,29 @@ static const RadKernelInfo kFlagged[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeRouterGemmQuant), NOTUNE,
   nullptr, nullptr, xe_rad_router_gemm_topk_scatter_quant, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* the decode step's pairs 5 and 4 (RADIANCE_XE_GEMV_MULTI=1, run 274): three int8 projections of one activation (the
+ * gated attention's q|gate, k, v), and an int8 projection with a bf16 one over the two planes of one activation (the
+ * GDN block's in-projection and its a|b), each as one GEMV launch whose rows are the standalone kernels' rows
+ * (xe_gemv_i8.cpp); a form the paired kernels are not built for runs as the separate launches */
+{ "xe_gemm_nt_q_x3", "gemm_nt_q_x3", "gemm",
+  "three int8 GEMVs over one int8 activation in one launch: y_i = a @ b_i^T with the per-(row, 128) scales of each",
+  "M <= 32 rows (the decode GEMV path); K a multiple of 128; bf16 weight scales; the NX cross-lane form",
+  "int8 a with f32 scales, int8 weights with bf16 scales, bf16 y; each row the standalone GEMV's bits",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvMulti), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_nt_q_x3, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+{ "xe_gemm_nt_q_bf16_pair", "gemm_nt_q_bf16_pair", "gemm",
+  "an int8 GEMV over an activation's int8 codes and a bf16 GEMV over its bf16 plane in one launch",
+  "M <= 32 rows; K a multiple of 128 (and of 8 for the bf16 set); bf16 weight scales; the NX form",
+  "int8 a with f32 scales and int8 weights with bf16 scales for the first set; bf16 x, weight and y for the second",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvMulti), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_nt_q_bf16_pair, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static bool flagged_on(int j) {
     return j == 0 ? xe_gate_quant_on() : j == 1 ? xe_gated_had_on() : j == 2 ? xe_gated_quant_pair_on()
-                                        : j == 3 ? xe_qk_prologue_on() : xe_router_quant_pair_on();   /* j 4 and 5 */
+                                        : j == 3 ? xe_qk_prologue_on() : j <= 5 ? xe_router_quant_pair_on()
+                                        : xe_gemv_multi_on();   /* j 6 and 7 */
 }
 static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
 /* the j-th listed flagged entry (counting only those on), or -1 */
@@ -602,6 +632,24 @@ static const RadOperandSpec oXeRouterGemmQuant[] = {
     { "gate", RAD_OPD_OUT, 1 },
     { "x", RAD_OPD_IN, 0 },             { "q", RAD_OPD_OUT, 0 },          { "scale", RAD_OPD_OUT, 0 },
 };
+/* gemm_nt_q_x3 / gemm_nt_q_bf16_pair (run 274): gemm_nt_q's a, a_scale, then each set's weight(s) and y */
+static const RadParamSpec pXeGemvX3[] = {
+    P_INT("M"), P_INT("K"), P_INT("N1"), P_INT("N2"), P_INT("N3"), P_INT("group"), P_STR("dtype"),
+};
+static const RadOperandSpec oXeGemvX3[] = {
+    { "a", RAD_OPD_IN, 0 },          { "a_scale", RAD_OPD_IN, 0 },
+    { "b1", RAD_OPD_WEIGHT, 0 },     { "b1_scale", RAD_OPD_WEIGHT, 0 }, { "y1", RAD_OPD_OUT, 0 },
+    { "b2", RAD_OPD_WEIGHT, 0 },     { "b2_scale", RAD_OPD_WEIGHT, 0 }, { "y2", RAD_OPD_OUT, 0 },
+    { "b3", RAD_OPD_WEIGHT, 0 },     { "b3_scale", RAD_OPD_WEIGHT, 0 }, { "y3", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pXeGemvPair[] = {
+    P_INT("M"), P_INT("K"), P_INT("N1"), P_INT("N2"), P_INT("group"), P_STR("dtype"),
+};
+static const RadOperandSpec oXeGemvPair[] = {
+    { "a", RAD_OPD_IN, 0 },          { "a_scale", RAD_OPD_IN, 0 },
+    { "b1", RAD_OPD_WEIGHT, 0 },     { "b1_scale", RAD_OPD_WEIGHT, 0 }, { "y1", RAD_OPD_OUT, 0 },
+    { "x", RAD_OPD_IN, 0 },          { "b2", RAD_OPD_WEIGHT, 0 },       { "y2", RAD_OPD_OUT, 0 },
+};
 /* kFlagged's schemas, in its order; listed under the same flags */
 static const RadOpSchema kFlaggedSchemas[] = {
     { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
@@ -622,6 +670,11 @@ static const RadOpSchema kFlaggedSchemas[] = {
     { "router_gemm_topk_scatter_quant", ROW(pXeRouterGemmQuant), ROW(oXeRouterGemmQuant),
       "router_gemm_topk_scatter with had_quant_act_i8g over `x` (the same rows) in its router launch: the two ops' "
       "bytes." },
+    { "gemm_nt_q_x3", ROW(pXeGemvX3), ROW(oXeGemvX3),
+      "three gemm_nt_q (dtype i8a8) over one activation in one launch, widths N1 / N2 / N3: the three ops' bytes." },
+    { "gemm_nt_q_bf16_pair", ROW(pXeGemvPair), ROW(oXeGemvPair),
+      "gemm_nt_q (dtype i8a8, width N1) over an activation's codes and gemm_nt (bf16, width N2) over its bf16 plane "
+      "`x` in one launch: the two ops' bytes." },
 };
 static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");
 static int own_schemas() { return kNumSchemas + flagged_count(); }

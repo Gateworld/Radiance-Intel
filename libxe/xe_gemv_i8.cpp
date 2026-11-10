@@ -28,6 +28,7 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include <cstdint>
+#include <atomic>   /* run 274: the paired GEMV ops' say-once fallback note */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +114,183 @@ void gemv_i8a8_kernel(const int8_t* __restrict__ a, long a_ld, const float* __re
                                                                                  : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
         }
     }
+}
+
+/* ------------------------------------------------------------- several projections of one activation (run 274)
+ *
+ * Pairs 4 and 5 of the decode step's adjacent launches (owner note 214 item 3): the gated attention's q|gate, k and v
+ * projections, and the GDN block's in-projection with its bf16 a|b projection, are GEMVs over the same normed input
+ * issued back to back; the small ones (one kv head a rank, 96 a|b rows) are launch and latency alone. One grid runs the
+ * sets in ranges of work-groups, each row by a COPY of the standalone kernel's row (as gemv_bf16_pair_kernel does for
+ * the router and the shared gate): the same lane mapping, loads, DP4A sums, cross-lane steps and rounding, so each
+ * output row's bytes are its own launch's. The standalone kernels above are untouched, so their codegen is too (the
+ * coordinator's condition, run 274). The forms copied are the trunk's: bf16 weight scales, the NX cross-lane steps, the
+ * runtime K, WCC 5 or the default policy; the launcher takes any other form to the separate launches (gemv_multi_form).
+ * The pointers ride in structs of 8-byte fields (no padding: the tape audit compares bytes). */
+struct GvI8Set {
+    const int8_t* b = nullptr;
+    const void* bs = nullptr;
+    uint16_t* y = nullptr;
+    long b_ld = 0, bs_ld = 0, y_ld = 0, n = 0;
+};
+struct GvBfSet {
+    const uint16_t* a = nullptr;   /* the activation's bf16 plane (the int8 sets read its codes) */
+    const uint16_t* b = nullptr;
+    uint16_t* y = nullptr;
+    long a_ld = 0, b_ld = 0, y_ld = 0, n = 0;
+};
+
+/* gemv_i8a8_kernel<WS_BF16, MB, true, 0, WCC>'s row `n` of one set: its body from `live` on, verbatim. */
+template <bool WS_BF16, int MB, int WCC>
+inline void gemv_i8a8_set_row(int n, int lane, const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as,
+                              long as_ld, const GvI8Set& t, int K, int M) {
+    const int G = K / 128;
+    const int chunk = lane & 7, gsub = lane >> 3;
+    float acc[MB];
+#pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+    const bool live = n < (int)t.n;
+    const int8_t* brow = t.b + (size_t)(live ? n : 0) * t.b_ld;
+    for (int g0 = 0; g0 < G; g0 += 4) {
+        const int g = g0 + gsub;
+        const bool gl = live && g < G;
+        uint4 w = {0, 0, 0, 0};
+        if (gl) w = xe_ld16<WCC>(brow + (size_t)g * 128 + chunk * 16);
+        float sb = 0.0f;
+        if (gl) sb = WS_BF16 ? __uint_as_float((uint32_t)((const uint16_t*)t.bs)[(size_t)n * t.bs_ld + g] << 16)
+                             : ((const float*)t.bs)[(size_t)n * t.bs_ld + g];
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            int s = 0;
+            if (gl && m < M) {
+                const uint4 x = *(const uint4*)(a + (size_t)m * a_ld + (size_t)g * 128 + chunk * 16);
+                const unsigned wv[4] = {w.x, w.y, w.z, w.w}, xv[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (int u = 0; u < 4; ++u)
+                    s = xe_dp4a((int32_t)wv[u], (int32_t)xv[u], s);
+            }
+            s += gv_xor_i<1>(s); s += gv_xor_i<2>(s); s += gv_xor_i<4>(s);
+            if (gl && m < M && chunk == 0) acc[m] += ((float)s * as[(size_t)m * as_ld + g]) * sb;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float v = acc[m];
+        v += gv_xor_f<8>(v); v += gv_xor_f<16>(v);
+        if (live && lane == 0 && m < M) {
+            const uint32_t u = __float_as_uint(v);
+            t.y[(size_t)m * t.y_ld + n] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
+                                                                                     : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+        }
+    }
+}
+
+/* xe_gemv_bf16.cpp's gemv_bf16_kernel<false, false, MB, 0>'s row `n` of one set: its body from `live` on, verbatim
+ * (ld_bf16 / to_bf16 written out). */
+template <int MB>
+inline void gemv_bf16_set_row(int n, int lane, const GvBfSet& t, int K, int M) {
+    const bool live = n < (int)t.n;
+    const uint16_t* brow = t.b + (size_t)(live ? n : 0) * t.b_ld;
+    float acc[MB];
+#pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+    const int nchunk = K / 8;
+    for (int c = lane; c < nchunk && live; c += 32) {
+        const uint4 w = *(const uint4*)(brow + (size_t)c * 8);
+        const unsigned wv[4] = {w.x, w.y, w.z, w.w};
+        float wf[8];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            wf[2 * u] = __uint_as_float(wv[u] << 16);
+            wf[2 * u + 1] = __uint_as_float(wv[u] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            float s = 0.0f;
+            const uint4 x = *(const uint4*)(t.a + (size_t)m * t.a_ld + (size_t)c * 8);
+            const unsigned xv[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned h = (e & 1) ? (xv[e >> 1] & 0xffff0000u) : (xv[e >> 1] << 16);
+                s += __uint_as_float(h) * wf[e];
+            }
+            acc[m] += s;
+        }
+    }
+    for (int k = nchunk * 8 + lane; k < K && live; k += 32)
+#pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            if (m >= M) break;
+            const float av = __uint_as_float((uint32_t)t.a[(size_t)m * t.a_ld + k] << 16);
+            acc[m] += av * __uint_as_float((uint32_t)brow[k] << 16);
+        }
+#pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float v = acc[m];
+        for (int x = 16; x >= 1; x >>= 1) v += __shfl_xor(v, x);
+        if (live && lane == 0 && m < M) {
+            const uint32_t u = __float_as_uint(v);
+            t.y[(size_t)m * t.y_ld + n] = (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u)
+                                                                                     : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+        }
+    }
+}
+
+/* Three int8 sets over one activation (pair 5: q|gate, k, v): work-groups [0, g1) set 1, [g1, g1 + g2) set 2, the rest
+ * set 3; within a set the row is the standalone kernel's `blockIdx.x * rows_wg + sub-group`. */
+template <bool WS_BF16, int MB, int WCC>
+void gemv_i8a8_x3_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld, int K,
+                         int M, long g1, long g2, GvI8Set s1, GvI8Set s2, GvI8Set s3) {
+    const int lane = (int)threadIdx.x & 31, rows = (int)blockDim.x >> 5, sub = (int)threadIdx.x >> 5;
+    const long blk = (long)blockIdx.x;
+    if (blk < g1)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)blk * rows + sub, lane, a, a_ld, as, as_ld, s1, K, M);
+    else if (blk < g1 + g2)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)(blk - g1) * rows + sub, lane, a, a_ld, as, as_ld, s2, K, M);
+    else
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)(blk - g1 - g2) * rows + sub, lane, a, a_ld, as, as_ld, s3, K, M);
+}
+
+/* An int8 set and a bf16 set over one activation's two planes (pair 4: the GDN in-projection and its a|b). */
+template <bool WS_BF16, int MB, int WCC>
+void gemv_i8a8_bf16_pair_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
+                                int K, int M, long g1, GvI8Set s1, GvBfSet s2) {
+    const int lane = (int)threadIdx.x & 31, rows = (int)blockDim.x >> 5, sub = (int)threadIdx.x >> 5;
+    const long blk = (long)blockIdx.x;
+    if (blk < g1)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)blk * rows + sub, lane, a, a_ld, as, as_ld, s1, K, M);
+    else
+        gemv_bf16_set_row<MB>((int)(blk - g1) * rows + sub, lane, s2, K, M);
+}
+
+/* The forms the paired launches are built for (the trunk's: NX on, no KC instance for this K, WCC 5 or the default
+ * policy, no GL / RT env form). Anything else returns false and the adapter issues the sets' separate launches. */
+static bool gemv_multi_form(int K, int* wcc_out) {
+    static const bool nx = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_NX"); return e && e[0] == '1'; }();
+    static const bool kc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_KC"); return e && e[0] == '1'; }();
+    static const int wcc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_WCC"); return e ? std::atoi(e) : 5; }();
+    static const int glf = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_GL"); return e ? std::atoi(e) : 0; }();
+    static const bool rt = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_RT"); return e && e[0] == '1'; }();
+    *wcc_out = wcc;
+    if (!nx || glf != 0 || rt) return false;
+    if (kc && (K == 2560 || K == 6144 || K == 640)) return false;
+    return wcc == 5 || wcc == 0;
+}
+
+template <int MB, int WCC>
+static void launch_x3_mb(sycl::queue* q, const int8_t* am, long a_ld, const float* asm_, long as_ld, int K, int mb,
+                         long g1, long g2, long g3, const GvI8Set& s1, const GvI8Set& s2, const GvI8Set& s3) {
+    const int rw = xe::gemv_rows_wg();
+    const dim3 grid((unsigned)(g1 + g2 + g3)), block(32 * rw);
+    XE_LAUNCH(q, (gemv_i8a8_x3_kernel<true, MB, WCC>), grid, block, 0, am, a_ld, asm_, as_ld, K, mb, g1, g2, s1, s2, s3);
+}
+template <int MB, int WCC>
+static void launch_pair_mb(sycl::queue* q, const int8_t* am, long a_ld, const float* asm_, long as_ld, int K, int mb,
+                           long g1, long g2, const GvI8Set& s1, const GvBfSet& s2) {
+    const int rw = xe::gemv_rows_wg();
+    const dim3 grid((unsigned)(g1 + g2)), block(32 * rw);
+    XE_LAUNCH(q, (gemv_i8a8_bf16_pair_kernel<true, MB, WCC>), grid, block, 0, am, a_ld, asm_, as_ld, K, mb, g1, s1, s2);
 }
 
 /* RT (RADIANCE_XE_GEMV_RT=1, the 4-row launches; owner note 129 item 3, run 110): the GEMV's mapping, loads and
@@ -740,6 +918,176 @@ extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* args, RadStream s) {
             launch<false>(q, (const int8_t*)A->data, (long)a_ld, (const float*)AS->data, (long)as_ld,
                           (const int8_t*)B->data, (long)b_ld, BS->data, (long)bs_ld, (uint16_t*)Y->data, (long)y_ld,
                           (int)N, (int)K, (int)M);
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------- the paired GEMV ops' adapters (run 274) */
+extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* args, RadStream s);   /* xe_gemv_bf16.cpp: the bf16 set's fallback */
+
+namespace {
+
+RadParam gm_pi(const char* k, long long v) { RadParam p{}; p.key = k; p.kind = RAD_P_INT; p.ival = v; return p; }
+RadParam gm_ps(const char* k, const char* v) { RadParam p{}; p.key = k; p.kind = RAD_P_STR; p.sval = v; return p; }
+
+/* One int8 set of a paired op (b, b_scale, y against the shared a): the standalone adapter's checks. RAD_OK, or
+ * RAD_E_UNSUPPORTED for a form the paired kernels are not built for (f32 scales), or an error. */
+int gm_i8_set(const RadTensor* B, const RadTensor* BS, const RadTensor* Y, long long N, long long K, long long M,
+              GvI8Set* o) {
+    if (!B || !BS || !Y || !B->data || !BS->data || !Y->data) return R4D_NO(RAD_E_INVAL);
+    if (B->dtype != RAD_I8 || Y->dtype != RAD_BF16 || (BS->dtype != RAD_BF16 && BS->dtype != RAD_F32))
+        return R4D_NO(RAD_E_DTYPE);
+    if (N <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long My = 0, Nb = 0, Nbs = 0;
+    const long long y_ld = r4d_rows_pitch(Y, N, &My), b_ld = r4d_rows_pitch(B, K, &Nb),
+                    bs_ld = r4d_rows_pitch(BS, K / 128, &Nbs);
+    if (y_ld < 0 || b_ld < 0 || bs_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < M || Nb < N || Nbs < N) return R4D_NO(RAD_E_SHAPE);
+    if ((uintptr_t)B->data % 16 || b_ld % 16) return R4D_NO(RAD_E_STRIDE);
+    if (BS->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+    o->b = (const int8_t*)B->data; o->bs = BS->data; o->y = (uint16_t*)Y->data;
+    o->b_ld = (long)b_ld; o->bs_ld = (long)bs_ld; o->y_ld = (long)y_ld; o->n = (long)N;
+    return RAD_OK;
+}
+
+/* The bf16 set (x, b2, y2): gemv's entry conditions (16-byte x, a_ld % 8). */
+int gm_bf_set(const RadTensor* X, const RadTensor* B, const RadTensor* Y, long long N, long long K, long long M,
+              GvBfSet* o) {
+    if (!X || !B || !Y || !X->data || !B->data || !Y->data) return R4D_NO(RAD_E_INVAL);
+    if (X->dtype != RAD_BF16 || B->dtype != RAD_BF16 || Y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (N <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long Mx = 0, My = 0, Nb = 0;
+    const long long a_ld = r4d_rows_pitch(X, K, &Mx), y_ld = r4d_rows_pitch(Y, N, &My), b_ld = r4d_rows_pitch(B, K, &Nb);
+    if (a_ld < 0 || y_ld < 0 || b_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (Mx < M || My < M || Nb < N) return R4D_NO(RAD_E_SHAPE);
+    if ((uintptr_t)X->data % 16 || a_ld % 8 || (uintptr_t)B->data % 16 || b_ld % 8) return RAD_E_UNSUPPORTED;
+    o->a = (const uint16_t*)X->data; o->b = (const uint16_t*)B->data; o->y = (uint16_t*)Y->data;
+    o->a_ld = (long)a_ld; o->b_ld = (long)b_ld; o->y_ld = (long)y_ld; o->n = (long)N;
+    return RAD_OK;
+}
+
+/* The shared activation: a int8 [M][K], a_scale f32 [M][K / 128]. */
+int gm_act(const RadArgs* args, long long K, const int8_t** a, long* a_ld, const float** as, long* as_ld, long long* M) {
+    const RadTensor* A = r4d_opt(args, 0);
+    const RadTensor* AS = r4d_opt(args, 1);
+    if (!A || !AS || !A->data || !AS->data) return R4D_NO(RAD_E_INVAL);
+    if (A->dtype != RAD_I8 || AS->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (K <= 0 || K % 128 || r4d_geti_or(args, "group", 128) != 128) return R4D_NO(RAD_E_SHAPE);
+    long long Ma = 0, Mas = 0;
+    const long long ald = r4d_rows_pitch(A, K, &Ma), asld = r4d_rows_pitch(AS, K / 128, &Mas);
+    if (ald < 0 || asld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (Ma <= 0 || Mas < Ma) return R4D_NO(RAD_E_SHAPE);
+    if ((uintptr_t)A->data % 16 || ald % 16) return R4D_NO(RAD_E_STRIDE);
+    *a = (const int8_t*)A->data; *a_ld = (long)ald; *as = (const float*)AS->data; *as_ld = (long)asld; *M = Ma;
+    return RAD_OK;
+}
+
+/* The separate launches (today's kernels) for a form the paired kernels are not built for; said once. */
+void gm_fallback_note(const char* op, const char* why) {
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) == 0)
+        std::fprintf(stderr, "libxe: %s runs its sets as separate launches (%s); the paired form is not built for it\n",
+                     op, why);
+}
+int gm_fallback_i8(const RadArgs* args, int ib, long long N, long long K, RadStream s) {
+    RadTensor t[5] = { args->t[0], args->t[1], args->t[ib], args->t[ib + 1], args->t[ib + 2] };
+    RadParam p[4] = { gm_pi("N", N), gm_pi("K", K), gm_pi("group", 128), gm_ps("dtype", "i8a8") };
+    RadArgs sub = *args; sub.t = t; sub.n_t = 5; sub.p = p; sub.n_p = 4;
+    return xe_rad_gemm_i8a8_gemv(&sub, s);
+}
+int gm_fallback_bf(const RadArgs* args, int ix, long long N, long long K, RadStream s) {
+    RadTensor t[3] = { args->t[ix], args->t[ix + 1], args->t[ix + 2] };
+    RadParam p[3] = { gm_pi("N", N), gm_pi("K", K), gm_ps("dtype", "bf16") };
+    RadArgs sub = *args; sub.t = t; sub.n_t = 3; sub.p = p; sub.n_p = 3;
+    return xe_rad_gemm_nt_bf16(&sub, s);
+}
+
+}  // namespace
+
+/* gemm_nt_q_x3 (pair 5): a, a_scale, b1, b1_scale, y1, b2, b2_scale, y2, b3, b3_scale, y3; M, K, N1, N2, N3, group,
+ * dtype i8a8. One launch over the three sets in the trunk's forms, else the three separate launches. */
+extern "C" int xe_rad_gemm_nt_q_x3(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 11) return R4D_NO(RAD_E_INVAL);
+    const long long K = r4d_geti_or(args, "K", 0);
+    const long long N[3] = { r4d_geti_or(args, "N1", 0), r4d_geti_or(args, "N2", 0), r4d_geti_or(args, "N3", 0) };
+    const int8_t* a = nullptr; const float* as = nullptr; long a_ld = 0, as_ld = 0; long long M = 0;
+    int rc = gm_act(args, K, &a, &a_ld, &as, &as_ld, &M);
+    if (rc != RAD_OK) return rc;
+    GvI8Set st[3];
+    bool fused = true;
+    for (int i = 0; i < 3; ++i) {
+        rc = gm_i8_set(r4d_opt(args, 2 + 3 * i), r4d_opt(args, 3 + 3 * i), r4d_opt(args, 4 + 3 * i), N[i], K, M, &st[i]);
+        if (rc == RAD_E_UNSUPPORTED) fused = false;
+        else if (rc != RAD_OK) return rc;
+    }
+    int wcc = 5;
+    if (fused && !gemv_multi_form((int)K, &wcc)) fused = false;
+    if (!fused) {
+        gm_fallback_note("gemm_nt_q_x3", "a GEMV env form or f32 scales");
+        for (int i = 0; i < 3; ++i)
+            if ((rc = gm_fallback_i8(args, 2 + 3 * i, N[i], K, s)) != RAD_OK) return rc;
+        return RAD_OK;
+    }
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        const int rw = xe::gemv_rows_wg();
+        const long g1 = (st[0].n + rw - 1) / rw, g2 = (st[1].n + rw - 1) / rw, g3 = (st[2].n + rw - 1) / rw;
+        for (long long m0 = 0; m0 < M; m0 += kMaxM) {
+            const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
+            GvI8Set t1 = st[0], t2 = st[1], t3 = st[2];
+            t1.y += (size_t)m0 * t1.y_ld; t2.y += (size_t)m0 * t2.y_ld; t3.y += (size_t)m0 * t3.y_ld;
+            const int8_t* am = a + (size_t)m0 * a_ld;
+            const float* asm_ = as + (size_t)m0 * as_ld;
+            if (mb == 1) { if (wcc == 5) launch_x3_mb<1, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3);
+                           else launch_x3_mb<1, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3); }
+            else { if (wcc == 5) launch_x3_mb<kMaxM, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3);
+                   else launch_x3_mb<kMaxM, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3); }
+        }
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
+
+/* gemm_nt_q_bf16_pair (pair 4): a, a_scale, b1, b1_scale, y1, x, b2, y2; M, K, N1, N2, group, dtype i8a8 -- an int8
+ * set over the activation's codes and a bf16 set over its bf16 plane in one launch, else the two separate launches. */
+extern "C" int xe_rad_gemm_nt_q_bf16_pair(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 8) return R4D_NO(RAD_E_INVAL);
+    const long long K = r4d_geti_or(args, "K", 0);
+    const long long N1 = r4d_geti_or(args, "N1", 0), N2 = r4d_geti_or(args, "N2", 0);
+    const int8_t* a = nullptr; const float* as = nullptr; long a_ld = 0, as_ld = 0; long long M = 0;
+    int rc = gm_act(args, K, &a, &a_ld, &as, &as_ld, &M);
+    if (rc != RAD_OK) return rc;
+    GvI8Set s1; GvBfSet s2;
+    bool fused = true;
+    rc = gm_i8_set(r4d_opt(args, 2), r4d_opt(args, 3), r4d_opt(args, 4), N1, K, M, &s1);
+    if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    rc = gm_bf_set(r4d_opt(args, 5), r4d_opt(args, 6), r4d_opt(args, 7), N2, K, M, &s2);
+    if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    int wcc = 5;
+    if (fused && !gemv_multi_form((int)K, &wcc)) fused = false;
+    if (!fused) {
+        gm_fallback_note("gemm_nt_q_bf16_pair", "a GEMV env form, f32 scales or an unaligned bf16 set");
+        if ((rc = gm_fallback_i8(args, 2, N1, K, s)) != RAD_OK) return rc;
+        return gm_fallback_bf(args, 5, N2, K, s);
+    }
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        const int rw = xe::gemv_rows_wg();
+        const long g1 = (s1.n + rw - 1) / rw, g2 = (s2.n + rw - 1) / rw;
+        for (long long m0 = 0; m0 < M; m0 += kMaxM) {
+            const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
+            GvI8Set t1 = s1; GvBfSet t2 = s2;
+            t1.y += (size_t)m0 * t1.y_ld; t2.y += (size_t)m0 * t2.y_ld; t2.a += (size_t)m0 * t2.a_ld;
+            const int8_t* am = a + (size_t)m0 * a_ld;
+            const float* asm_ = as + (size_t)m0 * as_ld;
+            if (mb == 1) { if (wcc == 5) launch_pair_mb<1, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2);
+                           else launch_pair_mb<1, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2); }
+            else { if (wcc == 5) launch_pair_mb<kMaxM, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2);
+                   else launch_pair_mb<kMaxM, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2); }
+        }
     } catch (const sycl::exception&) {
         return RAD_E_DEVICE;
     }

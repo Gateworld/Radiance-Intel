@@ -570,6 +570,19 @@ if(RAD_BUILD_TESTS)
     "RADIANCE_XE_ROUTER_QUANT_PAIR=1 $<TARGET_FILE:xe_router_quant_test> $<TARGET_FILE:libxe>")
   set_tests_properties(xe_router_quant_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # run 274 (the decode step's pairs 4 / 5): three gemm_nt_q rows vs gemm_nt_q_x3 and gemm_nt_q + gemm_nt vs
+  # gemm_nt_q_bf16_pair (RADIANCE_XE_GEMV_MULTI=1; the NX form the paired kernels copy), M 1 / 4, every output byte for
+  # byte; the same binary runs on the card (logs/gmstep.sh, the MB form)
+  add_executable(xe_gemv_multi_test test/gemv_multi_test.cpp)
+  rad_l0_sycl(xe_gemv_multi_test)
+  target_include_directories(xe_gemv_multi_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_gemv_multi_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_gemv_multi_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_gemv_multi_test libxe)
+  add_test(NAME xe_gemv_multi_cpu COMMAND sh -c
+    "RADIANCE_XE_GEMV_MULTI=1 RADIANCE_XE_GEMV_NX=1 $<TARGET_FILE:xe_gemv_multi_test> $<TARGET_FILE:libxe>")
+  set_tests_properties(xe_gemv_multi_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_executable(xe_hc_persist_test test/hc_persist_test.cpp)
   rad_l0_sycl(xe_hc_persist_test)
   target_include_directories(xe_hc_persist_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)

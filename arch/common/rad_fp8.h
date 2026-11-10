@@ -680,6 +680,11 @@ struct RowParts {
     }
 };
 
+/* Intel port, run 274 (owner note 214 item 3, the decode step's adjacent-launch pairs 4 and 5): the row bound of the
+ * paired GEMV ops (`gemm_nt_q_x3`, `gemm_nt_q_bf16_pair`, libxe under RADIANCE_XE_GEMV_MULTI=1) -- the decode GEMV
+ * path; above it the blocks issue the projections one by one as always (the matrix-unit forms serve prefill). */
+constexpr int64_t kGemvMultiRows = 32;
+
 /* ================================================================== one block-scaled linear */
 struct LinearFP8 {
     rad_weight w = 0, ws = 0;

@@ -115,6 +115,9 @@ struct GdnFP8 {
     QuantFP8   q_o{};
 
     rad_op op_ab = 0;
+    /* Intel port, run 274 (pair 4): the in-projection and the a|b projection as one `gemm_nt_q_bf16_pair` launch at
+     * decode rows, where a loaded library declares it and `in` is the plain int8 form over the norm's own codes. */
+    rad_op op_inab = 0;
     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
     /* `gdn_conv_recurrent_update`, if it resolves: the pair above in one launch, with the
@@ -264,6 +267,17 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", ab_dim),
                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                    RAD_WEIGHTS(w_ab)), {w.h.x}, {w.ab});
+    /* run 274 (pair 4): the two as one launch at decode rows -- the in-projection over the norm's codes and this a|b
+     * over its bf16 plane -- when `in` is the int8 form fed by those codes (no quantiser of its own); unresolved, the
+     * step issues the two as today. */
+    if (in.i8 && !in.op_q && w.h.q8_fed && rad_op_declared(b, "gemm_nt_q_bf16_pair")) {
+        op_inab = rw(b, RAD_OP(b, "gemm_nt_q_bf16_pair",
+                       RAD_PARAMS(RAD_RANGE("M", 1, kGemvMultiRows), RAD_INT("K", g.n_embd),
+                                  RAD_INT("N1", in.N), RAD_INT("N2", ab_dim),
+                                  RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8")),
+                       RAD_WEIGHTS(in.w, in.ws, w_ab)),
+                   {w.h.q8, w.h.s8, w.h.x}, {w.in.x, w.ab});
+    }
 
     /* ---- the chunked path. As in the bf16 block, except `a` and `b_gate` are views of `ab`. */
     op_conv_prep = rw(b, RAD_OP(b, "gdn_conv_prep",
@@ -429,8 +443,13 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
 
     if (!ext_in) nq_h.step(c, T);
+    if (op_inab && T <= kGemvMultiRows) {   /* run 274 (pair 4): the in-projection and a|b in one launch */
+        RAD_ISSUE_N(c, op_inab, T, brows(w.h.q8, T), brows(w.h.s8, T), RAD_W(in.w), RAD_W(in.ws),
+                    brows(w.in.x, T), brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+    } else {
     in.step(c, w.h, w.in.x, T);
     RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+    }
 
     /* Each path runs over its own run of sequences. The step is sorted decode-first: decode rows
      * are sequences [0, D) with tokens [0, DT), prefill chunks are [D, S) with the rest. A pure

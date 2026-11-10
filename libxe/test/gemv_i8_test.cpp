@@ -24,6 +24,8 @@
 #include <vector>
 
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
+/* run 274: the paired GEMV ops' bf16 fallback lives in xe_gemv_bf16.cpp, which this standalone test does not link */
+extern "C" int xe_rad_gemm_nt_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 
 namespace {
 
