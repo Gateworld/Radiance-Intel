@@ -17,9 +17,11 @@
  * bf16 output. So it is OPT-IN (RADIANCE_XE_MOE_BF16_DPAS=1) and the default follows note 149's KL-replay bar, not
  * the bit gate. With the switch unset nothing here runs and the dispatch is byte for byte the old one.
  *
- * Guards (the launcher returns 1 = not taken, and the caller runs the old kernel): K % 64, a call under 512 sorted
- * rows (the int8 form's cut-off), no or too small a scratch for the block map, a stride that is not a whole number of
- * 16-byte pieces (the caller already requires a_ld % 8 == 0, w_ld % 8 == 0, A and the planes 16-byte aligned).
+ * Guards (the launcher returns 1 = not taken, and the caller runs the old kernel): K % 64, a call under 64 sorted
+ * rows (one block; until run 268 it was 512, the int8 form's cut-off, which left the prompts' short last steps on
+ * the WMMA form at 2.9 ms a launch), no or too small a scratch for the block map, a stride that is not a whole number
+ * of 16-byte pieces (the caller already requires a_ld % 8 == 0, w_ld % 8 == 0, A and the planes 16-byte aligned).
+ * The caller takes this form only in its prefill class (T > 256 sorted rows): decode and the MTP verify never do.
  */
 #include "xe_lanes.h"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -208,8 +210,18 @@ extern "C" int xe_moe_bf16_dpas_launch(void* stream, const uint16_t* A, const vo
                                        uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k,
                                        uint32_t a_sorted, uint32_t a_ld, uint32_t w_ld, uint32_t y_ld,
                                        void* scratch, size_t scratch_bytes) {
+    static const int trace = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_DPAS_TRACE"); return (s && *s == '1') ? 1 : 0; }();
     if (!stream || !A || !Wt || !sorted || !off || !Y || !scratch) return 1;
-    if (K == 0 || K % 64u != 0 || N == 0 || T < 512u || n_expert == 0 || top_k == 0) return 1;
+    /* run 268 (the coordinator): the 512-slot cut-off was the int8 form's; this kernel serves any run (a block of 64
+     * rows, partial runs, dead rows -- the test's shapes D / E), so the guard is one block. The caller's own prefill
+     * class (T > 256) keeps decode and the MTP verify off this form. */
+    if (K == 0 || K % 64u != 0 || N == 0 || T < 64u || n_expert == 0 || top_k == 0) {
+        static uint32_t declined = 0;
+        if (trace && (++declined <= 16 || declined % 64 == 0))
+            std::fprintf(stderr, "[xe] moe_bf16_dpas trace: declined call %u: T %u N %u K %u experts %u top_k %u\n",
+                         declined, T, N, K, n_expert, top_k);
+        return 1;
+    }
     if (a_ld % 8u != 0 || w_ld % 8u != 0 || ((uintptr_t)A & 15u) != 0 || (w_s0 % 16u) != 0) return 1;
     const uint32_t cap = n_expert + (T + (uint32_t)kRows - 1) / (uint32_t)kRows + 1;
     const size_t bytes = (size_t)(1 + 2 * cap) * sizeof(uint32_t);
@@ -226,5 +238,24 @@ extern "C" int xe_moe_bf16_dpas_launch(void* stream, const uint16_t* A, const vo
     const dim3 grid((unsigned)((N + (uint32_t)kCols - 1) / (uint32_t)kCols), (unsigned)cap), block((unsigned)kThreads);
     XE_LAUNCH_SG(16, qq, moe_bf16_dpas_kernel, grid, block, 0, A, Wt, w_s0, sorted, off, Y, T, N, K, top_k, a_sorted,
                  a_ld, w_ld, y_ld, (const uint32_t*)map);
+    /* run 268 (the coordinator's question on B190's 43 us a launch): RADIANCE_XE_MOE_BF16_DPAS_TRACE=1 reads the call's
+     * live rows and block count back (a blocking copy: measurement only) and prints them with the running mean, so
+     * the kernel's FLOPs a launch follow from the rows it really covered, not from T's slots. */
+    if (trace) {
+        static uint32_t calls = 0;
+        static double rows = 0.0, blocks = 0.0;
+        uint32_t cnt = 0; int32_t lo = 0, hi = 0;
+        qq->memcpy(&cnt, map, sizeof cnt).wait();
+        qq->memcpy(&lo, off, sizeof lo).wait();
+        qq->memcpy(&hi, off + n_expert, sizeof hi).wait();
+        const uint32_t tail_blocks = (T > (uint32_t)hi) ? (T - (uint32_t)hi + (uint32_t)kRows - 1) / (uint32_t)kRows : 0u;
+        const uint32_t live_blocks = cnt > tail_blocks ? cnt - tail_blocks : 0u;
+        ++calls; rows += (double)(hi - lo); blocks += (double)live_blocks;
+        if (calls <= 64 || calls % 64 == 0)
+            std::fprintf(stderr, "[xe] moe_bf16_dpas trace: call %u T %u live %d (rows %d..%d) live blocks %u tail blocks %u "
+                                 "(cap %u) N %u K %u experts %u | mean live %.1f rows, %.2f live blocks over %u calls\n",
+                         calls, T, hi - lo, lo, hi, live_blocks, tail_blocks, cap, N, K, n_expert, rows / calls,
+                         blocks / calls, calls);
+    }
     return 0;
 }

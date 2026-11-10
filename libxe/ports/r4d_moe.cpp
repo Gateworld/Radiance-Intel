@@ -3324,7 +3324,10 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
          * not bit-identical to the WMMA forms below (note 149's bar, never the default by this code). When it declines
          * (its guards) the WMMA forms run; with the switch unset nothing is called and the dispatch is the old one. The
          * symbols are weak: the cpuprobe library of this unit alone has none. */
-        const bool mu = xe_moe_bf16_dpas_on && xe_moe_bf16_dpas_launch && xe_moe_bf16_dpas_on() &&
+        /* run 268 (the coordinator's prefill-only condition): T > 256 is the dispatch's own prefill class -- decode and
+         * the MTP verify (T <= 256: 16 tokens x top_k 10 = 160) take the GEMV form above when it is on, and with the
+         * GEMV opted out they fall through to here, so the class is required again: decode stays bit-exact. */
+        const bool mu = T > 256 && xe_moe_bf16_dpas_on && xe_moe_bf16_dpas_launch && xe_moe_bf16_dpas_on() &&
                         xe_moe_bf16_dpas_launch(stream, (const uint16_t*)A->data, tab, w_s0, (const int32_t*)sorted->data,
                                                 (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N,
                                                 (uint32_t)K, (uint32_t)n_expert, (uint32_t)top_k,

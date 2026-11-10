@@ -16,6 +16,10 @@
  */
 #include <sycl/sycl.hpp>
 
+#include "rad_abi.h"
+
+#include <dlfcn.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -51,6 +55,44 @@ int ulp_dist(uint16_t a, uint16_t b) {
 }
 constexpr size_t kCanary = 4096;
 constexpr uint8_t kPat = 0xC5;
+
+/* Run 268 (the coordinator's MB4): the OLD kernel too -- ports/r4d_moe.cpp's r4d_rad_moe_gemm_bf16 (the dispatch:
+ * T <= 256 the GEMV form when on, else the WMMA emulation's prefill form) loaded from the image's libxe.so (RI_LIBXE,
+ * default /opt/ri/radiance_home/kernels/libxe.so), scored against the same references as the matrix form. */
+typedef int (*LaunchFn)(const RadArgs*, RadStream);
+LaunchFn g_old = nullptr;
+
+RadTensor tn(void* p, uint32_t dt, std::initializer_list<int64_t> sh) {
+    RadTensor t{}; t.data = p; t.dtype = dt; t.rank = (int)sh.size();
+    int i = 0;
+    for (int64_t s : sh) t.shape[i++] = s;
+    int64_t st = 1;
+    for (int r = t.rank - 1; r >= 0; --r) { t.stride[r] = st; st *= t.shape[r]; }
+    return t;
+}
+
+/* the old op on contiguous operands: A [M, K], W [E, N, K] stacked, Y [T, N] (pitch N); 0 = ran */
+int run_old(sycl::queue& q, const uint16_t* dA, uint32_t M, const uint16_t* dW, const int32_t* dS, const int32_t* dO,
+            uint16_t* dY, uint32_t T, uint32_t N, uint32_t K, uint32_t E, uint32_t top_k, void* scratch, size_t scratch_bytes) {
+    RadTensor t[5];
+    t[0] = tn((void*)dA, RAD_BF16, {(int64_t)M, (int64_t)K});
+    t[1] = tn((void*)dW, RAD_BF16, {(int64_t)E, (int64_t)N, (int64_t)K});
+    t[2] = tn((void*)dS, RAD_I32, {(int64_t)T});
+    t[3] = tn((void*)dO, RAD_I32, {(int64_t)E + 1});
+    t[4] = tn((void*)dY, RAD_BF16, {(int64_t)T, (int64_t)N});
+    RadParam p[6]{};
+    const char* ik[] = {"N", "K", "n_expert", "top_k"};
+    const long long iv[] = {(long long)N, (long long)K, (long long)E, (long long)top_k};
+    for (int i = 0; i < 4; ++i) { p[i].key = ik[i]; p[i].kind = RAD_P_INT; p[i].ival = iv[i]; }
+    p[4].key = "dtype"; p[4].kind = RAD_P_STR; p[4].sval = "bf16";
+    p[5].key = "a_order"; p[5].kind = RAD_P_STR; p[5].sval = "token";
+    RadArgs args{};
+    args.t = t; args.n_t = 5; args.p = p; args.n_p = 6; args.scratch = scratch; args.scratch_bytes = (int64_t)scratch_bytes;
+    const int rc = g_old(&args, (RadStream)&q);
+    q.wait();
+    return rc;
+}
+const char* old_form_name(uint32_t T) { return T <= 256u ? "T <= 256: the GEMV form (default on)" : "T > 256: the WMMA prefill form"; }
 
 struct Case {
     const char* name;
@@ -135,7 +177,7 @@ bool run_case(sycl::queue& q, const Case& cs, bool gpu) {
     const size_t map_bytes = (size_t)(1 + 2 * cap) * 4;
     if (xe_moe_bf16_dpas_launch(&q, dA, (const void* const*)dW, (size_t)N * w_ld * 2, dS, dO, dY, T, N, K + 32, E, top_k, 0,
                                 a_ld, w_ld, y_ld, dMap, map_bytes) != 1) { std::printf("FAIL %s: K %% 64 not refused\n", cs.name); ok = false; }
-    if (xe_moe_bf16_dpas_launch(&q, dA, (const void* const*)dW, (size_t)N * w_ld * 2, dS, dO, dY, 500, N, K, E, top_k, 0,
+    if (xe_moe_bf16_dpas_launch(&q, dA, (const void* const*)dW, (size_t)N * w_ld * 2, dS, dO, dY, 50, N, K, E, top_k, 0,
                                 a_ld, w_ld, y_ld, dMap, map_bytes) != 1) { std::printf("FAIL %s: a small call not refused\n", cs.name); ok = false; }
     if (xe_moe_bf16_dpas_launch(&q, dA, (const void* const*)dW, (size_t)N * w_ld * 2, dS, dO, dY, T, N, K, E, top_k, 0,
                                 a_ld, w_ld, y_ld, dMap, 16) != 1) { std::printf("FAIL %s: a small scratch not refused\n", cs.name); ok = false; }
@@ -195,7 +237,141 @@ bool run_case(sycl::queue& q, const Case& cs, bool gpu) {
                 cs.name, T, live, N, K, E, n_cmp, n_diff, n_cmp ? 100.0 * (double)n_diff / (double)n_cmp : 0.0, max_ulp,
                 n_diff ? (double)sum_ulp / (double)n_diff : 0.0, bad, closer_new, closer_old, closer_tie, err_new, err_old,
                 far_new, min_cr_outlier, low_cr, ok ? "PASS" : "FAIL");
+    /* run 268 (MB4): the OLD kernel on the same operands, scored against the same references and against the matrix
+     * form's outputs. Its Y is contiguous (pitch N); rows below off[0] must stay 0x1234, the dropped tail zero. */
+    if (g_old) {
+        const size_t ybo = (size_t)T * N * 2;
+        uint8_t* dYo = sycl::malloc_device<uint8_t>(ybo + 2 * kCanary, q);
+        const size_t scr_bytes = 4u << 20;
+        void* dScr = sycl::malloc_device<uint8_t>(scr_bytes, q);
+        std::vector<uint16_t> yfo((size_t)T * N, 0x1234);
+        q.memset(dYo, kPat, kCanary); q.memset(dYo + kCanary + ybo, kPat, kCanary);
+        q.memcpy(dYo + kCanary, yfo.data(), ybo).wait();
+        const int rco = run_old(q, dA, M, dW, dS, dO, (uint16_t*)(dYo + kCanary), T, N, K, E, top_k, dScr, scr_bytes);
+        std::vector<uint8_t> yo(ybo + 2 * kCanary);
+        q.memcpy(yo.data(), dYo, yo.size()).wait();
+        bool oko = rco == 0;
+        if (rco != 0) std::printf("FAIL old-%s: the op returned rc %d\n", cs.name, rco);
+        for (size_t i = 0; i < kCanary; ++i)
+            if (yo[i] != kPat || yo[kCanary + ybo + i] != kPat) { std::printf("FAIL old-%s: canary broken at %zu\n", cs.name, i); oko = false; break; }
+        const uint16_t* yold = (const uint16_t*)(yo.data() + kCanary);
+        size_t o_cmp = 0, o_diff = 0, o_bad = 0, on_diff = 0, o_closer = 0, m_closer = 0, om_tie = 0; long long o_sum = 0;
+        int o_max = 0, on_max = 0; double o_err = 0.0, m_err = 0.0;
+        for (uint32_t r = 0; r < T; ++r)
+            for (uint32_t n = 0; n < N; ++n) {
+                const uint16_t a = yold[(size_t)r * N + n], b = ref[(size_t)r * y_ld + n], m = y[(size_t)r * y_ld + n];
+                const bool computed = r >= (uint32_t)off[0] && r < live && sorted[r] >= 0;
+                if (!computed) {
+                    const uint16_t want = (r >= (uint32_t)off[0] && r < live) ? (uint16_t)0 : b;   /* a dead row in a run: 0 */
+                    if (a != want) { if (o_bad < 5) std::printf("FAIL old-%s: row %u col %u is %04x, expected %04x\n", cs.name, r, n, a, want); ++o_bad; }
+                    continue;
+                }
+                ++o_cmp;
+                const double v = ref64[(size_t)r * y_ld + n];
+                const double ea = std::fabs((double)bf(a) - v), em = std::fabs((double)bf(m) - v);
+                if (ea > o_err) o_err = ea;
+                if (em > m_err) m_err = em;
+                const int d = ulp_dist(a, b);
+                if (d) { ++o_diff; o_sum += d; if (d > o_max) o_max = d; }
+                const int dm = ulp_dist(a, m);
+                if (dm) { ++on_diff; if (dm > on_max) on_max = dm; if (ea < em) ++o_closer; else if (em < ea) ++m_closer; else ++om_tie; }
+            }
+        if (o_bad) oko = false;
+        std::printf("RESULT old-%s: %s | %zu outputs compared: vs the sequential-fp32 reference %zu differ (%.3f %%), max ulp %d, "
+                    "mean %.3f; untouched / dead / tail rows wrong %zu | vs the matrix form %zu differ (%.3f %%), max ulp %d; where "
+                    "they differ, closer to fp64: old %zu, matrix %zu, tie %zu | max abs err vs fp64: old %.3g, matrix %.3g -> %s\n",
+                    cs.name, old_form_name(T), o_cmp, o_diff, o_cmp ? 100.0 * (double)o_diff / (double)o_cmp : 0.0, o_max,
+                    o_diff ? (double)o_sum / (double)o_diff : 0.0, o_bad, on_diff, o_cmp ? 100.0 * (double)on_diff / (double)o_cmp : 0.0,
+                    on_max, o_closer, m_closer, om_tie, o_err, m_err, oko ? "PASS" : "FAIL");
+        ok &= oko;
+        sycl::free(dYo, q); sycl::free(dScr, q);
+    }
     sycl::free(dA, q); sycl::free(dW, q); sycl::free(dS, q); sycl::free(dO, q); sycl::free(dYb, q); sycl::free(dMap, q);
+    return ok;
+}
+
+/* Run 268 (MB4): the same live rows at different offsets in the sorted array -- the run starts at `below` = 0, 3, 13,
+ * 17, 61 (not multiples of 16) with the same (token, expert) rows each time; each kernel's output per live row is
+ * compared bit for bit with its own output at offset 0, and with the sequential reference. T stays above 256 (the
+ * dispatch's prefill class) so the old op runs its WMMA prefill form. */
+bool offset_sweep(sycl::queue& q) {
+    const uint32_t K = 2560, N = 640, E = 2, top_k = 5, R0 = 40, R1 = 19, LIVE = R0 + R1, TAIL = 240;
+    const uint32_t belows[] = {0, 3, 13, 17, 61};
+    const uint32_t Tmax = 61 + LIVE + TAIL;
+    const uint32_t M = (Tmax + top_k - 1) / top_k + 1;
+    const uint32_t a_ld = K, w_ld = K;
+    std::vector<uint16_t> A((size_t)M * a_ld), W((size_t)E * N * w_ld);
+    for (size_t i = 0; i < A.size(); ++i) A[i] = to_bf(((float)(h32(201, i) % 2001) - 1000.0f) / 500.0f);
+    for (size_t i = 0; i < W.size(); ++i) W[i] = to_bf(((float)(h32(202, i) % 2001) - 1000.0f) / 1000.0f);
+    /* the live rows' tokens, relative to the run (the same at every offset), and their sequential reference */
+    std::vector<int32_t> tok(LIVE);
+    for (uint32_t j = 0; j < LIVE; ++j) tok[j] = (int32_t)((j * 7u + 3u) % (M * top_k));
+    std::vector<uint16_t> ref((size_t)LIVE * N);
+    for (uint32_t j = 0; j < LIVE; ++j) {
+        const uint32_t e = j < R0 ? 0 : 1, t = (uint32_t)tok[j] / top_k;
+        for (uint32_t n = 0; n < N; ++n) {
+            volatile float acc = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) acc = acc + bf(A[(size_t)t * a_ld + k]) * bf(W[((size_t)e * N + n) * w_ld + k]);
+            ref[(size_t)j * N + n] = to_bf((float)acc);
+        }
+    }
+    uint16_t* dA = sycl::malloc_device<uint16_t>(A.size(), q);
+    uint16_t* dW = sycl::malloc_device<uint16_t>(W.size(), q);
+    int32_t* dS = sycl::malloc_device<int32_t>(Tmax, q);
+    int32_t* dO = sycl::malloc_device<int32_t>(E + 1, q);
+    uint16_t* dYn = sycl::malloc_device<uint16_t>((size_t)Tmax * N, q);
+    uint16_t* dYo = sycl::malloc_device<uint16_t>((size_t)Tmax * N, q);
+    const uint32_t cap = E + (Tmax + 63) / 64 + 1;
+    uint32_t* dMap = sycl::malloc_device<uint32_t>(1 + 2 * cap + 64, q);
+    const size_t scr_bytes = 4u << 20;
+    void* dScr = sycl::malloc_device<uint8_t>(scr_bytes, q);
+    q.memcpy(dA, A.data(), A.size() * 2); q.memcpy(dW, W.data(), W.size() * 2); q.wait();
+    std::vector<uint16_t> base_n, base_o;
+    bool ok = true;
+    for (uint32_t below : belows) {
+        const uint32_t T = below + LIVE + TAIL;
+        std::vector<int32_t> sorted(T), off = {(int32_t)below, (int32_t)(below + R0), (int32_t)(below + LIVE)};
+        for (uint32_t r = 0; r < below; ++r) sorted[r] = (int32_t)((r * 5u + 1u) % (M * top_k));   /* another call's rows */
+        for (uint32_t j = 0; j < LIVE; ++j) sorted[below + j] = tok[j];
+        for (uint32_t r = below + LIVE; r < T; ++r) sorted[r] = -1;
+        q.memcpy(dS, sorted.data(), T * 4); q.memcpy(dO, off.data(), 3 * 4);
+        q.fill(dYn, (uint16_t)0x1234, (size_t)T * N); q.fill(dYo, (uint16_t)0x1234, (size_t)T * N); q.wait();
+        const int rcn = xe_moe_bf16_dpas_launch(&q, dA, (const void* const*)dW, (size_t)N * w_ld * 2, dS, dO, dYn, T, N, K, E,
+                                                top_k, 0, a_ld, w_ld, N, dMap, (size_t)(1 + 2 * cap) * 4);
+        q.wait();
+        const int rco = g_old ? run_old(q, dA, M, dW, dS, dO, dYo, T, N, K, E, top_k, dScr, scr_bytes) : -1;
+        std::vector<uint16_t> yn((size_t)T * N), yo((size_t)T * N);
+        q.memcpy(yn.data(), dYn, yn.size() * 2); q.memcpy(yo.data(), dYo, yo.size() * 2); q.wait();
+        for (int which = 0; which < 2; ++which) {
+            if (which == 1 && !g_old) break;
+            const std::vector<uint16_t>& yy = which ? yo : yn;
+            std::vector<uint16_t>& base = which ? base_o : base_n;
+            const int rc = which ? rco : rcn;
+            std::vector<uint16_t> live((size_t)LIVE * N);
+            for (uint32_t j = 0; j < LIVE; ++j) std::memcpy(&live[(size_t)j * N], &yy[(size_t)(below + j) * N], (size_t)N * 2);
+            if (below == 0) base = live;
+            uint32_t rows_diff = 0; int max_ulp0 = 0; size_t n_ref = 0; int max_ref = 0;
+            for (uint32_t j = 0; j < LIVE; ++j) {
+                bool rd = false;
+                for (uint32_t n = 0; n < N; ++n) {
+                    const int d0 = ulp_dist(live[(size_t)j * N + n], base[(size_t)j * N + n]);
+                    if (d0) { rd = true; if (d0 > max_ulp0) max_ulp0 = d0; }
+                    const int dr = ulp_dist(live[(size_t)j * N + n], ref[(size_t)j * N + n]);
+                    if (dr) { ++n_ref; if (dr > max_ref) max_ref = dr; }
+                }
+                if (rd) ++rows_diff;
+            }
+            const bool fine = rc == 0 && (below == 0 || rows_diff == 0);
+            if (which == 1 && !fine) ok = false;   /* the old kernel offset-dependent = a defect in today's path */
+            if (which == 0 && rc != 0) ok = false;
+            std::printf("RESULT offsets %s: run start %2u (T %u): rc %d | rows differing from the start-0 run %u of %u (max ulp %d) | "
+                        "vs the sequential reference %zu of %zu outputs differ, max ulp %d%s\n",
+                        which ? "old " : "matrix", below, T, rc, rows_diff, LIVE, max_ulp0, n_ref, (size_t)LIVE * N, max_ref,
+                        fine ? "" : " <-- OFFSET-DEPENDENT");
+        }
+    }
+    sycl::free(dA, q); sycl::free(dW, q); sycl::free(dS, q); sycl::free(dO, q); sycl::free(dYn, q); sycl::free(dYo, q);
+    sycl::free(dMap, q); sycl::free(dScr, q);
     return ok;
 }
 
@@ -209,6 +385,15 @@ int main() {
     const bool gpu = q.get_device().is_gpu();
     std::printf("moe_bf16_dpas_test: %s (%s)\n", q.get_device().get_info<sycl::info::device::name>().c_str(),
                 gpu ? "the matrix-unit kernel and the guards" : "the guards only");
+    /* run 268 (MB4): the old op from the image's libxe.so, on the GPU only */
+    if (gpu) {
+        const char* lib = std::getenv("RI_LIBXE");
+        if (!lib) lib = "/opt/ri/radiance_home/kernels/libxe.so";
+        void* h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+        if (h) g_old = (LaunchFn)dlsym(h, "r4d_rad_moe_gemm_bf16");
+        if (!g_old) std::printf("SKIP the old kernel: %s (%s)\n", lib, h ? "no r4d_rad_moe_gemm_bf16" : dlerror());
+        else std::printf("moe_bf16_dpas_test: the old op r4d_rad_moe_gemm_bf16 from %s\n", lib);
+    }
     bool ok = true;
     /* 1. the engine's shape class: K 2048, N 192 (not a multiple of 64), 6 experts with a small one, a dead row, a
      *    dropped tail, rows below off[0] */
@@ -219,6 +404,13 @@ int main() {
     ok &= run_case(q, Case{"shape-C", 2560, 320, 3, 2, {65, 129, 330}, 63, 5, 7}, gpu);
     /* 4. (run 268, the coordinator) shape-C again on a second seed: the same shapes, other data */
     ok &= run_case(q, Case{"shape-C2", 2560, 320, 3, 2, {65, 129, 330}, 63, 5, 7, 1}, gpu);
+    /* 5. (run 268, the guard at one block) the prompts' short last steps at the protected call's real shape: N 640,
+     *    K 2560, 2 experts, top_k 5 -- T 300 slots (the dispatch's prefill class is T > 256) with 59 live rows, and
+     *    T 180 (a 36-row tail's slots) with 27 live rows; both under the old 512 cut-off */
+    ok &= run_case(q, Case{"shape-D", 2560, 640, 2, 5, {40, 19}, 0, 241, 0}, gpu);
+    ok &= run_case(q, Case{"shape-E", 2560, 640, 2, 5, {20, 7}, 3, 153, 0}, gpu);
+    /* 6. (run 268, MB4) the same live rows at run starts 0 / 3 / 13 / 17 / 61: both kernels, bit for bit across offsets */
+    if (gpu) ok &= offset_sweep(q);
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
