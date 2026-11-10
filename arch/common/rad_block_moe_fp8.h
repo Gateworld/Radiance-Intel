@@ -368,6 +368,10 @@ struct MoeFP8 {
      * keeps every dependency; each work-group runs its own kernel's body. */
     rad_op  op_rtq = 0;
     int64_t rtq_rows = 0;
+    /* The same pairing behind the fused router GEMM (`router_gemm_topk_scatter_quant`), the path a decode step takes
+     * when op_router_fused resolved; up to `rtq2_rows` rows. */
+    rad_op  op_rtq2 = 0;
+    int64_t rtq2_rows = 0;
     /* Format B (Config::expert_i8): the down input's rotation and int8 quantiser over the bf16 silu
      * product; op_hq is then the gate_up input's, into the int8 pair. */
     rad_op op_eq8 = 0;
@@ -1602,6 +1606,27 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             rad_op_writes(b, op_router_fused, wr, gate ? 7 : 6);
         }
         router_fused_gate = op_router_fused && gate;
+        /* run 273 (pair 2): the same op with the block input's quantiser (op_hq) in its router launch, up to 16 rows;
+         * unresolved (no row, or the flag off), the step issues op_router_fused and op_hq as today. */
+        if (op_router_fused && op_hq && rad_op_declared(b, "router_gemm_topk_scatter_quant")) {
+            rtq2_rows = router_fused_rows < 16 ? router_fused_rows : 16;
+            const RadParam qp[] = {
+                RAD_RANGE("M", 1, rtq2_rows), RAD_INT("K", g.n_embd),
+                RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
+                RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
+                RAD_STR("dtype", g.dtype), RAD_INT("expert_base", c.expert_base),
+                RAD_INT("n", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
+                RAD_STR("protect", prot_list),
+            };
+            const int n_qp = (int)(sizeof(qp) / sizeof(qp[0])) - (prot_list ? 0 : 1);
+            op_rtq2 = rad_decl_op(b, "router_gemm_topk_scatter_quant", qp, n_qp, fw, gate ? 2 : 1);
+            if (op_rtq2) {
+                const rad_buf rd[1] = { w.h.x };
+                const rad_buf wr[9] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt, w.hr.q8, w.hr.s8, w.sgate };
+                rad_op_reads (b, op_rtq2, rd, 1);
+                rad_op_writes(b, op_rtq2, wr, gate ? 9 : 8);
+            }
+        }
     }
 
     /* GLM's selection and the sort as one op, plus the ungated shared arm's gate fill. Declared
@@ -1745,8 +1770,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const RadOperand ecnt = counts ? praw(counts, RAD_I32, ne) : brows(w.ecnt, ne);
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
-    const bool rfused = op_router_fused && rows <= router_fused_rows;
+    /* run 273 (pair 2): the fused router with the block input's quantiser in its router launch, when it resolved and
+     * the pass fits; `rfused` is then false and op_hq's issue below is skipped (hq_fused). */
+    const bool rqf = op_rtq2 && rows <= rtq2_rows;
+    const bool rfused = !rqf && op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    bool hq_fused = false;
     if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
@@ -1757,6 +1786,17 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
     } else if (c.sigmoid_router) {
         glm_router.step(c_, r0, rows, r0);
+    } else if (rqf) {
+        RAD_ISSUE_N(c_, op_rtq2, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                    RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
+                    brow_slice(w.logits, r0, rows, ne_all),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.h.x, r0, rows, g.n_embd),
+                    brow_slice(w.hr.q8, r0, rows, g.n_embd),
+                    brow_slice(w.hr.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
+        hq_fused = true;
     } else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
@@ -1768,8 +1808,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
-    bool hq_fused = false;
-    if (rfused || sfused) {
+    if (rfused || sfused || rqf) {
         /* the fused router wrote all five */
     } else if (op_rtq && rows <= rtq_rows) {
         /* run 273 (pair 2): the selection + sort and the block input's quantiser (op_hq's issue below) as one launch */
@@ -1849,7 +1888,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
-                          (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+                          ((rfused || rqf) && router_fused_gate) || (sfused && sigmoid_scatter_gate));
     if (op_gqp) {   /* run 273: the routed and the shared gated quantisers as one launch */
         const int64_t n2 = gq_sh.n;
         RAD_ISSUE_N(c_, op_gqp, rows * k + rows, brows(w.egu, rows * k), brows(w.eff.q8, rows * k),

@@ -655,6 +655,7 @@ copy.
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gated_quant_pair` | `M` `n` `n2` `group` `dtype` `act`:str/opt `rot`:opt `rot2`:opt | `gate_up` → `q`, `scale`, `out_bf16`?; `gate_up2` → `q2`, `scale2`, `out_bf16_2`? |
 | `router_topk_scatter_quant` | `router_topk_scatter`'s, then `n` `group` | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`; `x` → `q`, `scale` |
+| `router_gemm_topk_scatter_quant` | `router_gemm_topk_scatter`'s, then `n` `group` | `router_gemm_topk_scatter`'s ten, then `x` → `q`, `scale` |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.

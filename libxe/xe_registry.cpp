@@ -52,6 +52,12 @@ extern "C" int r4d_rad_router_topk_scatter_quant(const RadArgs* a, RadStream s);
 static const RadConstraint cXeRouterQuant[] = { C_GE("M", 1), C_LE("M", 16), C_GE("n_expert", 257),
                                                 C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
                                                 C_IN("dtype", "bf16"), C_DIV("n", 128), C_EQ("group", 128) };
+/* the same pairing behind the fused router GEMM op the decode step takes (xe_gemv_bf16.cpp): its constraints plus the
+ * paired launch's */
+extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* a, RadStream s);  /* xe_gemv_bf16.cpp */
+static const RadConstraint cXeRouterGemmQuant[] = { C_DIV("K", 8), C_GE("M", 1), C_LE("M", 16), C_GE("n_expert", 257),
+                                                    C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
+                                                    C_IN("dtype", "bf16"), C_DIV("n", 128), C_EQ("group", 128) };
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -442,10 +448,21 @@ static const RadKernelInfo kFlagged[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeRouterQuant), NOTUNE,
   nullptr, nullptr, r4d_rad_router_topk_scatter_quant, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* the same under the fused router GEMM op (router_gemm_topk_scatter) the decode step takes: the GEMV pair, then the
+ * paired launch above (xe_gemv_bf16.cpp, xe_rad_router_gemm_topk_scatter_quant); the same flag */
+{ "xe_router_gemm_topk_scatter_quant", "router_gemm_topk_scatter_quant", "moe",
+  "the router GEMV (and the shared expert's gate column), then the router's top-k, the stable sort and the block "
+  "input's rotated int8 quantiser (had_quant_act_i8g) in one launch",
+  "M <= 16 rows; n_expert in 257 .. 512, top_k <= 32; K a multiple of 8; n a multiple of 128, group 128",
+  "bf16 a and router weight, the logits as the operand declares them, i32 ids, f32 weights; bf16 input, int8 codes "
+  "with an f32 scale per (row, 128 columns) out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeRouterGemmQuant), NOTUNE,
+  nullptr, nullptr, xe_rad_router_gemm_topk_scatter_quant, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static bool flagged_on(int j) {
     return j == 0 ? xe_gate_quant_on() : j == 1 ? xe_gated_had_on() : j == 2 ? xe_gated_quant_pair_on()
-                                        : j == 3 ? xe_qk_prologue_on() : xe_router_quant_pair_on();
+                                        : j == 3 ? xe_qk_prologue_on() : xe_router_quant_pair_on();   /* j 4 and 5 */
 }
 static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
 /* the j-th listed flagged entry (counting only those on), or -1 */
@@ -572,6 +589,19 @@ static const RadOperandSpec oXeRouterQuant[] = {
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 }, { "expert_count", RAD_OPD_OUT, 0 },
     { "x", RAD_OPD_IN, 0 },             { "q", RAD_OPD_OUT, 0 },          { "scale", RAD_OPD_OUT, 0 },
 };
+/* router_gemm_topk_scatter_quant (run 273): libr4d's pRouterGemmTopkScatter / oRouterGemmTopkScatter, then the
+ * quantiser's */
+static const RadParamSpec pXeRouterGemmQuant[] = {
+    P_INT("M"), P_INT("K"), P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INT("norm"), P_STR("dtype"),
+    P_INTO("expert_base"), P_STRO("protect"), P_INT("n"), P_INT("group"),
+};
+static const RadOperandSpec oXeRouterGemmQuant[] = {
+    { "a", RAD_OPD_IN, 0 },             { "b", RAD_OPD_WEIGHT, 0 },       { "gate_b", RAD_OPD_WEIGHT, 1 },
+    { "logits", RAD_OPD_OUT, 0 },       { "expert_ids", RAD_OPD_OUT, 0 }, { "expert_w", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 }, { "expert_count", RAD_OPD_OUT, 0 },
+    { "gate", RAD_OPD_OUT, 1 },
+    { "x", RAD_OPD_IN, 0 },             { "q", RAD_OPD_OUT, 0 },          { "scale", RAD_OPD_OUT, 0 },
+};
 /* kFlagged's schemas, in its order; listed under the same flags */
 static const RadOpSchema kFlaggedSchemas[] = {
     { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
@@ -588,6 +618,9 @@ static const RadOpSchema kFlaggedSchemas[] = {
       "asked. The four ops' bytes (rmsnorm q, rmsnorm k, rope q, rope k)." },
     { "router_topk_scatter_quant", ROW(pXeRouterQuant), ROW(oXeRouterQuant),
       "router_topk_scatter over `logits` and had_quant_act_i8g over `x` (the same rows) in one launch: the two ops' "
+      "bytes." },
+    { "router_gemm_topk_scatter_quant", ROW(pXeRouterGemmQuant), ROW(oXeRouterGemmQuant),
+      "router_gemm_topk_scatter with had_quant_act_i8g over `x` (the same rows) in its router launch: the two ops' "
       "bytes." },
 };
 static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");

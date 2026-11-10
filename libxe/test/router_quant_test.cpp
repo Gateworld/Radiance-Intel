@@ -155,6 +155,80 @@ int run_m(void* hx, sycl::queue& q, int64_t M, int which) {
     return (d_ids || d_w || d_sorted || d_off || d_cnt || d_q || d_s) ? 1 : 0;
 }
 
+/* The same behind the fused router GEMM op the decode step takes: router_gemm_topk_scatter (logits = a @ b^T, then the
+ * selection + sort; no gate column here) + had_quant_act_i8g, against router_gemm_topk_scatter_quant, every output
+ * byte for byte (the logits too). */
+int run_gemm_m(void* hx, sycl::queue& q, int64_t M, int which) {
+    const int64_t NE = 512, NL = 256, K = 10, N = 2048, G = N / 128, T = M * K;
+    const RadKernelInfo* r_rg = row_of(hx, "router_gemm_topk_scatter");
+    const RadKernelInfo* r_hq = row_of(hx, "had_quant_act_i8g");
+    const RadKernelInfo* r_fz = row_of(hx, "router_gemm_topk_scatter_quant");
+    if (!r_rg || !r_hq) { std::printf("router_quant_test: a fused-router chain row is missing\n"); return 2; }
+    if (!r_fz) { std::printf("router_quant_test: no router_gemm_topk_scatter_quant row (RADIANCE_XE_ROUTER_QUANT_PAIR=1?)\n"); return 2; }
+    auto sh = [&](size_t bytes) { void* p = sycl::malloc_shared<uint8_t>(bytes, q); std::memset(p, 0, bytes); return p; };
+    uint16_t* x = (uint16_t*)sh((size_t)(M * N) * 2);
+    uint16_t* wb = (uint16_t*)sh((size_t)(NE * N) * 2);
+    for (int64_t i = 0; i < M * N; ++i) x[i] = bf16_of(1.5f * unit(71 + which, (uint64_t)i));
+    for (int64_t i = 0; i < NE * N; ++i) wb[i] = bf16_of(0.05f * unit(72, (uint64_t)i));
+    uint16_t* lg[2]; Outs o[2];
+    for (int f = 0; f < 2; ++f) {
+        lg[f] = (uint16_t*)sh((size_t)(M * NE) * 2);
+        o[f].ids = (int32_t*)sh((size_t)T * 4); o[f].w = (uint16_t*)sh((size_t)T * 2);
+        o[f].sorted = (int32_t*)sh((size_t)T * 4); o[f].off = (int32_t*)sh((size_t)(NL + 1) * 4);
+        o[f].cnt = (int32_t*)sh((size_t)NL * 4); o[f].q = (uint8_t*)sh((size_t)(M * N));
+        o[f].s = (float*)sh((size_t)(M * G) * 4);
+    }
+    int rc = RAD_OK;
+    {
+        RadTensor t[10] = { tn(x, RAD_BF16, M, N), tn(wb, RAD_BF16, NE, N), RadTensor{}, tn(lg[0], RAD_BF16, M, NE),
+                            tn(o[0].ids, RAD_I32, M, K), tn(o[0].w, RAD_BF16, M, K), tn1(o[0].sorted, RAD_I32, T),
+                            tn1(o[0].off, RAD_I32, NL + 1), tn1(o[0].cnt, RAD_I32, NL), RadTensor{} };
+        RadParam p[8] = { pint("M", M), pint("K", N), pint("n_expert", NE), pint("n_local", NL), pint("top_k", K),
+                          pint("norm", 1), pstr("dtype", "bf16"), pint("expert_base", 0) };
+        RadArgs a{}; a.t = t; a.n_t = 10; a.p = p; a.n_p = 8; a.world_size = 1;
+        rc |= r_rg->launch(&a, (RadStream)&q);
+        RadTensor tq[3] = { tn(x, RAD_BF16, M, N), tn(o[0].q, RAD_I8, M, N), tn(o[0].s, RAD_F32, M, G) };
+        RadParam pq[4] = { pint("M", M), pint("n", N), pint("group", 128), pstr("dtype", "bf16") };
+        RadArgs aq{}; aq.t = tq; aq.n_t = 3; aq.p = pq; aq.n_p = 4; aq.world_size = 1;
+        rc |= r_hq->launch(&aq, (RadStream)&q);
+    }
+    q.wait_and_throw();
+    if (rc != RAD_OK) { std::printf("router_quant_test: the fused-router chain refused (rc %d)\n", rc); return 2; }
+    {
+        RadTensor t[13] = { tn(x, RAD_BF16, M, N), tn(wb, RAD_BF16, NE, N), RadTensor{}, tn(lg[1], RAD_BF16, M, NE),
+                            tn(o[1].ids, RAD_I32, M, K), tn(o[1].w, RAD_BF16, M, K), tn1(o[1].sorted, RAD_I32, T),
+                            tn1(o[1].off, RAD_I32, NL + 1), tn1(o[1].cnt, RAD_I32, NL), RadTensor{},
+                            tn(x, RAD_BF16, M, N), tn(o[1].q, RAD_I8, M, N), tn(o[1].s, RAD_F32, M, G) };
+        RadParam p[10] = { pint("M", M), pint("K", N), pint("n_expert", NE), pint("n_local", NL), pint("top_k", K),
+                           pint("norm", 1), pstr("dtype", "bf16"), pint("expert_base", 0), pint("n", N), pint("group", 128) };
+        RadArgs a{}; a.t = t; a.n_t = 13; a.p = p; a.n_p = 10; a.world_size = 1;
+        rc |= r_fz->launch(&a, (RadStream)&q);
+    }
+    q.wait_and_throw();
+    if (rc != RAD_OK) { std::printf("router_quant_test: the fused-router paired row refused (rc %d)\n", rc); return 2; }
+    const int64_t d_lg = count_diff(lg[0], lg[1], (size_t)(M * NE) * 2),
+                  d_ids = count_diff(o[0].ids, o[1].ids, (size_t)T * 4), d_w = count_diff(o[0].w, o[1].w, (size_t)T * 2),
+                  d_sorted = count_diff(o[0].sorted, o[1].sorted, (size_t)T * 4),
+                  d_off = count_diff(o[0].off, o[1].off, (size_t)(NL + 1) * 4),
+                  d_cnt = count_diff(o[0].cnt, o[1].cnt, (size_t)NL * 4),
+                  d_q = count_diff(o[0].q, o[1].q, (size_t)(M * N)), d_s = count_diff(o[0].s, o[1].s, (size_t)(M * G) * 4);
+    int64_t nzl = 0, nzq = 0, nzc = 0;
+    for (int64_t i = 0; i < M * NE; ++i) nzl += lg[1][i] != 0;
+    for (int64_t i = 0; i < M * N; ++i) nzq += o[1].q[i] != 0;
+    for (int64_t i = 0; i < NL; ++i) nzc += o[1].cnt[i];
+    std::printf("RESULT gemm M %lld: bytes differing -- logits %lld, ids %lld, weights %lld, sorted %lld, offsets %lld, "
+                "counts %lld, codes %lld, scales %lld; %lld nonzero logits, %lld nonzero codes, %lld slots counted\n",
+                (long long)M, (long long)d_lg, (long long)d_ids, (long long)d_w, (long long)d_sorted, (long long)d_off,
+                (long long)d_cnt, (long long)d_q, (long long)d_s, (long long)nzl, (long long)nzq, (long long)nzc);
+    sycl::free(x, q); sycl::free(wb, q);
+    for (int f = 0; f < 2; ++f) {
+        sycl::free(lg[f], q); sycl::free(o[f].ids, q); sycl::free(o[f].w, q); sycl::free(o[f].sorted, q);
+        sycl::free(o[f].off, q); sycl::free(o[f].cnt, q); sycl::free(o[f].q, q); sycl::free(o[f].s, q);
+    }
+    if (nzl == 0 || nzq == 0 || nzc == 0) { std::printf("router_quant_test: the fused-router paired row wrote nothing\n"); return 2; }
+    return (d_lg || d_ids || d_w || d_sorted || d_off || d_cnt || d_q || d_s) ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -176,5 +250,13 @@ int main(int argc, char** argv) {
     }
     std::printf(worst ? "FAIL router_topk_scatter_quant: differs from router_topk_scatter + had_quant_act_i8g\n"
                       : "PASS router_topk_scatter_quant: bit-identical to router_topk_scatter + had_quant_act_i8g\n");
-    return worst;
+    int worst_g = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int r = run_gemm_m(hx, q, rows[i], i);
+        if (r == 2) return 2;
+        worst_g = std::max(worst_g, r);
+    }
+    std::printf(worst_g ? "FAIL router_gemm_topk_scatter_quant: differs from router_gemm_topk_scatter + had_quant_act_i8g\n"
+                        : "PASS router_gemm_topk_scatter_quant: bit-identical to router_gemm_topk_scatter + had_quant_act_i8g\n");
+    return std::max(worst, worst_g);
 }

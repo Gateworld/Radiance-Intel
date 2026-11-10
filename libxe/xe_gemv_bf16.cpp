@@ -837,8 +837,8 @@ static void route_dump(sycl::queue* q, const RadTensor* lg, const RadTensor* ids
  * expert_count, gate? -- the reference's own launches (libref: "the reference IS the launches"):
  * logits = a @ b^T, the shared expert's gate = a @ gate_b^T when both are present, then
  * router_topk_scatter (the ported libr4d kernel) over the logits and the five outputs after it. */
-extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s) {
-    if (!args || args->n_t < 9) return R4D_NO(RAD_E_INVAL);
+/* The GEMV part of the two fused router ops: logits = a @ b^T and the gate; `E` returned for the dump. */
+static int router_gemm_part(const RadArgs* args, RadStream s, long long* E_out) {
     const RadTensor* A = r4d_opt(args, 0);
     const RadTensor* B = r4d_opt(args, 1);
     const RadTensor* GB = r4d_opt(args, 2);
@@ -847,6 +847,7 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
     if ((GB && GB->data) != (G && G->data)) return R4D_NO(RAD_E_INVAL);   /* together or not at all */
     const long long K = r4d_geti_or(args, "K", r4d_dim(B, (int)B->rank - 1));
     const long long E = r4d_geti_or(args, "n_expert", r4d_dim(B, (int)B->rank - 2));
+    *E_out = E;
     int rc;
     if (GB && GB->data && router_pair_on()) rc = gemv_pair(A, B, r4d_opt(args, 3), E, GB, G, 1, K, s);
     else rc = RAD_E_UNSUPPORTED;
@@ -855,10 +856,42 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
         if (rc != RAD_OK) return rc;
         if (GB && GB->data && (rc = gemv(A, GB, G, 1, K, s)) != RAD_OK) return rc;
     } else if (rc != RAD_OK) return rc;
+    return RAD_OK;
+}
+
+extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 9) return R4D_NO(RAD_E_INVAL);
+    long long E = 0;
+    int rc = router_gemm_part(args, s, &E);
+    if (rc != RAD_OK) return rc;
     RadArgs sub = *args;
     sub.t = args->t + 3;
     sub.n_t = 6;
     rc = r4d_rad_router_topk_scatter(&sub, s);
+    if (rc == RAD_OK)
+        route_dump((sycl::queue*)s, r4d_opt(args, 3), r4d_opt(args, 4), r4d_opt(args, 5), E,
+                   r4d_geti_or(args, "top_k", 0));
+    return rc;
+}
+
+/* router_gemm_topk_scatter_quant (run 273, the decode step's pair 2 on the path the step takes): the op above's ten
+ * operands, then the block input `x`, its int8 codes `q` and scales `scale` (had_quant_act_i8g's) at 10 .. 12, with `n`
+ * and `group`: the GEMV part as above, then the router's selection + sort and the quantiser's rows in ONE launch
+ * (r4d_rad_router_topk_scatter_quant, ports/r4d_moe.cpp: the six router operands and the three of the quantiser,
+ * contiguous as that adapter reads them). */
+extern "C" int r4d_rad_router_topk_scatter_quant(const RadArgs* a, RadStream s);
+extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 13) return R4D_NO(RAD_E_INVAL);
+    long long E = 0;
+    int rc = router_gemm_part(args, s, &E);
+    if (rc != RAD_OK) return rc;
+    RadTensor t9[9];
+    for (int i = 0; i < 6; ++i) t9[i] = args->t[3 + i];
+    for (int i = 0; i < 3; ++i) t9[6 + i] = args->t[10 + i];
+    RadArgs sub = *args;
+    sub.t = t9;
+    sub.n_t = 9;
+    rc = r4d_rad_router_topk_scatter_quant(&sub, s);
     if (rc == RAD_OK)
         route_dump((sycl::queue*)s, r4d_opt(args, 3), r4d_opt(args, 4), r4d_opt(args, 5), E,
                    r4d_geti_or(args, "top_k", 0));

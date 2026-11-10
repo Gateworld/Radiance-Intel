@@ -27,6 +27,8 @@ extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* a, RadStream s);
 /* xe_gemv_bf16.cpp's router row calls the ported scatter (ports/r4d_moe.cpp), which this test never reaches: a stub
  * stands in so the test links without the MoE port and its libr4d configuration symbols. */
 extern "C" int r4d_rad_router_topk_scatter(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+/* run 273 (pair 2): the paired launch behind the fused router GEMM op, r4d_moe.cpp's too */
+extern "C" int r4d_rad_router_topk_scatter_quant(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 
 namespace {
 
