@@ -34,9 +34,12 @@ inline uint16_t to_bf16(float f) {
     return (uint16_t)(((u & 0x7fffffffu) > 0x7f800000u) ? ((u >> 16) | 0x40u) : ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
 }
 
-template <bool A_F32, bool Y_F32, int MB>
+/* KC (run 209, owner note 206 item 1, RADIANCE_XE_GEMV_KC=1): the model's K (2560) as a compile-time constant (0: the
+ * runtime K) -- the chunk loop's trip count known, the K % 8 tail gone. The same chunks in the same order. */
+template <bool A_F32, bool Y_F32, int MB, int KC = 0>
 void gemv_bf16_kernel(const void* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
-                      void* __restrict__ y, long y_ld, int N, int K, int M) {
+                      void* __restrict__ y, long y_ld, int N, int Kr, int M) {
+    const int K = KC ? KC : Kr;
     const int lane = (int)threadIdx.x & 31;
     const int n = (int)blockIdx.x * ((int)blockDim.x >> 5) + ((int)threadIdx.x >> 5);   /* xe::gemv_rows_wg() */
     const bool live = n < N;
@@ -293,6 +296,122 @@ void gemm_bf16_dpas_kernel(const void* __restrict__ a, long a_ld, const uint16_t
     }
 }
 
+/* ---- run 270 (owner note 209 item 3): the bf16 DPAS form without the shared-memory stages -- the "T form",
+ * RADIANCE_XE_GEMM_DPAS_T=1 (opt-in, the same switch as xe_gemv_i8.cpp's), for K % 64 == 0 ----
+ *
+ * gemm_bf16_dpas_kernel stages both operands through LDS every 64-K group (32 gathers + 32 scatters + 2 barriers
+ * a thread a group in each of the N / 64 work-groups) because the matrix unit's B operand must be packed and the
+ * activation may be f32. Here the roles are swapped: the WEIGHT (bf16 [N][K], row-major) is the A operand loaded
+ * straight from memory as 8 x 16 tiles, and the ACTIVATION is the B operand, packed ONCE per call by
+ * pack_a_bf16_kernel into P[k2][m] (word (k2, m) = bf16(a[m][2 k2]) | bf16(a[m][2 k2 + 1]) << 16 -- the words the
+ * stage above built, the f32 activation rounded to nearest even exactly as there) and read with packed block loads;
+ * the inner loop is 1 A load + 4 B loads + 4 joint_matrix_mad a step, no LDS, no barriers; the f32 tiles persist over
+ * K as above and the output is written from the accumulator's own work-item data (lane = activation row, 8 weight
+ * rows a lane: 8 consecutive outputs of one y row). The same products in the same 16-k steps, so the sums are the
+ * form above's (the hardware's k order inside a step does not depend on which operand is which); checked by the
+ * 7K logprobs. Whole 64 x 64 blocks only (the column tail N % 64 keeps the form above at an offset, the row tail the
+ * GEMV); K % 64 == 0 (the trunk's K are multiples of 64), so no tile reads past N, M or K. */
+template <bool A_F32>
+void pack_a_bf16_kernel(const void* __restrict__ a, long a_ld, uint32_t* __restrict__ p, int Mp) {
+    XE_SHARED(uint32_t, tile, 32 * 33);          /* [m 32][k2 32], padded a word: 32 rows x one 64-K group */
+    const int tid = (int)threadIdx.x;              /* 256 threads */
+    const int k20 = (int)blockIdx.x * 32, m0 = (int)blockIdx.y * 32;
+    {
+        const int r = tid >> 3, c = tid & 7;       /* row m0 + r, its k pairs 4c .. 4c + 3 */
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const long kk = (long)(k20 + 4 * c + j) * 2;
+            uint16_t lo, hi;
+            if constexpr (A_F32) {
+                const float* ar = (const float*)a + (size_t)(m0 + r) * a_ld;
+                lo = to_bf16(ar[kk]); hi = to_bf16(ar[kk + 1]);
+            } else {
+                const uint16_t* ar = (const uint16_t*)a + (size_t)(m0 + r) * a_ld;
+                lo = ar[kk]; hi = ar[kk + 1];
+            }
+            tile[r * 33 + 4 * c + j] = (uint32_t)lo | ((uint32_t)hi << 16);
+        }
+    }
+    xe::syncthreads();
+    {
+        const int k2 = tid >> 3, mm = (tid & 7) * 4;   /* word row k20 + k2, activation rows m0 + mm .. + 3 */
+        uint4 o;
+        o.x = tile[(mm + 0) * 33 + k2];
+        o.y = tile[(mm + 1) * 33 + k2];
+        o.z = tile[(mm + 2) * 33 + k2];
+        o.w = tile[(mm + 3) * 33 + k2];
+        *(uint4*)(p + (size_t)(k20 + k2) * (size_t)Mp + (size_t)(m0 + mm)) = o;
+    }
+}
+
+template <bool Y_F32>
+void gemm_bf16_dpas_t_kernel(const uint32_t* __restrict__ p, long p_ld, const uint16_t* __restrict__ b, long b_ld,
+                             void* __restrict__ y, long y_ld, int K) {
+    const int tid = (int)threadIdx.x, wave = tid / kBfSG, lane = tid % kBfSG;
+    const int n0 = (int)blockIdx.x * kBfNT + wave * 8;   /* this sub-group's 8 weight rows (whole: the launcher's N64) */
+    const int m0 = (int)blockIdx.y * kBfRT;              /* the work-group's 64 activation rows: 4 tiles of 16 */
+    const int G = K / 64;
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::a, 8, 16, jm::layout::row_major> Am;       /* weights */
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm; /* activations */
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
+    auto gptr = [](const sycl::ext::oneapi::bfloat16* q) {
+        return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(q);
+    };
+#pragma unroll
+    for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+    const sycl::ext::oneapi::bfloat16* brow = (const sycl::ext::oneapi::bfloat16*)(b + (size_t)n0 * b_ld);
+    const sycl::ext::oneapi::bfloat16* pbase = (const sycl::ext::oneapi::bfloat16*)(p + (size_t)m0);   /* + k2 * p_ld words */
+    const size_t p_stride = (size_t)p_ld * 2;                                                             /* bf16 elements between packed rows */
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            jm::joint_matrix_load(sg, Am, gptr(brow + (size_t)g * 64 + step * 16), (size_t)b_ld);
+            const sycl::ext::oneapi::bfloat16* pk = pbase + (size_t)(g * 32 + step * 8) * p_stride;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bm, gptr(pk + (size_t)t * 32), p_stride);
+                jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+            }
+        }
+    }
+    /* the tiles out from the work-item data: lane = activation row m0 + 16t + lane, element e = weight row n0 + e */
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, Cm[t]);
+        const size_t row = (size_t)(m0 + t * 16 + lane) * y_ld + n0;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float v = wd[e];
+            if constexpr (Y_F32) ((float*)y)[row + e] = v;
+            else ((uint16_t*)y)[row + e] = to_bf16(v);
+        }
+    }
+}
+
+bool bf16_dpas_t_on() {
+    static const bool want = [] { const char* v = std::getenv("RADIANCE_XE_GEMM_DPAS_T"); return v && v[0] == '1'; }();
+    return want;
+}
+/* the packed-activation buffer of a queue (its own, beside xe_gemv_i8.cpp's): grown to the largest K/2 x Mp words
+ * asked for, never freed; the growth waits for the queue's in-flight work first */
+uint32_t* bf16_pack_buffer(sycl::queue* q, size_t words) {
+    struct Buf { uint32_t* p; size_t words; };
+    static std::mutex mu;
+    static std::map<sycl::queue*, Buf> bufs;
+    std::lock_guard<std::mutex> lk(mu);
+    Buf& bb = bufs[q];
+    if (bb.words >= words && bb.p) return bb.p;
+    if (bb.p) { q->wait(); sycl::free(bb.p, *q); bb.p = nullptr; bb.words = 0; }
+    uint32_t* np = nullptr;
+    try { np = sycl::malloc_device<uint32_t>(words, *q); } catch (const sycl::exception&) { np = nullptr; }
+    if (!np) return nullptr;
+    bb.p = np; bb.words = words;
+    static bool said = false;
+    if (!said) { said = true; std::fprintf(stderr, "[xe] gemm_bf16: the T form (RADIANCE_XE_GEMM_DPAS_T=1) packs the activations into %.1f MiB a queue\n", (double)words * 4.0 / 1048576.0); }
+    return np;
+}
+
 bool bf16_dpas_on(sycl::queue* q) {   /* RADIANCE_XE_GEMM_BF16_DPAS=0: prefill rows keep the GEMV; the CPU device has no matrix unit */
     static const bool want = [] { const char* v = std::getenv("RADIANCE_XE_GEMM_BF16_DPAS"); return !(v && *v == '0'); }();
     static const bool gpu = q->get_device().is_gpu();
@@ -304,8 +423,31 @@ void launch(sycl::queue* q, const void* a, long a_ld, const uint16_t* b, long b_
     int m_start = 0;
     if (M >= kBfRT && bf16_dpas_on(q)) {
         const int blocks = M / kBfRT;
-        const dim3 dgrid((unsigned)((N + kBfNT - 1) / kBfNT), (unsigned)blocks), dblock(kBfThreads);
-        XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_kernel<A_F32, Y_F32>), dgrid, dblock, 0, a, a_ld, b, b_ld, y, y_ld, N, K, M);
+        const dim3 dblock(kBfThreads);
+        /* run 270 (owner note 209 item 3): the T form for the whole 64 x 64 blocks at K % 64 == 0; the column tail
+         * (N % 64) keeps the staged form at an offset, the row tail (M % 64) the GEMV below */
+        const int N64 = (N / kBfNT) * kBfNT;
+        bool done = false;
+        if (N64 > 0 && K % 64 == 0 && bf16_dpas_t_on()) {
+            const int Mp = blocks * kBfRT;
+            uint32_t* p = bf16_pack_buffer(q, (size_t)(K / 2) * (size_t)Mp);
+            if (p) {
+                const dim3 pgrid((unsigned)(K / 64), (unsigned)(Mp / 32)), pblock(256);
+                XE_LAUNCH_SG(16, q, (pack_a_bf16_kernel<A_F32>), pgrid, pblock, 0, a, a_ld, p, Mp);
+                const dim3 tgrid((unsigned)(N64 / kBfNT), (unsigned)blocks);
+                XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_t_kernel<Y_F32>), tgrid, dblock, 0, (const uint32_t*)p, (long)Mp, b, b_ld, y, y_ld, K);
+                if (N64 < N) {
+                    const dim3 dgrid(1u, (unsigned)blocks);
+                    void* y_t = (char*)y + (size_t)N64 * (Y_F32 ? 4u : 2u);
+                    XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_kernel<A_F32, Y_F32>), dgrid, dblock, 0, a, a_ld, b + (size_t)N64 * b_ld, b_ld, y_t, y_ld, N - N64, K, M);
+                }
+                done = true;
+            }
+        }
+        if (!done) {
+            const dim3 dgrid((unsigned)((N + kBfNT - 1) / kBfNT), (unsigned)blocks);
+            XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_kernel<A_F32, Y_F32>), dgrid, dblock, 0, a, a_ld, b, b_ld, y, y_ld, N, K, M);
+        }
         m_start = blocks * kBfRT;
         if (m_start >= M) return;
     }
@@ -316,6 +458,13 @@ void launch(sycl::queue* q, const void* a, long a_ld, const uint16_t* b, long b_
         const int mb = M - m0 < kMaxM ? M - m0 : kMaxM;
         const void* am = (const char*)a + (size_t)m0 * a_ld * ae;
         void* ym = (char*)y + (size_t)m0 * y_ld * ye;
+        /* run 209 (owner note 206 item 1): K = 2560 as a compile-time instance under RADIANCE_XE_GEMV_KC=1 */
+        static const bool kc = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_KC"); return e && e[0] == '1'; }();
+        if (kc && K == 2560) {
+            if (mb == 1) XE_LAUNCH(q, (gemv_bf16_kernel<A_F32, Y_F32, 1, 2560>), grid, block, 0, am, a_ld, b, b_ld, ym, y_ld, N, K, mb);
+            else XE_LAUNCH(q, (gemv_bf16_kernel<A_F32, Y_F32, kMaxM, 2560>), grid, block, 0, am, a_ld, b, b_ld, ym, y_ld, N, K, mb);
+            continue;
+        }
         if (mb == 1) XE_LAUNCH(q, (gemv_bf16_kernel<A_F32, Y_F32, 1>), grid, block, 0, am, a_ld, b, b_ld, ym, y_ld, N, K, mb);
         else XE_LAUNCH(q, (gemv_bf16_kernel<A_F32, Y_F32, kMaxM>), grid, block, 0, am, a_ld, b, b_ld, ym, y_ld, N, K, mb);
     }

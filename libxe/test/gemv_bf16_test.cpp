@@ -133,7 +133,9 @@ int main(int argc, char** argv) {
     bool ok = true;
     /* small M (the GEMV), then the matrix-unit sizes: a full block, a block plus a tail, two blocks; an N and a K
      * off the tile multiples (N 200 = 3 tiles + 8; K 1000 = 15 groups + 40) */
-    const int cases[][3] = { {1, 96, 256}, {3, 200, 1000}, {64, 128, 2560}, {70, 200, 1000}, {128, 1024, 2048}, {130, 96, 640} };
+    /* run 209: {1, 33, 2560} and {2, 77, 2560} give the K = 2560 instances (RADIANCE_XE_GEMV_KC=1) odd N at decode M */
+    const int cases[][3] = { {1, 96, 256}, {3, 200, 1000}, {64, 128, 2560}, {70, 200, 1000}, {128, 1024, 2048}, {130, 96, 640},
+                             {1, 33, 2560}, {2, 77, 2560} };
     for (const auto& c : cases) {
         ok &= run_case(q, c[0], c[1], c[2], false, false, 11, 0);
         ok &= run_case(q, c[0], c[1], c[2], true, false, 13, 0);
