@@ -361,6 +361,13 @@ struct MoeFP8 {
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
+    /* Intel port, run 273 (owner note 214 item 3, the decode step's adjacent-launch pair 2): op_topk_scatter and
+     * op_hq as one `router_topk_scatter_quant` launch where a loaded library declares it (libxe under
+     * RADIANCE_XE_ROUTER_QUANT_PAIR=1), up to `rtq_rows` rows: the two read the block input (the router its logits),
+     * write disjoint buffers, and nothing between them reads either, so the one launch in op_topk_scatter's place
+     * keeps every dependency; each work-group runs its own kernel's body. */
+    rad_op  op_rtq = 0;
+    int64_t rtq_rows = 0;
     /* Format B (Config::expert_i8): the down input's rotation and int8 quantiser over the bf16 silu
      * product; op_hq is then the gate_up input's, into the int8 pair. */
     rad_op op_eq8 = 0;
@@ -1134,6 +1141,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                       RAD_NOWEIGHTS),
                   {w.h.x}, {w.hr.q8, w.hr.s8});
         if (!op_hq) return RAD_E_INVAL;
+        /* run 273 (pair 2): this quantiser beside the router's selection + sort, up to 16 rows (the router's 8- and
+         * 16-wave forms); unresolved (no row, or the flag off), the step issues the two as today. */
+        if (op_topk_scatter && rad_op_declared(b, "router_topk_scatter_quant")) {
+            rtq_rows = topk_scatter_rows < 16 ? topk_scatter_rows : 16;
+            const RadParam ps[] = { RAD_RANGE("M", 1, rtq_rows),
+                                    RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
+                                    RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("expert_base", c.expert_base),
+                                    RAD_INT("n", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
+                                    RAD_STR("protect", prot_list) };
+            op_rtq = rw(b, rad_decl_op(b, "router_topk_scatter_quant", ps, 9 + n_prot, RAD_NOWEIGHTS),
+                        {w.logits, w.h.x}, {w.ids, w.ew, w.sorted, w.eoff, w.ecnt, w.hr.q8, w.hr.s8});
+        }
     } else if (rot) {
         if (!w.hr.q || !w.hr.s) {
             fprintf(stderr, "radiance: rotated experts need the `hr` (q, scale) pair on the wire; "
@@ -1748,8 +1768,18 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
+    bool hq_fused = false;
     if (rfused || sfused) {
         /* the fused router wrote all five */
+    } else if (op_rtq && rows <= rtq_rows) {
+        /* run 273 (pair 2): the selection + sort and the block input's quantiser (op_hq's issue below) as one launch */
+        RAD_ISSUE_N(c_, op_rtq, rows, brow_slice(w.logits, r0, rows, ne_all),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    brow_slice(w.h.x, r0, rows, g.n_embd),
+                    brow_slice(w.hr.q8, r0, rows, g.n_embd),
+                    brow_slice(w.hr.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
+        hq_fused = true;
     } else if (op_topk_scatter && rows <= topk_scatter_rows) {
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
@@ -1784,7 +1814,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool i8 = c.expert_i8 || c.expert_c8;   /* format B or C */
     const rad_buf gq = i8 ? w.hr.q8 : rot ? w.hr.q : w.h.q, gs = i8 ? w.hr.s8 : rot ? w.hr.s : w.h.s;
     const rad_buf dq = i8 ? w.eff.q8 : w.eff.q, ds = i8 ? w.eff.s8 : w.eff.s;
-    if (op_hq)
+    if (op_hq && !hq_fused)
         RAD_ISSUE_N(c_, op_hq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(i8 ? w.hr.q8 : w.hr.q, r0, rows, g.n_embd),
                     brow_slice(i8 ? w.hr.s8 : w.hr.s, r0, rows, g.n_embd / RAD_FP8_BLOCK));

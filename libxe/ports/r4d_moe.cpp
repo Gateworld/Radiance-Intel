@@ -51,6 +51,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
+#include "r4d_quant_act_body.h"   /* run 273 (pair 2): the block input's quantiser beside the router's launch */
 
 #include <hip/hip_bf16.h>
 
@@ -435,14 +436,17 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
  * ranks here). Passing one count to both would let the sort index its histogram out of range. */
 /* DIRECT (the Intel port, RADIANCE_XE_SORT_DIRECT=1 at T <= kSortDirectMax): the sort's outputs counted straight
  * from the slot list (r4d_moe_sort.h's scatter_direct_place), the same bytes. */
-template <uint32_t MAXOWN, uint32_t NW, bool DIRECT = false>
-__global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
-    const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
-    int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
-    uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,
-    int32_t base, Protect prot, uint32_t lean_n, float lean_margin, uint32_t lean_rows) {
-    XE_SHARED_VAR(ScatterLds<NW>, sl);
-    XE_SHARED_VAR(LeanLds, ll);
+/* Intel port, run 273 (the decode step's adjacent-launch pair 2): the kernel's body, so that the paired launch below
+ * (router_topk_scatter_quant_kernel) runs it for its work-group 0 exactly as this kernel does. */
+#define R4D_RTS_PARAMS                                                                              \
+    const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,          \
+    int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,            \
+    uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,      \
+    int32_t base, Protect prot, uint32_t lean_n, float lean_margin, uint32_t lean_rows
+#define R4D_RTS_PASS lg, ids, w, sorted, off, cnt, M, n_expert, n_local, top_k, lg_ld, norm, base, prot, lean_n, \
+    lean_margin, lean_rows
+template <uint32_t MAXOWN, uint32_t NW, bool DIRECT>
+__device__ __forceinline__ void router_topk_scatter_body(ScatterLds<NW>& sl, LeanLds& ll, R4D_RTS_PARAMS) {
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
     if constexpr (!DIRECT)
         for (uint32_t e = threadIdx.x; e < n_local; e += blockDim.x) sl.cnt[e] = 0;
@@ -466,6 +470,38 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     lds_barrier();
     if constexpr (DIRECT) scatter_direct_place(sorted, off, cnt, M * top_k, n_local, sl.e);
     else scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
+}
+
+template <uint32_t MAXOWN, uint32_t NW, bool DIRECT = false>
+__global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(R4D_RTS_PARAMS) {
+    XE_SHARED_VAR(ScatterLds<NW>, sl);
+    XE_SHARED_VAR(LeanLds, ll);
+    router_topk_scatter_body<MAXOWN, NW, DIRECT>(sl, ll, R4D_RTS_PASS);
+}
+
+/* ================================================================== router_topk_scatter + the input quantiser
+ *
+ * Intel port, run 273 (owner note 214 item 3; the decode step's adjacent-launch map, pair 2): a MoE layer issues the
+ * router's selection + sort (one work-group, 15 us) and then the block input's rotated int8 quantiser
+ * (had_quant_act_i8g, a work-group a row, 5 us) back to back; the two read the block input (the router its logits) and
+ * write disjoint buffers. One grid: work-group 0 runs the router's body unchanged, work-groups 1 .. M quantise row
+ * blockIdx.x - 1 by quant_act_fp8_body (r4d_quant_act_body.h), each wave the groups it does in its own launch (the body
+ * strides by its own eight waves; at NW 16 / 32 the waves past eight return at once -- that body has no barrier). The
+ * branch on blockIdx.x is uniform per work-group, so the router's barriers see every thread of theirs. The same block,
+ * GRF file and sub-group (32) as the two launches, so each row's bytes are its own kernel's; the quantiser's rows run
+ * beside the router's work-group instead of after it. */
+template <uint32_t MAXOWN, uint32_t NW, bool DIRECT, bool ROT, bool I8>
+__global__ __launch_bounds__(NW * kWave) void router_topk_scatter_quant_kernel(
+    R4D_RTS_PARAMS, const uint16_t* __restrict__ qx, uint8_t* __restrict__ qq, float* __restrict__ qs,
+    uint32_t qK, uint32_t qnkb, uint32_t qx_ld, uint32_t qq_ld, uint32_t qs_ld) {
+    XE_SHARED_VAR(ScatterLds<NW>, sl);
+    XE_SHARED_VAR(LeanLds, ll);
+    if (blockIdx.x == 0) {
+        router_topk_scatter_body<MAXOWN, NW, DIRECT>(sl, ll, R4D_RTS_PASS);
+        return;
+    }
+    if (threadIdx.x / kWave >= r4d_qa::kWaves) return;
+    r4d_qa::quant_act_fp8_body<ROT, I8, false>(blockIdx.x - 1, qx, qq, qs, qK, qnkb, qx_ld, qq_ld, qs_ld);
 }
 
 /* The general form, in three passes so it stays stable without an atomic deciding order. `bcnt` is
@@ -2362,7 +2398,16 @@ extern "C" int r4d_rad_router_topk(const RadArgs* a, RadStream s) {
  * It refuses, rather than falls back, when the sort would not fit one workgroup, so the op's cost
  * does not hinge on a hidden bound; the architecture checks the same before declaring it
  * (`moe_fuse_rows`). */
-extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
+/* The quantiser arm of router_topk_scatter_quant (run 273, pair 2): had_quant_act_i8g's operands over the block input,
+ * checked by r4d_rad_router_topk_scatter_quant and launched in the router's grid. */
+struct RouterQuantArm {
+    long x = 0, q = 0, s = 0;
+    long long M = 0;
+    uint32_t K = 0, nkb = 0, x_ld = 0, q_ld = 0, s_ld = 0;
+};
+
+/* router_topk_scatter, or with `qa` the paired launch router_topk_scatter_quant (the same checks and dispatch). */
+static int router_topk_scatter_common(const RadArgs* a, RadStream stream, const RouterQuantArm* qa) {
     int emit_rc = RAD_OK;
     const RadTensor* lg     = r4d_opt(a, 0);
     const RadTensor* ids    = r4d_opt(a, 1);
@@ -2453,6 +2498,30 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
     /* the Intel port (owner note 129 item 4): the direct sort at a decode or verify step's few slots */
     static const bool direct_on = [] { const char* e = std::getenv("RADIANCE_XE_SORT_DIRECT"); return e && e[0] == '1'; }();
     const bool direct = direct_on && nw == 8 && T <= (long long)r4d_moesort::kSortDirectMax;
+    /* run 273 (pair 2): the paired launch, 1 + M work-groups of the router's block; the forms instantiated are the
+     * decode step's (MAXOWN 16: more than 256 experts; NW 8 and 16: M <= 16, the architecture's bound). */
+#define R4D_RTQ_ARGS                                                                             \
+                       (const uint16_t*)qa->x, (uint8_t*)qa->q, (float*)qa->s, qa->K, qa->nkb,   \
+                       qa->x_ld, qa->q_ld, qa->s_ld
+#define R4D_RTQ_L(NWV, DIR)                                                                      \
+    emit_rc = router_grf()                                                                      \
+        ? (XE_LAUNCH_GGL_GRF256((router_topk_scatter_quant_kernel<16, NWV, DIR, true, true>),    \
+                                dim3((uint32_t)(1 + M)), dim3((NWV) * kWave), 0, stream,         \
+                                R4D_RTS_ARGS, R4D_RTQ_ARGS), 0)                                  \
+        : R4D_EMIT(stream, (router_topk_scatter_quant_kernel<16, NWV, DIR, true, true>),         \
+                   dim3((uint32_t)(1 + M)), dim3((NWV) * kWave), 0, R4D_RTS_ARGS, R4D_RTQ_ARGS)
+    if (qa) {
+        if (qa->M != M) return R4D_NO(RAD_E_SHAPE);
+        if (nw > 16 || n_expert <= (long long)(8 * kWave)) return R4D_NO(RAD_E_UNSUPPORTED);
+        if (direct)         R4D_RTQ_L(8, true);
+        else if (nw == 8)   R4D_RTQ_L(8, false);
+        else                R4D_RTQ_L(16, false);
+        if (emit_rc != RAD_OK) return emit_rc;
+        R4D_MOE_CHK();
+        return RAD_OK;
+    }
+#undef R4D_RTQ_L
+#undef R4D_RTQ_ARGS
     if (direct) {
         if (n_expert <= (long long)(8 * kWave)) R4D_RTS_L(8, 8, true);
         else                                    R4D_RTS_L(16, 8, true);
@@ -2469,6 +2538,37 @@ extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
     if (emit_rc != RAD_OK) return emit_rc;
     R4D_MOE_CHK();
     return RAD_OK;
+}
+
+extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
+    return router_topk_scatter_common(a, stream, nullptr);
+}
+
+/* router_topk_scatter_quant (run 273, pair 2): router_topk_scatter's six operands and parameters, then the block
+ * input `x` [M][n] bf16, its codes `q` [M][n] int8 and scales `scale` [M][n / 128] f32 (had_quant_act_i8g's: the one
+ * form instantiated is the rotated int8 one the format C experts read; n a multiple of 128), `n` and `group`. */
+extern "C" int r4d_rad_router_topk_scatter_quant(const RadArgs* a, RadStream stream) {
+    const RadTensor* x  = r4d_opt(a, 6);
+    const RadTensor* q  = r4d_opt(a, 7);
+    const RadTensor* sc = r4d_opt(a, 8);
+    if (!x || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || q->dtype != RAD_I8 || sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (x->rank != 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    RouterQuantArm qa;
+    qa.M = x->shape[0];
+    const long long K = x->shape[1];
+    const long long grp = (long long)r4d_qa::kGroup;
+    if (K <= 0 || K % grp) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_geti_or(a, "n", K) != K || r4d_geti_or(a, "group", grp) != grp) return R4D_NO(RAD_E_SHAPE);
+    const long long nkb = K / grp;
+    if (q->shape[0] != qa.M || q->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
+    if (sc->shape[0] != qa.M || sc->shape[1] != nkb) return R4D_NO(RAD_E_SHAPE);
+    const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    if (xp < 0 || qp < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
+    qa.x = r4d_addr(x); qa.q = r4d_addr(q); qa.s = r4d_addr(sc);
+    qa.K = (uint32_t)K; qa.nkb = (uint32_t)nkb;
+    qa.x_ld = (uint32_t)xp; qa.q_ld = (uint32_t)qp; qa.s_ld = (uint32_t)sp;
+    return router_topk_scatter_common(a, stream, &qa);
 }
 
 /* Scratch for the general scatter: the per-tile histogram plane (none for the small form). Sized
