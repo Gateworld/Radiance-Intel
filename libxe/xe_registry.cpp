@@ -38,6 +38,14 @@ extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream s);  /* ports/
 static const RadConstraint cXeGateQuant[] = { C_DIV("n", 4), C_EQ("group", 128), C_IN("dtype", "bf16") };
 extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream s);  /* ports/r4d_fused_quant_fp8.cpp */
 static const RadConstraint cXeGatedHad[] = { C_DIV("n", 128), C_EQ("group", 128), C_IN("dtype", "bf16") };
+extern "C" int r4d_rad_gated_quant_pair(const RadArgs* a, RadStream s);  /* ports/r4d_fused_quant_fp8.cpp, run 273 */
+static const RadConstraint cXeGatedQuantPair[] = { C_DIV("n", 128), C_DIV("n2", 4), C_EQ("group", 128),
+                                                   C_IN("dtype", "bf16") };
+/* run 273 (pair 3 of the decode step's adjacent launches): libr4d's gated-attention prologue, ported in milestone 1
+ * (ports/r4d_qk_norm_rope_gate.cpp) and left unlisted only because libref declares no schema for it; its constraints
+ * are libr4d's cQkNormRopeGate field for field */
+extern "C" int r4d_rad_qk_norm_rope_gate(const RadArgs* a, RadStream s);  /* ports/r4d_qk_norm_rope_gate.cpp */
+static const RadConstraint cXeQkPrologue[] = { C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32) };
 /* libxe's own kernels (step 4: matrix-unit ops libr4d does on WMMA, written for Xe2) */
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 static const RadConstraint cXeGemvI8[] = {
@@ -352,6 +360,16 @@ static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 static bool env_on(const char* k) { const char* e = std::getenv(k); return !(e && e[0] == '0'); }
 static bool xe_gate_quant_on() { static const bool v = env_on("RADIANCE_XE_GATE_QUANT"); return v; }
 static bool xe_gated_had_on() { static const bool v = env_on("RADIANCE_XE_GATED_HAD"); return v; }
+/* run 273 (owner note 214 item 3, the decode step's adjacent-launch pair 1): opt-in, =1 lists it */
+static bool xe_gated_quant_pair_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GATED_QUANT_PAIR"); return e && e[0] == '1'; }();
+    return v;
+}
+/* run 273 (pair 3): the fused q / k norm + rope prologue; opt-in, =1 lists it */
+static bool xe_qk_prologue_on() {
+    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_QK_PROLOGUE"); return e && e[0] == '1'; }();
+    return v;
+}
 static const RadKernelInfo kFlagged[] = {
 /* pair 4 (RADIANCE_XE_GATE_QUANT=1): libr4d's gate_quant_fp8, its port's adapter -- the gated attention's sigmoid, mul
  * and quantiser as one pass, the sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does */
@@ -374,8 +392,37 @@ static const RadKernelInfo kFlagged[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGatedHad), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* the decode step's pair 1 (RADIANCE_XE_GATED_QUANT_PAIR=1, run 273, owner note 214 item 3): the routed experts'
+ * gated_had_quant_i8g and the shared expert's gated_quant_fp8 (int8 codes), the two launches a MoE layer issues back
+ * to back over different buffers, as one launch whose work-groups are split by row set; each row's arithmetic is its
+ * own kernel's (r4d_fused_quant_fp8.cpp, gated_quant_row), so the bytes are the two launches' */
+{ "gated_quant_pair", "gated_quant_pair", "quant",
+  "two independent gated products quantised in one launch: the first operand set's rows rotated to int8 codes "
+  "(gated_had_quant_i8g's), the second's to plain int8 codes (gated_quant_fp8's at int8)",
+  "n a multiple of 128 (the rotated set), n2 of 4; each gated operand [M_i][2 n_i], gate then up; group 128; silu",
+  "bf16 in, int8 codes with an f32 scale per (row, 128 columns) and an optional bf16 out, per set",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGatedQuantPair), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_quant_pair, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* the decode step's pair 3 (RADIANCE_XE_QK_PROLOGUE=1, run 273): libr4d's qk_norm_rope_gate row, text for text
+ * (libr4d/r4d_rows.cpp), over the port's adapter -- the gated attention asks for it at <= 64 rows
+ * (rad_block_attn_gated_fp8.h) and issues q norm, k norm, rope q and rope k when it is not declared */
+{ "qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
+  "the gated-attention QKV preamble in one pass: split [q|gate] per head, QK RMS norm over the "
+  "head, partial NeoX RoPE and the gate copy",
+  "head_dim 64, 128 or 256; rotary_dim even and <= head_dim, with rotary_dim/2 a power-of-two "
+  "multiple of head_dim/32 so the RoPE pair is one shuffle; NeoX style; bf16; n_head may be 0, "
+  "which is the K-only form and serves an input with no gate interleaved",
+  "bf16 in and out; the norm output is rounded to bf16 before the rotation, as the unfused "
+  "reference does by storing it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeQkPrologue), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope_gate, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
-static bool flagged_on(int j) { return j == 0 ? xe_gate_quant_on() : xe_gated_had_on(); }
+static bool flagged_on(int j) {
+    return j == 0 ? xe_gate_quant_on() : j == 1 ? xe_gated_had_on() : j == 2 ? xe_gated_quant_pair_on()
+                                                                      : xe_qk_prologue_on();
+}
 static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
 /* the j-th listed flagged entry (counting only those on), or -1 */
 static int flagged_index(int j) {
@@ -473,6 +520,24 @@ static const RadParamSpec pXeGatedHad[] = {
 static const RadOperandSpec oXeGatedHad[] = {
     { "gate_up", RAD_OPD_IN, 0 }, { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 }, { "out_bf16", RAD_OPD_OUT, 1 },
 };
+/* gated_quant_pair (run 273): two gated_quant operand sets, the second's names and width suffixed 2 */
+static const RadParamSpec pXeGatedQuantPair[] = {
+    P_INT("M"), P_INT("n"), P_INT("n2"), P_INT("group"), P_STR("dtype"), P_STRO("act"), P_INTO("rot"), P_INTO("rot2"),
+};
+static const RadOperandSpec oXeGatedQuantPair[] = {
+    { "gate_up", RAD_OPD_IN, 0 },  { "q", RAD_OPD_OUT, 0 },  { "scale", RAD_OPD_OUT, 0 },  { "out_bf16", RAD_OPD_OUT, 1 },
+    { "gate_up2", RAD_OPD_IN, 0 }, { "q2", RAD_OPD_OUT, 0 }, { "scale2", RAD_OPD_OUT, 0 }, { "out_bf16_2", RAD_OPD_OUT, 1 },
+};
+/* qk_norm_rope_gate (run 273): libr4d's pQkNormRopeGate / oQkNormRopeGate, field for field */
+static const RadParamSpec pXeQkPrologue[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("n_head"), P_INT("n_head_kv"), P_INT("rot"), P_STR("q_dtype"),
+    P_F64O("eps"), P_F64O("wadd"), P_INTO("cs_f32"), P_INTO("pos_i64"),
+};
+static const RadOperandSpec oXeQkPrologue[] = {
+    { "q_gate", RAD_OPD_IN, 1 },     { "k", RAD_OPD_IN, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
+    { "positions", RAD_OPD_IN, 0 },  { "q_w", RAD_OPD_WEIGHT, 1 }, { "k_w", RAD_OPD_WEIGHT, 0 },
+    { "q_out", RAD_OPD_OUT, 1 },     { "k_out", RAD_OPD_OUT, 0 },  { "gate_out", RAD_OPD_OUT, 1 },
+};
 /* kFlagged's schemas, in its order; listed under the same flags */
 static const RadOpSchema kFlaggedSchemas[] = {
     { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
@@ -480,6 +545,13 @@ static const RadOpSchema kFlaggedSchemas[] = {
     { "gated_had_quant_i8g", ROW(pXeGatedHad), ROW(oXeGatedHad),
       "gated_had_quant_fp8 at int8 codes: silu(a)*b or sigmoid(a)*b, a `group`-wide Hadamard, then int8 codes at "
       "amax / 127 (the bf16 out unrotated)." },
+    { "gated_quant_pair", ROW(pXeGatedQuantPair), ROW(oXeGatedQuantPair),
+      "gated_had_quant_i8g over the first operand set (`rot` 1) and gated_quant_fp8 at int8 codes over the second "
+      "(`rot2` 0, width `n2`), silu, in one launch; `M` is the two sets' rows together. The two ops' bytes." },
+    { "qk_norm_rope_gate", ROW(pXeQkPrologue), ROW(oXeQkPrologue),
+      "the gated attention's prologue in one launch: per head, the q half of [q|gate] and k RMS-normed (the output "
+      "rounded to bf16), partial NeoX RoPE from the cos/sin table at each token's position, the gate copied when "
+      "asked. The four ops' bytes (rmsnorm q, rmsnorm k, rope q, rope k)." },
 };
 static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");
 static int own_schemas() { return kNumSchemas + flagged_count(); }
