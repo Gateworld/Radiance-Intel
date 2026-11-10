@@ -3320,10 +3320,11 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
                            (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
                            (uint32_t)a_ld, (uint32_t)w_ld, (uint32_t)y_ld, nullptr);
     } else {
-        /* run 267 (owner lever #3, OPT-IN RADIANCE_XE_MOE_BF16_DPAS=1): the matrix-unit form (xe_moe_bf16_dpas.cpp),
-         * not bit-identical to the WMMA forms below (note 149's bar, never the default by this code). When it declines
-         * (its guards) the WMMA forms run; with the switch unset nothing is called and the dispatch is the old one. The
-         * symbols are weak: the cpuprobe library of this unit alone has none. */
+        /* run 267 (owner lever #3): the matrix-unit form (xe_moe_bf16_dpas.cpp), not bit-identical to the WMMA forms
+         * below, so its default followed note 149's KL-replay bar -- opt-in from run 268, ON by default since run 271
+         * (owner note 212 item 1); RADIANCE_XE_MOE_BF16_DPAS=0 is the opt-out. When it declines (its guards) the WMMA
+         * forms run; with the switch off nothing is called and the dispatch is the old one. The symbols are weak: the
+         * cpuprobe library of this unit alone has none. */
         /* run 268 (the coordinator's prefill-only condition): T > 256 is the dispatch's own prefill class -- decode and
          * the MTP verify (T <= 256: 16 tokens x top_k 10 = 160) take the GEMV form above when it is on, and with the
          * GEMV opted out they fall through to here, so the class is required again: decode stays bit-exact. */

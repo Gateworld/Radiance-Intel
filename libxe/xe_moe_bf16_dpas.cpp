@@ -14,8 +14,10 @@
  * NOT bit-identical to the WMMA form: that one adds a tile's 16 products to the fp32 accumulator one k at a time in
  * ascending k; the matrix unit sums each 8x16x16 step in its own order and adds the step. Same bf16 operands (their
  * products are exact in fp32), a different association of the K sum: last-bit fp32 differences, an occasional one-ulp
- * bf16 output. So it is OPT-IN (RADIANCE_XE_MOE_BF16_DPAS=1) and the default follows note 149's KL-replay bar, not
- * the bit gate. With the switch unset nothing here runs and the dispatch is byte for byte the old one.
+ * bf16 output. So its default followed note 149's KL-replay bar, not the bit gate: opt-in from run 268, and ON BY
+ * DEFAULT since run 271 (owner note 212 item 1: KMB1 mean KL 0.0027 / top-1 98.9 % on the agreement corpus, KMB2
+ * 0.0021 / 98.65 % on the long corpus, both well inside the accepted forms' band). RADIANCE_XE_MOE_BF16_DPAS=0 is the
+ * opt-out: nothing here runs and the dispatch is byte for byte the old one (B155's bits).
  *
  * Guards (the launcher returns 1 = not taken, and the caller runs the old kernel): K % 64, a call under 64 sorted
  * rows (one block; until run 268 it was 512, the int8 form's cut-off, which left the prompts' short last steps on
@@ -197,9 +199,11 @@ void moe_bf16_dpas_kernel(const uint16_t* __restrict__ A, const void* const* __r
 
 }  // namespace
 
-/* RADIANCE_XE_MOE_BF16_DPAS=1: the switch, read once */
+/* RADIANCE_XE_MOE_BF16_DPAS: the switch, read once. ON by default since run 271 (owner note 212 item 1: the form
+ * passed note 149's KL-replay bar on both corpora -- KMB1 0.0027 / 98.9 %, KMB2 0.0021 / 98.65 %); =0 keeps the WMMA
+ * form (the opt-out, the bits of B155). */
 extern "C" int xe_moe_bf16_dpas_on() {
-    static const int v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_DPAS"); return (s && *s == '1') ? 1 : 0; }();
+    static const int v = [] { const char* s = std::getenv("RADIANCE_XE_MOE_BF16_DPAS"); return (s && *s == '0') ? 0 : 1; }();
     return v;
 }
 
