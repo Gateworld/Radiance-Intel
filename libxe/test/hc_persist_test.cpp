@@ -107,7 +107,10 @@ int main(int argc, char** argv) {
                 q.get_device().get_info<sycl::info::device::name>().c_str(), pers ? pers : "(unset)");
 
     /* hc 4 streams of n 512 (HN 2048: a whole number of the S8 form's 2048-element steps), lowrank 128 */
-    const int64_t hc = 4, n = 512, HN = hc * n, lr = 128, M = 4;
+    /* RI_HC_ROWS (run 279, owner note 221): one row count instead of 2..4 -- 64 rows and more take the prefill
+     * matrix-unit module (kPfMinRows) under RADIANCE_XE_HC_PF_DPAS=1: the hang's smallest reproducer, no engine */
+    const char* rv = std::getenv("RI_HC_ROWS");
+    const int64_t hc = 4, n = 512, HN = hc * n, lr = 128, M = rv && std::atoi(rv) >= 2 ? std::atoi(rv) : 4;
     auto sh = [&](size_t bytes) { return sycl::malloc_shared<uint8_t>(bytes, q); };
     std::vector<uint16_t> hh((size_t)(M * HN)), hi((size_t)(hc * HN));
     std::vector<float> hw((size_t)HN);
@@ -139,7 +142,7 @@ int main(int argc, char** argv) {
     std::FILE* f = std::fopen(argv[2], "wb");
     if (!f) { std::printf("cannot write %s\n", argv[2]); return 2; }
     int fails = 0;
-    for (int64_t rows = 2; rows <= 4; ++rows) {
+    for (int64_t rows = rv ? M : 2; rows <= M; ++rows) {
         RadTensor t[13]{};
         if (wrm >= 0) std::memcpy(d_h, hh.data(), hh.size() * 2);   /* each row count writes from the same stream */
         t[0] = tn(d_h, RAD_BF16, 2, rows, HN);

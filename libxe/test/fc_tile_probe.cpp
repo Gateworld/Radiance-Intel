@@ -35,6 +35,8 @@
  * T2 (run 206, gate_up only): T1 with the rows' activations staged in LDS once a work-group and CB = 1 / 2 / 4 / 8
  * column blocks a work-group (T2 and RESULT-T2 lines; the bytes on every device, the times on a card).
  * RESULT lines: per launch us (host wall over LAUNCHES back-to-back launches, the median of RUNS), today's and T1's.
+ * E3 (run 279, owner note 218 stage 2, gate_up only, GPU only): the whole-kernel ESIMD form of gate_up over today's entries
+ * (e3_launch), bytes against today's kernel (E3 lines) and timed (RESULT-E3 lines); RI_NO_E3=1 skips it.
  */
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
@@ -664,6 +666,228 @@ void e1_launch(sycl::queue& q, const int8_t* A, const float* As, const ECls& c0,
     });
 }
 
+/* ---- E3 (run 279, owner note 218 stage 2): format C's GATE_UP as one whole ESIMD kernel over today's entries, today's
+ * arithmetic in today's order (the design: logs/run279-esimd-design.md; the stage 0 compile record: esimd_fc_probe.cpp).
+ * A thread = 16 columns as lanes x up to kMT rows of one expert's run x ONE of today's eight even-lane partial sums
+ * (gi = 0..7: the groups gi + 8 u, u = 0..4, in u order); a work-group = 8 x CB threads; the eight partials meet in shared
+ * memory and are added in the xor tree's order ((0 + 4) + (2 + 6)) + ((1 + 5) + (3 + 7)), then + 0.0 (the odd lane's),
+ * then to_bf16. A group's codes for the 16 columns: one transposed 2D block load (16 rows x 8 dwords) of today's layout;
+ * the 256-entry pair table in registers (two dword tables) from the entry's 16 levels with today's rounding (div_ieee,
+ * rnde); dp4a over the packed levels and the row's activation dwords in natural order (float(s_lo) + float(s_hi) ==
+ * float(s): 64 products < 2^24); each product xor'd with the runtime zero before the add (P100's lesson). */
+struct E3Cls {
+    const uint8_t* wbase;   /* the joined entries: the codes [n][K/2] at c_off, the 16 f32 levels at t_off */
+    uint64_t wstride;
+    uint32_t c_off, t_off;
+    const uint8_t* sbase;   /* the E4M3 scales [n][K/64] at s_off, scale.1 at s1_off */
+    uint64_t sstride;
+    uint32_t s_off, s1_off;
+    uint32_t n;
+};
+constexpr int kE3GI = 8, kE3U = 5;   /* K 2560: 40 groups = 8 partials x 5 units */
+/* PF (E3b, the one variant round of E1, run 279): E1 measured E3 bit-identical and 1.6x SLOWER than today (116.9 vs 73.2
+ * us at 4 tokens) with 2.8x fewer instructions a MAC -- a thread's dependent load chain is what shows: one 2D code load
+ * a group issued just before its use, a scalar activation-scale load a row a group inside the loop, a nine-step scalar
+ * binary search over `off`. PF issues the five code blocks' prefetches first (prefetch_2d, no registers), loads the five
+ * activation scales a row up front as one gather, and finds the expert with two 16-wide gathers over `off` (n_expert
+ * <= 512: the samples off[32 j], then the chosen 32) instead of the scalar search. The same reads, the same arithmetic. */
+template <int CB, bool PF = false>
+void e3_launch(sycl::queue& q, const int8_t* A, const float* As, const E3Cls& c0, const E3Cls& c1, const int32_t* sorted,
+               const int32_t* off, uint16_t* Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld,
+               uint32_t as_ld, uint32_t y_ld, uint32_t parts, uint32_t a_rows, uint32_t zero) {
+    constexpr uint32_t kLW = kE3GI * CB, kSlm = CB * kE3GI * kMT * 64, kWLd = 1280u, kSLd = 40u;
+    q.parallel_for(sycl::nd_range<2>({ (size_t)T, (size_t)(N / 16 / CB) * kLW }, { 1, (size_t)kLW }),
+                   [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+        es::slm_init<kSlm>();
+        const uint32_t i = (uint32_t)it.get_global_id(0);
+        const uint32_t lid = (uint32_t)it.get_local_id(1), gi = lid & 7u, cb = lid >> 3;
+        const uint32_t n0 = ((uint32_t)it.get_group(1) * CB + cb) * 16u;
+        const int32_t flat = sorted[i];
+        int32_t e = -1;
+        if (flat >= 0 && i < (uint32_t)off[n_expert]) {
+            if constexpr (PF) {
+                /* off is non-decreasing: e = (the count of entries off[0..n_expert-1] <= i) - 1, found as the last sampled
+                 * 32-block whose first entry is <= i, then the count inside that block (entries past n_expert read as
+                 * off[n_expert], which is > i here) */
+                const es::simd<uint32_t, 16> lanes(0u, 1u);
+                es::simd<uint32_t, 16> so = lanes * 32u;
+                so.merge(es::simd<uint32_t, 16>(n_expert), so > n_expert);
+                const es::simd<int32_t, 16> s1 = es::gather<int32_t, 16>(off, so * 4u);
+                const uint32_t nb = es::cbit(es::pack_mask(s1 <= (int32_t)i));   /* >= 1: off[0] = 0 <= i */
+                const uint32_t b0 = (nb - 1u) * 32u;
+                es::simd<uint32_t, 16> o0 = lanes + b0, o1 = lanes + (b0 + 16u);
+                o0.merge(es::simd<uint32_t, 16>(n_expert), o0 > n_expert);
+                o1.merge(es::simd<uint32_t, 16>(n_expert), o1 > n_expert);
+                const es::simd<int32_t, 16> v0 = es::gather<int32_t, 16>(off, o0 * 4u), v1 = es::gather<int32_t, 16>(off, o1 * 4u);
+                const uint32_t cnt = es::cbit(es::pack_mask(v0 <= (int32_t)i)) + es::cbit(es::pack_mask(v1 <= (int32_t)i));
+                e = (int32_t)(b0 + cnt - 1u);
+            } else {
+                uint32_t lo = 0, hi = n_expert;
+                while (lo + 1 < hi) {
+                    const uint32_t mid = (lo + hi) / 2;
+                    if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+                }
+                e = (int32_t)lo;
+            }
+        }
+        uint32_t rn = 1;
+        if (e >= 0) {
+            const uint32_t first = (uint32_t)off[e], last = (uint32_t)off[e + 1];
+            if ((i - first) % kMT != 0) return;
+            rn = (last - i) < (uint32_t)kMT ? (last - i) : (uint32_t)kMT;
+        }
+        uint32_t tokr[kMT];
+        bool liver[kMT];
+#pragma unroll
+        for (int q2 = 0; q2 < kMT; ++q2) {
+            tokr[q2] = 0; liver[q2] = false;
+            if (e >= 0 && (uint32_t)q2 < rn) {
+                const int32_t fq = sorted[i + q2];
+                const uint32_t t = (uint32_t)fq / top_k;   /* token rows */
+                tokr[q2] = t;
+                liver[q2] = fq >= 0 && t < a_rows;
+            }
+        }
+        if (e < 0) {
+            if (gi == 0 && n0 < N) es::block_store<uint16_t, 16>(Y + (size_t)i * y_ld + n0, es::simd<uint16_t, 16>(0));
+            return;
+        }
+        const E3Cls& c = (e & 1) ? c1 : c0;
+        const uint32_t fy = N / parts, fc = c.n / parts;
+        const uint32_t pp = n0 / fy, j0 = n0 - pp * fy;
+        const es::simd<uint32_t, 16> lane(0u, 1u);
+        const es::simd<uint32_t, 16> jj = lane + j0;
+        const es::simd_mask<16> dead = (jj >= fc) | ((lane + n0) >= N);
+        const uint32_t row0 = pp * fc + j0;
+        const uint32_t eh = (uint32_t)e >> 1;
+        const uint8_t* wentry = c.wbase + (uint64_t)eh * c.wstride;
+        const uint8_t* sentry = c.sbase + (uint64_t)eh * c.sstride;
+        const uint8_t* we = wentry + c.c_off;
+        const uint8_t* se = sentry + c.s_off;
+        if constexpr (PF) {   /* the five code blocks on their way while the table is built (a prefetch needs its hints) */
+            es::properties pf_props{ es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached> };
+#pragma unroll
+            for (int u = 0; u < kE3U; ++u)
+                es::prefetch_2d<uint32_t, 8, 16, 1>((const uint32_t*)we, kWLd - 1u, c.n - 1u, kWLd - 1u,
+                                                    (int)((gi + 8u * (uint32_t)u) * 8u), (int)row0, pf_props);
+        }
+        const es::simd<float, 16> tv = es::block_load<float, 16>((const float*)(wentry + c.t_off));
+        const float amax = es::hmax<float>(es::abs(tv));
+        const float s1 = *(const float*)(sentry + c.s1_off);
+        es::simd<int32_t, 16> lev;
+        float smul;
+        if (amax > 0.0f) {
+            const es::simd<float, 16> l127 = tv * 127.0f;
+            const es::simd<float, 16> ld = es::div_ieee(l127, es::simd<float, 16>(amax));
+            lev = es::simd<int32_t, 16>(es::rnde<float, 16>(ld));
+            const es::simd<float, 1> d = es::div_ieee(es::simd<float, 1>(amax), es::simd<float, 1>(127.0f));
+            smul = s1 * d[0];
+        } else {
+            lev = es::simd<int32_t, 16>(tv);
+            smul = s1;
+        }
+        const es::simd<uint16_t, 256> xs(0, 1);
+        const es::simd<uint16_t, 256> x_lo = es::simd<uint16_t, 256>(xs & 15u), x_hi = es::simd<uint16_t, 256>(xs >> 4u);
+        const es::simd<uint32_t, 256> l_lo = es::simd<uint32_t, 256>(lev.iselect(x_lo)) & 255u;
+        const es::simd<uint32_t, 256> l_hi = es::simd<uint32_t, 256>(lev.iselect(x_hi)) & 255u;
+        es::simd<uint32_t, 256> P0 = l_lo | (l_hi << 8);
+        es::simd<uint32_t, 256> P1 = P0 << 16;
+        es::simd<int32_t, 16> av[kMT][kE3U];
+#pragma unroll
+        for (int q2 = 0; q2 < kMT; ++q2)
+#pragma unroll
+            for (int u = 0; u < kE3U; ++u) {
+                if ((uint32_t)q2 < rn && liver[q2])
+                    av[q2][u] = es::block_load<int32_t, 16>((const int32_t*)(A + (size_t)tokr[q2] * a_ld) + 16 * (gi + 8 * u));
+                else
+                    av[q2][u] = 0;
+            }
+        es::simd<float, 8> asv[kMT];   /* PF: a row's five activation scales (g / 2 = gi / 2 + 4 u), one gather */
+        if constexpr (PF) {
+            es::simd<uint32_t, 8> aso(0u, 1u);
+            aso.merge(es::simd<uint32_t, 8>(4u), aso > 4u);   /* lanes 5..7 repeat u = 4 */
+            const es::simd<uint32_t, 8> asb = ((aso * 4u) + (gi >> 1)) * 4u;
+#pragma unroll
+            for (int q2 = 0; q2 < kMT; ++q2) {
+                if ((uint32_t)q2 < rn && liver[q2]) asv[q2] = es::gather<float, 8>(As + (size_t)tokr[q2] * as_ld, asb);
+                else asv[q2] = 0.0f;
+            }
+        }
+        es::simd<uint32_t, 16> rclamp = es::simd<uint32_t, 16>(row0) + lane;
+        rclamp.merge(0u, dead);
+        es::simd<float, 16> sbr[kE3U];
+#pragma unroll
+        for (int u = 0; u < kE3U; ++u) {
+            const uint32_t b = gi + 8u * (uint32_t)u;
+            const es::simd<uint32_t, 16> sw = es::gather<uint32_t, 16>((const uint32_t*)se, rclamp * kSLd + (b & ~3u));
+            const es::simd<uint32_t, 16> v = (sw >> (8u * (b & 3u))) & 255u;
+            const es::simd<uint32_t, 16> s = (v & 0x80u) << 24, ex = (v >> 3) & 15u, m = v & 7u;
+            es::simd<float, 16> mf = es::simd<float, 16>(m) * 0.001953125f;
+            es::simd<uint32_t, 16> rr = s | ((ex + 120u) << 23) | (m << 20);
+            rr.merge(s | mf.template bit_cast_view<uint32_t>(), ex == 0u);
+            rr.merge(s | 0x7fc00000u, (v & 0x7fu) == 0x7fu);
+            sbr[u] = rr.template bit_cast_view<float>() * smul;
+        }
+        es::simd<float, 16> acc[kMT];
+#pragma unroll
+        for (int q2 = 0; q2 < kMT; ++q2) acc[q2] = 0.0f;
+#pragma unroll
+        for (int u = 0; u < kE3U; ++u) {
+            const uint32_t g = gi + 8u * (uint32_t)u;
+            es::simd<uint32_t, 128> cw = es::load_2d<uint32_t, 8, 16, 1, true>(
+                (const uint32_t*)we, kWLd - 1u, c.n - 1u, kWLd - 1u, (int)(g * 8u), (int)row0);
+            es::simd<int32_t, 16> lv[16];
+            auto cb8 = cw.template bit_cast_view<uint8_t>();
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const es::simd<uint16_t, 16> i0 = es::simd<uint8_t, 16>(cb8.template select<16, 4>(64 * w));
+                const es::simd<uint16_t, 16> i1 = es::simd<uint8_t, 16>(cb8.template select<16, 4>(64 * w + 1));
+                const es::simd<uint16_t, 16> i2 = es::simd<uint8_t, 16>(cb8.template select<16, 4>(64 * w + 2));
+                const es::simd<uint16_t, 16> i3 = es::simd<uint8_t, 16>(cb8.template select<16, 4>(64 * w + 3));
+                lv[2 * w] = es::simd<int32_t, 16>(P0.iselect(i0) | P1.iselect(i1));
+                lv[2 * w + 1] = es::simd<int32_t, 16>(P0.iselect(i2) | P1.iselect(i3));
+            }
+#pragma unroll
+            for (int q2 = 0; q2 < kMT; ++q2) {
+                if ((uint32_t)q2 >= rn || !liver[q2]) continue;
+                float asc;
+                if constexpr (PF) asc = asv[q2][u];
+                else asc = As[(size_t)tokr[q2] * as_ld + g / 2u];
+                es::simd<int32_t, 16> s = 0;
+#pragma unroll
+                for (int x = 0; x < 16; ++x) s = es::dp4a<int32_t>(s, lv[x], es::simd<int32_t, 16>((int32_t)av[q2][u][x]));
+                const es::simd<float, 16> fs = s;
+                const es::simd<float, 16> p = fs * asc;
+                es::simd<float, 16> m = p * sbr[u];
+                es::simd<uint32_t, 16> mb = m.template bit_cast_view<uint32_t>();
+                mb ^= zero;
+                acc[q2] += mb.template bit_cast_view<float>();
+            }
+        }
+#pragma unroll
+        for (int q2 = 0; q2 < kMT; ++q2)
+            es::slm_block_store<float, 16>(((cb * kE3GI + gi) * kMT + (uint32_t)q2) * 64u, acc[q2]);
+        es::barrier();
+        if (gi < (uint32_t)kMT && gi < rn) {
+            const uint32_t q2 = gi;
+            es::simd<float, 16> pa[kE3GI];
+#pragma unroll
+            for (int g2 = 0; g2 < kE3GI; ++g2)
+                pa[g2] = es::slm_block_load<float, 16>(((cb * kE3GI + (uint32_t)g2) * kMT + q2) * 64u);
+            es::simd<float, 16> v = ((pa[0] + pa[4]) + (pa[2] + pa[6])) + ((pa[1] + pa[5]) + (pa[3] + pa[7]));
+            es::simd<uint32_t, 16> zb(zero);
+            v = v + zb.template bit_cast_view<float>();
+            es::simd<uint32_t, 16> ub = v.template bit_cast_view<uint32_t>();
+            es::simd<uint32_t, 16> h = (ub + 0x7fffu + ((ub >> 16) & 1u)) >> 16;
+            h.merge((ub >> 16) | 0x40u, (ub & 0x7fffffffu) > 0x7f800000u);
+            es::simd<uint16_t, 16> o = h;
+            o.merge(0, dead);
+            if (!liver[q2]) o = 0;
+            if (n0 < N) es::block_store<uint16_t, 16>(Y + (size_t)(i + q2) * y_ld + n0, o);
+        }
+    });
+}
+
 /* ---- inputs, as moe_i4i8_test.cpp's format C cases build them */
 uint32_t h32(uint64_t a, uint64_t b) {
     uint64_t x = a * 0x9e3779b97f4a7c15ull ^ (b + 0x632be59bd9b4e019ull);
@@ -918,6 +1142,25 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
     };
     auto e1 = [&]() { return e1f(dy3, true); };
     auto e1b = [&]() { return e1f(dy4, false); };
+    /* E3 (run 279, note 218 stage 2): gate_up's shape on a GPU -- the whole-kernel ESIMD form over today's entries (dy3) */
+    bool e3on = !gl && q.get_device().is_gpu() && sh.parts == 2 && !sh.sorted_a && Kcl[0] == 2560 && Kcl[1] == 2560 &&
+                Nmax % 32 == 0 && !std::getenv("RI_NO_E3");
+    E3Cls e3c[2];
+    for (int c = 0; c < 2; ++c)
+        e3c[c] = E3Cls{ dw[c], went[c], (uint32_t)p0, (uint32_t)toff[c], dws[c], sent[c], (uint32_t)p0, (uint32_t)s1off[c],
+                        (uint32_t)Ncl[c] };
+    auto e3 = [&]() {
+        e3_launch<2>(q, da, das, e3c[0], e3c[1], dso, doff, (uint16_t*)(dy3 + kCanary), (uint32_t)T, (uint32_t)Nmax,
+                     (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)Kmax, (uint32_t)(Kmax / 128), (uint32_t)Nmax,
+                     (uint32_t)sh.parts, (uint32_t)AR, 0u);
+        return 0;
+    };
+    auto e3b = [&]() {   /* E3b = PF (the one variant round): prefetched code blocks, hoisted scales, the vector search; dy4 */
+        e3_launch<2, true>(q, da, das, e3c[0], e3c[1], dso, doff, (uint16_t*)(dy4 + kCanary), (uint32_t)T, (uint32_t)Nmax,
+                           (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)Kmax, (uint32_t)(Kmax / 128), (uint32_t)Nmax,
+                           (uint32_t)sh.parts, (uint32_t)AR, 0u);
+        return 0;
+    };
     const int rc = today();
     t1();
     if (gl) { t1b(); t1c(); }
@@ -930,6 +1173,16 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
         } catch (const std::exception& x) {
             std::printf("E1: %s\n", x.what());
             e1on = false;
+        }
+    }
+    if (e3on) {
+        try {
+            e3();
+            e3b();
+            q.wait_and_throw();
+        } catch (const std::exception& x) {
+            std::printf("E3: %s\n", x.what());
+            e3on = false;
         }
     }
     std::vector<uint8_t> h0(ybytes + 2 * kCanary), h1(ybytes + 2 * kCanary), h2(ybytes + 2 * kCanary);
@@ -985,6 +1238,20 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
         if (d4) std::printf("  E1b's first difference at output %zu (row %zu, column %zu): %04x vs today %04x\n", f4, f4 / Nmax,
                             f4 % Nmax, ((const uint16_t*)(h4.data() + kCanary))[f4], ((const uint16_t*)(h0.data() + kCanary))[f4]);
         e1bad = d3 || d4 || !c3 || !c4;
+    }
+    bool e3bad = false;
+    if (e3on) {
+        size_t f3 = 0, f4 = 0;
+        const size_t d3 = cmp(h3, &f3), d4 = cmp(h4, &f4);
+        const bool c3 = canary_ok(h3), c4 = canary_ok(h4);
+        std::printf("E3 %s tokens %d: %zu of %zu outputs differ from today%s; E3b %zu differ%s; canaries %s\n", sh.name, tokens,
+                    d3, ybytes / 2, d3 ? "" : " (BIT-IDENTICAL)", d4, d4 ? "" : " (BIT-IDENTICAL)",
+                    c3 && c4 ? "intact" : "BROKEN");
+        if (d3) std::printf("  E3's first difference at output %zu (row %zu, column %zu): %04x vs today %04x\n", f3, f3 / Nmax,
+                            f3 % Nmax, ((const uint16_t*)(h3.data() + kCanary))[f3], ((const uint16_t*)(h0.data() + kCanary))[f3]);
+        if (d4) std::printf("  E3b's first difference at output %zu (row %zu, column %zu): %04x vs today %04x\n", f4, f4 / Nmax,
+                            f4 % Nmax, ((const uint16_t*)(h4.data() + kCanary))[f4], ((const uint16_t*)(h0.data() + kCanary))[f4]);
+        e3bad = d3 || d4 || !c3 || !c4;
     }
     /* T2 (gate_up's shape): CB column blocks a work-group over one staging; bytes always, times on a card */
     bool t2bad = false;
@@ -1060,6 +1327,14 @@ bool run_shape(sycl::queue& q, LaunchFn fn, const Shape& sh, int tokens, int lau
                             e1bad ? " (OUTPUTS DIFFER)" : "");
             }
             lw_now = e1lw;
+        }
+        /* E3 timed even when it differs (the design is exact by construction; a difference is a bug to find) */
+        if (e3on) {
+            const double u3 = time(e3), u4 = time(e3b), u0c = time(today);
+            const double b2 = std::min(base, u0c);
+            std::printf("RESULT-E3 %s tokens %d: today %.1f us (re-timed %.1f), E3 %.1f us a launch -> %.0f %%, E3b %.1f us -> "
+                        "%.0f %%%s\n", sh.name, tokens, base, u0c, u3, 100.0 * u3 / b2, u4, 100.0 * u4 / b2,
+                        e3bad ? " (OUTPUTS DIFFER)" : "");
         }
         /* RI_PAIR=1 (run 193, owner note 191 item 2: independent kernels side by side, briefs/2026-11-05-concurrency.md),
          * gate_up's shape at 4 tokens: today's routed-expert GEMM beside a shared-expert-shaped int8 GEMV (libxe's
