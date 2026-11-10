@@ -8481,12 +8481,16 @@ struct ArchCases {
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
             qwen35_fp8::step, 7, {}, 0x76bc2f92b452df49ull);
+        /* Intel port, run 274 / 279: the W8A8 trunk's gated attention and GDN blocks declare the paired GEMV launches
+         * (`gemm_nt_q_x3` over q|gate, k, v; `gemm_nt_q_bf16_pair` over the in-projection and a|b) where every op is
+         * declared, so these two graphs moved (from 0x5570932de623edca / 0xec1ca3ad670311bb); the fallbacks stay the
+         * chains these fuse, bit for bit. */
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x5570932de623edcaull);
+            qwen35_w8a8::step, 7, {}, 0x5840041d661f200dull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xec1ca3ad670311bbull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x3448cf1e1ae85ff4ull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);

@@ -379,20 +379,15 @@ static bool env_on(const char* k) { const char* e = std::getenv(k); return !(e &
 static bool xe_gate_quant_on() { static const bool v = env_on("RADIANCE_XE_GATE_QUANT"); return v; }
 static bool xe_gated_had_on() { static const bool v = env_on("RADIANCE_XE_GATED_HAD"); return v; }
 /* run 273 (owner note 214 item 3, the decode step's adjacent-launch pair 1): opt-in, =1 lists it */
-static bool xe_gated_quant_pair_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GATED_QUANT_PAIR"); return e && e[0] == '1'; }();
-    return v;
-}
-/* run 273 (pair 3): the fused q / k norm + rope prologue; opt-in, =1 lists it */
-static bool xe_qk_prologue_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_QK_PROLOGUE"); return e && e[0] == '1'; }();
-    return v;
-}
-/* run 273 (pair 2): the router's selection + sort and the block input's quantiser as one launch; opt-in, =1 lists it */
-static bool xe_router_quant_pair_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_ROUTER_QUANT_PAIR"); return e && e[0] == '1'; }();
-    return v;
-}
+/* the default since run 279 (owner note 215: same image 301, M388 87.14 vs M387 85.55 = +1.9 % single user, the rotation
+ * H152 vs H153 +1.6-1.8 % with every prompt length up, byte-identical on the B70 in QK1 / RQ1, M389's kernel table);
+ * =0 opts out, as the run-207 set's */
+static bool xe_gated_quant_pair_on() { static const bool v = env_on("RADIANCE_XE_GATED_QUANT_PAIR"); return v; }
+/* run 273 (pair 3): the fused q / k norm + rope prologue; the default since run 279 (note 215), =0 opts out */
+static bool xe_qk_prologue_on() { static const bool v = env_on("RADIANCE_XE_QK_PROLOGUE"); return v; }
+/* run 273 (pair 2): the router's selection + sort and the block input's quantiser as one launch; the default since
+ * run 279 (note 215), =0 opts out */
+static bool xe_router_quant_pair_on() { static const bool v = env_on("RADIANCE_XE_ROUTER_QUANT_PAIR"); return v; }
 /* run 274 (pairs 4 / 5): the paired GEMV launches; opt-in, =1 lists them */
 static bool xe_gemv_multi_on() {
     static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_MULTI"); return e && e[0] == '1'; }();
