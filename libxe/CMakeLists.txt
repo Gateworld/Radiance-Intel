@@ -409,6 +409,16 @@ if(RAD_BUILD_TESTS)
     set_tests_properties(xe_moe_i4i8_downr${_r}_cpu PROPERTIES LABELS "xe"
       ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_DOWN_R=${_r}" TIMEOUT 600)
   endforeach()
+  # Run 279 (owner note 218 stage 0): format C's gate_up decode GEMM as a whole-kernel ESIMD form (a thread = 16 columns
+  # x one of today's eight partial sums; the pair table in registers; dp4a), ahead of time for the B70. GPU only: the
+  # CPU device has no ESIMD, so the ctest is the build plus the probe's "skip" exit; the card run is stage 2's.
+  add_executable(xe_esimd_fc_probe test/esimd_fc_probe.cpp)
+  rad_l0_sycl(xe_esimd_fc_probe)
+  target_compile_options(xe_esimd_fc_probe PRIVATE -ffp-contract=off)
+  set_target_properties(xe_esimd_fc_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_esimd_fc_cpu COMMAND xe_esimd_fc_probe 0)
+  set_tests_properties(xe_esimd_fc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 300)
   add_test(NAME xe_fc_tile_wcc_cpu COMMAND xe_fc_tile_probe $<TARGET_FILE:libxe> 0)   # run 211: RADIANCE_XE_I4I8_WCC=5
   set_tests_properties(xe_fc_tile_wcc_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_I4I8_WCC=5" TIMEOUT 1200)
