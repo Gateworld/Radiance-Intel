@@ -94,6 +94,61 @@ int main(int argc, char** argv) {
         std::memcpy(d_gu + (size_t)(r * 2 * n) * 2, hg.data() + r * n, (size_t)n * 2);
         std::memcpy(d_gu + (size_t)(r * 2 * n + n) * 2, hxv.data() + r * n, (size_t)n * 2);
     }
+    if (mode == 4 || mode == 5) {
+        /* run 273 (the decode step's adjacent-launch pair 1): set A = d_gu [R][2n], rotated int8 codes without the bf16
+         * out (the routed experts' gated_had_quant_i8g); set B = [R2][2n2] at another width, plain int8 codes with the
+         * bf16 out (the shared expert's gated_quant_fp8 at int8). RI_GQ=4 the two rows, =5 the gated_quant_pair row
+         * (RADIANCE_XE_GATED_QUANT_PAIR=1). Writes A's codes and scales, then B's codes, scales and bf16 product. */
+        const int64_t R2 = 5, n2 = 384, G2 = n2 / 128;
+        std::vector<uint16_t> hb((size_t)(R2 * 2 * n2));
+        for (int64_t i = 0; i < R2 * 2 * n2; ++i) hb[(size_t)i] = bf16_of(4.0f * unit(43, (uint64_t)i));
+        uint8_t* d_gu2 = sh(hb.size() * 2); std::memcpy(d_gu2, hb.data(), hb.size() * 2);
+        uint8_t* d_q2 = sh((size_t)(R2 * n2)); float* d_s2 = (float*)sh((size_t)(R2 * G2 * 4));
+        uint8_t* d_y2 = sh((size_t)(R2 * n2 * 2));
+        std::memset(d_q2, 0, (size_t)(R2 * n2)); std::memset(d_s2, 0, (size_t)(R2 * G2 * 4));
+        std::memset(d_y2, 0, (size_t)(R2 * n2 * 2));
+        if (mode == 5) {
+            const RadKernelInfo* row = row_of(hx, "gated_quant_pair");
+            if (!row) { std::printf("gate_quant_test: no gated_quant_pair row (RADIANCE_XE_GATED_QUANT_PAIR=1?)\n"); return 2; }
+            RadTensor t[8] = { tn(d_gu, RAD_BF16, R, 2 * n), tn(d_q, RAD_I8, R, n), tn(d_s, RAD_F32, R, G), RadTensor{},
+                               tn(d_gu2, RAD_BF16, R2, 2 * n2), tn(d_q2, RAD_I8, R2, n2), tn(d_s2, RAD_F32, R2, G2),
+                               tn(d_y2, RAD_BF16, R2, n2) };
+            RadParam p[8] = { pint("M", R + R2), pint("n", n), pint("n2", n2), pint("group", 128), pstr("dtype", "bf16"),
+                              pstr("act", "silu"), pint("rot", 1), pint("rot2", 0) };
+            RadArgs a{}; a.t = t; a.n_t = 8; a.p = p; a.n_p = 8; a.world_size = 1;
+            rc = row->launch(&a, (RadStream)&q);
+            std::printf("gate_quant_test: %s rc %d\n", row->name, rc);
+        } else {
+            const RadKernelInfo* ra = row_of(hx, "gated_had_quant_i8g");
+            const RadKernelInfo* rb = row_of(hx, "gated_quant_fp8");
+            if (!ra || !rb) { std::printf("gate_quant_test: a pair-1 chain row is missing (RADIANCE_XE_GATED_HAD=0?)\n"); return 2; }
+            RadTensor ta[4] = { tn(d_gu, RAD_BF16, R, 2 * n), tn(d_q, RAD_I8, R, n), tn(d_s, RAD_F32, R, G), RadTensor{} };
+            RadParam pa[5] = { pint("M", R), pint("n", n), pint("group", 128), pstr("dtype", "bf16"), pstr("act", "silu") };
+            RadArgs aa{}; aa.t = ta; aa.n_t = 4; aa.p = pa; aa.n_p = 5; aa.world_size = 1;
+            rc |= ra->launch(&aa, (RadStream)&q);
+            RadTensor tb[4] = { tn(d_gu2, RAD_BF16, R2, 2 * n2), tn(d_q2, RAD_I8, R2, n2), tn(d_s2, RAD_F32, R2, G2),
+                                tn(d_y2, RAD_BF16, R2, n2) };
+            RadParam pb[5] = { pint("M", R2), pint("n", n2), pint("group", 128), pstr("dtype", "bf16"), pstr("act", "silu") };
+            RadArgs ab{}; ab.t = tb; ab.n_t = 4; ab.p = pb; ab.n_p = 5; ab.world_size = 1;
+            rc |= rb->launch(&ab, (RadStream)&q);
+            std::printf("gate_quant_test: %s + %s rc %d\n", ra->name, rb->name, rc);
+        }
+        q.wait_and_throw();
+        if (rc != RAD_OK) return 1;
+        std::FILE* f = std::fopen(argv[2], "wb");
+        if (!f) return 2;
+        std::fwrite(d_q, 1, (size_t)(R * n), f);
+        std::fwrite(d_s, 4, (size_t)(R * G), f);
+        std::fwrite(d_q2, 1, (size_t)(R2 * n2), f);
+        std::fwrite(d_s2, 4, (size_t)(R2 * G2), f);
+        std::fwrite(d_y2, 2, (size_t)(R2 * n2), f);
+        std::fclose(f);
+        int nz = 0, nz2 = 0;
+        for (int64_t i = 0; i < R * n; ++i) nz += d_q[i] != 0;
+        for (int64_t i = 0; i < R2 * n2; ++i) nz2 += d_q2[i] != 0;
+        std::printf("gate_quant_test: %d + %d nonzero codes -> %s\n", nz, nz2, argv[2]);
+        return (nz && nz2) ? 0 : 1;
+    }
     if (mode == 2 || mode == 3) {
         RadParam p[5] = { pint("M", R), pint("n", n), pint("group", 128), pstr("dtype", "bf16"), pstr("act", "silu") };
         if (mode == 3) {

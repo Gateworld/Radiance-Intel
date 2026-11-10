@@ -653,9 +653,17 @@ copy.
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gated_quant_pair` | `M` `n` `n2` `group` `dtype` `act`:str/opt `rot`:opt `rot2`:opt | `gate_up` → `q`, `scale`, `out_bf16`?; `gate_up2` → `q2`, `scale2`, `out_bf16_2`? |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
+
+`gated_quant_pair` (the Intel port's libxe, listed under `RADIANCE_XE_GATED_QUANT_PAIR=1`) is two
+independent gated quantisers in one launch: `gated_had_quant_i8g` over the first operand set
+(`rot` 1, width `n`, a multiple of `group`) and `gated_quant_fp8` at int8 codes over the second
+(`rot2` 0, width `n2`), silu only, each row by the same kernel body as its own op, so the bytes are
+the two ops'. `M` is the two sets' rows together; each set's row count is its own operand's. A MoE
+layer issues it where it issued the routed experts' quantiser, after both gate_up projections.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded

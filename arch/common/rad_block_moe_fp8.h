@@ -368,6 +368,12 @@ struct MoeFP8 {
      * `gated_had_quant_i8g` where a loaded library declares it (libxe under RADIANCE_XE_GATED_HAD=1); then gq_exp and
      * op_eq8 are not declared. The same codes: the product rounded to bf16 before the rotation, as the pair's buffer. */
     rad_op op_egq8 = 0;
+    /* Intel port, run 273 (owner note 214 item 3, the decode step's adjacent-launch pair 1): op_egq8 and the shared
+     * arm's gated quantiser (gq_sh at int8 codes) as one `gated_quant_pair` launch where a loaded library declares it
+     * (libxe under RADIANCE_XE_GATED_QUANT_PAIR=1). The two read different operands (w.egu, w.sgu) and write
+     * different pairs, so the one launch, issued where op_egq8 was (after both gate_up GEMMs), keeps every
+     * dependency; each row's arithmetic is its own kernel's, so the codes are the two launches'. */
+    rad_op op_gqp = 0;
     /* The caller's read writes the rotated pair (HyperConn::Config::rotate), so this block declares
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
@@ -1493,6 +1499,24 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         RAD_ARCH_TRY(gq_sh.declare(b, g, w.sgu, w.sff, c.n_ff_shared, "silu", c.rows,
                                    sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8), false,
                                    c.swiglu_limit));
+        /* run 273: the routed arm's op_egq8 and this quantiser, when it is the plain int8 form (one
+         * `gated_quant_fp8` at int8 codes), as one launch. Unresolved (no row, or the flag off), the
+         * step issues the two as today. */
+        if (op_egq8 && !gq_sh.clamped_fused && !gq_sh.clipped && !gq_sh.bf16 && !gq_sh.op_q &&
+            gq_sh.a.q8_fed && !gq_sh.a.q8_rot && rad_op_declared(b, "gated_quant_pair")) {
+            op_gqp = RAD_OP(b, "gated_quant_pair",
+                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k + c.rows),
+                                       RAD_INT("n", c.n_ff_exp), RAD_INT("n2", c.n_ff_shared),
+                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
+                                       RAD_STR("act", "silu"), RAD_INT("rot", 1), RAD_INT("rot2", 0)),
+                            RAD_NOWEIGHTS);
+            if (op_gqp) {
+                const rad_buf rd[2] = { w.egu, w.sgu };
+                const rad_buf wr[5] = { w.eff.q8, w.eff.s8, gq_sh.a.cq(), gq_sh.a.cs(), gq_sh.a.x };
+                RAD_ARCH_TRY(rad_op_reads (b, op_gqp, rd, 2));
+                RAD_ARCH_TRY(rad_op_writes(b, op_gqp, wr, gq_sh.want_x ? 5 : 4));
+            }
+        }
         RAD_ARCH_TRY(sh_down.declare(b, nm, g, down_base,
                                      g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
                                      { nm.ckpt("%s.down_proj.weight", src.shared) },
@@ -1796,6 +1820,14 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (op_gqp) {   /* run 273: the routed and the shared gated quantisers as one launch */
+        const int64_t n2 = gq_sh.n;
+        RAD_ISSUE_N(c_, op_gqp, rows * k + rows, brows(w.egu, rows * k), brows(w.eff.q8, rows * k),
+                    brows(w.eff.s8, rows * k), RAD_NONE,
+                    brow_slice(w.sgu, r0, rows, 2 * n2), brow_slice(gq_sh.a.cq(), r0, rows, n2),
+                    brow_slice(gq_sh.a.cs(), r0, rows, n2 / RAD_FP8_BLOCK),
+                    gq_sh.want_x ? brow_slice(gq_sh.a.x, r0, rows, n2) : RAD_NONE);
+    } else {
     if (op_egq8)   /* run 207: the product, rotation and int8 quantiser as one op */
         RAD_ISSUE_N(c_, op_egq8, rows * k, brows(w.egu, rows * k), brows(w.eff.q8, rows * k),
                     brows(w.eff.s8, rows * k), RAD_NONE);
@@ -1805,6 +1837,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_eq8, rows * k, brows(w.eff.x, rows * k), brows(w.eff.q8, rows * k),
                     brows(w.eff.s8, rows * k));
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+    }
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));

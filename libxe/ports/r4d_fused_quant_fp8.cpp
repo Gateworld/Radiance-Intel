@@ -206,12 +206,14 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
 //
 // The launcher sizes the workgroup to the row's groups (capped at r4d_act_threads' width) and the
 // kernel reads the width from blockDim, so a narrow row does not leave most waves idle.
-template <int ACT, bool ROT = false, bool I8 = false>
-__global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
-    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
-    float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
-    uint32_t q_ld, uint32_t s_ld) {
-    const uint32_t row = blockIdx.x;
+//
+// Intel port, run 273 (owner note 214 item 3): the row's work is gated_quant_row, which the paired
+// launch below (gated_quant_pair_kernel) also calls, so the two forms share every instruction.
+template <int ACT, bool ROT, bool I8>
+__device__ __forceinline__ void gated_quant_row(
+    uint32_t row, const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
+    uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld,
+    uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint16_t* __restrict__ gr = gu + (size_t)row * gu_ld;
     uint16_t* __restrict__ yr = y ? y + (size_t)row * y_ld : nullptr;
@@ -241,6 +243,41 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
         if constexpr (ROT) r4d_fwht_wave<(int)kGroup>(v, (int)lane);
         quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
     }
+}
+
+template <int ACT, bool ROT = false, bool I8 = false>
+__global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
+    float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
+    uint32_t q_ld, uint32_t s_ld) {
+    gated_quant_row<ACT, ROT, I8>(blockIdx.x, gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
+}
+
+// ------------------------------------------------------ two gated quantisers in one launch
+//
+// Intel port, run 273 (owner note 214 item 3; the decode step's adjacent-launch map, pair 1): a MoE
+// layer quantises the routed experts' gate x up (rotated, int8: gated_had_quant_i8g) and then the
+// shared expert's (plain int8: gated_quant_fp8 at int8 codes), two launches of a few tens of rows
+// each, back to back, reading and writing different buffers. Work-groups [0, M1) run the first
+// set's rows under <ROT_A, I8_A>, the rest the second set's under <ROT_B, I8_B>, each row by
+// gated_quant_row exactly as its own launch would run it, so the bytes are the two launches'. What
+// is saved is one launch's fixed cost and one command boundary a layer.
+template <int ACT, bool ROT_A, bool I8_A, bool ROT_B, bool I8_B>
+__global__ __launch_bounds__(1024) void gated_quant_pair_kernel(
+    uint32_t M1,
+    const uint16_t* __restrict__ gu_a, uint16_t* __restrict__ y_a, uint8_t* __restrict__ q_a,
+    float* __restrict__ s_a, uint32_t n_a, uint32_t nkb_a, uint32_t gu_ld_a, uint32_t y_ld_a,
+    uint32_t q_ld_a, uint32_t s_ld_a,
+    const uint16_t* __restrict__ gu_b, uint16_t* __restrict__ y_b, uint8_t* __restrict__ q_b,
+    float* __restrict__ s_b, uint32_t n_b, uint32_t nkb_b, uint32_t gu_ld_b, uint32_t y_ld_b,
+    uint32_t q_ld_b, uint32_t s_ld_b) {
+    const uint32_t row = blockIdx.x;
+    if (row < M1)
+        gated_quant_row<ACT, ROT_A, I8_A>(row, gu_a, y_a, q_a, s_a, n_a, nkb_a, gu_ld_a, y_ld_a,
+                                          q_ld_a, s_ld_a);
+    else
+        gated_quant_row<ACT, ROT_B, I8_B>(row - M1, gu_b, y_b, q_b, s_b, n_b, nkb_b, gu_ld_b,
+                                          y_ld_b, q_ld_b, s_ld_b);
 }
 
 // -------------------------------------------------- gate . x -> quant, two source buffers
@@ -752,6 +789,56 @@ extern "C" int r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, i
                                   (RadStream)(uintptr_t)stream, true, true);
 }
 
+// One operand set of the paired launch (gated_quant_pair_kernel): gated_quant_fp8_launch's operands,
+// checks and defaults for one set.
+struct GqArm {
+    long gu = 0, y = 0, q = 0, s = 0;
+    int  M = 0, n = 0, gu_ld = 0, y_ld = 0, q_ld = 0, s_ld = 0, nkb = 0;
+    bool rot = false, i8 = false;
+};
+
+static int gq_arm_check(GqArm& a) {
+    if (!a.gu || !a.q || !a.s) return -1;
+    if (a.M <= 0 || a.n <= 0) return -2;
+    if (a.n % 4) return -3;
+    if (a.rot && (a.n % (int)kGroup)) return -6;
+    if (!a.gu_ld) a.gu_ld = 2 * a.n;
+    if (!a.y_ld) a.y_ld = a.n;
+    if (!a.q_ld) a.q_ld = a.n;
+    a.nkb = (a.n + (int)kGroup - 1) / (int)kGroup;
+    if (!a.s_ld) a.s_ld = a.nkb;
+    return 0;
+}
+
+// The two sets as one grid of A.M + B.M work-groups (run 273, see gated_quant_pair_kernel). The
+// workgroup is the wider of the two sets' own widths (r4d_act_threads at each set's M and n, as
+// gated_quant_fp8_launch sizes it): a wave takes whole groups, so the width decides which wave does
+// a group and nothing of the arithmetic. One form is instantiated, the decode step's: the first set
+// rotated int8 (gated_had_quant_i8g's codes), the second plain int8 (gated_quant_fp8's at int8
+// codes), silu; any other pairing returns -7 and the caller keeps its two launches.
+static int gated_quant_pair_launch(GqArm& A, GqArm& B, int mode, RadStream stream) {
+    int rc = gq_arm_check(A);
+    if (rc) return rc;
+    rc = gq_arm_check(B);
+    if (rc) return rc;
+    if (mode != 0) return -5;
+    if (!(A.rot && A.i8 && !B.rot && B.i8)) return -7;
+    const int thr_a = std::min(A.nkb, r4d_act_threads(A.M, A.n) / (int)kWave) * (int)kWave;
+    const int thr_b = std::min(B.nkb, r4d_act_threads(B.M, B.n) / (int)kWave) * (int)kWave;
+    const int thr = std::max(thr_a, thr_b);
+    const int emit_rc =
+        R4D_EMIT(stream, (gated_quant_pair_kernel<0, true, true, false, true>),
+                 dim3((uint32_t)(A.M + B.M)), dim3(thr), 0, (uint32_t)A.M,
+                 (const uint16_t*)A.gu, (uint16_t*)A.y, (uint8_t*)A.q, (float*)A.s, (uint32_t)A.n,
+                 (uint32_t)A.nkb, (uint32_t)A.gu_ld, (uint32_t)A.y_ld, (uint32_t)A.q_ld,
+                 (uint32_t)A.s_ld,
+                 (const uint16_t*)B.gu, (uint16_t*)B.y, (uint8_t*)B.q, (float*)B.s, (uint32_t)B.n,
+                 (uint32_t)B.nkb, (uint32_t)B.gu_ld, (uint32_t)B.y_ld, (uint32_t)B.q_ld,
+                 (uint32_t)B.s_ld);
+    if (emit_rc != RAD_OK) return -4;
+    return (hipGetLastError() != hipSuccess) ? -4 : 0;
+}
+
 // act . x with the gate and x in separate buffers; see the kernel for why a row is a (token, head)
 // pair and why the activation is rounded to bf16 before the product. `mode` as in
 // r4d_gated_quant_fp8.
@@ -1017,6 +1104,54 @@ extern "C" int r4d_rad_gated_had_quant_fp8(const RadArgs* a, RadStream stream) {
 /* Its int8 twin, had_quant_act_i8g's codes: pairs only with a weight stored at dtype i8a8h. */
 extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream stream) {
     return rad_gated_quant_fp8(a, stream, true, true);
+}
+
+/* gated_quant_pair (Intel port, run 273; libxe lists it under RADIANCE_XE_GATED_QUANT_PAIR=1): two gated_quant
+ * operand sets, gated_quant_fp8's four then the same four again (`gate_up2`, `q2`, `scale2`, `out_bf16_2`), the
+ * second set's width `n2`; `rot` / `rot2` (0 / 1, defaults 1 and 0) say which set is rotated, the codes' dtype which
+ * quantiser (int8 or E4M3). The one launch is the two ops' bytes (gated_quant_pair_kernel). */
+enum { GQP_GU = 0, GQP_Q = 1, GQP_S = 2, GQP_Y = 3, GQP_GU2 = 4, GQP_Q2 = 5, GQP_S2 = 6, GQP_Y2 = 7 };
+
+static int gqp_arm(const RadArgs* a, int base, long long n, bool rot, GqArm& o) {
+    const RadTensor* gu = r4d_opt(a, base + 0);
+    const RadTensor* q  = r4d_opt(a, base + 1);
+    const RadTensor* sc = r4d_opt(a, base + 2);
+    const RadTensor* y  = r4d_opt(a, base + 3);
+    if (!gu || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (gu->rank != 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long M = gu->shape[0], K = q->shape[1];
+    const long long grp = r4d_quant_act_fp8_group();
+    const long long nkb = (K + grp - 1) / grp;
+    if (K != n) return R4D_NO(RAD_E_SHAPE);
+    if (gu->shape[1] != 2 * K) return R4D_NO(RAD_E_SHAPE);
+    if (q->shape[0] != M) return R4D_NO(RAD_E_SHAPE);
+    if (sc->shape[0] != M || sc->shape[1] != nkb) return R4D_NO(RAD_E_SHAPE);
+    if (y && (y->shape[0] != M || y->shape[1] != K)) return R4D_NO(RAD_E_SHAPE);
+    const long long gp = r4d_row_pitch(gu), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    const long long yp = y ? r4d_row_pitch(y) : 0;
+    if (gp < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
+    o.gu = r4d_addr(gu); o.y = y ? r4d_addr(y) : 0; o.q = r4d_addr(q); o.s = r4d_addr(sc);
+    o.M = (int)M; o.n = (int)K;
+    o.gu_ld = (int)gp; o.y_ld = (int)yp; o.q_ld = (int)qp; o.s_ld = (int)sp;
+    o.rot = rot; o.i8 = q->dtype == RAD_I8;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_gated_quant_pair(const RadArgs* a, RadStream stream) {
+    const long long grp = r4d_quant_act_fp8_group();
+    if (r4d_geti_or(a, "group", grp) != grp) return R4D_NO(RAD_E_SHAPE);
+    const int mode = act_mode(a, 0);
+    if (mode != 0) return R4D_NO(RAD_E_UNSUPPORTED);   /* silu: both are MLP gates */
+    GqArm A, B;
+    int rc = gqp_arm(a, GQP_GU, r4d_geti_or(a, "n", 0), r4d_geti_or(a, "rot", 1) != 0, A);
+    if (rc != RAD_OK) return rc;
+    rc = gqp_arm(a, GQP_GU2, r4d_geti_or(a, "n2", 0), r4d_geti_or(a, "rot2", 0) != 0, B);
+    if (rc != RAD_OK) return rc;
+    const int e = gated_quant_pair_launch(A, B, mode, stream);
+    if (e == -7) return R4D_NO(RAD_E_UNSUPPORTED);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
 /* Elements between consecutive `width`-wide rows, as r4d_gdn.cpp's gn_row_pitch: a
