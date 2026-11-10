@@ -334,7 +334,8 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
      * a code's level by a select chain, as the DPAS form decodes (run 166 / B92) -- the dump showed this kernel's code
      * decode as one SLM gather a code byte (194 load.slm.d32 in down's ISA, 100 in gate_up's); the same rounding as the
      * table above, so the same integers */
-    uint32_t pk[4] = { 0u, 0u, 0u, 0u };
+    /* SCALARIZATION FIX: four scalars avoid private gathers (array[4] was 27% decode overhead). */
+    uint32_t pk0 = 0u, pk1 = 0u, pk2 = 0u, pk3 = 0u;
     (void)sel;
     if constexpr (FC && SEL) {
         if (e >= 0) {
@@ -345,7 +346,8 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
                 const int iv = amax > 0.0f ? (int)sycl::rint(tab[t] * 127.0f / amax) : (int)tab[t];
-                pk[t >> 2] |= ((uint32_t)iv & 255u) << (8 * (t & 3));
+                const uint32_t v = ((uint32_t)iv & 255u) << (8 * (t & 3));
+                switch (t >> 2) { case 0: pk0 |= v; break; case 1: pk1 |= v; break; case 2: pk2 |= v; break; default: pk3 |= v; break; }
             }
         }
     }
@@ -421,8 +423,8 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
 #pragma unroll
                                 for (int bb = 0; bb < 4; ++bb) {
                                     const uint32_t by = (d[x] >> (8 * bb)) & 255u, c0 = by & 15u, c1 = by >> 4;
-                                    const uint32_t w0 = (c0 & 8u) ? ((c0 & 4u) ? pk[3] : pk[2]) : ((c0 & 4u) ? pk[1] : pk[0]);
-                                    const uint32_t w1 = (c1 & 8u) ? ((c1 & 4u) ? pk[3] : pk[2]) : ((c1 & 4u) ? pk[1] : pk[0]);
+                                    const uint32_t w0 = (c0 & 8u) ? ((c0 & 4u) ? pk3 : pk2) : ((c0 & 4u) ? pk1 : pk0);
+                                    const uint32_t w1 = (c1 & 8u) ? ((c1 & 4u) ? pk3 : pk2) : ((c1 & 4u) ? pk1 : pk0);
                                     lo8 |= ((w0 >> (8u * (c0 & 3u))) & 255u) << (8 * bb);
                                     hi8 |= ((w1 >> (8u * (c1 & 3u))) & 255u) << (8 * bb);
                                 }
@@ -1059,13 +1061,17 @@ void moe_i4i8_dec_kernel(ICls c0, ICls c1, const int32_t* __restrict__ off, uint
     const float lv = tab[lane];
     const uint32_t lvi = (uint32_t)(amax > 0.0f ? (int)sycl::rint(lv * 127.0f / amax) : (int)lv) & 255u;
     sycl::sub_group sg = xe::sg();
-    uint32_t pk[4] = {0u, 0u, 0u, 0u};
+    /* SCALARIZATION FIX: four scalars avoid private gathers (array[4] was 27% decode overhead). */
+    uint32_t pk0 = 0u, pk1 = 0u, pk2 = 0u, pk3 = 0u;
 #pragma unroll
     for (int k = 0; k < 4; ++k)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) pk[k] |= sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t v = sycl::select_from_group(sg, lvi, 4 * k + j) << (8 * j);
+            switch (k) { case 0: pk0 |= v; break; case 1: pk1 |= v; break; case 2: pk2 |= v; break; default: pk3 |= v; break; }
+        }
     auto lvl = [&](uint32_t cc) -> uint32_t {
-        const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk[3] : pk[2]) : ((cc & 4u) ? pk[1] : pk[0]);
+        const uint32_t d = (cc & 8u) ? ((cc & 4u) ? pk3 : pk2) : ((cc & 4u) ? pk1 : pk0);
         return (d >> (8u * (cc & 3u))) & 255u;
     };
     const int bt = (wave & 7) >> 1, bstep = wave & 1;
