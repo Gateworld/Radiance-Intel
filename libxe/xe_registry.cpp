@@ -388,11 +388,10 @@ static bool xe_qk_prologue_on() { static const bool v = env_on("RADIANCE_XE_QK_P
 /* run 273 (pair 2): the router's selection + sort and the block input's quantiser as one launch; the default since
  * run 279 (note 215), =0 opts out */
 static bool xe_router_quant_pair_on() { static const bool v = env_on("RADIANCE_XE_ROUTER_QUANT_PAIR"); return v; }
-/* run 274 (pairs 4 / 5): the paired GEMV launches; opt-in, =1 lists them */
-static bool xe_gemv_multi_on() {
-    static const bool v = [] { const char* e = std::getenv("RADIANCE_XE_GEMV_MULTI"); return e && e[0] == '1'; }();
-    return v;
-}
+/* run 274 (pairs 4 / 5): the paired GEMV launches; the default since run 279 (owner note 217: same image 302, M392
+ * 88.50 vs M393 87.18 = +1.5 % single user, the rotation H154 vs H152 +1.0-1.2 % with every prompt length up,
+ * byte-identical on the B70 in GM1, M391's kernel table, the flag-off kernels unchanged in M394); =0 opts out */
+static bool xe_gemv_multi_on() { static const bool v = env_on("RADIANCE_XE_GEMV_MULTI"); return v; }
 static const RadKernelInfo kFlagged[] = {
 /* pair 4 (RADIANCE_XE_GATE_QUANT=1): libr4d's gate_quant_fp8, its port's adapter -- the gated attention's sigmoid, mul
  * and quantiser as one pass, the sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does */
