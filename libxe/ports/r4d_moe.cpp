@@ -84,6 +84,8 @@ using r4d_moesort::protect_of;
 using r4d_moesort::kScatterSmall;
 using r4d_moesort::ScatterLds;
 using r4d_moesort::wave_incl_scan_i32;
+using r4d_moesort::scatter_reg_place;   /* run 279: the register direct sort (RB4) */
+using r4d_moesort::kSortRegMax;
 using r4d_moesort::scatter_small_place;
 using r4d_moesort::scatter_direct_place;
 using r4d_moesort::kScatWaves;
@@ -438,13 +440,16 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
  * from the slot list (r4d_moe_sort.h's scatter_direct_place), the same bytes. */
 /* Intel port, run 273 (the decode step's adjacent-launch pair 2): the kernel's body, so that the paired launch below
  * (router_topk_scatter_quant_kernel) runs it for its work-group 0 exactly as this kernel does. */
+/* `sort_form` (run 279, owner note 216 item 3, the router bench's variants): 0 the small sort as always, 1 the small
+ * sort with the sub-group's native scan (RADIANCE_XE_SORT_SCAN=1), 2 the direct form with the list in registers
+ * (RADIANCE_XE_SORT_DIRECT=2, M * top_k <= kSortRegMax). The same integers in every form. */
 #define R4D_RTS_PARAMS                                                                              \
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,          \
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,            \
     uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,      \
-    int32_t base, Protect prot, uint32_t lean_n, float lean_margin, uint32_t lean_rows
+    int32_t base, Protect prot, uint32_t lean_n, float lean_margin, uint32_t lean_rows, int sort_form
 #define R4D_RTS_PASS lg, ids, w, sorted, off, cnt, M, n_expert, n_local, top_k, lg_ld, norm, base, prot, lean_n, \
-    lean_margin, lean_rows
+    lean_margin, lean_rows, sort_form
 template <uint32_t MAXOWN, uint32_t NW, bool DIRECT>
 __device__ __forceinline__ void router_topk_scatter_body(ScatterLds<NW>& sl, LeanLds& ll, R4D_RTS_PARAMS) {
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x % kWave;
@@ -469,7 +474,8 @@ __device__ __forceinline__ void router_topk_scatter_body(ScatterLds<NW>& sl, Lea
     }
     lds_barrier();
     if constexpr (DIRECT) scatter_direct_place(sorted, off, cnt, M * top_k, n_local, sl.e);
-    else scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
+    else if (sort_form == 2) scatter_reg_place(sorted, off, cnt, M * top_k, n_local, sl.e);   /* RB4 */
+    else scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl, nullptr, sort_form == 1);   /* RB4a at 1 */
 }
 
 template <uint32_t MAXOWN, uint32_t NW, bool DIRECT = false>
@@ -2458,7 +2464,7 @@ static int router_topk_scatter_common(const RadArgs* a, RadStream stream, const 
                        (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                    \
                        (uint32_t)n_local, (uint32_t)top_k,                                      \
                        (uint32_t)lg_ld, (int)norm, (int32_t)base, prot, lean_n, lean_margin,   \
-                       lean_rows
+                       lean_rows, sort_form
 #define R4D_RTS_L(OWN, NWV, ...)                                                                \
     emit_rc = router_grf()                                                                      \
         ? (XE_LAUNCH_GGL_GRF256((router_topk_scatter_kernel<OWN, NWV, ##__VA_ARGS__>), dim3(1), \
@@ -2496,8 +2502,13 @@ static int router_topk_scatter_common(const RadArgs* a, RadStream stream, const 
      * waves wrap. */
     const int nw = M <= 8 ? 8 : M <= 16 ? 16 : 32;
     /* the Intel port (owner note 129 item 4): the direct sort at a decode or verify step's few slots */
-    static const bool direct_on = [] { const char* e = std::getenv("RADIANCE_XE_SORT_DIRECT"); return e && e[0] == '1'; }();
+    static const int direct_env = [] { const char* e = std::getenv("RADIANCE_XE_SORT_DIRECT"); return e ? std::atoi(e) : 0; }();
+    const bool direct_on = direct_env == 1;
     const bool direct = direct_on && nw == 8 && T <= (long long)r4d_moesort::kSortDirectMax;
+    /* run 279 (note 216 item 3, the bench variants): =2 the register direct form up to kSortRegMax slots, else the small
+     * sort; RADIANCE_XE_SORT_SCAN=1 the small sort's native scan */
+    static const bool scan_on = [] { const char* e = std::getenv("RADIANCE_XE_SORT_SCAN"); return e && e[0] == '1'; }();
+    const int sort_form = (direct_env == 2 && T <= (long long)r4d_moesort::kSortRegMax) ? 2 : scan_on ? 1 : 0;
     /* run 273 (pair 2): the paired launch, 1 + M work-groups of the router's block; the forms instantiated are the
      * decode step's (MAXOWN 16: more than 256 experts; NW 8 and 16: M <= 16, the architecture's bound). */
 #define R4D_RTQ_ARGS                                                                             \

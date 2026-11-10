@@ -122,10 +122,14 @@ __device__ __forceinline__ int32_t wave_incl_scan_i32(int32_t x, uint32_t lane) 
  *
  * INV also writes the inverse: `inv[i]` is slot i's row in `sorted`, -1 for a dropped slot, the
  * table moe_gather would otherwise build from `sorted`. */
+/* `native_scan` (the Intel port, run 279, owner note 216 item 3, RB4a: RADIANCE_XE_SORT_SCAN=1): the wave's inclusive
+ * prefix sum as the sub-group's own scan instead of the emulated DPP row shifts (xe_lanes.h update_dpp: a
+ * select_from_group a step). Integers, so the same sums whatever the order. */
 template <uint32_t NW, bool INV = false>
 __device__ __forceinline__ void scatter_small_place(
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
-    uint32_t T, uint32_t n_expert, ScatterLds<NW>& sl, int32_t* __restrict__ inv = nullptr) {
+    uint32_t T, uint32_t n_expert, ScatterLds<NW>& sl, int32_t* __restrict__ inv = nullptr,
+    bool native_scan = false) {
     const uint32_t tid = threadIdx.x, lane = tid % kSortWave, wave = tid / kSortWave;
 
     for (uint32_t i = tid; i < T; i += blockDim.x) {
@@ -140,7 +144,8 @@ __device__ __forceinline__ void scatter_small_place(
     for (uint32_t b = 0, t = 0; b < n_expert; b += NW * kSortWave, ++t) {
         const uint32_t e = b + tid;
         const int32_t  v = (e < n_expert) ? sl.cnt[e] : 0;
-        const int32_t  x = wave_incl_scan_i32(v, lane);
+        const int32_t  x = native_scan ? sycl::inclusive_scan_over_group(xe::sg(), v, sycl::plus<int32_t>())
+                                       : wave_incl_scan_i32(v, lane);
         if (lane == kSortWave - 1) sl.wt[t][wave] = x;
         lds_barrier();
         int32_t below = 0, tot = 0;
@@ -212,6 +217,49 @@ __device__ __forceinline__ void scatter_direct_place(int32_t* __restrict__ sorte
                 at_e += ej == (int32_t)x;
                 pos += lj && (ej < ei || (ej == ei && j < x));
             }
+        }
+        if (x < n_expert) { off[x] = below_e; cnt[x] = at_e; }
+        if (x == n_expert) off[x] = live;
+        if (x < T) {
+            if (ei >= 0) sorted[pos] = (int32_t)x;
+            if ((int32_t)x >= live) sorted[x] = -1;
+        }
+    }
+}
+
+/* RB4 (the Intel port, run 279, owner note 216 item 3; RADIANCE_XE_SORT_DIRECT=2): the direct form with the slot list
+ * read ONCE into registers a thread -- the whole 64-slot capacity by 16 int4 loads from the LDS list (which is
+ * kScatterSmall ints long, so the loads past T are in bounds), the entries past T masked to -1 -- and the counting
+ * loops unrolled over the fixed 64, so no per-slot bound test and no reload. The same integers as scatter_direct_place
+ * (position = the live slots placed before the slot, offset / count per expert), so the same bytes. T <= kSortRegMax
+ * (the caller's choice; above it the small sort). The one value a thread reads by a runtime index (its own slot's
+ * expert) comes from the LDS list, not the register copy, so no register array is indexed at run time. */
+constexpr uint32_t kSortRegMax = 64;
+
+__device__ __forceinline__ void scatter_reg_place(int32_t* __restrict__ sorted, int32_t* __restrict__ off,
+                                                  int32_t* __restrict__ cnt, uint32_t T, uint32_t n_expert,
+                                                  const int32_t* __restrict__ se) {
+    const uint32_t tid = threadIdx.x;
+    int32_t e[kSortRegMax];
+#pragma unroll
+    for (uint32_t j0 = 0; j0 < kSortRegMax; j0 += 4) {
+        const int4 q4 = *(const int4*)(se + j0);
+        e[j0]     = j0 < T      ? q4.x : -1;
+        e[j0 + 1] = j0 + 1 < T  ? q4.y : -1;
+        e[j0 + 2] = j0 + 2 < T  ? q4.z : -1;
+        e[j0 + 3] = j0 + 3 < T  ? q4.w : -1;
+    }
+    for (uint32_t x = tid; x < n_expert + 1u || x < T; x += blockDim.x) {
+        const int32_t ei = x < T ? se[x] : -1;
+        int32_t live = 0, below_e = 0, at_e = 0, pos = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < kSortRegMax; ++j) {
+            const int32_t ej = e[j];
+            const bool lj = ej >= 0;
+            live += lj;
+            below_e += lj && ej < (int32_t)x;
+            at_e += ej == (int32_t)x;
+            pos += lj && (ej < ei || (ej == ei && j < x));
         }
         if (x < n_expert) { off[x] = below_e; cnt[x] = at_e; }
         if (x == n_expert) off[x] = live;
