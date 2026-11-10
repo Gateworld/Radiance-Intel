@@ -150,10 +150,28 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_moe_bf16_dpas_cpu COMMAND xe_moe_bf16_dpas_test)
   set_tests_properties(xe_moe_bf16_dpas_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Run 267 (owner lever #2, step 0 -- "card test only"): do two in-order queues run kernels concurrently on one card,
+  # and how much does a memory-bound kernel slow beside a (bounded) spinner. A card probe; no CPU test.
+  add_executable(two_queue_probe test/two_queue_probe.cpp)
+  rad_l0_sycl(two_queue_probe)
+  target_link_libraries(two_queue_probe PRIVATE ${RAD_ZE_LOADER})   # the command-queue groups' listing
+  set_target_properties(two_queue_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Run 271 (owner lever #2's pricing probe, the coordinator's item 2): the engine's 16 MiB all-reduce beside the trunk's
+  # int8 matrix-unit GEMM on a second in-order queue of each card, alone vs together, through libxe's entries (dlopen).
+  # A two-GPU probe; no CPU test.
+  add_executable(ar_overlap_probe test/ar_overlap_probe.cpp)
+  rad_l0_sycl(ar_overlap_probe)
+  target_include_directories(ar_overlap_probe PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(ar_overlap_probe PRIVATE rad_abi rad_l0k ${CMAKE_DL_LIBS} Threads::Threads)
+  set_target_properties(ar_overlap_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(ar_overlap_probe libxe)
   # Run 207 (owner note 203 item 2): both GEMVs at every other rows-a-work-group choice (RADIANCE_XE_GEMV_WG), whose
   # small cases' N (33, 40, 77, 130, 200 ...) leave a partial last work-group at each
   # Run 209 (owner note 206 item 1): the K-specialised NX instances (RADIANCE_XE_GEMV_KC=1); `full` adds the trunk's
   # K 6144 / 2560 shapes to the small cases (K 640, 2560 and the odd ones on the runtime-K instance)
+  add_test(NAME xe_gemv_bf16_kc_cpu COMMAND xe_gemv_bf16_test)
+  set_tests_properties(xe_gemv_bf16_kc_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GEMV_KC=1" TIMEOUT 900)
   # Run 211 (owner note 206 item 2): the cache-hinted weight loads (RADIANCE_XE_GEMV_WCC; on the CPU the plain load,
   # so this checks the dispatch) on the NX form
   add_test(NAME xe_gemv_i8_wcc_cpu COMMAND xe_gemv_i8_test)
@@ -518,6 +536,39 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_gate_quant_cpu COMMAND sh -c
     "RI_GQ=0 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq0.bin && RADIANCE_XE_GATE_QUANT=1 RI_GQ=1 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq1.bin && cmp gq0.bin gq1.bin && echo 'gate_quant_fp8 (pair 4): bit-identical' && RI_GQ=2 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq2.bin && RADIANCE_XE_GATED_HAD=1 RI_GQ=3 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gq3.bin && cmp gq2.bin gq3.bin && echo 'gated_had_quant_i8g (pair 2): bit-identical'")
   set_tests_properties(xe_gate_quant_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # run 273 (owner note 214 item 3, the decode step's adjacent-launch pair 1): the routed gated_had_quant_i8g and the
+  # shared gated_quant_fp8 (int8 codes) against the gated_quant_pair row (RADIANCE_XE_GATED_QUANT_PAIR=1), both sets'
+  # codes, scales and bf16 product byte for byte
+  add_test(NAME xe_gated_quant_pair_cpu COMMAND sh -c
+    "RI_GQ=4 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gqp4.bin && RADIANCE_XE_GATED_QUANT_PAIR=1 RI_GQ=5 $<TARGET_FILE:xe_gate_quant_test> $<TARGET_FILE:libxe> gqp5.bin && cmp gqp4.bin gqp5.bin && echo 'gated_quant_pair (the decode step pair 1): bit-identical'")
+  set_tests_properties(xe_gated_quant_pair_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # run 273 (the decode step's pair 3 as libr4d's fused prologue): rmsnorm q (the [q|gate] column view) + rmsnorm k +
+  # rope q + rope k against the qk_norm_rope_gate row (RADIANCE_XE_QK_PROLOGUE=1), q and k byte for byte over three
+  # shapes; the same binary runs on the card (logs/qkstep.sh, the MB form)
+  add_executable(xe_qk_prologue_test test/qk_prologue_test.cpp)
+  rad_l0_sycl(xe_qk_prologue_test)
+  target_include_directories(xe_qk_prologue_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_qk_prologue_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_qk_prologue_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_qk_prologue_test libxe)
+  add_test(NAME xe_qk_prologue_cpu COMMAND sh -c
+    "RADIANCE_XE_QK_PROLOGUE=1 $<TARGET_FILE:xe_qk_prologue_test> $<TARGET_FILE:libxe>")
+  set_tests_properties(xe_qk_prologue_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # run 273 (the decode step's pair 2): router_topk_scatter + had_quant_act_i8g against the router_topk_scatter_quant
+  # row (RADIANCE_XE_ROUTER_QUANT_PAIR=1) at M 1 / 4 / 8 / 12, every output byte for byte; the same binary runs on the
+  # card (logs/rqstep.sh, the MB form)
+  add_executable(xe_router_quant_test test/router_quant_test.cpp)
+  rad_l0_sycl(xe_router_quant_test)
+  target_include_directories(xe_router_quant_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_link_libraries(xe_router_quant_test PRIVATE rad_abi ${CMAKE_DL_LIBS})
+  set_target_properties(xe_router_quant_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_dependencies(xe_router_quant_test libxe)
+  add_test(NAME xe_router_quant_cpu COMMAND sh -c
+    "RADIANCE_XE_ROUTER_QUANT_PAIR=1 $<TARGET_FILE:xe_router_quant_test> $<TARGET_FILE:libxe>")
+  set_tests_properties(xe_router_quant_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
   add_executable(xe_hc_persist_test test/hc_persist_test.cpp)
   rad_l0_sycl(xe_hc_persist_test)
