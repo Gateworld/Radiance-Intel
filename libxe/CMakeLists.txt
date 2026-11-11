@@ -387,6 +387,15 @@ if(RAD_BUILD_TESTS)
   add_test(NAME xe_mtp_couple_cpu COMMAND xe_mtp_couple_test $<TARGET_FILE:libxe> $<TARGET_FILE:spechub>)
   set_tests_properties(xe_mtp_couple_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 600)
+  # Run 312 (owner notes 243 item 2 / 246): the verify's two device forms against the same host reference bytes at
+  # widths 64, 129, 1024 and 1025 (past the cooperative form's LDS plane: its serial fallback).
+  foreach(_w 64 129 1024 1025)
+    foreach(_coop 0 1)
+      add_test(NAME xe_mtp_couple_w${_w}_c${_coop}_cpu COMMAND xe_mtp_couple_test $<TARGET_FILE:libxe> $<TARGET_FILE:spechub>)
+      set_tests_properties(xe_mtp_couple_w${_w}_c${_coop}_cpu PROPERTIES LABELS "xe"
+        ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RI_MTP_NCAND=${_w};RADIANCE_XE_MTP_COOP=${_coop}" TIMEOUT 600)
+    endforeach()
+  endforeach()
   # Milestone 2, owner note 28: the feasibility probe for tapes on direct Level Zero command lists (a
   # launch_as kernel launched natively, and the cost of a submission: SYCL graphs vs native lists).
   add_executable(xe_native_launch_test test/native_launch_test.cpp)

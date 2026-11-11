@@ -110,6 +110,12 @@ int Engine::step_state_init() {
                     "plane the coupling reads", (int)RAD_MTP_COUPLE_STATE_WORDS);
             return RAD_E_STATE;
         }
+        /* The readback copies whole rows of rounds 1..done (issue_serial_drafter). */
+        if (sd.shape[0] < (int64_t)drafter_.depth) {
+            RAD_ERR("RADIANCE_MTP_COUPLED: 'mtp_couple_state' holds %lld round(s), the drafter %d",
+                    (long long)sd.shape[0], drafter_.depth);
+            return RAD_E_STATE;
+        }
         couple_rows_ = sd.shape[1];
         /* ONE ENTRY PER CARD SLOT, indexed by StepEntry::card exactly as slots_host_ is: the plan
          * names a request's sequence on the slot the advance writes, and the draft row carries the
@@ -344,10 +350,14 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
          * states come back behind the proposal that they were drawn beside. */
         const void* state = r0.ctx.buf_ptr(couple_state_buf_);
         if (!state || serial_done_ > (int)drafter_.depth) return RAD_E_STATE;
+        /* One dense copy of rounds 1..done, whole rows: the same layout as a 2D copy of the first
+         * n entries a row (both pitches are the row's), and the bind reads only those. Not
+         * rad_memcpy_2d_async: on the L0 backend a 2D copy settles -- the host waits for the
+         * draft chain's play before it can submit, so the next step's trunk is appended late
+         * (owner note 246: ~330 us between plays at the step boundary against 53 uncoupled). */
         const int64_t pitch = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
-        RAD_TRY(rad_memcpy_2d_async(couple_readback_, pitch, state, pitch,
-                                    (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), serial_done_,
-                                    r0.ctx.stream()));
+        RAD_TRY(rad_memcpy_async(couple_readback_, state, pitch * (int64_t)serial_done_,
+                                 r0.ctx.stream()));
     }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));

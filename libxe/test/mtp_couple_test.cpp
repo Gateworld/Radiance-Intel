@@ -80,7 +80,14 @@ int main(int argc, char** argv) {
     std::printf("device: %s; fp64 %s\n", q.get_device().get_info<sycl::info::device::name>().c_str(),
                 q.get_device().has(sycl::aspect::fp64) ? "yes" : "NO");
 
-    const int64_t M = 6, vocab = 1000, n_cand = 64, rounds = 3, round = 1;
+    /* RI_MTP_NCAND (run 312, owner note 246): the verify's candidate width, 64 unless set -- the wide forms (129,
+     * 1024, 1025 > the cooperative form's LDS plane, its serial fallback) repeat ids past the vocabulary of 1000, so
+     * the first-occurrence rule is exercised too; RADIANCE_XE_MTP_COOP picks the device form under test */
+    const char* ncs = std::getenv("RI_MTP_NCAND");
+    const int64_t n_cand = ncs && std::atoll(ncs) > 8 ? std::atoll(ncs) : 64;
+    const int64_t M = 6, vocab = 1000, rounds = 3, round = 1;
+    std::printf("verify width %lld, device form %s\n", (long long)n_cand,
+                (std::getenv("RADIANCE_XE_MTP_COOP") && *std::getenv("RADIANCE_XE_MTP_COOP") == '1') ? "cooperative" : "serial");
     const int64_t DW = RAD_MTP_COUPLE_DRAW_WORDS, SW = RAD_MTP_COUPLE_STATE_WORDS;
     /* ---- propose: the head's top-8 a row, the draw rows, the state plane; rows 4 (mode 0) and 5 (card
      * mismatch) must stay untouched */
