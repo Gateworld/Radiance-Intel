@@ -20,6 +20,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -38,6 +39,94 @@ typedef int (*InitFn)(const RadParam*, int, int, int, void**);
 typedef void (*FiniFn)(void*);
 typedef int (*LaunchFn)(const RadArgs*, RadStream);
 typedef uint32_t (*StallFn)(void*, RadStream);
+typedef int64_t (*StampsFn)(void*, RadStream, uint64_t*, int64_t, uint32_t*);   /* run 280: xe_ar_stamps */
+typedef void (*StampsLayoutFn)(uint32_t*, uint32_t*, uint32_t*);               /* xe_ar_stamps_layout */
+
+/* Owner note 219 B.0 (run 280, AR_STAMPS=1 with XE_AR_STAMPS=1 in the library): the LL form's phase stamps of the
+ * last launches in the ring, one rank -- block 0, the last block and every block: the median / p90 of each phase in
+ * ticks, and in us when AR_TICK_NS (the clock probe's tick length) is given. The phases: store = T1 - T0 (the lane's
+ * payload stores issued), wait1 = T2 - T1 (until the first pair's tags match: the peer's skew + the link), rest =
+ * T3 - T2 (the remaining pairs' polls and every emit), barrier = T4 - T3 (the block's lane skew at the final barrier),
+ * arrive = T5 - T4 (the arrival atomic), total = T5 - T0. Cross-card stamps are not comparable (each card's clock). */
+void stamps_table(int rank, int rows, int nb, double pitch_us, StampsFn stamps, StampsLayoutFn layout, void* inst,
+                  sycl::queue& q) {
+    uint32_t L = 0, B = 0, Wd = 0;
+    layout(&L, &B, &Wd);
+    if (!L || !B || Wd < 8) { std::printf("STAMPS rank %d: bad layout %u / %u / %u\n", rank, L, B, Wd); return; }
+    std::vector<uint64_t> ring((size_t)L * B * Wd);
+    uint32_t cur = 0;
+    const int64_t got = stamps(inst, (RadStream)&q, ring.data(), (int64_t)ring.size(), &cur);
+    if (got <= 0) { std::printf("STAMPS rank %d: none (XE_AR_STAMPS=1 not set for the library, or the host form)\n", rank); return; }
+    const double probe_tick_ns = std::getenv("AR_TICK_NS") ? std::atof(std::getenv("AR_TICK_NS")) : 0.0;
+    const uint32_t nl = (uint32_t)nb < L ? (uint32_t)nb : L;
+    const char* names[6] = { "store", "wait1", "rest", "barrier", "arrive", "total" };
+    std::vector<double> ph[3][6];   /* 0 block 0, 1 the last block, 2 every block */
+    std::vector<double> polls0, pollsall, pitch_t, stagger_last;
+    uint32_t nblk = 0, valid = 0, bad = 0;
+    uint64_t prev_t0 = 0;   /* block 0's T0 of the launch before (the ring is walked newest first) */
+    for (uint32_t i = 0; i < nl; ++i) {
+        const uint32_t s = cur - i;
+        const uint64_t* e0 = &ring[(size_t)(s & (L - 1u)) * B * Wd];
+        if ((uint32_t)e0[0] != s) { ++bad; prev_t0 = 0; continue; }
+        const uint32_t nb_ = (uint32_t)(e0[0] >> 32);
+        if (nb_ == 0 || nb_ > B) { ++bad; prev_t0 = 0; continue; }
+        nblk = nb_;
+        /* the launch pitch in ticks: block 0's T0 against the next launch's (AR1 showed the clock counts EU cycles under
+         * DVFS -- 67 ticks an LCG iteration at every loop length while the wall time an iteration varied 2x -- so the
+         * probe's tick is not this run's; the markers' pitch in ns over the same launches calibrates it) */
+        if (prev_t0 && prev_t0 > e0[1] && prev_t0 - e0[1] < (1ull << 40)) pitch_t.push_back((double)(prev_t0 - e0[1]));
+        prev_t0 = e0[1];
+        for (uint32_t b = 0; b < nb_; ++b) {
+            const uint64_t* e = e0 + (size_t)b * Wd;
+            if ((uint32_t)e[0] != s) { ++bad; continue; }
+            const uint64_t T[6] = { e[1], e[2], e[3], e[4], e[5], e[6] };
+            bool okv = T[0] != 0;
+            for (int k = 1; k < 6; ++k) if (T[k] < T[k - 1] || T[k] - T[k - 1] > (1ull << 40)) okv = false;
+            if (!okv) { ++bad; continue; }
+            const double d[6] = { (double)(T[1] - T[0]), (double)(T[2] - T[1]), (double)(T[3] - T[2]),
+                                  (double)(T[4] - T[3]), (double)(T[5] - T[4]), (double)(T[5] - T[0]) };
+            for (int k = 0; k < 6; ++k) {
+                ph[2][k].push_back(d[k]);
+                if (b == 0) ph[0][k].push_back(d[k]);
+                if (b == nb_ - 1) ph[1][k].push_back(d[k]);
+            }
+            if (b == 0) { polls0.push_back((double)(uint32_t)e[7]); pollsall.push_back((double)(uint32_t)(e[7] >> 32)); }
+            /* the dispatch stagger: the last block's T0 against block 0's, the same launch (the same card's clock) */
+            if (b == nb_ - 1 && b > 0 && e0[1] != 0) stagger_last.push_back((double)T[0] - (double)e0[1]);
+            ++valid;
+        }
+    }
+    auto pct = [](std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const size_t i = (size_t)(p * (double)(v.size() - 1) + 0.5);
+        return v[i < v.size() ? i : v.size() - 1];
+    };
+    /* the tick from this run: the markers' pitch (ns) over the median pitch in ticks; the probe's figure for comparison */
+    const double pitch_med_t = pct(pitch_t, 0.5);
+    const double tick_ns = (pitch_med_t > 0 && pitch_us > 0) ? pitch_us * 1000.0 / pitch_med_t : probe_tick_ns;
+    std::printf("STAMPS rank %d rows %d: %u launches read (seq %u), %u blocks a launch, %u block entries valid, %u skipped; "
+                "tick %.4f ns (this run: pitch %.2f us / median %.0f ticks a launch, p10 %.0f, p90 %.0f; the probe said %.4f)%s\n",
+                rank, rows, nl, cur, nblk, valid, bad, tick_ns, pitch_us, pitch_med_t, pct(pitch_t, 0.1), pct(pitch_t, 0.9),
+                probe_tick_ns, tick_ns > 0 ? "" : " (no tick: values in ticks)");
+    for (int g = 0; g < 3; ++g) {
+        std::printf("  %-10s", g == 0 ? "block 0" : g == 1 ? "last block" : "all blocks");
+        for (int k = 0; k < 6; ++k) {
+            const double med = pct(ph[g][k], 0.5), p90 = pct(ph[g][k], 0.9);
+            if (tick_ns > 0) std::printf(" | %s %.2f / %.2f us", names[k], med * tick_ns * 1e-3, p90 * tick_ns * 1e-3);
+            else std::printf(" | %s %.0f / %.0f t", names[k], med, p90);
+        }
+        std::printf("  (median / p90)\n");
+    }
+    std::printf("  block 0 polls before the first word: median %.0f, p90 %.0f; over all its words: median %.0f, p90 %.0f\n",
+                pct(polls0, 0.5), pct(polls0, 0.9), pct(pollsall, 0.5), pct(pollsall, 0.9));
+    if (tick_ns > 0) {
+        const double span = pct(ph[1][5], 0.5) * tick_ns * 1e-3;   /* the last block's total, median */
+        const double stag = pct(stagger_last, 0.5) * tick_ns * 1e-3, stag90 = pct(stagger_last, 0.9) * tick_ns * 1e-3;
+        std::printf("  launch pitch (the markers) %.2f us; the last block's span (T5 - T0, median) %.2f us; outside the kernel "
+                    "%.2f us; the last block's T0 after block 0's: median %.2f us, p90 %.2f us\n", pitch_us, span, pitch_us - span, stag, stag90);
+    }
+}
 
 sycl::device g_dev[2];
 sycl::context g_ctx;
@@ -70,6 +159,8 @@ int main(int argc, char** argv) {
     LaunchFn launch[2] = { (LaunchFn)dlsym(h, "xe_rad_ar_oneshot_2rank_exact"), (LaunchFn)dlsym(h, "xe_rad_ar_oneshot_2rank_exact_host") };
     StallFn stalled = (StallFn)dlsym(h, "xe_ar2_stalled");
     StallFn retries = (StallFn)dlsym(h, "xe_ar2_retries");   /* run 170: proto 6's checksum re-reads (null on older libxe) */
+    StampsFn stampsq = (StampsFn)dlsym(h, "xe_ar_stamps");                 /* run 280 (owner note 219 B.0); null on older libxe */
+    StampsLayoutFn layoutq = (StampsLayoutFn)dlsym(h, "xe_ar_stamps_layout");
     if (!init[0] || !init[1] || !fini || !launch[0] || !launch[1] || !stalled) { std::printf("allreduce_test: symbols missing\n"); return 2; }
     /* XE_AR_TEST_TEAR (run 170): the library holds one quad a block back under proto 6, so every peer case of the
      * bandwidth form must re-read before passing -- a case that passes with no re-read then proves nothing */
@@ -155,6 +246,11 @@ int main(int argc, char** argv) {
             const bool st = stalled(inst[0], (RadStream)&pq[0]) || stalled(inst[1], (RadStream)&pq[1]);
             std::printf("RESULT ar_bench rows %d, %d launches (a graph): device %.2f / %.2f us a launch (rank 0 / 1), recording "
                         "%.2f / %.2f us a launch%s\n", rows, nb, per[0], per[1], sub[0], sub[1], st ? ", STALLED" : "");
+            /* AR_STAMPS=1 (run 280, owner note 219 B.0): the phase table from the last rep's launches, each rank */
+            if (rep == 2 && std::getenv("AR_STAMPS") && std::atoi(std::getenv("AR_STAMPS")) > 0) {
+                if (!stampsq || !layoutq) std::printf("STAMPS: this libxe has no xe_ar_stamps\n");
+                else for (int r = 0; r < 2; ++r) stamps_table(r, rows, nb, per[r], stampsq, layoutq, inst[r], pq[r]);
+            }
         }
         for (int r = 0; r < 2; ++r) { sycl::free(x[r], pq[r]); fini(inst[r]); }
         return 0;

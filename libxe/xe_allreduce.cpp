@@ -112,6 +112,32 @@ inline void ar_skew(uint64_t* ring, uint32_t s, uint32_t first, uint32_t total) 
     ring[s & (kSkewRing - 1u)] = ((uint64_t)s << 32) | (total << 16) | first;
 }
 
+/* Owner note 219 B.0 (run 280, XE_AR_STAMPS=1): where the LL form's ~17-19 us a launch go. Thread 0 of EVERY block of
+ * ar_kernel<.., PR 5> reads the device clock at its phase boundaries -- T0 after the sequence load, T1 its payload
+ * stores issued, T2 the first pair's tags matched (the wait for the peer), T3 every pair polled and emitted, T4 the
+ * final barrier passed, T5 the arrival atomic done -- into the launch's entry of a device ring (the last
+ * kStampLaunches launches x kMaxBlocks blocks x kStampWords words): [0] s | nblk << 32, [1..6] T0..T5, [7] block 0's
+ * polls0 | polls_all << 32. xe_ar_stamps copies the ring out; allreduce_test's AR_STAMPS=1 prints the table. Off (the
+ * default) the kernel gets a null pointer and the stamp branches, uniform and read once, are not taken: the measured
+ * kernel is today's. The clock is SPIR-V's OpReadClockKHR (scope Device), compiled only in the B70's own pass
+ * (ar_clock): the spir64 pass the CPU device JIT-compiles carries no such capability and never records. A tick's
+ * length is the clock probe's measurement (tests/xe_clock_probe), not assumed. */
+constexpr uint32_t kStampLaunches = 256, kStampWords = 8;
+inline uint64_t ar_clock() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SYCL_TARGET_INTEL_GPU_BMG_G31__) && __SYCL_TARGET_INTEL_GPU_BMG_G31__
+    return __spirv_ReadClockKHR(1);   /* declared by sycl/__spirv/spirv_ops_runtime.hpp; SPV_KHR_shader_clock allowed at the link */
+#else
+    return 0ull;
+#endif
+}
+inline uint64_t* ar_stamp_entry(uint64_t* stamps, uint32_t s, uint32_t b) {
+    return stamps + ((size_t)(s & (kStampLaunches - 1u)) * kMaxBlocks + b) * kStampWords;
+}
+bool ar_stamps_on() {
+    static const bool v = [] { const char* e = std::getenv("XE_AR_STAMPS"); return e && e[0] == '1'; }();
+    return v;
+}
+
 struct Inst {
     int       rank = 0, world = 2, dtype = 0;   /* dtype: 0 bf16, 1 fp16, 2 fp32 */
     int       host = 0;
@@ -133,6 +159,7 @@ struct Inst {
     uint32_t  ring_mask = 0, last_s = 0;
     uint64_t  calls = 0;
     FILE*     skew_f = nullptr;
+    uint64_t* stamps = nullptr;   /* XE_AR_STAMPS=1 (owner note 219 B.0): the phase-stamp ring, device memory; else null */
 };
 const char* skew_dir() {
     static const char* v = [] { const char* e = std::getenv("RADIANCE_XE_AR_SKEW"); return e && *e ? e : nullptr; }();
@@ -230,6 +257,12 @@ int build(Inst* in) {
         std::snprintf(path, sizeof path, "%s/ar-skew-r%d-dt%d-n%lld.bin", skew_dir(), in->rank, in->dtype, (long long)in->numel);
         in->skew_f = std::fopen(path, "wb");
     }
+    if (ar_stamps_on() && !in->host) {   /* owner note 219 B.0: the stamp ring, 8 MiB, zeroed (an entry's s of 0 is never a launch's) */
+        const size_t n = (size_t)kStampLaunches * kMaxBlocks * kStampWords;
+        in->stamps = sycl::aligned_alloc_device<uint64_t>(4096, n, *in->dev, *in->ctx);
+        if (!in->stamps) return RAD_E_NOMEM;
+        q.memset(in->stamps, 0, n * sizeof(uint64_t));
+    }
     q.wait_and_throw();
     /* rendezvous: publish, wait for the peer, take its pointers */
     World& w = world_for(in->dtype * 2 + in->host);
@@ -299,6 +332,7 @@ void ar_fini(void* instance) {
         if (in->my_flags) sycl::free(in->my_flags, *in->ctx);
         if (in->my_seq) sycl::free(in->my_seq, *in->ctx);
         if (in->ring) sycl::free(in->ring, *in->ctx);
+        if (in->stamps) sycl::free(in->stamps, *in->ctx);
     } catch (const sycl::exception&) {}
     if (in->skew_f) std::fclose(in->skew_f);
     delete in;
@@ -331,10 +365,12 @@ inline uint16_t hcw_f2bf(float f) { return (uint16_t)((__float_as_uint(f) + 0x80
 template <int DT, bool HW = false, int PR = 0>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
-               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw, uint64_t* ring, uint32_t tear) {
+               uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw, uint64_t* ring, uint32_t tear, uint64_t* stamps) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
+    /* owner note 219 B.0 (XE_AR_STAMPS=1, the PR 5 form only): this block's stamp entry, thread 0; null when off */
+    uint64_t* se = nullptr;
     const uint32_t par = s & 1u;
     uint32_t* out = peer_slots + par * slot_words;
     const uint32_t* in = my_slots + par * slot_words;
@@ -374,10 +410,15 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
          * page-aligned, so every pair's store is 16-byte aligned. An odd last word of the message goes alone. */
         uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
         const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
+        /* B.0's stamps (see ar_clock): thread 0 of every block; the branches are uniform and read once a launch */
+        const bool st = stamps != nullptr && t == 0;
+        uint64_t tc0 = 0, tc1 = 0, tc2 = 0, tc3 = 0;
+        if (st) { se = ar_stamp_entry(stamps, s, b); tc0 = ar_clock(); }
         for (uint32_t k = w0 + 2u * t; k < w1; k += 2u * kWG) {
             if (k + 1u < w1) uc_st128(out64 + k, v2u64{((uint64_t)s << 32) | x[k], ((uint64_t)s << 32) | x[k + 1u]});
             else uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
         }
+        if (st) tc1 = ar_clock();
         uint32_t ok = 1, polls0 = 0, polls_all = 0;
         bool first = true;
         for (uint32_t k = w0 + 2u * t; k < w1 && ok; k += 2u * kWG) {
@@ -391,9 +432,16 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
                 sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                 if (--budget == 0) { ok = 0; break; }
             }
-            if (first) { polls0 = spin - budget; first = false; }
+            if (first) { polls0 = spin - budget; first = false; if (st) tc2 = ar_clock(); }
             polls_all += spin - budget;
             if (ok) { emit(k, x[k], (uint32_t)v[0]); if (pair) emit(k + 1u, x[k + 1u], (uint32_t)v[1]); }
+        }
+        if (st) {
+            tc3 = ar_clock();
+            if (tc2 == 0) tc2 = tc1;   /* a block with no words of its own: no wait */
+            se[0] = (uint64_t)s | ((uint64_t)nblk << 32);
+            se[1] = tc0; se[2] = tc1; se[3] = tc2; se[4] = tc3;
+            se[7] = (uint64_t)polls0 | ((uint64_t)polls_all << 32);
         }
         if (b == 0 && t == 0) ar_skew(ring, s, polls0, polls_all);
         if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
@@ -590,8 +638,10 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
      * counter behind for the rest of the run, a stall at every later collective) */
     __syncthreads();
     if (t == 0) {
+        const uint64_t tc4 = se ? ar_clock() : 0ull;   /* B.0: T4, the final barrier passed */
         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> arr(seq_ctr[2]);
         if (arr.fetch_add(1u) + 1u == nblk) { arr.store(0u); uc_st(seq_ctr, s); }
+        if (se) { se[5] = tc4; se[6] = ar_clock(); }   /* T5, the arrival done */
     }
 }
 
@@ -634,7 +684,7 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
 #define XE_ARP(DT, HW_, PR_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_>), grid, block, 0, (const uint32_t*)x->data,       \
                             (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
                             in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
-                            spin_budget(), hw ? *hw : HcW{}, in->ring, ar_test_tear())
+                            spin_budget(), hw ? *hw : HcW{}, in->ring, ar_test_tear(), in->stamps)
         /* the LL form (a sequence number in every payload word; the default since run 105, RADIANCE_XE_AR_PROTO=0 the
          * old form), taken when the message's 8-byte words fit a parity's slot -- build() doubles the slots, so always */
         const uint32_t slot_words = (uint32_t)(in->slot_bytes / 4);
@@ -914,4 +964,26 @@ extern "C" uint32_t xe_ar2_retries(void* instance, RadStream s) {
     uint32_t v = 0;
     ((sycl::queue*)s)->memcpy(&v, in->my_seq + 4, 4).wait();
     return v;
+}
+/* Owner note 219 B.0 (run 280): the stamp ring's shape (launches x blocks x words a block), and the ring itself --
+ * `out` receives min(max_words, the ring) u64 words, the launch counter (the newest launch's sequence number) goes to
+ * seq_out; the entry of launch s is at ((s & (launches - 1)) * blocks + block) * words (see ar_stamp_entry). Returns
+ * the words copied; 0 when XE_AR_STAMPS=1 was not set for this instance (or the host form). */
+extern "C" void xe_ar_stamps_layout(uint32_t* launches, uint32_t* blocks, uint32_t* words) {
+    if (launches) *launches = kStampLaunches;
+    if (blocks) *blocks = kMaxBlocks;
+    if (words) *words = kStampWords;
+}
+extern "C" int64_t xe_ar_stamps(void* instance, RadStream s, uint64_t* out, int64_t max_words, uint32_t* seq_out) {
+    Inst* in = (Inst*)instance;
+    if (!in || !in->stamps || !out || max_words <= 0) return 0;
+    const int64_t words = (int64_t)kStampLaunches * kMaxBlocks * kStampWords;
+    const int64_t n = max_words < words ? max_words : words;
+    sycl::queue* q = (sycl::queue*)s;
+    uint32_t cur = 0;
+    q->memcpy(&cur, in->my_seq, 4);
+    q->memcpy(out, in->stamps, (size_t)n * sizeof(uint64_t));
+    q->wait();
+    if (seq_out) *seq_out = cur;
+    return n;
 }

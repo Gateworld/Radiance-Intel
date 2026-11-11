@@ -19,6 +19,10 @@ list(APPEND XE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/xe_hc_f16_layout.cpp)
 
 rad_add_plugin(libxe kernels SOURCES ${XE_SRC})
 rad_l0_sycl(libxe)
+# Run 280 (owner note 219 B.0): the all-reduce's phase stamps read the device clock through SPIR-V's OpReadClockKHR
+# (xe_allreduce.cpp, ar_clock; the B70's pass only). No translator flag: this toolchain's default extension list
+# already allows SPV_KHR_shader_clock on both targets (m3/spvflag-test.sh, a dry run of the two-target link), and the
+# bare -Xspirv-translator cannot name a target with two of them ("cannot deduce implicit triple").
 # Run 207 (owner note 203 item 1): the int8 dots by IGC's dp4a builtin on the card's pass alone (xe_dp4a.h); the
 # spir64 pass, which the CPU device JIT-compiles, keeps the portable form, told by a define to that triple's
 # frontend (the intel_gpu_bmg_g31 form of the option reaches neither pass). Every target in this directory that
@@ -289,6 +293,11 @@ if(RAD_BUILD_TESTS)
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1800)
   # Milestone 2, stage 2: the two-rank all_reduce rows (peer stores / host mailbox) through the plugin
   # entry points, two rank threads, against the host sum; on the CPU device as a ctest, on two GPUs timed.
+  # Run 279 / 280 (owner note 219 B.0): the device clock's tick length, measured (B.0's stamps are this read at the
+  # all-reduce's phase boundaries); GPU only, no ctest
+  add_executable(xe_clock_probe test/clock_probe.cpp)
+  rad_l0_sycl(xe_clock_probe)   # SPV_KHR_shader_clock is in the translator's default list (see libxe above)
+  set_target_properties(xe_clock_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   add_executable(xe_allreduce_test test/allreduce_test.cpp)
   rad_l0_sycl(xe_allreduce_test)
   target_include_directories(xe_allreduce_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
