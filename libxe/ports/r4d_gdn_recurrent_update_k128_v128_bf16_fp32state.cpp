@@ -1555,9 +1555,15 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
    * norm, then ru_split_norm_kernel -- the same bits (see both kernels). KT 8 only (the norm kernel mirrors that
    * layout's order). Run 113: the anchor form too (MTP on), its shift marker stamped by the key head's last
    * arriving workgroup. */
+  /* Run 284 (owner note 228 item 2, note 229): the VS 2 split + L1 is THE DEFAULT in the Intel builds -- the same-image
+   * rotation pair on image 308 (H155 plain vs H156 -gs2) gained on median / mean / aggregate (106.7 -> 107.7, 107.01 ->
+   * 107.96, 106.37 -> 107.32 tok/s) with every text unchanged, after the bench's and the engine's exactness (hashes =
+   * the fused kernel; M400 / H156 texts = the plain run's). RADIANCE_XE_GDN_SPLIT=0 opts out (the fused kernel), 4 the
+   * four-way split, 8 / 16 the slice-group record. One revertable commit. */
   static const int split_vs = [] {
     const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT");
-    return e && (e[0] == '2' || e[0] == '4') ? e[0] - '0' : 0;
+    if (!e || !*e) return 2;
+    return (e[0] == '2' || e[0] == '4') ? e[0] - '0' : 0;
   }();
   /* Run 283 (owner note 224 item 2): RADIANCE_XE_GDN_SPLIT=8|16 -> the slice-group kernel (ru_sg_update_kernel: the key
    * head's GC = 3 value heads x RU_V / VS rows a workgroup, the shared factors by the last arriver), then the split
@@ -1901,7 +1907,8 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
     /* owner note 138: the split fold's scratch, only when RADIANCE_XE_GDN_SPLIT asks for it */
-    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = e ? std::atoi(e) : 0; return v == 2 || v == 4 || v == 8 || v == 16; }();
+    /* run 284: the split is the default (2); =0 opts out; 4 / 8 / 16 the other forms */
+    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = (e && *e) ? std::atoi(e) : 2; return v == 2 || v == 4 || v == 8 || v == 16; }();
     cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
     cv.nctr = split_asked ? ru_split_ctr(s, o->data) : nullptr;   /* run 283, the brief's N1 (RADIANCE_XE_GDN_LAT=7) */
 
