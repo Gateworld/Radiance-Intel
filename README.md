@@ -5,7 +5,7 @@ This repository is a fork of **[radiance](https://codeberg.org/StillDeadcode/rad
 It is licensed under the Apache License 2.0, like the original (see `LICENSE` and `NOTICE`). The original README is kept as [README-radiance.md](README-radiance.md).
 
 I only modded it for Intel: this fork adds a backend for two Intel Arc Pro B70 GPUs (Xe2, SYCL / Level Zero), in
-`src/libxe/` and related changes, tested with a Qwen3-Next-style model in tensor-parallel decode and prefill.
+`libxe/` and related changes, tested with a Qwen3-Next-style model in tensor-parallel decode and prefill.
 
 Most of the Intel port's code, tests and notes were written with **Claude (Anthropic)**, running as Claude Code
 sessions, with me directing the work and making the decisions.
