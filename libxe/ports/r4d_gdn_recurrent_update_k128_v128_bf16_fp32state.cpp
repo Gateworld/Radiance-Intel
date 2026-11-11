@@ -913,7 +913,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
  * parks skipped, 3 the sbad barrier removed (a per-thread early return), 4 the per-token global stores skipped (the
  * factor v, its duplicates, onf), 5 q / k read straight from global x (no q | k convolution: wrong values), 6 GC 1
  * (one value head a workgroup; DG 6 changes nothing else). DG 0 is the kernel above, bit for bit. */
-template <int NT, int ANC, int SDT, int VS, int GC, int DG = 0>
+template <int NT, int ANC, int SDT, int VS, int GC, int DG = 0, int HYB = 0>
 __global__ __launch_bounds__(GC * RU_V / VS * 8)
 void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ bv, long ab_stride,
                          const float* __restrict__ A_log, const float* __restrict__ dt_bias,
@@ -925,7 +925,12 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
   constexpr int KT = 8, NR = RU_V / VS, HK = RU_K / KT, HT = NR * KT, THR = GC * HT;
   constexpr int CW = R4D_GDN_CONV_W, CS = R4D_GDN_CONV_W - 1;
   constexpr int CPT = (2 * RU_K + THR - 1) / THR;       /* q | k channels a thread: 1 at VS 8, 2 at VS 16 */
-  static_assert(VS == 8 || VS == 16, "the slice-group form is for VS 8 / 16; 2 / 4 take the split kernel");
+  /* Owner note 230 (run 284): HYB = the VS 4 HYBRID -- 8 key heads x 4 slices = 32 workgroups of 3 heads x 32 rows x 8
+   * lanes (768 threads); at VS 4 a slice's 32 rows ARE one factor group, read and written by this workgroup alone
+   * (libr4d's rule), so every head's group factors are written in the token loop as the VS 2 / 4 split kernel writes
+   * them (no parks, no shared-factor tail); the last arriver keeps the marker stamp and the q | k conv rewrite only. */
+  static_assert(VS == 8 || VS == 16 || (HYB && VS == 4), "the slice-group form is for VS 8 / 16, or VS 4 as the hybrid");
+  static_assert(!HYB || (VS == 4 && GC == 3 && DG == 0), "the hybrid: VS 4, GC 3, no timing variant");
   static_assert(HT % 32 == 0, "no head straddles a sub-group");
   static_assert(NR <= 32, "a slice lies inside one 32-row group");
   XE_SHARED(unsigned short, cvq, RU_CVT * RU_K); XE_SHARED(unsigned short, cvk, RU_CVT * RU_K);
@@ -1182,7 +1187,35 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
     if (ANC) {
       /* this step's factors for the next step's replay: the key head's scaled k and this head's (g, bt) are parked
        * in LDS for the last arriver (the race fix); every lane writes its own row's v now */
-      if constexpr (DG != 2) {                            /* the sweep's V2 skips the parks */
+      if constexpr (HYB) {
+        /* the hybrid: this head's first row's 8 lanes write the group's k copy (the key head's scaled k, 8 x 16
+         * floats) and its lane 0 the group's (g, bt), into this head's factor block (+ the duplicates) -- the split
+         * kernel's writes, each address written once a launch by this workgroup alone */
+        if (rl == 0) {
+          ST* f  = fb  + (size_t)t * RU_FSTR;
+#pragma unroll
+          for (int j = 0; j < HK; j += 8) {
+            float kn[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) kn[e] = kk[j + e];
+            ru_store8<0, SDT>(f + grp * RU_K + k0 + j, kn);
+            if (dup_f) {
+              ru_store8<0, SDT>(fb0 + (size_t)t * RU_FSTR + grp * RU_K + k0 + j, kn);
+              ru_store8<0, SDT>(fb2 + (size_t)t * RU_FSTR + grp * RU_K + k0 + j, kn);
+            }
+          }
+          if (half == 0) {
+            f[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+            f[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+            if (dup_f) {
+              fb0[(size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+              fb0[(size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+              fb2[(size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+              fb2[(size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+            }
+          }
+        }
+      } else if constexpr (DG != 2) {                     /* the sweep's V2 skips the parks */
         if (tid < KT) {                                   /* row 0 of head 0: the key head's k, the same every row */
 #pragma unroll
           for (int j = 0; j < HK; ++j) skh[t * RU_K + k0 + j] = kk[j];
@@ -1232,7 +1265,11 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
   }
   __syncthreads();
   if (!cvlast) return;
-  if (ANC) {
+  if constexpr (HYB) {
+    /* the hybrid's tail: every slice wrote its own group's factors in the loop; only the stamp (and the conv rewrite
+     * below) are the last arriver's */
+    if constexpr (ANC && RU_ANC_MARK) { if (tid == 0) stamp_group(); }
+  } else if (ANC) {
     /* G heads x T tokens x 4 groups: the k copy (RU_K floats) and (g, bt), into fb and the duplicates */
     for (int idx = tid; idx < G * T * 4 * (RU_K / 8); idx += THR) {
       const int blk8 = idx % (RU_K / 8), g4 = (idx / (RU_K / 8)) % 4, t = (idx / (RU_K / 8) / 4) % T, g2 = idx / (RU_K / 8) / 4 / T;
@@ -1573,15 +1610,24 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
     const int v = e ? std::atoi(e) : 0;
     return (v == 8 || v == 16) ? v : 0;
   }();
-  if (split_sg && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK) && H % Hg == 0
-      && H / Hg == 3) {
-    dim3 ggrid(N, Hg, split_sg), gblk(3 * RU_V / split_sg * RC_KT);
-#define RC_SG_A(VSC, NTC, ANCC, SDTC, GCC, DGC)                                                                 \
-  XE_LAUNCH_GGL_GRF256((ru_sg_update_kernel<NTC, ANCC, SDTC, VSC, GCC, DGC>), ggrid, gblk, 0, (hipStream_t)stream, \
+  /* Owner note 230 (run 284): RADIANCE_XE_GDN_HYBRID=4 -> the slice-group kernel's VS 4 HYBRID (HYB 1: per-slice factor
+   * writes, no shared-factor tail), 32 workgroups of 768 threads; it takes precedence over RADIANCE_XE_GDN_SPLIT. */
+  static const int split_hyb = [] {
+    const char* e = std::getenv("RADIANCE_XE_GDN_HYBRID");
+    return (e && std::atoi(e) == 4) ? 4 : 0;
+  }();
+  if ((split_sg || split_hyb) && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK)
+      && H % Hg == 0 && H / Hg == 3) {
+    const int sgv = split_hyb ? 4 : split_sg;
+    dim3 ggrid(N, Hg, sgv), gblk(3 * RU_V / sgv * RC_KT);
+#define RC_SG_A(VSC, NTC, ANCC, SDTC, GCC, DGC, HYBC)                                                           \
+  XE_LAUNCH_GGL_GRF256((ru_sg_update_kernel<NTC, ANCC, SDTC, VSC, GCC, DGC, HYBC>), ggrid, gblk, 0, (hipStream_t)stream, \
                      a, b, ab_stride, (const float*)A_log, (const float*)dt_bias, (ru_state<SDTC>::T*)state,     \
                      st_slot, st_head, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc, H, Hg,  \
                      scale, thr, cv)
-#define RC_SG(VSC, NTC, SDTC) do { if (anc) RC_SG_A(VSC, NTC, 1, SDTC, 3, 0); else RC_SG_A(VSC, NTC, 0, SDTC, 3, 0); } while (0)
+#define RC_SG(VSC, NTC, SDTC) do { if (anc) RC_SG_A(VSC, NTC, 1, SDTC, 3, 0, 0); else RC_SG_A(VSC, NTC, 0, SDTC, 3, 0, 0); } while (0)
+#define RC_SG_HY(SDTC) do { if (nt) { if (anc) RC_SG_A(4, 1, 1, SDTC, 3, 0, 1); else RC_SG_A(4, 1, 0, SDTC, 3, 0, 1); }   \
+                            else    { if (anc) RC_SG_A(4, 0, 1, SDTC, 3, 0, 1); else RC_SG_A(4, 0, 0, SDTC, 3, 0, 1); } } while (0)
 #define RC_SG_NT(VSC, SDTC) do { if (nt) RC_SG(VSC, 1, SDTC); else RC_SG(VSC, 0, SDTC); } while (0)
 #define RC_SG_VS(SDTC) do { if (split_sg == 16) RC_SG_NT(16, SDTC); else RC_SG_NT(8, SDTC); } while (0)
 #ifdef XE_GDN_SG_DIAG
@@ -1596,7 +1642,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
     }();
     if (sg_diag && anc && !nt && split_sg == 8) {
       if (sg_diag == 6) { ggrid.y = H; gblk.x = RU_V / 8 * RC_KT; }
-#define RC_SG_D(DGC, GCC) do { if (sdt) RC_SG_A(8, 0, 1, 1, GCC, DGC); else RC_SG_A(8, 0, 1, 0, GCC, DGC); } while (0)
+#define RC_SG_D(DGC, GCC) do { if (sdt) RC_SG_A(8, 0, 1, 1, GCC, DGC, 0); else RC_SG_A(8, 0, 1, 0, GCC, DGC, 0); } while (0)
       switch (sg_diag) {
         case 1: RC_SG_D(1, 3); break;
         case 2: RC_SG_D(2, 3); break;
@@ -1608,7 +1654,9 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #undef RC_SG_D
     } else
 #endif
-    { if (sdt) RC_SG_VS(1); else RC_SG_VS(0); }
+    { if (split_hyb) { if (sdt) RC_SG_HY(1); else RC_SG_HY(0); }
+      else { if (sdt) RC_SG_VS(1); else RC_SG_VS(0); } }
+#undef RC_SG_HY
 #undef RC_SG_VS
 #undef RC_SG_NT
 #undef RC_SG
@@ -1908,7 +1956,11 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
     /* owner note 138: the split fold's scratch, only when RADIANCE_XE_GDN_SPLIT asks for it */
     /* run 284: the split is the default (2); =0 opts out; 4 / 8 / 16 the other forms */
-    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = (e && *e) ? std::atoi(e) : 2; return v == 2 || v == 4 || v == 8 || v == 16; }();
+    static const bool split_asked = [] {
+      const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = (e && *e) ? std::atoi(e) : 2;
+      const char* h = std::getenv("RADIANCE_XE_GDN_HYBRID");   /* run 284: the VS 4 hybrid writes onf too */
+      return v == 2 || v == 4 || v == 8 || v == 16 || (h && std::atoi(h) == 4);
+    }();
     cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
     cv.nctr = split_asked ? ru_split_ctr(s, o->data) : nullptr;   /* run 283, the brief's N1 (RADIANCE_XE_GDN_LAT=7) */
 
