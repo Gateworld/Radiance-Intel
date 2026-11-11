@@ -204,6 +204,9 @@ struct RuConv {
   /* Intel port, run 112 (owner note 138, RADIANCE_XE_GDN_SPLIT): the split fold (VS > 1, no fused norm) writes
    * each row's f32 output here, [token][H][RU_V], for ru_split_norm_kernel; null otherwise */
   float* onf;
+  /* Run 284 (briefs/2026-11-11-gdn-split-latency.md N1, RADIANCE_XE_GDN_LAT=7): one arrival counter per (sequence,
+   * value head) for the split fold's own norm by the head's last arriving slice; null otherwise */
+  unsigned int* nctr = nullptr;
 };
 // Max tokens per sequence for the folded convolution (preloaded into registers, static indices).
 #define RU_CVT 8
@@ -230,8 +233,74 @@ __device__ __forceinline__ float ru_row_sum(float x) {
   return x;
 }
 
+/* Intel port, run 112 (owner note 138): the split fold's norm -- one (token, value head), a thread a row (128 rows), as
+ * the fused path's arithmetic in the fused path's order at KT 8: on^2 a row; a 32-lane wave there holds four rows
+ * (lanes 0 / 8 / 16 / 24) and its xor tree gives (r0^2 + r2^2) + (r1^2 + r3^2) (the other lanes add zeros); the 32
+ * wave sums are added in order from 0; then the gate, the bf16 store and the quantiser as there. The same bits.
+ * Run 284 (briefs/2026-11-11-gdn-split-latency.md N1): the body is a device function so the split kernel's last
+ * arriving slice can run it itself (the same code, the same bits); s2 / ws / red are this (token, head)'s own LDS,
+ * `active` false for a lane whose token is past T (it keeps the barriers, stores nothing). The barriers are the
+ * workgroup's: every lane of the workgroup calls it together. */
+constexpr int kSplitNormRowsAWave = 4;   /* RU_V rows over 1,024 threads at KT 8, 32 lanes a wave */
+template <int NQ>
+__device__ __forceinline__ void ru_split_norm_body(bool active, int tok, int hv, int row,
+                                                   const float* __restrict__ onf, unsigned short* __restrict__ o,
+                                                   unsigned char* __restrict__ oq, float* __restrict__ os,
+                                                   long oq_pitch, long os_ld, const unsigned short* __restrict__ zg,
+                                                   long zg_pitch, const float* __restrict__ nw, float neps, int nact,
+                                                   int H, float* s2, float* ws, float* red) {
+  float on = active ? onf[((size_t)tok * H + hv) * RU_V + row] : 0.0f;
+  s2[row] = on * on;
+  __syncthreads();
+  if (row < RU_V / kSplitNormRowsAWave) {
+    const int r0 = row * kSplitNormRowsAWave;
+    ws[row] = (s2[r0] + s2[r0 + 2]) + (s2[r0 + 1] + s2[r0 + 3]);
+  }
+  __syncthreads();
+  if (row == 0) {
+    float tot = 0.0f;
+    for (int i = 0; i < RU_V / kSplitNormRowsAWave; ++i) tot += ws[i];
+    *red = tot;
+  }
+  __syncthreads();
+  const float sc = __frsqrt_rn(*red * (1.0f / RU_V) + neps);
+  const unsigned short zr = active ? zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row] : (unsigned short)0;
+  on *= sc * nw[row] * ru_act(bf2f(zr), nact);
+  const unsigned short ob = f2bf(on);
+  if (active) o[((size_t)tok * H + hv) * RU_V + row] = ob;
+  if constexpr (NQ != 0) {
+    const float ov = bf2f(ob);
+    __syncthreads();                         /* red is read above by every thread */
+    s2[row] = fabsf(ov);
+    __syncthreads();
+    if (row == 0) {
+      float amax = 0.0f;
+      for (int i = 0; i < RU_V; ++i) amax = fmaxf(amax, s2[i]);
+      *red = amax;
+    }
+    __syncthreads();
+    const float amax = *red;
+    const float qs = amax > 0.0f ? amax * (1.0f / q8_top<NQ == 2>()) : 1.0f;
+    if (active && row == 0) os[(size_t)tok * os_ld + hv] = qs;
+    unsigned char code;
+    if constexpr (NQ == 2) {
+      code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f));
+    } else {
+      const float cvq = fminf(fmaxf(ov * (1.0f / qs), -448.0f), 448.0f);
+      code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cvq, cvq, 0, false) & 0xff);
+    }
+    if (active) oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
+  }
+}
+
+/* Run 283 (briefs/2026-11-11-gdn-split-latency.md; KG17): of the brief's three EXACT load-chain changes, L1 (the anchor
+ * slot selected from the sidx registers instead of a dependent reload, -1.3 us a launch at T 4) is FOLDED into every
+ * form above; L2 (the replay rows preloaded) was slower and is dropped; N1 -- the split fold's norm, gate, store and
+ * quantiser (ru_split_norm_body<2>, the int8 codes) run by the head's last arriving slice over the head's T rows, the
+ * norm launch skipped -- was exact over 3,000 stressed calls but slower (+3.9 us at T 4) and stays an opt-in RECORD:
+ * LAT = 4 (RADIANCE_XE_GDN_LAT=7 on the VS 2 split at KT 8, the coordinator's switch value). LAT 0 is the kernel. */
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0, int KT = 2>
+          int CV = 0, int KT = 2, int LAT = 0>
 __global__ __launch_bounds__(RU_V / VS * KT)
 void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
@@ -297,6 +366,12 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   XE_SHARED(unsigned short, cvq, CV ? RU_CVT * RU_K : 1); XE_SHARED(unsigned short, cvk, CV ? RU_CVT * RU_K : 1);
   XE_SHARED(unsigned short, cvv, CV ? RU_CVT * RU_V : 1);
   XE_SHARED_VAR(int, cvlast);
+  /* N1 (LAT & 4): the folded norm's LDS, one 128-row group a token (THR / RU_V groups a pass), and the arrival flag */
+  static_assert(!(LAT & 4) || (CV && !NORM && VS == 2 && KT == 8 && THR % RU_V == 0), "N1 is the VS 2 split at KT 8");
+  XE_SHARED(float, ns2, (LAT & 4) ? THR : 1);
+  XE_SHARED(float, nws, (LAT & 4) ? THR / kSplitNormRowsAWave : 1);
+  XE_SHARED(float, nred, (LAT & 4) ? THR / RU_V : 1);
+  XE_SHARED_VAR(int, nlast);
   /* The key head's history for the final rewrite (two newest history entries and this step's
    * inputs, one channel per thread), parked in LDS: in registers across the token loop they spill. */
   XE_SHARED(unsigned short, cvh, CV ? (CS - 1 + RU_CVT) * THR : 1);
@@ -425,7 +500,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       ? (const ST*)(state + (size_t)(mrk == 0 ? sf2 : (mrk == 1 ? sf : sf0)) * st_slot
                     + (size_t)hv * st_head)
       : (const ST*)fb;
-  const int si = sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
+  /* Run 283 (briefs/2026-11-11-gdn-split-latency.md L1, folded after KG17: exact in every form, -1.3 us a launch at
+   * T 4): in the anchor form acol is 1, 2 or 3 and those columns' slots are in registers from the row's loads above
+   * (sa1, sa2, sf0) -- select instead of a dependent reload: the same integer, one round trip fewer */
+  const int si = ANC ? (acol == 1 ? sa1 : (acol == 2 ? sa2 : sf0)) : sidx[(size_t)n * sidx_stride + (nacc - 1)];
   // A negative slot is padding; 0 is a real slot.
   if (si < 0) return;
   /* Fixed 32-row group (see RU_FSTR), uniform per wave for any VS (a wave is 16 consecutive rows
@@ -442,6 +520,8 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   }
 
   if (ANC) {
+    /* (the brief's L2 -- the replay rows preloaded four at a time -- was exact but slower in KG17, +2.2 us at T 4:
+     * dropped; today's loop stays) */
     for (int t = 0; t < nacc; ++t) {
       const ST* f = fr + (size_t)t * RU_FSTR;
       float kk[HK];
@@ -747,6 +827,35 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     }
   }
 
+  if constexpr (LAT & 4) {
+    /* N1: the head's last arriving slice norms, gates, stores and quantises the head's T rows itself, so the norm
+     * launch is skipped. Every lane's onf stores are issued before the barrier; the slice's device fence orders them
+     * before its arrival, and the last arriver fences again before reading both slices' rows (the same code as
+     * ru_split_norm_kernel: the same bits). THR / RU_V tokens a pass, a 128-row group each. */
+    __syncthreads();
+    if (tid == 0) {
+      __threadfence();                                  /* release: this slice's onf rows before its arrival */
+      const unsigned int wasn = __hip_atomic_fetch_add(cv.nctr + (size_t)n * H + hv, 1u, __ATOMIC_RELAXED,
+                                                       __HIP_MEMORY_SCOPE_AGENT);
+      nlast = wasn == (unsigned)(VS - 1);
+      if (nlast) {
+        __threadfence();                                /* acquire, in the arriving thread: the other slices' rows */
+        __hip_atomic_store(cv.nctr + (size_t)n * H + hv, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      }
+    }
+    __syncthreads();
+    if (nlast) {
+      __threadfence();                                  /* every lane of the last arriver, before its reads */
+      constexpr int NG = THR / RU_V;
+      const int tg = tid / RU_V, nrow = tid - tg * RU_V;
+      for (int t0 = 0; t0 < T; t0 += NG) {
+        const int t = t0 + tg;
+        ru_split_norm_body<2>(t < T, bos + t, hv, nrow, cv.onf, o, oq, os, oq_pitch, os_ld, zg, zg_pitch, nw, neps,
+                              nact, H, ns2 + tg * RU_V, nws + tg * (RU_V / kSplitNormRowsAWave), nred + tg);
+      }
+    }
+  }
+
   if constexpr (CV) {
     // The last arriving reader rewrites the key head's q and k channels. The count was taken
     // before the token loop, hiding its latency. Split: G x VS readers.
@@ -798,8 +907,13 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
  * Exactness: the same operations on the same operands per (row, half) lane; the row's 8 lanes stay consecutive in
  * one sub-group, so ru_row_sum<8> pairs the same halves in the same xor order. The gate is the hashes (gdn_split_bench
  * anchor-seq) against the fused kernel. GRF 256 in stage 1 (the fused kernel's); the zeinfo must show zero scratch.
- * Not for the CPU module (KT 8). */
-template <int NT, int ANC, int SDT, int VS, int GC>
+ * Not for the CPU module (KT 8).
+ * Run 284 (the coordinator's diagnostic sweep of stage 1): DG picks a TIMING-ONLY variant, compiled into the launcher
+ * only under XE_GDN_SG_DIAG (the bench build; never an image) -- 1 the last arriver's tail skipped, 2 the skh / sgb
+ * parks skipped, 3 the sbad barrier removed (a per-thread early return), 4 the per-token global stores skipped (the
+ * factor v, its duplicates, onf), 5 q / k read straight from global x (no q | k convolution: wrong values), 6 GC 1
+ * (one value head a workgroup; DG 6 changes nothing else). DG 0 is the kernel above, bit for bit. */
+template <int NT, int ANC, int SDT, int VS, int GC, int DG = 0>
 __global__ __launch_bounds__(GC * RU_V / VS * 8)
 void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ bv, long ab_stride,
                          const float* __restrict__ A_log, const float* __restrict__ dt_bias,
@@ -822,17 +936,20 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
   XE_SHARED(float, sgb, GC * RU_CVT * 2);                           /* [head][token][g, bt] */
   XE_SHARED_VAR(int, cvlast);
   XE_SHARED_VAR(int, sbad);
-  const int n = blockIdx.x, hk = blockIdx.y, s = blockIdx.z;
+  const int G = H / Hg;   /* == GC (the launcher checks); at GC 1 (the sweep's V6) blockIdx.y is the value head */
+  const int n = blockIdx.x, hk = GC == 1 ? (int)blockIdx.y / G : (int)blockIdx.y, s = blockIdx.z;
   const int bos = cu[n], T = cu[n + 1] - bos;
   const bool empty = (T <= 0);
   if (empty && !ANC) return;
   const int tid = threadIdx.x;
   const int gi = tid / HT, ti = tid - gi * HT, rl = ti / KT, half = tid & (KT - 1), k0 = half * HK;
-  const int hv = hk * GC + gi, row = s * NR + rl;
-  const int G = H / Hg;   /* == GC (the launcher checks) */
+  const int hv = GC == 1 ? (int)blockIdx.y : hk * GC + gi, row = s * NR + rl;
+  const unsigned last_arrival = (unsigned)(GC == 1 ? VS * G - 1 : VS - 1);   /* the key head's arrivals a launch */
   const float a_log_h = A_log[hv], dtb = dt_bias[hv];
-  if (tid == 0) sbad = 0;
-  __syncthreads();                                        /* sbad's zero is ordered before any lane's set */
+  if constexpr (DG != 3) {
+    if (tid == 0) sbad = 0;
+    __syncthreads();                                      /* sbad's zero is ordered before any lane's set */
+  }
 
   /* ---- the convolution's inputs first (in flight during the replay) */
   float cwa[CPT][CW], cwb[CW], cba[CPT], cbb = 0.0f;
@@ -849,6 +966,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
     if (cslot < 0) return;                               /* padding: every workgroup of the sequence leaves */
     const int off = naccept ? naccept[n] - 1 : 0;
     const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
+    if constexpr (DG != 5) {
 #pragma unroll
     for (int c = 0; c < CPT; ++c) {
       const int ch = tid + c * THR;                       /* this thread's q | k channel(s) */
@@ -864,6 +982,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
 #pragma unroll
         for (int i = 0; i < CS; ++i) cha[c][i] = spa[c][(size_t)(off + i) * cv.cs_tok];
       }
+    }
     }
     if (half == 0) {                                      /* one v channel a (head, row): this lane's own */
       const int cb = (2 * Hg + hv) * RU_V + row;
@@ -905,12 +1024,17 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
   const ST* const fr = (ANC && RU_ANC_MARK && (RU_ANC_FRD || !RU_ANC_DUP))
       ? (const ST*)(state + (size_t)(mrk == 0 ? sf2 : (mrk == 1 ? sf : sf0)) * st_slot + (size_t)hv * st_head)
       : (const ST*)fb;
-  const int si = sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
+  /* run 283 (L1, folded as in the kernel above): the anchor column's slot from the registers, not a dependent reload */
+  const int si = ANC ? (acol == 1 ? sa1 : (acol == 2 ? sa2 : sf0)) : sidx[(size_t)n * sidx_stride + (nacc - 1)];
   /* the anchor slot is per (sequence, head's marker): make a negative one uniform over the slice-group before any
    * barrier (consistent markers agree; a disagreement counts the whole sequence as padding, as the plan says) */
-  if (si < 0) sbad = 1;
-  __syncthreads();
-  if (sbad) return;
+  if constexpr (DG == 3) {                                /* the sweep's V3: a per-thread early return, no barrier */
+    if (si < 0) return;
+  } else {
+    if (si < 0) sbad = 1;
+    __syncthreads();
+    if (sbad) return;
+  }
   const int grp = __builtin_amdgcn_readfirstlane(row >> 5);
 
   float h[HK];
@@ -964,7 +1088,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
       if (tid == 0) {
         const unsigned int was = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
                                                         __HIP_MEMORY_SCOPE_AGENT);
-        if (was == (unsigned)(VS - 1)) {
+        if (was == last_arrival) {
           __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
           stamp_group();
         }
@@ -991,6 +1115,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
       }
     }
   };
+  if constexpr (DG != 5) {
 #pragma unroll
   for (int c = 0; c < CPT; ++c) {
     const int ch = tid + c * THR;
@@ -1003,6 +1128,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
         if (t < T) cvh[(CS - 1 + t) * (2 * RU_K) + ch] = cxa[c][t];
     }
   }
+  }
   if (half == 0) {   /* this lane's (head, row) v channel: one reader, this workgroup */
     conv(cwb, cbb, chb, cxb, cvv + gi * RU_CVT * RU_K + rl);   /* dst[t * RU_K]: this head's [token][row] block */
     ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
@@ -1013,10 +1139,18 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
     arrived = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
   const float alog = __expf(a_log_h);
+  float dsink = 0.0f;                                     /* the sweep's V4: keeps `on` alive without its store */
   for (int t = 0; t < T; ++t) {
     const int tok = bos + t;
-    const unsigned short* qp = cvq + t * RU_K + k0;
-    const unsigned short* kp = cvk + t * RU_K + k0;
+    const unsigned short* qp;
+    const unsigned short* kp;
+    if constexpr (DG == 5) {                              /* the sweep's V5: unconvolved x from global (wrong values) */
+      qp = cv.x + (size_t)tok * cv.xpitch + hk * RU_K + k0;
+      kp = cv.x + (size_t)tok * cv.xpitch + (Hg + hk) * RU_K + k0;
+    } else {
+      qp = cvq + t * RU_K + k0;
+      kp = cvk + t * RU_K + k0;
+    }
     float qq[HK], kk[HK];
 #pragma unroll
     for (int j = 0; j < HK; j += 8) {
@@ -1048,17 +1182,21 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
     if (ANC) {
       /* this step's factors for the next step's replay: the key head's scaled k and this head's (g, bt) are parked
        * in LDS for the last arriver (the race fix); every lane writes its own row's v now */
-      if (tid < KT) {                                     /* row 0 of head 0: the key head's k, the same every row */
+      if constexpr (DG != 2) {                            /* the sweep's V2 skips the parks */
+        if (tid < KT) {                                   /* row 0 of head 0: the key head's k, the same every row */
 #pragma unroll
-        for (int j = 0; j < HK; ++j) skh[t * RU_K + k0 + j] = kk[j];
+          for (int j = 0; j < HK; ++j) skh[t * RU_K + k0 + j] = kk[j];
+        }
+        if (ti == 0) { sgb[(gi * RU_CVT + t) * 2] = g; sgb[(gi * RU_CVT + t) * 2 + 1] = bt; }
       }
-      if (ti == 0) { sgb[(gi * RU_CVT + t) * 2] = g; sgb[(gi * RU_CVT + t) * 2 + 1] = bt; }
-      if (half == 0) {
-        ST* f  = fb  + (size_t)t * RU_FSTR;
-        f[4 * RU_K + row] = (ST)vraw;
-        if (dup_f) {
-          fb0[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
-          fb2[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
+      if constexpr (DG != 4) {                            /* the sweep's V4 skips the per-token global stores */
+        if (half == 0) {
+          ST* f  = fb  + (size_t)t * RU_FSTR;
+          f[4 * RU_K + row] = (ST)vraw;
+          if (dup_f) {
+            fb0[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
+            fb2[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
+          }
         }
       }
     }
@@ -1066,7 +1204,11 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
 #pragma unroll
     for (int j = 0; j < HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
     on = ru_row_sum<KT>(on);
-    if (half == 0) cv.onf[((size_t)tok * H + hv) * RU_V + row] = on;
+    if constexpr (DG != 4) {
+      if (half == 0) cv.onf[((size_t)tok * H + hv) * RU_V + row] = on;
+    } else {
+      dsink += on;
+    }
     if (!ANC) {
       const int so = sidx[(size_t)n * sidx_stride + t];
       if (so >= 0) {
@@ -1081,9 +1223,11 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
    * the key head's conv state; everyone else leaves. The parked values are complete: every lane's loop is done
    * before the barrier below, and the last arrival follows every slice's replay (each arrived after its own replay
    * and conv barrier). */
+  if constexpr (DG == 4) { if (dsink == 1.2345e-37f) cv.onf[0] = dsink; }   /* the sink: never true in practice */
+  if constexpr (DG == 1) return;                          /* the sweep's V1: no tail (the counter stays unreset) */
   __syncthreads();
   if (tid == 0) {
-    cvlast = arrived == (unsigned)(VS - 1);
+    cvlast = arrived == last_arrival;
     if (cvlast) __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
   __syncthreads();
@@ -1118,6 +1262,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
     if constexpr (RU_ANC_MARK) { if (tid == 0) stamp_group(); }
   }
   /* the key head's conv state, one channel a thread from the parked history */
+  if constexpr (DG != 5) {
 #pragma unroll
   for (int c = 0; c < CPT; ++c) {
     const int ch = tid + c * THR;
@@ -1131,6 +1276,7 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
       ru_conv_rewrite(spa[c], rh, rx, T, cv.cs_tok);
     }
   }
+  }
 }
 /* ============================================================================================================ */
 
@@ -1138,8 +1284,8 @@ void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ b
  * It is the fused path's arithmetic in the fused path's order at KT 8: on^2 a row; a 32-lane wave there holds four
  * rows (lanes 0 / 8 / 16 / 24) and its xor tree gives (r0^2 + r2^2) + (r1^2 + r3^2) (the other lanes add zeros); the
  * 32 wave sums are added in order from 0; then the gate, the bf16 store and the quantiser as there. The same bits.
- * Tokens past cu's end and padding sequences (no conv slot) are left alone, as the fused fold leaves them. */
-constexpr int kSplitNormRowsAWave = 4;   /* RU_V rows over 1,024 threads at KT 8, 32 lanes a wave */
+ * Tokens past cu's end and padding sequences (no conv slot) are left alone, as the fused fold leaves them.
+ * Run 284: the body is ru_split_norm_body (above the update kernel), shared with the split kernel's N1 fold. */
 template <int NQ>
 __global__ __launch_bounds__(RU_V)
 void ru_split_norm_kernel(const float* __restrict__ onf, unsigned short* __restrict__ o,
@@ -1155,48 +1301,8 @@ void ru_split_norm_kernel(const float* __restrict__ onf, unsigned short* __restr
   int lo = 0, hi = N;                        /* the token's sequence: the last n with cu[n] <= tok */
   while (hi - lo > 1) { const int mid = (lo + hi) / 2; if (cu[mid] <= tok) lo = mid; else hi = mid; }
   if (cidx[(size_t)lo * ci_stride] < 0) return;
-  float on = onf[((size_t)tok * H + hv) * RU_V + row];
-  s2[row] = on * on;
-  __syncthreads();
-  if (row < RU_V / kSplitNormRowsAWave) {
-    const int r0 = row * kSplitNormRowsAWave;
-    ws[row] = (s2[r0] + s2[r0 + 2]) + (s2[r0 + 1] + s2[r0 + 3]);
-  }
-  __syncthreads();
-  if (row == 0) {
-    float tot = 0.0f;
-    for (int i = 0; i < RU_V / kSplitNormRowsAWave; ++i) tot += ws[i];
-    red = tot;
-  }
-  __syncthreads();
-  const float sc = __frsqrt_rn(red * (1.0f / RU_V) + neps);
-  const unsigned short zr = zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row];
-  on *= sc * nw[row] * ru_act(bf2f(zr), nact);
-  const unsigned short ob = f2bf(on);
-  o[((size_t)tok * H + hv) * RU_V + row] = ob;
-  if constexpr (NQ != 0) {
-    const float ov = bf2f(ob);
-    __syncthreads();                         /* red is read above by every thread */
-    s2[row] = fabsf(ov);
-    __syncthreads();
-    if (row == 0) {
-      float amax = 0.0f;
-      for (int i = 0; i < RU_V; ++i) amax = fmaxf(amax, s2[i]);
-      red = amax;
-    }
-    __syncthreads();
-    const float amax = red;
-    const float qs = amax > 0.0f ? amax * (1.0f / q8_top<NQ == 2>()) : 1.0f;
-    if (row == 0) os[(size_t)tok * os_ld + hv] = qs;
-    unsigned char code;
-    if constexpr (NQ == 2) {
-      code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f));
-    } else {
-      const float cvq = fminf(fmaxf(ov * (1.0f / qs), -448.0f), 448.0f);
-      code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cvq, cvq, 0, false) & 0xff);
-    }
-    oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
-  }
+  ru_split_norm_body<NQ>(true, tok, hv, row, onf, o, oq, os, oq_pitch, os_ld, zg, zg_pitch, nw, neps, nact, H,
+                         s2, ws, &red);
 }
 
 // Non-temporal hint on the state load and store (TH_LOAD_NT / TH_STORE_NT): no result changes;
@@ -1394,6 +1500,29 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   return (unsigned int*)p;
 }
 
+/* Run 284 (the gdn-split-latency brief's N1): the per-(sequence, value head) arrival counters of the split fold's own
+ * norm, kMaxConvCtr of them, allocated and zeroed as ru_conv_ctr's block (one per (stream, output)); the launcher
+ * declines N1 when N * H exceeds the block. */
+static unsigned int* ru_split_ctr(RadStream s, const void* out) {
+  static std::mutex m;
+  static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
+  std::lock_guard<std::mutex> lk(m);
+  const auto key = std::make_pair(s, out);
+  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  sycl::queue& q = *(sycl::queue*)s;
+  void* p = nullptr;
+  try {
+    p = sycl::malloc_device((size_t)kMaxConvCtr * sizeof(unsigned int), q);
+    if (!p) return nullptr;
+    sycl::queue(q.get_context(), q.get_device()).memset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)).wait();
+  } catch (const sycl::exception&) {
+    if (p) sycl::free(p, q);
+    return nullptr;
+  }
+  blocks.emplace(key, (unsigned int*)p);
+  return (unsigned int*)p;
+}
+
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
 // factor-block bounds are as in ru_update_launch.
@@ -1440,16 +1569,40 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   }();
   if (split_sg && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK) && H % Hg == 0
       && H / Hg == 3) {
-    const dim3 ggrid(N, Hg, split_sg), gblk(3 * RU_V / split_sg * RC_KT);
-#define RC_SG_A(VSC, NTC, ANCC, SDTC)                                                                           \
-  XE_LAUNCH_GGL_GRF256((ru_sg_update_kernel<NTC, ANCC, SDTC, VSC, 3>), ggrid, gblk, 0, (hipStream_t)stream,      \
+    dim3 ggrid(N, Hg, split_sg), gblk(3 * RU_V / split_sg * RC_KT);
+#define RC_SG_A(VSC, NTC, ANCC, SDTC, GCC, DGC)                                                                 \
+  XE_LAUNCH_GGL_GRF256((ru_sg_update_kernel<NTC, ANCC, SDTC, VSC, GCC, DGC>), ggrid, gblk, 0, (hipStream_t)stream, \
                      a, b, ab_stride, (const float*)A_log, (const float*)dt_bias, (ru_state<SDTC>::T*)state,     \
                      st_slot, st_head, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc, H, Hg,  \
                      scale, thr, cv)
-#define RC_SG(VSC, NTC, SDTC) do { if (anc) RC_SG_A(VSC, NTC, 1, SDTC); else RC_SG_A(VSC, NTC, 0, SDTC); } while (0)
+#define RC_SG(VSC, NTC, SDTC) do { if (anc) RC_SG_A(VSC, NTC, 1, SDTC, 3, 0); else RC_SG_A(VSC, NTC, 0, SDTC, 3, 0); } while (0)
 #define RC_SG_NT(VSC, SDTC) do { if (nt) RC_SG(VSC, 1, SDTC); else RC_SG(VSC, 0, SDTC); } while (0)
 #define RC_SG_VS(SDTC) do { if (split_sg == 16) RC_SG_NT(16, SDTC); else RC_SG_NT(8, SDTC); } while (0)
-    if (sdt) RC_SG_VS(1); else RC_SG_VS(0);
+#ifdef XE_GDN_SG_DIAG
+    /* Run 284 (the coordinator's diagnostic sweep): RADIANCE_XE_GDN_SG_DIAG=1..6 picks one of the kernel's TIMING-ONLY
+     * variants (DG above; the hashes may differ) -- the bench build alone (-DXE_GDN_SG_DIAG=ON), never an image
+     * (make-rt-neo2.sh refuses such a tree). The anchor form at NT 0 and VS 8 only, as the sweep measures; elsewhere
+     * the knob is ignored. V6 is GC 1: grid (N, H, 8), one value head a workgroup of RU_V / 8 x 8 lanes. */
+    static const int sg_diag = [] {
+      const char* e = std::getenv("RADIANCE_XE_GDN_SG_DIAG");
+      const int v = e ? std::atoi(e) : 0;
+      return (v >= 1 && v <= 6) ? v : 0;
+    }();
+    if (sg_diag && anc && !nt && split_sg == 8) {
+      if (sg_diag == 6) { ggrid.y = H; gblk.x = RU_V / 8 * RC_KT; }
+#define RC_SG_D(DGC, GCC) do { if (sdt) RC_SG_A(8, 0, 1, 1, GCC, DGC); else RC_SG_A(8, 0, 1, 0, GCC, DGC); } while (0)
+      switch (sg_diag) {
+        case 1: RC_SG_D(1, 3); break;
+        case 2: RC_SG_D(2, 3); break;
+        case 3: RC_SG_D(3, 3); break;
+        case 4: RC_SG_D(4, 3); break;
+        case 5: RC_SG_D(5, 3); break;
+        default: RC_SG_D(6, 1); break;
+      }
+#undef RC_SG_D
+    } else
+#endif
+    { if (sdt) RC_SG_VS(1); else RC_SG_VS(0); }
 #undef RC_SG_VS
 #undef RC_SG_NT
 #undef RC_SG
@@ -1465,30 +1618,45 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   }
   if (split_vs && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK)) {
     const dim3 sgrid(N, H, split_vs), sblk(RU_V / split_vs * RC_KT);
-#define RC_SPLIT_A(VSC, NTC, ANCC, SDTC)                                                      \
-  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, ANCC, 0, SDTC, 1, RC_KT>), \
+    /* Run 283 (briefs/2026-11-11-gdn-split-latency.md, KG17): RADIANCE_XE_GDN_LAT=7 = N1, the exact opt-in RECORD (the
+     * folded norm; L1 is folded into every kernel, L2 dropped), instantiated for the VS 2 split at NT 0 with the f32
+     * state and the int8 quantiser (the served form) when its counter block holds N * H; elsewhere ignored. With N1
+     * the norm launch below is skipped. */
+    static const int split_lat = [] {
+      const char* e = std::getenv("RADIANCE_XE_GDN_LAT");
+      return (e && std::atoi(e) == 7) ? 7 : 0;
+    }();
+    int lat = (split_vs == 2 && !nt && !sdt) ? split_lat : 0;
+    if (lat && !(oq && oq_i8 && cv.nctr && (long)N * H <= (long)kMaxConvCtr)) lat = 0;
+#define RC_SPLIT_A(VSC, NTC, ANCC, SDTC, LATC)                                                 \
+  XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, ANCC, 0, SDTC, 1, RC_KT, LATC>), \
                      sgrid, sblk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,     \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
-                     nullptr, nullptr, 0L, 0L, (const int*)cu,                                 \
+                     (unsigned char*)oq, (float*)os, oq_pitch, os_ld, (const int*)cu,          \
                      (const int*)sidx, sidx_stride, (const int*)nacc,                          \
                      (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
                      scale, thr, cv)
-#define RC_SPLIT(VSC, NTC, SDTC) do { if (anc) RC_SPLIT_A(VSC, NTC, 1, SDTC); else RC_SPLIT_A(VSC, NTC, 0, SDTC); } while (0)
+#define RC_SPLIT(VSC, NTC, SDTC) do { if (anc) RC_SPLIT_A(VSC, NTC, 1, SDTC, 0); else RC_SPLIT_A(VSC, NTC, 0, SDTC, 0); } while (0)
 #define RC_SPLIT_NT(VSC, SDTC) do { if (nt) RC_SPLIT(VSC, 1, SDTC); else RC_SPLIT(VSC, 0, SDTC); } while (0)
 #define RC_SPLIT_VS(SDTC) do { if (split_vs == 4) RC_SPLIT_NT(4, SDTC); else RC_SPLIT_NT(2, SDTC); } while (0)
-    if (sdt) RC_SPLIT_VS(1); else RC_SPLIT_VS(0);
+#define RC_SPLIT_L(LATC) do { if (anc) RC_SPLIT_A(2, 0, 1, 0, LATC); else RC_SPLIT_A(2, 0, 0, 0, LATC); } while (0)
+    if (lat == 7) RC_SPLIT_L(4);
+    else { if (sdt) RC_SPLIT_VS(1); else RC_SPLIT_VS(0); }
+#undef RC_SPLIT_L
 #undef RC_SPLIT_VS
 #undef RC_SPLIT_NT
 #undef RC_SPLIT
 #undef RC_SPLIT_A
-    const dim3 ngrid((unsigned)ntok, (unsigned)H), nblk(RU_V);
+    if (lat != 7) {
+      const dim3 ngrid((unsigned)ntok, (unsigned)H), nblk(RU_V);
 #define RC_NORM(NQ) hipLaunchKernelGGL((ru_split_norm_kernel<NQ>), ngrid, nblk, 0, (hipStream_t)stream,          \
                                        (const float*)cv.onf, (unsigned short*)o, (unsigned char*)oq, (float*)os, \
                                        oq_pitch, os_ld, (const unsigned short*)z, z_pitch, (const float*)nw,    \
                                        neps, nact, H, (const int*)cu, N, cv.cidx, cv.ci_stride)
-    if (!oq) RC_NORM(0); else if (oq_i8) RC_NORM(2); else RC_NORM(1);
+      if (!oq) RC_NORM(0); else if (oq_i8) RC_NORM(2); else RC_NORM(1);
 #undef RC_NORM
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
   }
 #endif
@@ -1735,6 +1903,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     /* owner note 138: the split fold's scratch, only when RADIANCE_XE_GDN_SPLIT asks for it */
     static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = e ? std::atoi(e) : 0; return v == 2 || v == 4 || v == 8 || v == 16; }();
     cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
+    cv.nctr = split_asked ? ru_split_ctr(s, o->data) : nullptr;   /* run 283, the brief's N1 (RADIANCE_XE_GDN_LAT=7) */
 
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,

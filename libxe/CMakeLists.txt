@@ -97,6 +97,14 @@ endif()
 if(RAD_XE_WMMA_BCAST)
   target_compile_definitions(libxe PRIVATE XE_WMMA_BCAST=1)
 endif()
+# Run 284 (the coordinator's GDN diagnostic sweep): XE_GDN_SG_DIAG=ON compiles the slice-group decode kernel's
+# TIMING-ONLY variants (RADIANCE_XE_GDN_SG_DIAG=1..6, ports/r4d_gdn_recurrent_update_*.cpp) into libxe -- a bench build
+# alone, never an image (m3/make-rt-neo2.sh refuses a tree whose cache has it ON). A cached option: the tree keeps it
+# until a configure with -DXE_GDN_SG_DIAG=OFF.
+option(XE_GDN_SG_DIAG "the GDN slice-group kernel's timing-only variants (bench builds only)" OFF)
+if(XE_GDN_SG_DIAG)
+  target_compile_definitions(libxe PRIVATE XE_GDN_SG_DIAG=1)
+endif()
 
 if(RAD_BUILD_TESTS)
   # This directory is added before the top level's enable_testing(), so enable it here.
@@ -354,6 +362,20 @@ if(RAD_BUILD_TESTS)
   add_executable(xe_vram_fill_probe test/vram_fill_probe.cpp)
   rad_l0_sycl(xe_vram_fill_probe)
   set_target_properties(xe_vram_fill_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # Milestone 3, owner note 61 phase 1: xe direct's standalone proof (card1 only): a SYCL kernel's zebin run from
+  # the engine's own VM, buffers, batch and compute queue on the xe render node. A card probe; no CPU test.
+  add_executable(xe_direct_proof test/xe_direct_proof.cpp ${CMAKE_SOURCE_DIR}/core/device/xe_direct.cpp)
+  rad_l0_sycl(xe_direct_proof)
+  target_link_libraries(xe_direct_proof PRIVATE ${RAD_ZE_LOADER} ${CMAKE_DL_LIBS})
+  set_target_properties(xe_direct_proof PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # the zebins embedded in a host file, with their sections and relocations (CPU only; a tool, no test)
+  add_executable(zebin_dump test/zebin_dump.cpp)
+  set_target_properties(zebin_dump PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  # its CPU side: the command writers, the walker's fields, the cross-thread data, the zebin reader's refusals
+  add_executable(xe_direct_cmds_test test/xe_direct_cmds_test.cpp ${CMAKE_SOURCE_DIR}/core/device/xe_direct.cpp)
+  set_target_properties(xe_direct_cmds_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME xe_direct_cmds_cpu COMMAND xe_direct_cmds_test)
+  set_tests_properties(xe_direct_cmds_cpu PROPERTIES LABELS "xe;fast" TIMEOUT 60)
   # Milestone 3, owner note 47 item 2: libxe's MTP coupling rows against the spechub plugin's host reference rows
   # on the same bytes (dlopen of both libraries; the CPU SYCL device here, card1 in the card steps).
   add_executable(xe_mtp_couple_test test/mtp_couple_test.cpp)

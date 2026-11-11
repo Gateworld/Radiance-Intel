@@ -185,7 +185,15 @@ int main(int argc, char** argv) {
         return rc;
     }
     const int Hg = 8, H = 24, K = 128, V = 128, W = 4, CD = 2 * Hg * K + H * V, SL = 6;   /* SL = 4 tokens + W - 2 */
-    for (int T : { 1, 4 }) {
+    /* RI_GDN_T (run 283): the token counts to run, e.g. "4" alone, so the launch profiler's exit summary (over every
+     * launch of the process) is one T's; default both */
+    std::vector<int> Ts = { 1, 4 };
+    if (const char* e = std::getenv("RI_GDN_T"); e && *e) {
+        Ts.clear();
+        for (const char* p = e; *p; ++p) if (*p >= '1' && *p <= '8') Ts.push_back(*p - '0');
+        if (Ts.empty()) Ts = { 1, 4 };
+    }
+    for (int T : Ts) {
         const int N = 1, S = anchor ? 8 : T + 1;
         const int SW = anchor ? 8 : T;   /* the sidx row: anchor's stride is the draft window + 1 */
         auto dev = [&](size_t bytes) { return sycl::malloc_device<uint8_t>(bytes, q); };
