@@ -704,6 +704,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RadKVGroupDecl sd{};
         sd.kind         = RAD_KV_LINEAR;
         sd.dtype        = RAD_F32;   /* f16 trades draft acceptance for a sliver of step time */
+        /* Intel port, run 294 (owner note 235): RADIANCE_GDN_STATE_F16=1 stores the recurrent state in fp16 (the kernels'
+         * SDT=1 instances: fp16 storage, fp32 arithmetic, in the chunk scan's h0 / ht and the decode update alike) --
+         * opt-in, non-exact, measured by the KL replay first; the default stays fp32. */
+        {
+            static const bool f16 = [] { const char* e = std::getenv("RADIANCE_GDN_STATE_F16"); return e && e[0] == '1'; }();
+            if (f16) {
+                sd.dtype = RAD_F16;
+                rad_note(b, "GDN recurrent state cache in fp16 (RADIANCE_GDN_STATE_F16=1, owner note 235): half the "
+                            "state bytes; the arithmetic stays fp32");
+            }
+        }
         sd.n_head_kv    = m.gcfg.n_head_v;
         sd.state_dim[0] = m.gcfg.head_v;
         sd.state_dim[1] = m.gcfg.head_k;

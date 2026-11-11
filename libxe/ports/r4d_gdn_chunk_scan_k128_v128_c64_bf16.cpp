@@ -30,6 +30,9 @@
 #include "r4d_common.h"
 #include "r4d_gdn_args.h"
 #include "r4d_gdn_wmma.h"
+/* owner note 235 (run 294): the state's range probe, defined beside the recurrent update (off unless
+ * RADIANCE_GDN_STATE_RANGE=1); here it reads ht's slots after a scan that wrote them */
+extern "C" void xe_gdn_state_range_probe(const RadTensor* state, const RadTensor* sidx, int N, int H, RadStream s);
 // Barriers are lds_barrier(): __syncthreads() fences all address spaces, so the barrier after the
 // global O store would wait on s_wait_storecnt_dscnt 0x0.
 
@@ -611,11 +614,13 @@ extern "C" int r4d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s) {
     const float scale = (float)r4d_getf(a, "scale", 1.0);
     const int state_fp16 = st_dt == RAD_F16;
 
-    return R4D_RAW(r4d_gdn_chunk_scan_k128_v128_c64_bf16_sidx(
+    const int rr = r4d_gdn_chunk_scan_k128_v128_c64_bf16_sidx(
         q->data, k->data, v->data, A->data, g->data, bt->data,
         h0 ? h0->data : nullptr, o->data, ht ? ht->data : nullptr, cu->data,
         sidx ? sidx->data : nullptr, sidx && sidx->rank >= 2 ? (long)sidx->stride[0] : 1,
         (long)st_slot, (long)st_head,
-        N, (int)H, (int)Hg, (int)K, (int)V, (int)bt_chunk, scale, state_fp16, s));
+        N, (int)H, (int)Hg, (int)K, (int)V, (int)bt_chunk, scale, state_fp16, s);
+    if (rr == 0 && ht && sidx) xe_gdn_state_range_probe(ht, sidx, N, (int)H, s);   /* owner note 235's range probe */
+    return R4D_RAW(rr);
 }
 

@@ -44,6 +44,7 @@
 #include <map>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #define RU_K   128              // head_k
 #define RU_V   128              // head_v
@@ -1790,6 +1791,116 @@ static int ru_state_form(const RadArgs* a) {
     return std::strcmp(sf, "anchor") == 0 ? 1 : -1;
 }
 
+/* ------------------------------------------------------------- the state's range (owner note 235, run 294)
+ * RADIANCE_GDN_STATE_RANGE=1: before an fp16 state cache is tried, the fp32 state's true range. After every launch that
+ * writes the state (the two update adapters below, the chunk scan's ht), a probe kernel folds max |h| over every slot
+ * the rows name (every head; the factor slots too) into one cell a layer -- the layer being the state pointer in
+ * first-seen order, since each layer's cache slice is its own pointer -- and the cells are printed every
+ * kGdnRangeEvery probes and at exit, against fp16's largest normal, 65,504. A diagnostic: one extra launch a call,
+ * the readback on a private queue (no wait on the engine's stream inside a step). Off, nothing of it runs. */
+template <int SDT>
+__global__ __launch_bounds__(256)
+void gdn_state_range_kernel(const typename ru_state<SDT>::T* __restrict__ state, long st_slot, long st_head,
+                            const int* __restrict__ sidx, long sidx_stride, long per_head, long n_slots,
+                            unsigned* __restrict__ cell) {
+  XE_SHARED(float, red, 256);
+  const int n = blockIdx.x, j = blockIdx.y, h = blockIdx.z, t = threadIdx.x;
+  const int slot = sidx[(size_t)n * sidx_stride + j];
+  float m = 0.0f;
+  if (slot >= 0 && slot < n_slots) {
+    const typename ru_state<SDT>::T* p = state + (size_t)slot * st_slot + (size_t)h * st_head;
+    for (long i = (long)t * 8; i + 8 <= per_head; i += 256 * 8) {
+      float d[8];
+      ru_load8<0, SDT>(d, p + i);
+      for (int k = 0; k < 8; ++k) m = fmaxf(m, fabsf(d[k]));
+    }
+  }
+  red[t] = m;
+  __syncthreads();
+  for (int w = 128; w > 0; w >>= 1) {
+    if (t < w) red[t] = fmaxf(red[t], red[t + w]);
+    __syncthreads();
+  }
+  if (t == 0) atomicMax(cell, __float_as_uint(red[0]));   /* non-negative floats order as their bits */
+}
+namespace {
+constexpr int  kGdnRangeCells = 128;
+constexpr long kGdnRangeEvery = 2000;
+struct GdnRange {
+  std::mutex m;
+  std::vector<const void*> layers;
+  unsigned* dev = nullptr;
+  sycl::queue* q = nullptr;
+  long calls = 0;
+};
+GdnRange& gdn_range() { static GdnRange r; return r; }
+bool gdn_range_on() {
+  static const bool on = [] { const char* e = std::getenv("RADIANCE_GDN_STATE_RANGE"); return e && e[0] == '1'; }();
+  return on;
+}
+void gdn_range_print_locked(GdnRange& r, const char* when) {
+  if (!r.dev || !r.q) return;
+  std::vector<unsigned> h((size_t)kGdnRangeCells, 0u);
+  try {
+    sycl::queue(r.q->get_context(), r.q->get_device()).memcpy(h.data(), r.dev, h.size() * sizeof(unsigned)).wait();
+  } catch (...) { return; }
+  float worst = 0.0f;
+  for (size_t i = 0; i < r.layers.size(); ++i) {
+    float v = 0.0f;
+    std::memcpy(&v, &h[i], sizeof v);
+    if (v > worst) worst = v;
+    std::fprintf(stderr, "[xe] gdn state range (%s): layer %2zu  max |h| %.5g\n", when, i, (double)v);
+  }
+  std::fprintf(stderr, "[xe] gdn state range (%s): %zu layers over %ld probes, worst max |h| %.5g = %.3f %% of fp16's "
+                       "65504\n", when, r.layers.size(), r.calls, (double)worst, 100.0 * (double)worst / 65504.0);
+}
+void gdn_range_print_exit() {
+  GdnRange& r = gdn_range();
+  std::lock_guard<std::mutex> lk(r.m);
+  gdn_range_print_locked(r, "exit");
+}
+/* the cell of a layer's state (allocating the cells on first use; -1 when full or without memory) */
+int gdn_range_cell(const void* state, sycl::queue* q) {
+  GdnRange& r = gdn_range();
+  std::lock_guard<std::mutex> lk(r.m);
+  if (!r.dev) {
+    try {
+      r.dev = sycl::malloc_device<unsigned>((size_t)kGdnRangeCells, *q);
+      sycl::queue(q->get_context(), q->get_device()).memset(r.dev, 0, (size_t)kGdnRangeCells * sizeof(unsigned)).wait();
+    } catch (...) { r.dev = nullptr; return -1; }
+    r.q = q;
+    std::atexit(gdn_range_print_exit);
+  }
+  if (++r.calls % kGdnRangeEvery == 0) gdn_range_print_locked(r, "running");
+  for (size_t i = 0; i < r.layers.size(); ++i) if (r.layers[i] == state) return (int)i;
+  if ((int)r.layers.size() >= kGdnRangeCells) return -1;
+  r.layers.push_back(state);
+  return (int)r.layers.size() - 1;
+}
+}  // namespace
+/* The probe over `state`'s slots named by `sidx` ([N][stride] or [N]) after a launch that wrote them; also called by
+ * the chunk scan (ht). Silent when the flag is off or a shape is not the dense [n_states][H][V][K] cache. */
+extern "C" void xe_gdn_state_range_probe(const RadTensor* state, const RadTensor* sidx, int N, int H, RadStream s) {
+  if (!gdn_range_on() || !state || !sidx || !state->data || !sidx->data || N <= 0 || H <= 0 || !s) return;
+  if (state->rank < 2 || sidx->rank < 1) return;
+  const long st_slot = (long)state->stride[0], st_head = (long)state->stride[1];
+  const long per_head = (long)RU_K * RU_V;
+  if (st_head < per_head || st_slot < st_head * H) return;
+  const long stride = sidx->rank >= 2 ? (long)sidx->stride[0] : 1;
+  if (stride <= 0 || stride > 64) return;
+  const long n_slots = (long)state->shape[0];
+  const int cell = gdn_range_cell(state->data, (sycl::queue*)s);
+  if (cell < 0) return;
+  unsigned* c = gdn_range().dev + cell;
+  const dim3 grid((unsigned)N, (unsigned)stride, (unsigned)H), blk(256);
+  if (state->dtype == RAD_F16)
+    hipLaunchKernelGGL((gdn_state_range_kernel<1>), grid, blk, 0, (hipStream_t)s, (const _Float16*)state->data,
+                       st_slot, st_head, (const int*)sidx->data, stride, per_head, n_slots, c);
+  else if (state->dtype == RAD_F32)
+    hipLaunchKernelGGL((gdn_state_range_kernel<0>), grid, blk, 0, (hipStream_t)s, (const float*)state->data,
+                       st_slot, st_head, (const int*)sidx->data, stride, per_head, n_slots, c);
+}
+
 extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
     if (gdn_dims_ok() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
     const RadTensor* q     = r4d_opt(a, OPD_RU_Q);
@@ -1874,7 +1985,7 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
 
     /* Slot and head strides come from the tensor, so a cache with padded slots is served too
      * (see the header); the engine's own state cache is dense ([n_states, H, V, K] per layer). */
-    return R4D_RAW(ru_update_launch(
+    const int rr = ru_update_launch(
         q->data, k->data, v->data, ta->data, tb->data, (long)ab_stride, ab_is_bf16,
         alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1],
@@ -1884,7 +1995,9 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         nacc ? nacc->data : nullptr, z ? z->data : nullptr, (long)z_row,
         nw ? nw->data : nullptr,
         neps, nact, N, (int)H, (int)Hg, (int)K, (int)V, scale, thr, sfp16, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0));
+        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
+    if (rr == 0) xe_gdn_state_range_probe(state, sidx, N, (int)H, s);   /* owner note 235's range probe (off: nothing) */
+    return R4D_RAW(rr);
 }
 
 
@@ -2000,7 +2113,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
     cv.nctr = split_asked ? ru_split_ctr(s, o->data) : nullptr;   /* run 283, the brief's N1 (RADIANCE_XE_GDN_LAT=7) */
 
-    return ru_conv_recurrent_launch(
+    const int rc_cr = ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
         os ? os->data : nullptr, oq ? (long)r4d_row_pitch(oq) : 0,
@@ -2008,4 +2121,6 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
         oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, (int)T);
+    if (rc_cr == RAD_OK) xe_gdn_state_range_probe(state, sidx, N, (int)H, s);   /* owner note 235's range probe */
+    return rc_cr;
 }
