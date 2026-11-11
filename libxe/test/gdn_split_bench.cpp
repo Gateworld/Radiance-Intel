@@ -14,6 +14,18 @@
  * from the factor block, the six anchor / factor columns on distinct slots (1-3, 4-6) and the read copy's shift
  * marker at 3 (shift +1), so a slice that read a marker another had already stamped would read the wrong anchor
  * column and change the hashes.
+ *
+ * Run 282 (owner note 224 item 2, the GDN redesign's gate; logs/run281-gdn-stage1-plan.md): `anchor-seq [reps]` runs
+ * the anchor form as a SEQUENCE of calls on ONE state -- the factor block zeroed first (marker 0: the default anchor
+ * column), then (T 4, nacc 1), (T 4, nacc 2), (T 2, nacc 4), (T 4, nacc 1), (T 0, fold-only), (T 3, nacc 2), the same
+ * sidx row every call (slide 0: the engine's linear pool, one slot a sequence for its life, the anchor read and written
+ * at column 2 by the marker's algebra) -- and hashes every output after EVERY call, `reps` times over (default 1; 200
+ * shows an intermittent ordering race). Step s + 1 replays step s's factors, so a slice that overwrote a row group's
+ * factors while another slice of the group was still replaying them (the run-271 race at VS 8 / 16) changes the state
+ * hash. The hashes must equal SPLIT 0's after every call. The sliding cases (+1 / -1) come once the bench copies the
+ * engine's column rotation from src/tests/ref_test.cpp; N = 2 with a padding sequence is the next addition.
+ *
+ *   xe_gdn_split_bench LIBXE.so [launches=200] [anchor | anchor-seq [reps=1]]
  */
 #include <sycl/sycl.hpp>
 
@@ -54,12 +66,106 @@ uint64_t fnv(const void* p, size_t n, uint64_t h) {
     return h;
 }
 
+/* Run 282: the anchor form as a sequence of calls on one state (see the header). The buffers are sized for T <= 4
+ * and re-filled per call (the token inputs x / a / b / z from a per-call seed, cu = {0, T}, nacc); the state, the conv
+ * state and the factor block carry over. A hash line per call; `reps` repetitions of the whole schedule. */
+int run_anchor_seq(LaunchFn fn, sycl::queue& q, int reps) {
+    const int Hg = 8, H = 24, K = 128, V = 128, W = 4, CD = 2 * Hg * K + H * V, SL = 6, TM = 4, N = 1, S = 8, SW = 8;
+    struct Call { int T, nacc; };
+    const Call sched[6] = { { 4, 1 }, { 4, 2 }, { 2, 4 }, { 4, 1 }, { 0, 0 }, { 3, 2 } };
+    auto dev = [&](size_t bytes) { return sycl::malloc_device<uint8_t>(bytes, q); };
+    std::vector<uint16_t> hx((size_t)TM * CD), hcw((size_t)CD * W), hcb(CD), hcs((size_t)CD * SL), ha((size_t)TM * H),
+        hb((size_t)TM * H), hz((size_t)TM * H * V);
+    std::vector<float> halog(H), hdtb(H), hst((size_t)S * H * V * K), hnw(V);
+    for (size_t i = 0; i < hcw.size(); ++i) hcw[i] = bf(uni(2, i, -0.5f, 0.5f));
+    for (size_t i = 0; i < hcb.size(); ++i) hcb[i] = bf(uni(3, i, -0.1f, 0.1f));
+    for (size_t i = 0; i < hcs.size(); ++i) hcs[i] = bf(uni(4, i, -2.f, 2.f));
+    for (int i = 0; i < H; ++i) { halog[i] = uni(8, i, -1.f, 1.f); hdtb[i] = uni(9, i, -1.f, 1.f); }
+    for (size_t i = 0; i < hst.size(); ++i) hst[i] = uni(10, i, -0.2f, 0.2f);
+    for (int i = 0; i < V; ++i) hnw[i] = uni(11, i, 0.5f, 1.5f);
+    /* the factor slots 4-6 ZEROED (a fresh block: marker 0 reads as absent, so the first call takes the default anchor
+     * column 2 = slot 3; its replay of a zero factor leaves the state as it was); the anchor slots 1-3 random */
+    const size_t head = (size_t)V * K;
+    for (int sl = 4; sl <= 6; ++sl)
+        for (size_t i = 0; i < (size_t)H * head; ++i) hst[(size_t)sl * H * head + i] = 0.0f;
+    std::vector<int32_t> hcidx = { 0 }, hcu = { 0, 0 }, hsidx(SW), hnacc = { 0 };
+    for (int i = 0; i < 6; ++i) hsidx[i] = 1 + i;   /* anchor 1-3, factors 4-6, the same row every call (slide 0) */
+    hsidx[6] = 7; hsidx[7] = 7;
+    uint8_t *dx = dev(hx.size() * 2), *dcw = dev(hcw.size() * 2), *dcb = dev(hcb.size() * 2), *dcs = dev(hcs.size() * 2),
+            *da = dev(ha.size() * 2), *db = dev(hb.size() * 2), *dz = dev(hz.size() * 2), *dal = dev(H * 4),
+            *ddt = dev(H * 4), *dst = dev(hst.size() * 4), *dnw = dev(V * 4), *dci = dev(4), *dcu = dev(8),
+            *dsi = dev(SW * 4), *dO = dev((size_t)TM * H * V * 2), *dq = dev((size_t)TM * H * V), *ds = dev((size_t)TM * H * 4),
+            *dna = dev(4);
+    q.memcpy(dcw, hcw.data(), hcw.size() * 2); q.memcpy(dcb, hcb.data(), hcb.size() * 2);
+    q.memcpy(dal, halog.data(), H * 4); q.memcpy(ddt, hdtb.data(), H * 4); q.memcpy(dnw, hnw.data(), V * 4);
+    q.memcpy(dci, hcidx.data(), 4); q.memcpy(dsi, hsidx.data(), SW * 4);
+    q.wait();
+    const uint64_t f0 = 1469598103934665603ull;
+    int rc_all = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        /* the state and the conv state start the same every repetition */
+        q.memcpy(dst, hst.data(), hst.size() * 4); q.memcpy(dcs, hcs.data(), hcs.size() * 2); q.wait();
+        for (int c = 0; c < 6; ++c) {
+            const int T = sched[c].T, nacc = sched[c].nacc;
+            const uint64_t seed = 100 + (uint64_t)c;
+            for (size_t i = 0; i < (size_t)T * CD; ++i) hx[i] = bf(uni(seed, i, -2.f, 2.f));
+            for (size_t i = 0; i < (size_t)T * H; ++i) { ha[i] = bf(uni(seed + 20, i, -3.f, 3.f)); hb[i] = bf(uni(seed + 40, i, -3.f, 3.f)); }
+            for (size_t i = 0; i < (size_t)T * H * V; ++i) hz[i] = bf(uni(seed + 60, i, -3.f, 3.f));
+            hcu[1] = T; hnacc[0] = nacc;
+            if (T > 0) {
+                q.memcpy(dx, hx.data(), (size_t)T * CD * 2); q.memcpy(da, ha.data(), (size_t)T * H * 2);
+                q.memcpy(db, hb.data(), (size_t)T * H * 2); q.memcpy(dz, hz.data(), (size_t)T * H * V * 2);
+            }
+            q.memcpy(dcu, hcu.data(), 8); q.memcpy(dna, hnacc.data(), 4);
+            q.memset(dO, 0, (size_t)TM * H * V * 2); q.memset(dq, 0, (size_t)TM * H * V); q.memset(ds, 0, (size_t)TM * H * 4);
+            q.wait();
+            const int Tt = T > 0 ? T : 1;   /* the tensors keep a row at T 0 (cu says 0 tokens) */
+            RadTensor t[18] = {
+                ten(dx, RAD_BF16, { Tt, CD }), ten(dcw, RAD_BF16, { CD, W }), ten(dcb, RAD_BF16, { CD }),
+                ten(dcs, RAD_BF16, { 1, CD, SL }), ten(dci, RAD_I32, { N }), ten(da, RAD_BF16, { Tt, H }),
+                ten(db, RAD_BF16, { Tt, H }), ten(dal, RAD_F32, { H }), ten(ddt, RAD_F32, { H }),
+                ten(dst, RAD_F32, { S, H, V, K }), ten(dsi, RAD_I32, { N, SW }), ten(dna, RAD_I32, { N }),
+                ten(dcu, RAD_I32, { N + 1 }),
+                ten(dz, RAD_BF16, { Tt, H * V }), ten(dnw, RAD_F32, { V }), ten(dO, RAD_BF16, { Tt, H, V }),
+                ten(dq, RAD_I8, { Tt, H * V }), ten(ds, RAD_F32, { Tt, H }) };
+            RadParam p[8]{};
+            const char* ik[] = { "head_k", "head_v", "conv_width", "n_head_v" };
+            const long long iv[] = { K, V, W, H };
+            for (int i = 0; i < 4; ++i) { p[i].key = ik[i]; p[i].kind = RAD_P_INT; p[i].ival = iv[i]; }
+            p[4].key = "scale"; p[4].kind = RAD_P_F64; p[4].dval = 1.0 / std::sqrt((double)K);
+            p[5].key = "eps"; p[5].kind = RAD_P_F64; p[5].dval = 1e-6;
+            p[6].key = "state_form"; p[6].kind = RAD_P_STR; p[6].sval = "anchor";
+            RadArgs args{};
+            args.t = t; args.n_t = 18; args.p = p; args.n_p = 7;
+            const int rc = fn(&args, (RadStream)&q);
+            q.wait_and_throw();
+            if (rc != RAD_OK && T == 0) {   /* a fold-only call the row refuses at N 1: recorded, not a failure (the same for every SPLIT) */
+                std::printf("RESULT anchor-seq rep %d call %d (T 0 fold-only): refused rc %d, skipped\n", rep, c, rc);
+                continue;
+            }
+            if (rc != RAD_OK) { std::printf("RESULT anchor-seq rep %d call %d (T %d nacc %d): launch refused rc %d\n", rep, c, T, nacc, rc); rc_all = 1; break; }
+            std::vector<uint8_t> o((size_t)Tt * H * V * 2), oq((size_t)Tt * H * V), os((size_t)Tt * H * 4), st(hst.size() * 4),
+                cs(hcs.size() * 2);
+            q.memcpy(o.data(), dO, o.size()); q.memcpy(oq.data(), dq, oq.size()); q.memcpy(os.data(), ds, os.size());
+            q.memcpy(st.data(), dst, st.size()); q.memcpy(cs.data(), dcs, cs.size()); q.wait();
+            std::printf("RESULT anchor-seq rep %d call %d (T %d nacc %d) hashes: o %016llx codes %016llx scales %016llx state %016llx conv %016llx\n",
+                        rep, c, T, nacc, (unsigned long long)fnv(o.data(), o.size(), f0), (unsigned long long)fnv(oq.data(), oq.size(), f0),
+                        (unsigned long long)fnv(os.data(), os.size(), f0), (unsigned long long)fnv(st.data(), st.size(), f0),
+                        (unsigned long long)fnv(cs.data(), cs.size(), f0));
+        }
+        if (rc_all) break;
+    }
+    for (uint8_t* x : { dx, dcw, dcb, dcs, da, db, dz, dal, ddt, dst, dnw, dci, dcu, dsi, dO, dq, ds, dna }) sycl::free(x, q);
+    return rc_all;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: xe_gdn_split_bench LIBXE.so [launches]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: xe_gdn_split_bench LIBXE.so [launches] [anchor | anchor-seq [reps]]\n"); return 2; }
     const int launches = argc > 2 ? std::atoi(argv[2]) : 200;
     const bool anchor = argc > 3 && std::strcmp(argv[3], "anchor") == 0;
+    const bool seq = argc > 3 && std::strcmp(argv[3], "anchor-seq") == 0;
     void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::printf("dlopen %s: %s\n", argv[1], dlerror()); return 2; }
     LaunchFn fn = (LaunchFn)dlsym(h, "r4d_rad_gdn_conv_recurrent_update");
@@ -71,7 +177,13 @@ int main(int argc, char** argv) {
     const char* sp = std::getenv("RADIANCE_XE_GDN_SPLIT");
     std::printf("gdn_split_bench: %s, RADIANCE_XE_GDN_SPLIT=%s, %s\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str(), sp ? sp : "(unset)",
-                anchor ? "anchor" : "per_candidate");
+                seq ? "anchor-seq" : anchor ? "anchor" : "per_candidate");
+    if (seq) {
+        const int reps = argc > 4 ? std::atoi(argv[4]) : 1;
+        const int rc = run_anchor_seq(fn, q, reps);
+        std::printf("RESULT gdn_split_bench %s\n", rc ? "FAIL" : "DONE");
+        return rc;
+    }
     const int Hg = 8, H = 24, K = 128, V = 128, W = 4, CD = 2 * Hg * K + H * V, SL = 6;   /* SL = 4 tokens + W - 2 */
     for (int T : { 1, 4 }) {
         const int N = 1, S = anchor ? 8 : T + 1;

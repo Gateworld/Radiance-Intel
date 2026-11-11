@@ -361,8 +361,11 @@ struct HcW {
 inline float hcw_bf2f(uint32_t b16) { return __uint_as_float(b16 << 16); }
 inline uint16_t hcw_f2bf(float f) { return (uint16_t)((__float_as_uint(f) + 0x8000u) >> 16); }
 
-/* One all-reduce: words of 32 bits (two bf16/fp16 or one f32); `n32` words in the message. */
-template <int DT, bool HW = false, int PR = 0>
+/* One all-reduce: words of 32 bits (two bf16/fp16 or one f32); `n32` words in the message.
+ * ST (run 282, the coordinator's ask after AR2): the B.0 stamps as a compile-time parameter, so the default instance's
+ * code is today's kernel (no dormant branches: AR2's stamped <0,0,5> had grown 513 -> 677 instructions) and
+ * XE_AR_STAMPS=1 selects the stamped instance (PR 5 only). */
+template <int DT, bool HW = false, int PR = 0, bool ST = false>
 void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_t* peer_slots, uint32_t* my_slots,
                uint32_t* peer_flags, uint32_t* my_flags, uint32_t* seq_ctr, uint32_t n32, uint32_t slot_words,
                uint32_t rank, uint32_t nblk, uint32_t spin, HcW hw, uint64_t* ring, uint32_t tear, uint64_t* stamps) {
@@ -410,15 +413,16 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
          * page-aligned, so every pair's store is 16-byte aligned. An odd last word of the message goes alone. */
         uint64_t* out64 = (uint64_t*)peer_slots + par * (slot_words / 2);
         const uint64_t* in64 = (const uint64_t*)my_slots + par * (slot_words / 2);
-        /* B.0's stamps (see ar_clock): thread 0 of every block; the branches are uniform and read once a launch */
-        const bool st = stamps != nullptr && t == 0;
+        /* B.0's stamps (see ar_clock): thread 0 of every block, in the ST instance only (the default instance compiles
+         * none of this) */
+        const bool st = ST && stamps != nullptr && t == 0;
         uint64_t tc0 = 0, tc1 = 0, tc2 = 0, tc3 = 0;
         if (st) { se = ar_stamp_entry(stamps, s, b); tc0 = ar_clock(); }
         for (uint32_t k = w0 + 2u * t; k < w1; k += 2u * kWG) {
             if (k + 1u < w1) uc_st128(out64 + k, v2u64{((uint64_t)s << 32) | x[k], ((uint64_t)s << 32) | x[k + 1u]});
             else uc_st64(out64 + k, ((uint64_t)s << 32) | x[k]);
         }
-        if (st) tc1 = ar_clock();
+        if constexpr (ST) { if (st) tc1 = ar_clock(); }
         uint32_t ok = 1, polls0 = 0, polls_all = 0;
         bool first = true;
         for (uint32_t k = w0 + 2u * t; k < w1 && ok; k += 2u * kWG) {
@@ -432,16 +436,18 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
                 sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                 if (--budget == 0) { ok = 0; break; }
             }
-            if (first) { polls0 = spin - budget; first = false; if (st) tc2 = ar_clock(); }
+            if (first) { polls0 = spin - budget; first = false; if constexpr (ST) { if (st) tc2 = ar_clock(); } }
             polls_all += spin - budget;
             if (ok) { emit(k, x[k], (uint32_t)v[0]); if (pair) emit(k + 1u, x[k + 1u], (uint32_t)v[1]); }
         }
-        if (st) {
-            tc3 = ar_clock();
-            if (tc2 == 0) tc2 = tc1;   /* a block with no words of its own: no wait */
-            se[0] = (uint64_t)s | ((uint64_t)nblk << 32);
-            se[1] = tc0; se[2] = tc1; se[3] = tc2; se[4] = tc3;
-            se[7] = (uint64_t)polls0 | ((uint64_t)polls_all << 32);
+        if constexpr (ST) {
+            if (st) {
+                tc3 = ar_clock();
+                if (tc2 == 0) tc2 = tc1;   /* a block with no words of its own: no wait */
+                se[0] = (uint64_t)s | ((uint64_t)nblk << 32);
+                se[1] = tc0; se[2] = tc1; se[3] = tc2; se[4] = tc3;
+                se[7] = (uint64_t)polls0 | ((uint64_t)polls_all << 32);
+            }
         }
         if (b == 0 && t == 0) ar_skew(ring, s, polls0, polls_all);
         if (!ok) ar_gave_up(seq_ctr, rank, s, b, nblk, t);
@@ -638,11 +644,13 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
      * counter behind for the rest of the run, a stall at every later collective) */
     __syncthreads();
     if (t == 0) {
-        const uint64_t tc4 = se ? ar_clock() : 0ull;   /* B.0: T4, the final barrier passed */
+        uint64_t tc4 = 0;
+        if constexpr (ST) { if (se) tc4 = ar_clock(); }   /* B.0: T4, the final barrier passed */
         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> arr(seq_ctr[2]);
         if (arr.fetch_add(1u) + 1u == nblk) { arr.store(0u); uc_st(seq_ctr, s); }
-        if (se) { se[5] = tc4; se[6] = ar_clock(); }   /* T5, the arrival done */
+        if constexpr (ST) { if (se) { se[5] = tc4; se[6] = ar_clock(); } }   /* T5, the arrival done */
     }
+    (void)se; (void)stamps;
 }
 
 /* XE_AR_SPIN: the poll budget (default kSpin); a probe lowers it so a stalled pair fails in seconds */
@@ -681,7 +689,7 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
     try {
         sycl::queue* q = (sycl::queue*)s;
         const dim3 grid(nblk), block(kWG);
-#define XE_ARP(DT, HW_, PR_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_>), grid, block, 0, (const uint32_t*)x->data,       \
+#define XE_ARP(DT, HW_, PR_, ST_) XE_LAUNCH(q, (ar_kernel<DT, HW_, PR_, ST_>), grid, block, 0, (const uint32_t*)x->data, \
                             (uint32_t*)y->data, (uint32_t*)in->peer_scratch, (uint32_t*)in->my_scratch, in->peer_flags, \
                             in->my_flags, in->my_seq, n32, (uint32_t)(in->slot_bytes / 4), (uint32_t)in->rank, nblk,     \
                             spin_budget(), hw ? *hw : HcW{}, in->ring, ar_test_tear(), in->stamps)
@@ -703,7 +711,10 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
                 std::fprintf(stderr, "[xe] all-reduce: form 0 (the all-thread flag poll) dispatched under RADIANCE_XE_AR_PROTO=%d for a %llu-byte message (slot %u bytes, bw_min %llu): neither the LL nor the bandwidth form fit -- see logs/run271-light-poll-design.md\n",
                              ar_proto(), (unsigned long long)bytes, (unsigned)in->slot_bytes, (unsigned long long)ar_bw_min_bytes());
         }
-#define XE_AR(DT, HW_) do { if (bw) XE_ARP(DT, HW_, 6); else if (!ll) XE_ARP(DT, HW_, 0); else if (ar_proto() >= 5) XE_ARP(DT, HW_, 5); else XE_ARP(DT, HW_, 4); } while (0)
+        /* the stamped instance (run 282: a compile-time twin of the PR 5 form) only when XE_AR_STAMPS=1 allocated the ring */
+#define XE_AR(DT, HW_) do { if (bw) XE_ARP(DT, HW_, 6, false); else if (!ll) XE_ARP(DT, HW_, 0, false);                   \
+                            else if (ar_proto() >= 5) { if (in->stamps) XE_ARP(DT, HW_, 5, true); else XE_ARP(DT, HW_, 5, false); } \
+                            else XE_ARP(DT, HW_, 4, false); } while (0)
         if (hw && in->dtype == 0) XE_AR(0, true);
         else switch (in->dtype) { case 0: XE_AR(0, false); break; case 1: XE_AR(1, false); break; default: XE_AR(2, false); break; }
 #undef XE_AR
