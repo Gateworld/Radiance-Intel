@@ -774,6 +774,366 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   }
 }
 
+/* ============================================================================================================
+ * Intel port, run 283 (owner note 224 item 2; briefs/2026-11-11-gdn-redesign-draft.md, logs/run281-gdn-stage1-plan.md):
+ * the decode fold at VS 8 / 16 -- STAGE 1, the structure alone, no arithmetic moved.
+ *
+ * One workgroup is a SLICE-GROUP: the GC (= H / Hg = 3) value heads that share a key head, x NR = RU_V / VS rows each,
+ * x KT = 8 lanes a row. Grid (N, Hg, VS): 64 workgroups at VS 8, 128 at VS 16 (the fused kernel: 24 of 32 cores).
+ *   - the key head's q | k convolution is computed ONCE a workgroup (today: once in each of the G x VS workgroups),
+ *     one channel a thread (two at VS 16), into cvq / cvk shared by the GC heads; the history parked by CHANNEL;
+ *   - the v convolution for the workgroup's own rows of its GC heads;
+ *   - the replay, the publish and the token loop are today's, per (row, half) lane, in today's order, with NORM off
+ *     (the f32 row output to cv.onf for ru_split_norm_kernel, as the VS 2 / 4 split);
+ *   - THE RUN-271 RACE FIX: no lane writes a 32-row group's shared factors (the group's k copy, decay / beta) inside
+ *     the token loop -- at VS 8 two slices share a group and a late slice could replay this step's factors instead
+ *     of the previous step's. The lanes of row 0 park the key head's scaled k (the same values every row computes)
+ *     in skh[t], one lane a (head, token) parks (g, bt) in sgb; the LAST ARRIVER on the key head's counter (VS
+ *     arrivals) writes every group's copy for every head of the key head after its own token loop, when every slice
+ *     has finished reading the previous step's factors (the same read-before-rewrite argument as the conv state).
+ *     Each lane still writes its own rows' v. The stored bytes are today's: (ST)kk, (ST)g, (ST)bt from the same
+ *     expressions on the same inputs, each address written once a launch;
+ *   - the shift marker: read at the top by every lane for its head (today's algebra); stamped only by the last
+ *     arriver (run 113's stamp_group over the GC heads, the 1 / 2 / 3 order); the fold-only (T == 0) path arrives too.
+ * Exactness: the same operations on the same operands per (row, half) lane; the row's 8 lanes stay consecutive in
+ * one sub-group, so ru_row_sum<8> pairs the same halves in the same xor order. The gate is the hashes (gdn_split_bench
+ * anchor-seq) against the fused kernel. GRF 256 in stage 1 (the fused kernel's); the zeinfo must show zero scratch.
+ * Not for the CPU module (KT 8). */
+template <int NT, int ANC, int SDT, int VS, int GC>
+__global__ __launch_bounds__(GC * RU_V / VS * 8)
+void ru_sg_update_kernel(const void* __restrict__ av, const void* __restrict__ bv, long ab_stride,
+                         const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+                         typename ru_state<SDT>::T* __restrict__ state, long st_slot, long st_head,
+                         const int* __restrict__ cu, const int* __restrict__ sidx, long sidx_stride,
+                         const int* __restrict__ naccept, int H, int Hg, float scale, float sp_thr,
+                         const RuConv cv) {
+  using ST = typename ru_state<SDT>::T;
+  constexpr int KT = 8, NR = RU_V / VS, HK = RU_K / KT, HT = NR * KT, THR = GC * HT;
+  constexpr int CW = R4D_GDN_CONV_W, CS = R4D_GDN_CONV_W - 1;
+  constexpr int CPT = (2 * RU_K + THR - 1) / THR;       /* q | k channels a thread: 1 at VS 8, 2 at VS 16 */
+  static_assert(VS == 8 || VS == 16, "the slice-group form is for VS 8 / 16; 2 / 4 take the split kernel");
+  static_assert(HT % 32 == 0, "no head straddles a sub-group");
+  static_assert(NR <= 32, "a slice lies inside one 32-row group");
+  XE_SHARED(unsigned short, cvq, RU_CVT * RU_K); XE_SHARED(unsigned short, cvk, RU_CVT * RU_K);
+  XE_SHARED(unsigned short, cvv, GC * RU_CVT * RU_K);               /* [head][token][row], the lambda's RU_K pitch */
+  XE_SHARED(unsigned short, cvh, (CS - 1 + RU_CVT) * 2 * RU_K);    /* the key head's history by channel */
+  XE_SHARED(float, sab, GC * 2 * RU_CVT);                           /* [head][a (T) | b (T)] */
+  XE_SHARED(float, skh, RU_CVT * RU_K);                             /* the scaled k a token (the same every row) */
+  XE_SHARED(float, sgb, GC * RU_CVT * 2);                           /* [head][token][g, bt] */
+  XE_SHARED_VAR(int, cvlast);
+  XE_SHARED_VAR(int, sbad);
+  const int n = blockIdx.x, hk = blockIdx.y, s = blockIdx.z;
+  const int bos = cu[n], T = cu[n + 1] - bos;
+  const bool empty = (T <= 0);
+  if (empty && !ANC) return;
+  const int tid = threadIdx.x;
+  const int gi = tid / HT, ti = tid - gi * HT, rl = ti / KT, half = tid & (KT - 1), k0 = half * HK;
+  const int hv = hk * GC + gi, row = s * NR + rl;
+  const int G = H / Hg;   /* == GC (the launcher checks) */
+  const float a_log_h = A_log[hv], dtb = dt_bias[hv];
+  if (tid == 0) sbad = 0;
+  __syncthreads();                                        /* sbad's zero is ordered before any lane's set */
+
+  /* ---- the convolution's inputs first (in flight during the replay) */
+  float cwa[CPT][CW], cwb[CW], cba[CPT], cbb = 0.0f;
+  unsigned short cha[CPT][CS], chb[CS], cxa[CPT][RU_CVT], cxb[RU_CVT];
+  unsigned short* spa[CPT];
+  unsigned short* spb = nullptr;
+  unsigned int arrived = 0;
+  float ca_b = 0.0f;
+#pragma unroll
+  for (int c = 0; c < CPT; ++c) { spa[c] = nullptr; cba[c] = 0.0f; }
+  int cslot = 0;
+  if (!empty) {
+    cslot = cv.cidx[(size_t)n * cv.ci_stride];
+    if (cslot < 0) return;                               /* padding: every workgroup of the sequence leaves */
+    const int off = naccept ? naccept[n] - 1 : 0;
+    const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
+#pragma unroll
+    for (int c = 0; c < CPT; ++c) {
+      const int ch = tid + c * THR;                       /* this thread's q | k channel(s) */
+      if (ch < 2 * RU_K) {
+        const int ca = ch < RU_K ? hk * RU_K + ch : (Hg + hk) * RU_K + (ch - RU_K);
+#pragma unroll
+        for (int t = 0; t < RU_CVT; ++t)
+          if (t < T) cxa[c][t] = xr[(size_t)t * cv.xpitch + ca];
+        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
+        cwa[c][0] = bf2f(w4.x); cwa[c][1] = bf2f(w4.y); cwa[c][2] = bf2f(w4.z); cwa[c][3] = bf2f(w4.w);
+        if (cv.b) cba[c] = bf2f(cv.b[ca]);
+        spa[c] = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
+#pragma unroll
+        for (int i = 0; i < CS; ++i) cha[c][i] = spa[c][(size_t)(off + i) * cv.cs_tok];
+      }
+    }
+    if (half == 0) {                                      /* one v channel a (head, row): this lane's own */
+      const int cb = (2 * Hg + hv) * RU_V + row;
+#pragma unroll
+      for (int t = 0; t < RU_CVT; ++t)
+        if (t < T) cxb[t] = xr[(size_t)t * cv.xpitch + cb];
+      const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)cb * CW);
+      cwb[0] = bf2f(w4.x); cwb[1] = bf2f(w4.y); cwb[2] = bf2f(w4.z); cwb[3] = bf2f(w4.w);
+      if (cv.b) cbb = bf2f(cv.b[cb]);
+      spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
+#pragma unroll
+      for (int i = 0; i < CS; ++i) chb[i] = spb[(size_t)(off + i) * cv.cs_tok];
+    }
+    if (ti < 2 * T)                                       /* a (ti < T) or b of this head's token ti */
+      ca_b = ti < T ? ru_ab<1>(av, (size_t)(bos + ti) * ab_stride + hv)
+                    : ru_ab<1>(bv, (size_t)(bos + ti - T) * ab_stride + hv);
+  }
+
+  /* ---- the anchor's columns (today's algebra, per sequence; the marker per head) */
+  const int nacc = naccept ? naccept[n] : 1;
+  const int sa0 = ANC ? sidx[(size_t)n * sidx_stride + 0] : 0;
+  const int sa1 = ANC ? sidx[(size_t)n * sidx_stride + 1] : 0;
+  const int sa2 = ANC ? sidx[(size_t)n * sidx_stride + 2] : 0;
+  const int sf0 = ANC ? sidx[(size_t)n * sidx_stride + 3] : 0;
+  const int sf  = ANC ? sidx[(size_t)n * sidx_stride + 4] : 0;
+  const int sf2 = ANC ? sidx[(size_t)n * sidx_stride + 5] : 0;
+  if (ANC && (sa0 < 0 || sa1 < 0 || sa2 < 0 || sf0 < 0 || sf < 0 || sf2 < 0)) return;   /* per sequence: uniform */
+  ST* const fb  = ANC ? (state + (size_t)sf  * st_slot + (size_t)hv * st_head) : nullptr;
+  ST* const fb0 = ANC ? (state + (size_t)sf0 * st_slot + (size_t)hv * st_head) : nullptr;
+  ST* const fb2 = ANC ? (state + (size_t)sf2 * st_slot + (size_t)hv * st_head) : nullptr;
+  const bool dup_f = ANC && RU_ANC_DUP && (sf0 != sf || sf2 != sf);
+  int acol = RU_ANC_MARK ? 2 : 1;
+  int mrk = 1;
+  if (ANC && RU_ANC_MARK) {
+    const int m = (int)((float)fb[RU_MARK_OFF] + 0.5f) - 1;
+    mrk = (m >= 0 && m <= 2) ? m : 1;
+    acol = 3 - mrk;
+  }
+  const ST* const fr = (ANC && RU_ANC_MARK && (RU_ANC_FRD || !RU_ANC_DUP))
+      ? (const ST*)(state + (size_t)(mrk == 0 ? sf2 : (mrk == 1 ? sf : sf0)) * st_slot + (size_t)hv * st_head)
+      : (const ST*)fb;
+  const int si = sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
+  /* the anchor slot is per (sequence, head's marker): make a negative one uniform over the slice-group before any
+   * barrier (consistent markers agree; a disagreement counts the whole sequence as padding, as the plan says) */
+  if (si < 0) sbad = 1;
+  __syncthreads();
+  if (sbad) return;
+  const int grp = __builtin_amdgcn_readfirstlane(row >> 5);
+
+  float h[HK];
+  {
+    const ST* p = state + (size_t)si * st_slot + (size_t)hv * st_head + (size_t)row * RU_K + k0;
+#pragma unroll
+    for (int j = 0; j < HK; j += 8) ru_load8<NT, SDT>(&h[j], p + j);
+  }
+  if (ANC) {
+    for (int t = 0; t < nacc; ++t) {
+      const ST* f = fr + (size_t)t * RU_FSTR;
+      float kk[HK];
+#pragma unroll
+      for (int j = 0; j < HK; j += 8) ru_load8<0, SDT>(&kk[j], f + grp * RU_K + k0 + j);
+      const float vv = (float)f[4 * RU_K + row];
+      const float eg = __expf((float)f[4 * RU_K + RU_V + 2 * grp]);
+      const float bt = (float)f[4 * RU_K + RU_V + 2 * grp + 1];
+      float dot = 0.0f;
+#pragma unroll
+      for (int j = 0; j < HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+      dot = ru_row_sum<KT>(dot);
+      const float u = (vv - dot) * bt;
+#pragma unroll
+      for (int j = 0; j < HK; ++j) h[j] += u * kk[j];
+    }
+    const size_t rowoff = (size_t)hv * st_head + (size_t)row * RU_K + k0;
+    ST* p  = state + (size_t)(RU_ANC_MARK ? sa2 : sa1) * st_slot + rowoff;
+#pragma unroll
+    for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+    if (!RU_ANC_MARK && RU_ANC_DUP && (sa0 != sa2 || sa1 != sa2)) {
+      ST* p0 = state + (size_t)sa0 * st_slot + rowoff;
+      ST* p2 = state + (size_t)sa2 * st_slot + rowoff;
+#pragma unroll
+      for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p0 + j, &h[j]);
+#pragma unroll
+      for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p2 + j, &h[j]);
+    }
+    __syncthreads();                                      /* every replay read is done before any factor write */
+  }
+  /* the stamp of every head of the key head, by the last arriver (run 113's order) */
+  auto stamp_group = [&]() {
+    for (int g2 = 0; g2 < G; ++g2) {
+      const size_t ho = (size_t)(hk * G + g2) * st_head + RU_MARK_OFF;
+      state[(size_t)sf0 * st_slot + ho] = (ST)1.0f;
+      state[(size_t)sf  * st_slot + ho] = (ST)2.0f;
+      state[(size_t)sf2 * st_slot + ho] = (ST)3.0f;
+    }
+  };
+  if (empty) {
+    if constexpr (ANC && RU_ANC_MARK) {
+      if (tid == 0) {
+        const unsigned int was = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
+                                                        __HIP_MEMORY_SCOPE_AGENT);
+        if (was == (unsigned)(VS - 1)) {
+          __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          stamp_group();
+        }
+      }
+    }
+    return;
+  }
+
+  /* ---- the convolution into LDS (today's lambda), the history parked by channel */
+  auto conv = [&](const float* wt, float bs, const unsigned short* hist, const unsigned short* xs, unsigned short* dst) {
+    float win[CW];
+#pragma unroll
+    for (int i = 0; i < CS; ++i) win[i] = bf2f(hist[i]);
+#pragma unroll
+    for (int t = 0; t < RU_CVT; ++t) {
+      if (t < T) {
+        win[CW - 1] = bf2f(xs[t]);
+        float acc = bs;
+#pragma unroll
+        for (int i = 0; i < CW; ++i) acc += wt[i] * win[i];
+        dst[t * RU_K] = f2bf(cp_silu(acc));
+#pragma unroll
+        for (int i = 0; i < CW - 1; ++i) win[i] = win[i + 1];
+      }
+    }
+  };
+#pragma unroll
+  for (int c = 0; c < CPT; ++c) {
+    const int ch = tid + c * THR;
+    if (ch < 2 * RU_K) {
+      conv(cwa[c], cba[c], cha[c], cxa[c], (ch < RU_K ? cvq : cvk) + (ch & (RU_K - 1)));
+#pragma unroll
+      for (int i = 1; i < CS; ++i) cvh[(i - 1) * (2 * RU_K) + ch] = cha[c][i];
+#pragma unroll
+      for (int t = 0; t < RU_CVT; ++t)
+        if (t < T) cvh[(CS - 1 + t) * (2 * RU_K) + ch] = cxa[c][t];
+    }
+  }
+  if (half == 0) {   /* this lane's (head, row) v channel: one reader, this workgroup */
+    conv(cwb, cbb, chb, cxb, cvv + gi * RU_CVT * RU_K + rl);   /* dst[t * RU_K]: this head's [token][row] block */
+    ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
+  }
+  if (ti < 2 * T) sab[gi * 2 * RU_CVT + ti] = ca_b;
+  __syncthreads();
+  if (tid == 0)
+    arrived = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+  const float alog = __expf(a_log_h);
+  for (int t = 0; t < T; ++t) {
+    const int tok = bos + t;
+    const unsigned short* qp = cvq + t * RU_K + k0;
+    const unsigned short* kp = cvk + t * RU_K + k0;
+    float qq[HK], kk[HK];
+#pragma unroll
+    for (int j = 0; j < HK; j += 8) {
+      const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+      const unsigned short* sq = (const unsigned short*)&wq;
+      const unsigned short* sk = (const unsigned short*)&wk;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) { qq[j + e] = bf2f(sq[e]); kk[j + e] = bf2f(sk[e]); }
+    }
+    float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+    for (int j = 0; j < HK; ++j) { sq += qq[j] * qq[j]; sk += kk[j] * kk[j]; }
+    sq = ru_row_sum<KT>(sq);
+    sk = ru_row_sum<KT>(sk);
+    const float qs = __frsqrt_rn(sq + 1e-6f) * scale, ks = __frsqrt_rn(sk + 1e-6f);
+#pragma unroll
+    for (int j = 0; j < HK; ++j) { qq[j] *= qs; kk[j] *= ks; }
+    const float ra  = sab[gi * 2 * RU_CVT + t];
+    const float rb  = sab[gi * 2 * RU_CVT + T + t];
+    const float g   = -alog * ru_softplus(ra + dtb, sp_thr);
+    const float bt  = 1.0f / (1.0f + __expf(-rb));
+    const float eg  = __expf(g);
+    float dot = 0.0f;
+#pragma unroll
+    for (int j = 0; j < HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+    dot = ru_row_sum<KT>(dot);
+    const float vraw = bf2f(cvv[gi * RU_CVT * RU_K + t * RU_K + rl]);
+    const float u = (vraw - dot) * bt;
+    if (ANC) {
+      /* this step's factors for the next step's replay: the key head's scaled k and this head's (g, bt) are parked
+       * in LDS for the last arriver (the race fix); every lane writes its own row's v now */
+      if (tid < KT) {                                     /* row 0 of head 0: the key head's k, the same every row */
+#pragma unroll
+        for (int j = 0; j < HK; ++j) skh[t * RU_K + k0 + j] = kk[j];
+      }
+      if (ti == 0) { sgb[(gi * RU_CVT + t) * 2] = g; sgb[(gi * RU_CVT + t) * 2 + 1] = bt; }
+      if (half == 0) {
+        ST* f  = fb  + (size_t)t * RU_FSTR;
+        f[4 * RU_K + row] = (ST)vraw;
+        if (dup_f) {
+          fb0[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
+          fb2[(size_t)t * RU_FSTR + 4 * RU_K + row] = (ST)vraw;
+        }
+      }
+    }
+    float on = 0.0f;
+#pragma unroll
+    for (int j = 0; j < HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
+    on = ru_row_sum<KT>(on);
+    if (half == 0) cv.onf[((size_t)tok * H + hv) * RU_V + row] = on;
+    if (!ANC) {
+      const int so = sidx[(size_t)n * sidx_stride + t];
+      if (so >= 0) {
+        ST* p = state + (size_t)so * st_slot + (size_t)hv * st_head + (size_t)row * RU_K + k0;
+#pragma unroll
+        for (int j = 0; j < HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+      }
+    }
+  }
+
+  /* ---- the tail: the last arriver writes the shared factors of every head of the key head, stamps, and rewrites
+   * the key head's conv state; everyone else leaves. The parked values are complete: every lane's loop is done
+   * before the barrier below, and the last arrival follows every slice's replay (each arrived after its own replay
+   * and conv barrier). */
+  __syncthreads();
+  if (tid == 0) {
+    cvlast = arrived == (unsigned)(VS - 1);
+    if (cvlast) __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
+  __syncthreads();
+  if (!cvlast) return;
+  if (ANC) {
+    /* G heads x T tokens x 4 groups: the k copy (RU_K floats) and (g, bt), into fb and the duplicates */
+    for (int idx = tid; idx < G * T * 4 * (RU_K / 8); idx += THR) {
+      const int blk8 = idx % (RU_K / 8), g4 = (idx / (RU_K / 8)) % 4, t = (idx / (RU_K / 8) / 4) % T, g2 = idx / (RU_K / 8) / 4 / T;
+      const int hv2 = hk * G + g2;
+      float kn[8];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) kn[e] = skh[t * RU_K + blk8 * 8 + e];
+      ST* f = state + (size_t)sf * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + g4 * RU_K + blk8 * 8;
+      ru_store8<0, SDT>(f, kn);
+      if (dup_f) {
+        ru_store8<0, SDT>(state + (size_t)sf0 * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + g4 * RU_K + blk8 * 8, kn);
+        ru_store8<0, SDT>(state + (size_t)sf2 * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + g4 * RU_K + blk8 * 8, kn);
+      }
+    }
+    for (int idx = tid; idx < G * T * 4; idx += THR) {
+      const int g4 = idx % 4, t = (idx / 4) % T, g2 = idx / 4 / T;
+      const int hv2 = hk * G + g2;
+      const float g = sgb[(g2 * RU_CVT + t) * 2], bt = sgb[(g2 * RU_CVT + t) * 2 + 1];
+      ST* f = state + (size_t)sf * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * g4;
+      f[0] = (ST)g; f[1] = (ST)bt;
+      if (dup_f) {
+        ST* f0 = state + (size_t)sf0 * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * g4;
+        ST* f2 = state + (size_t)sf2 * st_slot + (size_t)hv2 * st_head + (size_t)t * RU_FSTR + 4 * RU_K + RU_V + 2 * g4;
+        f0[0] = (ST)g; f0[1] = (ST)bt; f2[0] = (ST)g; f2[1] = (ST)bt;
+      }
+    }
+    if constexpr (RU_ANC_MARK) { if (tid == 0) stamp_group(); }
+  }
+  /* the key head's conv state, one channel a thread from the parked history */
+#pragma unroll
+  for (int c = 0; c < CPT; ++c) {
+    const int ch = tid + c * THR;
+    if (ch < 2 * RU_K) {
+      unsigned short rh[CS], rx[RU_CVT];
+      rh[0] = 0;
+#pragma unroll
+      for (int i = 1; i < CS; ++i) rh[i] = cvh[(i - 1) * (2 * RU_K) + ch];
+#pragma unroll
+      for (int t = 0; t < RU_CVT; ++t) rx[t] = t < T ? cvh[(CS - 1 + t) * (2 * RU_K) + ch] : (unsigned short)0;
+      ru_conv_rewrite(spa[c], rh, rx, T, cv.cs_tok);
+    }
+  }
+}
+/* ============================================================================================================ */
+
 /* Intel port, run 112 (owner note 138): the split fold's norm, one workgroup a (token, value head), a thread a row.
  * It is the fused path's arithmetic in the fused path's order at KT 8: on^2 a row; a 32-lane wave there holds four
  * rows (lanes 0 / 8 / 16 / 24) and its xor tree gives (r0^2 + r2^2) + (r1^2 + r3^2) (the other lanes add zeros); the
@@ -1070,6 +1430,39 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
     const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT");
     return e && (e[0] == '2' || e[0] == '4') ? e[0] - '0' : 0;
   }();
+  /* Run 283 (owner note 224 item 2): RADIANCE_XE_GDN_SPLIT=8|16 -> the slice-group kernel (ru_sg_update_kernel: the key
+   * head's GC = 3 value heads x RU_V / VS rows a workgroup, the shared factors by the last arriver), then the split
+   * norm kernel as the 2 / 4 split. Needs H / Hg == 3 (Flash-Next's 24 / 8) and the split's other conditions. */
+  static const int split_sg = [] {
+    const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT");
+    const int v = e ? std::atoi(e) : 0;
+    return (v == 8 || v == 16) ? v : 0;
+  }();
+  if (split_sg && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK) && H % Hg == 0
+      && H / Hg == 3) {
+    const dim3 ggrid(N, Hg, split_sg), gblk(3 * RU_V / split_sg * RC_KT);
+#define RC_SG_A(VSC, NTC, ANCC, SDTC)                                                                           \
+  XE_LAUNCH_GGL_GRF256((ru_sg_update_kernel<NTC, ANCC, SDTC, VSC, 3>), ggrid, gblk, 0, (hipStream_t)stream,      \
+                     a, b, ab_stride, (const float*)A_log, (const float*)dt_bias, (ru_state<SDTC>::T*)state,     \
+                     st_slot, st_head, (const int*)cu, (const int*)sidx, sidx_stride, (const int*)nacc, H, Hg,  \
+                     scale, thr, cv)
+#define RC_SG(VSC, NTC, SDTC) do { if (anc) RC_SG_A(VSC, NTC, 1, SDTC); else RC_SG_A(VSC, NTC, 0, SDTC); } while (0)
+#define RC_SG_NT(VSC, SDTC) do { if (nt) RC_SG(VSC, 1, SDTC); else RC_SG(VSC, 0, SDTC); } while (0)
+#define RC_SG_VS(SDTC) do { if (split_sg == 16) RC_SG_NT(16, SDTC); else RC_SG_NT(8, SDTC); } while (0)
+    if (sdt) RC_SG_VS(1); else RC_SG_VS(0);
+#undef RC_SG_VS
+#undef RC_SG_NT
+#undef RC_SG
+#undef RC_SG_A
+    const dim3 ngrid((unsigned)ntok, (unsigned)H), nblk(RU_V);
+#define RC_NORM(NQ) hipLaunchKernelGGL((ru_split_norm_kernel<NQ>), ngrid, nblk, 0, (hipStream_t)stream,          \
+                                       (const float*)cv.onf, (unsigned short*)o, (unsigned char*)oq, (float*)os, \
+                                       oq_pitch, os_ld, (const unsigned short*)z, z_pitch, (const float*)nw,    \
+                                       neps, nact, H, (const int*)cu, N, cv.cidx, cv.ci_stride)
+    if (!oq) RC_NORM(0); else if (oq_i8) RC_NORM(2); else RC_NORM(1);
+#undef RC_NORM
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+  }
   if (split_vs && cv.onf && ntok > 0 && (long)ntok * H <= kSplitOnfTokHeads && (!anc || RU_ANC_MARK)) {
     const dim3 sgrid(N, H, split_vs), sblk(RU_V / split_vs * RC_KT);
 #define RC_SPLIT_A(VSC, NTC, ANCC, SDTC)                                                      \
@@ -1340,7 +1733,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
     /* owner note 138: the split fold's scratch, only when RADIANCE_XE_GDN_SPLIT asks for it */
-    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); return e && (e[0] == '2' || e[0] == '4'); }();
+    static const bool split_asked = [] { const char* e = std::getenv("RADIANCE_XE_GDN_SPLIT"); const int v = e ? std::atoi(e) : 0; return v == 2 || v == 4 || v == 8 || v == 16; }();
     cv.onf = split_asked ? ru_split_onf(s, o->data) : nullptr;
 
     return ru_conv_recurrent_launch(
