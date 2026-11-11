@@ -400,14 +400,15 @@ static bool xe_router_quant_pair_on() { static const bool v = env_on("RADIANCE_X
  * byte-identical on the B70 in GM1, M391's kernel table, the flag-off kernels unchanged in M394); =0 opts out */
 static bool xe_gemv_multi_on() { static const bool v = env_on("RADIANCE_XE_GEMV_MULTI"); return v; }
 /* run 285 (owner note 232's audit, groups A and B): the fused router op with the shared expert's gate_up in its GEMV
- * launch (A, j 8) and the gated attention's x3 with the QSA indexer's qk projection in one launch (B, j 9); opt-in --
- * RADIANCE_XE_GEMV_MULTI2=1 lists both, =a / =b one of them (so the M-pair can measure them apart); the defaults are
- * the owner's call */
+ * launch (A, j 8) and the gated attention's x3 with the QSA indexer's qk projection in one launch (B, j 9). THE DEFAULT
+ * since run 294 (owner note 234: GSH1 byte-identical at M 1 / 4 / 8 / 12 for both groups; M404 / M405 91.06 / 91.01 vs
+ * M402 88.99 single-user, +2.3 %; the rotation H157 vs H158 +2.0 % on median / mean / aggregate, texts 11 / 11):
+ * RADIANCE_XE_GEMV_MULTI2 unset or =1 lists both, =0 opts out (today's separate launches), =a / =b one group alone */
 static int xe_gemv_multi2_mode() {
     static const int m = [] {
         const char* e = std::getenv("RADIANCE_XE_GEMV_MULTI2");
-        if (!e) return 0;
-        return e[0] == '1' ? 3 : e[0] == 'a' ? 1 : e[0] == 'b' ? 2 : 0;
+        if (!e) return 3;
+        return e[0] == '0' ? 0 : e[0] == 'a' ? 1 : e[0] == 'b' ? 2 : 3;
     }();
     return m;
 }
