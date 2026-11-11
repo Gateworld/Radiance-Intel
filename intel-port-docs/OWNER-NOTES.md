@@ -4344,3 +4344,51 @@ a time):
    preventing the OOM (reserve the grammar path's buffers up front) if the diagnosis shows that is the cause.
 4. Gates: the reproducer passes (>= 10 runs, no hang) at headroom 2048; texts = M285 on the M-pair; one rotation with a
    tool mix shows no regression; klog clean. Design (step 3) to the coordinator before building. Budget ~$40.
+
+## 237. Owner: re-check the MTP draft depth on today's engine (owner, ~14:0x UTC 11-11, via coordinator)
+
+Run 160 (11-03, image 179, ~69 tok/s) measured depth 1 / 2 / 3 / 4 = 66.1 / 71.8 / 68.9 / 68.6 tok/s on the single prompt
+(steps for 256 tokens 149 / 124 / 112 / 112), and the rotation at depth 2 was -3.5 % (H113) -> depth 3 stayed. The engine
+is now ~91 tok/s with cheaper passes (fusions, GDN split), which can move the balance. Re-measure, config only (the same
+--num-speculative-tokens substitution run 160 used), on the current default image (311, or later), single prompt,
+2 runs each, texts = M285: depth 2, 3, 4. Report tok/s, steps per 256 tokens and the acceptance per position. If depth 2
+or 4 beats depth 3 by >= 1 % single-user, one 10-min rotation pair (it vs depth 3, same image); a default change goes to
+the owner. ~$5, ~30 min of card time. Order: after note 235's accuracy step, before note 236's build (it is quick).
+
+## 238. Owner: GDN STOP (owner, ~14:1x UTC 11-11, via coordinator)
+
+The fp16 GDN state (note 235) fails on long contexts (KGS2 mean KL 0.0449, 2-8K bucket 0.0723 / 95.6 %): CLOSED, the state
+stays fp32, no bf16 / mixed-precision follow-up. The whole GDN line is closed: default = the VS 2 split + L1; N1 (LAT 7),
+C (LAT 8), the VS 4 hybrid and VS 8 / 16 stay as exact opt-in records; the fp16 switch stays off. Skip the range-probe
+run on image 314 unless it is already built and free (record only). Continue: note 237 (draft depth), then note 236.
+
+## 239. Owner YES: MTP draft head v3 -- an ACCEPTANCE-focused objective (owner, ~14:2x UTC 11-11, via coordinator)
+
+v2 (KL to the trunk's top-32) lowered KL at every depth but left top-1 agreement flat and the tokens/step proxy at or below
+the shipped head. v3 changes the objective, reusing v2's data (/srv/train/mtp-distill/flashnext-v2, 1.13 M positions),
+trainer, gates and launch path. Training runs on amd-host cards 2 / 3 (qwen27b / textsearch / vlembed paused ~1 h; owner OK)
+-- independent of intel-host, so it may run while the runner does note 236. Marker: /srv/train/checkpoints/mtp-v3-TRAINED
+(same contents as v2's: A=, B=, pick=). **Runner, after that marker exists AND note 236 is done:** note 233 step 3
+unchanged -- the pick's winner (if any) -> rad-convert --reuse -> intel-host -> M-pair + rotation with per-depth acceptance
+and tool calls separately; >= +1.5 % with no depth worse; default = owner. No winner offline = stop and record.
+
+## 240. Coordinator: an outside review's input for note 236 + ops_doc (coordinator, ~14:5x UTC 11-11; owner pasted the review)
+1. **Note 236's design must include a bounded drain** (the review's patch, l0.cpp ~l.1551): replace
+   `zeCommandListHostSynchronize(Z.imm, UINT64_MAX)` with slices (RADIANCE_L0_APPEND_DRAIN_MS, default 10) and a retry of
+   the append between slices; a total budget (RADIANCE_L0_APPEND_DRAIN_BUDGET_MS, default 60000) then note 58's throw.
+   Common path unchanged (no OOM -> no drain). This is the SAFETY NET, not the root fix. Two checks before you adopt
+   the review's story: (a) STALL1's rank 1 had NO failed append, so "the peer's half sits in the peer's failed append"
+   fits GEN0 (both ranks failed) but not STALL1 -- find what rank 0's immediate list is actually waiting on;
+   (b) the all-reduce has a spin give-up (XE_AR_SPIN): if an AR were the waiter the drain should have returned --
+   say why it did not. And: one rank throwing while the other finished its step must end in a lock-step abort of
+   the step (both ranks, the scheduler released, the requests failed cleanly), never one rank waiting at the barrier.
+   **Root fix** stays yours to design: the ~2.5K live recorded lists outside the headroom (count them in the headroom,
+   or cap kept tapes, LRU by `used`, as your stage-D note already sketched). Gates as note 236.
+2. **ops_doc (docs only, exact):** add the `moe_host_experts` row to docs/OPS.md (params from ref_registry.cpp) so
+   ops_doc goes green; avx_check stays a known failure. Commit with note 236's work; no card time.
+
+## 241. Owner: the draft depth decision WAITS for MTP v3 (owner, ~14:5x UTC 11-11, via coordinator)
+Depth 3 stays the default for now (run 294's report: no change). When note 239's engine test runs with a v3 winner,
+measure it at depth 2 AND depth 3 (single prompt 2 runs each, then the rotation pair at the better pair-up), reporting
+per-position acceptance, tokens a step and tok/s -- the owner decides the depth on those numbers. No v3 winner = depth 3
+stays and this note closes.

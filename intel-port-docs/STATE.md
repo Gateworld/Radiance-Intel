@@ -1,5 +1,5 @@
 <!-- runner:begin (written by run.sh after every run; do not edit) -->
-Milestone 3 usage: $3382.66 of $4000 budget (240 session(s)). Today (2026-11-11, America/New_York): $108.71 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 72. Updated 2026-11-11 12:10 UTC.
+Milestone 3 usage: $3428.55 of $4000 budget (240 session(s)). Today (2026-11-11, America/New_York): $154.60 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 73. Updated 2026-11-11 15:19 UTC.
 <!-- runner:end -->
 # STATE — Radiance on Intel, milestone 3
 
@@ -4441,6 +4441,282 @@ reviewed-fault: klog@2026-11-09T14:26:01Z=0000:0f:00.0 | fault-response | the su
     logs/long-corpus5.jsonl 3000`: the long corpus, KMB2's form) -> mean KL / top-1 vs lever #3's 0.0027 / 98.9 % (the
     bar: well inside 0.026-0.042 / >= 96.2 %) + KL by position bucket 0-2K / 2-8K / 8-20K from the per-position output
     + the fp32 state's max |h| per layer; the owner decides before any speed work.**
+  - **NOTE 235 STEP 1 BUILT + COMMITTED (12:51-13:0x): the 2640 tree rebuilt green (0 errors; `l0t 'xe_gdn|xe_lane_test'`
+    matched NO ctest, as in run 284 -- the GDN kernels have no CPU test; the card check is the KL replay itself);
+    COMMIT 4b00920 (the switch, the probe, the chunk-scan hook; the owner's xe_direct files left alone); IMAGE 312
+    building + loading from 13:0x (logs/make-rt-neo2-312.txt). m3/kld_buckets.py (new): the KL replay's .json.rows
+    (16 B a position: kl, cand_nll, ref_nll, agree, in corpus order) split by the by_source position counts in corpus
+    order into 0-2K / 2-8K / 8-20K+ buckets; checked on KMB2's rows (lever #3, the long corpus, 54,722 positions): 0-2K
+    0.00184 / 98.54 %, 2-8K 0.00270 / 98.40 %, 8-20K+ 0.00060 / 99.64 % -- the fp32 reference's buckets for KGS2 (the
+    8-20K+ bucket = prefill-20k's 7,991 + transcript-serve-log's 1,297 positions). OWNER NOTE 236 ARRIVED (12:5x, via the
+    coordinator radiance-test-e2): fix the GEN0 multi-user + tool-call STALL (headroom 2048, tape append OOM -> drain-retry
+    -> step-barrier hang), AFTER note 235's accuracy step, one card step at a time: 1 bounded reproducer (host timeout
+    that kills the container), 2 desk diagnosis, 3 design to the coordinator (lock-step degrade or clean abort, never an
+    indefinite wait; prevent the OOM up front if that is the cause), 4 gates (>= 10 runs no hang at hr 2048, texts = M285,
+    a rotation with a tool mix, klog clean); budget ~$40. Acknowledged to the coordinator 13:0x.**
+  - **IMAGE 312 = 9595298a6d35 loaded on intel-host 12:57 (local 310 removed; / 54 GB). PROBE FIX (12:5x, uncommitted until
+    its build is green): the exit print used the engine's queue pointer, which rad_stream_destroy (l0.cpp l.2950)
+    deletes before main returns -> a dangling queue at atexit; now GdnRange holds `new sycl::context` / `new
+    sycl::device` copies (shared handles, never freed; the cells allocated in that context) and the private queues come
+    from them. Rebuilding (`l0t xe_lane_cpu`, logs/build-l0neo-l0t-run294-gsf16b.txt) -> image 313. KGS1 STARTED 13:1x
+    ON 312 (`kdstep.sh KGS1 9595298a6d35 gsf16 KDP2`, logs/kdstep-KGS1.txt): the KL numbers do not depend on the exit
+    print (kld-gl.sh echoes the record rc and carries on; the json is written before teardown), only the final range
+    line might be missing -- the every-2,000-probes lines still give the fp32 range. KGS2 on 313 when it is loaded.**
+  - **KGS1 (12:58-13:03, image 312, `kld-gl.sh gsf16`; klog2 clean, peak 60 C, lowest MemAvailable 24.7 GiB): 11 docs,
+    2,765 positions: mean KL 1.49e-8, median 1.3e-10, p99 3.1e-7, max 1.3e-6, top-1 100.0 %, ppl ratio 1.0000 = THE
+    SHORT-CORPUS CONTROL FLOOR (1.5e-8, STATE l.1085) -- BY CONSTRUCTION: every agreement prompt (<= 2,051 tokens) is
+    ONE prefill chunk (max_tok 4096), so the chunk scan writes ht in fp16 but nothing reads it back; the 64-token state
+    chunks stay inside the kernel in fp32. KGS1 says nothing about the fp16 state; the long corpus (chunks of 4,096 ->
+    the state crosses the boundary from position 4,096 on) and a DECODE-SHAPED replay do. Both passes rc=139 (SIGSEGV at
+    exit = the probe's exit print on the deleted queue, as feared; the json / rows were written before, the record
+    reference too; < 2,000 probes so no running range line) -> image 313 carries the fix. GAP IN THE OWNER'S PLAN AS
+    SPECIFIED: note 149's replay is prefill-only; the token loop's recurrent update (the kernel whose fp32 state traffic
+    the owner wants halved) rounds the state to fp16 EVERY token, so its error accumulates over a generation -- the
+    4,096-token boundary round trips of the long corpus are a much weaker test. ADDED: mode `gsf16d` = gsf16 with
+    `lean`'s `--max-num-batched-tokens 4` in both passes (each prompt advances 4 tokens at a time: the state is read and
+    written through fp16 every 4 tokens over the whole prompt, the reference the same in fp32), the accumulation the
+    token loop sees. PLAN: 313 -> KGS2 (long corpus, the owner's form) -> KGS3 (`gsf16d`, the agreement corpus, ~700
+    4-token steps a pass) -> KGS4 (`gsf16d`, the long corpus, ~13.7K steps a pass, if the times allow).** CORRECTION:
+    geometry.cpp l.147 refuses --max-num-batched-tokens below the quantum (64) with linear state, so `gsf16d` is the
+    64-token form (lean64's; kld-gl.sh l.42 + l.198): the state crosses the fp16 cache every 64 tokens, 64x the owner's
+    form's frequency; both corpora are then ~45 / ~860 chunk steps a pass (minutes). The replay never runs the recurrent
+    update kernel itself (rad_block_gdn_fp8.h l.476-493: op_cr / op_recur serve the DECODE rows only; prefill chunks of
+    any size go to op_scan), so its fp16 store path is exercised only by decode steps (M-pair texts, a rotation).
+  - **PROBE FIX BUILT + COMMITTED (12:58-13:09, 0 errors, xe_lane_cpu passed): commit cd982a1. IMAGE 313 building +
+    loading from 13:10 (logs/make-rt-neo2-313.txt). NEXT: KGS2 = `timeout 3000 bash logs/kdstep.sh KGS2 <313> gsf16 KDP2
+    logs/long-corpus5.jsonl 3000` (the owner's form, long corpus), then KGS3 = `kdstep.sh KGS3 <313> gsf16d KDP2
+    logs/long-corpus5.jsonl 3000` (64-token chunks, long corpus), KGS4 = `kdstep.sh KGS4 <313> gsf16d KDP2` (64-token
+    chunks, agreement corpus); each: m3/kld_buckets.py on the fetched json + .rows (fetch the .rows by `ssh intel-host cat`),
+    the range lines from kld-record.log (fp32) and kld-score.log (fp16) on intel-host.**
+  - **IMAGE 313 = 17ec262e6afa loaded on intel-host 13:11 (local 311 / 312 removed; / 54 GB). KGS2 STARTED 13:12 (`kdstep.sh KGS2
+    17ec262e6afa gsf16 KDP2 logs/long-corpus5.jsonl 3000`, logs/kdstep-KGS2.txt). Desk meanwhile (note 236 step 1, no
+    card use): m3/intel-host/stall-serve.sh written (in-container: a fresh engine a try with the staged svc args = headroom
+    2048 + tapes, GEN0's three documents at concurrency 3 through the client, a watcher on serve.log: the barrier's 10 s
+    warning = STALL -> the lines around the first failed append on each device, the barrier / 'not at a futex' thread
+    lines, serve-stall-N.log kept, SIGTERM then SIGKILL with a report if the process stays; a finished client = PASS;
+    up to 10 tries); logs/stallstep.sh (host side, genstep.sh's form) next. GEN0's facts for it: the three documents
+    were ids 1 (dolly), 721 (glaive, tools), 1301 (gsm8k); dolly done at 4 s, gsm8k at 8 s, the glaive request never got
+    a token (finish=abort at 900 s, client time-out at 1,804 s); serve.log: tape 49's append failed on device 1
+    (attempt 1 of 3), tape 50's on device 0; "1 of 3 arrived" at the barrier = two of three threads missing.**
+  - **KGS2 (13:12-13:26, image 313, `gsf16`, the long corpus, 7 docs, 54,722 positions; klog2 clean, peak 63 C, lowest
+    MemAvailable 22.4 GiB; record and score rc 0 -- the exit crash is gone): mean KL 0.0449, median 7.8e-5, p99 1.05, max
+    14.7, top-1 97.14 %, ppl ratio 1.0015 -- OUTSIDE lever #3's class (KMB2 on the same corpus: 0.0021 / 98.65 %), above
+    the accepted band's KL edge (0.026-0.042) with the top-1 inside it (>= 96.2 %). By bucket (m3/kld_buckets.py):
+    0-2K 0.00163 / 99.62 % (lever #3: 0.00184 / 98.54), 2-8K 0.0723 / 95.56 % (0.0027 / 98.40), 8-20K+ 0.0203 / 98.60 %
+    (0.0006 / 99.64). Per document: prefill-7k 0.0006 / 99.96, prefill-20k 0.0022 / 99.96, code-engine 0.0197 / 95.5,
+    code-moe 0.0089 / 98.1, prose-stories 0.0017 / 98.96, transcript-serve-log 0.229 / 90.07 (!), doc-owner-notes 0.0106
+    / 96.92. ONSET (m3/kld_onset.py, 1024-bins and 256-windows): every document sits at the floor (1e-8) until its
+    FIRST PREFILL STEP ENDS -- onsets at 1,024 / 1,026 / 3,072 / 3,074 / 4,032 (the 4,096 budget shared by the documents
+    in flight), i.e. the first time the state is stored in fp16 and read back -- then the KL jumps at once (serve-log:
+    0.63 / 77.7 % top-1 in the first 256 positions after it, 0.4-0.8 for the next 2,000; code-engine 0.013 / 94.5 %;
+    owner-notes 0.036 / 91.8 %; prefill-7k only 3e-4 / 100 %) and does not decay. NOT garbage states (a layout bug would
+    hit every document; prefill-7k / 20k stay at 100 % top-1 with KL 3e-4 to 2e-3), so the fp16 store of a correct
+    state perturbs it enough to flip 5-22 % of the next tokens on repetitive / code documents: a sensitivity to the
+    state's precision far beyond the 2^-11 relative rounding (cancellation in q.h, or the small components fp16 cannot
+    hold: subnormal under 6.1e-5, zero under 6e-8 -- the per-device probe counts those next). The fp16 path itself was
+    desk-checked: chunk scan (both the non-JM kernel l.180-196 / 460-472 and the default JM form .inc l.91 / 317-327)
+    loads h0 and stores ht element-wise in the state's type; the engine's state cache is 27 MiB a slot in the score pass
+    vs 54 fp32 (the switch fires; "kv_gdn_state" line). THE RANGE PROBE'S FIRST FORM WAS BROKEN: 72 cells (36 layers x 2
+    devices, first-seen order) of which ~half read random words (negative, 1e+32 ...) -- l0.cpp l.3620 makes one SYCL
+    CONTEXT PER DEVICE, and the cells lived in the first queue's context while the other rank's kernels wrote across
+    contexts (klog clean, no fault logged). The sane cells (both passes): max |h| 0.4-20 a layer (19.6 / 15.1 / 8.2 the
+    largest), nowhere near 65,504. KGS2N (13:32-13:46, `gsf16n` = the same without the probe): IDENTICAL numbers to all
+    digits (mean KL 0.044938, every bucket) -> the probe did not touch the engine's memory; the KL results are clean.**
+  - **PROBE SECOND FORM (13:4x): one set of cells a device in its own context (GdnRangeDev keyed by the queue's
+    sycl::device), 4 words a layer (max |h| bits, elements counted, below fp16's smallest normal 6.1e-5, below its
+    smallest subnormal 6e-8: the precision side of the question, not just the range), `xe_gdn_state_range_read` for
+    tests, test/gdn_range_test.cpp + ctest xe_gdn_range_cpu (a 4-slot cache of known contents through the probe on the
+    CPU device: max 7.5, 98,304 / 65,536 / 49,162 words expected). BUILDING 13:46 (`l0t 'xe_gdn_range_cpu|xe_lane_cpu'`,
+    logs/build-l0neo-l0t-run294-gsf16c.txt) -> image 314 -> KGS2R (`gsf16` on the long corpus, the range + precision
+    counts; the KL will be KGS2's). NOTE 237 (owner, via coordinator radiance-test-68, 13:3x): re-measure the MTP draft
+    depth on today's engine, config only (run 160's `-ad2-` / `-ad4-` substitution), current image, single prompt, 2 runs
+    each, texts = M285; tok/s, steps per 256 tokens, acceptance per position; if 2 or 4 beats 3 by >= 1 % -> one rotation
+    pair vs depth 3; the default is the owner's; slotted after 235's accuracy step and before 236's build. M409 STARTED
+    13:47 (`mstep.sh M409 17ec262e6afa svcmtpx-gnt0-hc8-rp-gnx-ad2 M285 svcmtpx-gnt0-hc8-rp-gnx`: depth 2 on image 313
+    = 311 + the two off-by-default additions), then M410 (-ad4), M411 (depth 3, the same-image control).**
+  - **OWNER NOTE 238 (~14:1x, via coordinator 68): GDN STOP -- the fp16 state CLOSED (the state stays fp32, no bf16 /
+    mixed follow-up); the whole GDN line closed: default = the VS 2 split + L1; N1 (LAT 7), C (LAT 8), the VS 4 hybrid,
+    VS 8 / 16 stay exact opt-in records; the fp16 switch stays off; the image-314 range run SKIPPED (record only); continue
+    with 237, then 236. The probe's second form built (0 errors) but its CPU test xe_gdn_range_cpu FAILED (lane test
+    passed) -- a DPC++ COMPILER CRASH compiling the kernel for the CPU device ("Running pass
+    sycl-kernel-reduce-cross-barrier-values ... Segmentation fault", the shared-memory reduce across barriers; the card's
+    AOT build compiled it), not a logic failure; per the stop it is NOT pursued: the diff kept as logs/gdn-range-probe-v2.patch + logs/gdn_range_test.cpp.v2
+    (record), the working tree reverted to HEAD cd982a1 (the first form, cross-context-unsafe only with the flag on and
+    two devices; off by default). Reported to the owner (WAITING, run 294 section) and the coordinator (13:5x).**
+  - **M409 (13:47-13:5x, image 313, `svcmtpx-gnt0-hc8-rp-gnx-ad2` = depth 2, 2 runs; klog2 clean): TEXTS IDENTICAL (both
+    runs) to M285; run 2 96.50 tok/s at 124 chunks (steps) for the 256 tokens (run 1 77.18, the cold run) -- against
+    M407's depth 3 on 311: 91.36 at 112 steps (+5.6 %; the same-image control M411 decides). Serve log: drafts=244
+    kept=133 a request (54.5 % of the drafts; 2.06 tokens a step).**
+  - **M410 (13:5x-14:0x, `-ad4` = depth 4, 2 runs; klog2 clean): TEXTS IDENTICAL; run 2 91.10 tok/s at 112 steps (run 1
+    63.77 cold); drafts=330 kept=146 (44 %; 2.29 tokens a step) -- the same step count as depth 3, so the fourth draft
+    is almost never taken, and the verify's extra row costs the time (run 160's finding repeats). M411 (depth 3, the
+    same-image control) STARTED 14:0x. Per-position acceptance: m3-tps.sh already writes /metrics' radiance:draft_*
+    lines to metrics-K.txt after each run (kept on intel-host under m3/STEP/CFG/; fetched by hand). CONDITIONAL ACCEPTANCE
+    (both runs pooled, metrics-2): depth 2 -- position 0 67.6 % (167 / 247), position 1 62.3 % (104 / 167), pooled
+    54.9 %; depth 4 -- position 0 70.3 % (156 / 222), 1 59.6 % (93 / 156), 2 50.5 % (47 / 93), 3 33 % (2 / 6: the fourth
+    position was REACHED only 6 times in 222 verifies -- the drafter rarely offers a fourth token), pooled 42.5 %.**
+  - **M411 (14:0x, depth 3 = the served setting, the same-image control, 2 runs; klog2 clean): run 2 90.97 tok/s at 112
+    steps (run 1 71.99 cold); drafts=330 kept=146 (44.2 %; 2.29 tokens a step); conditional acceptance 70.3 / 60.3 /
+    51.1 % at positions 0 / 1 / 2 (156 / 222, 94 / 156, 48 / 94). DEPTH 2 BEATS DEPTH 3 BY +6.1 % on the single prompt
+    (96.50 vs 90.97; depth 4 91.10 = depth 3 within noise: the same 330 drafts offered and 146 kept, the fourth position
+    reached 6 times) -> the coordinator's rule (>= 1 %): one ROTATION PAIR vs depth 3 on the same image. m2-heat.sh gains
+    the `-ad2` suffix (AD2S: `--num-speculative-tokens 2`); H159 / H160 staged on intel-host from H157's card files + today's
+    m2-heat.sh. H159 (`hstep.sh H159 17ec262e6afa bestrxgrf3w16p4-ad2 10`: depth 2, 10 min) STARTED 14:0x; H160
+    (`bestrxgrf3w16p4`, depth 3, the control) after it. The default is the owner's call (note 237).**
+  - **H159 (14:02-14:14, image 313, `bestrxgrf3w16p4-ad2` = depth 2, 10 min, both cards; klog2 clean, peak 63 C, lowest
+    MemAvailable 34.1 GiB): 298 requests, tok/s median 109.1 (min 88.1, max 117.2), ttft median 0.31 s; after the
+    first rotation 287 requests: median 109.2 / mean 108.00 / aggregate 107.13 -- against H157 (depth 3 + groups A/B on
+    310): 110.0 / 110.23 / 109.59, i.e. -0.7 % median, -2.0 % mean, -2.2 % aggregate: at the rotation depth 2 LOSES what
+    it won on the single prompt (its max 117.2 vs 131.2: the long high-acceptance answers want the third draft). By
+    prompt length vs H157: 6: 103.2 vs 101.8, 7: 108.6 vs 113.4, 13: 96.4 vs 93.5, 16: 116.1 vs 120.3, 63: 113.0 vs
+    114.5, 66: 112.8 vs 117.7, 151: 102.0 vs 104.3, 348: 95.9 vs 92.7, 454: 109.2 vs 110. H160 (depth 3, the same-image
+    control) STARTED 14:15.**
+  - **H160 (14:15-14:27, `bestrxgrf3w16p4` = depth 3, the same-image control; klog2 clean): 302 requests, median 109.8
+    (min 85.4, max 131.0), ttft median 0.32 s; after the first rotation 291 requests: median 109.8 / mean 109.92 /
+    aggregate 109.26. NOTE 237 VERDICT: depth 2 vs depth 3 on image 313 -- single prompt +6.1 % (96.50 vs 90.97 tok/s,
+    124 vs 112 steps for 256 tokens), ROTATION -0.5 % median / -1.7 % mean / -1.9 % aggregate (109.1 vs 109.8, 108.00
+    vs 109.92, 107.13 vs 109.26); the longest answers want the third draft (max 117.2 vs 131.0; the 462-token prompt
+    bucket 115.3 vs 130.5); depth 4 = depth 3 (the drafter offers a fourth token in 6 of 222 verifies). Texts: the
+    M-steps' = M285 (all), the rotation pair 11 / 11 identical (logs/rot_texts.sh H159 H160). RECOMMENDATION: keep depth
+    3 (the service is the rotation's shape); the default is the owner's (note 237). Reported (WAITING run 294 + the
+    coordinator). NOTE 236 STEP 1 STARTED 14:28: STALL1 (`stallstep.sh STALL1 92783bde5591 10 svc`: ri-m3gen:2 = 313 +
+    python3, GEN0's three documents at concurrency 3, headroom 2048, up to 10 tries, the watcher kills the engine at the
+    barrier's 10 s warning, the host step kills the container; logs/stallstep-STALL1.txt). GEN0's full serve.log
+    (intel-host m3/GEN0/serve.log l.760-830) re-read for the diagnosis: the FIRST glaive request had generated 67 tokens
+    (the other two documents done) when "a library launch: the glued append failed (0x70000003)" and tape 50's append
+    failed on device 0 -> the drain (tid 137 "state R, running" inside libze = zeCommandListHostSynchronize spinning),
+    then within 10 s "a thread on device 1 is waiting 10 s for a play on device 1, slot 65, serial 45634 ... tape 49
+    range [697, 698) ... signal event pending" = rank 1 waiting for ITS OWN play of the same stretch 697 to settle, and
+    the barrier's "1 of 3 arrived" (= the scheduler; both rank threads missing). The all-reduce's peer wait is bounded
+    (xe_allreduce.cpp kSpin 400M polls ~ minutes), so a torn collective ends; the drain's HostSynchronize(UINT64_MAX)
+    and a device-side wait on an event never signalled do not. Hypotheses for the reproducer: (A) the failed append left
+    device 0's immediate list with an unsignalled fence, so the drain never returns, while device 1's play waits on a
+    device-0 event of stretch 697 that never comes; (B) the drain itself (a host wait on in-flight work that waits on
+    the peer's NEXT append) is the cycle. The `fake` form (RADIANCE_L0_FAKE_APPEND_FAIL=N, the engine's test hook)
+    discriminates: it runs the retry path without the OOM's driver state.**
+  - **STALL1 (14:27-14:33, ri-m3gen:2 92783bde5591, headroom 2048, 3 in flight): THE STALL REPRODUCED AT TRY 2 (try 1
+    passed: dolly / gsm8k done, the glaive request got "Connection refused" at 14 s -- the client's second turn hit the
+    server as the try's engine... no: the engine was up; a client-side refusal to look at), 20 s after the requests
+    started; the watcher killed the engine (SIGKILL took 2 s -- it CAN be killed; GEN0's engine ignored SIGTERM only).
+    The stalled try's serve log (results-m3/card01/STALL1/serve-stall-2.log, l.804-824): the glaive tool-call request
+    (tools=1, prompt 411) FINISHED (finish=tool_calls, 68 tokens, 7.1 s); the client sent the conversation's NEXT turn
+    (msgs=4, tools=1, prompt 552: the tool result + the next assistant turn); gsm8k finished; then "a library launch:
+    the glued append failed (0x70000003)" + "tape 55: appending 1 list(s) failed out of device memory; draining device
+    0's immediate list and retrying (attempt 1 of 3)" -> "rank barrier: a thread has waited 10 s (generation 361, 2 OF 3
+    ARRIVED)": the scheduler AND rank 1 at the barrier, rank 0 (tid 428, "state R, running", libze_intel_gpu+0x95fa38
+    <- +0x39855f <- radiance) spinning in the drain's zeCommandListHostSynchronize(UINT64_MAX) -- device 1 had NO failed
+    append. So: ONE rank's drain never returns while the other rank has finished issuing its step. The tape counters
+    before it: "16384 plays; lists created 31427, destroyed 28938 (ALIVE 2489)" -- ~2.5K live recorded command lists in
+    device memory, outside the headroom's accounting: the likely VRAM eater at headroom 2048 (GEN1 at 4096 never hit it).
+    STALL2 STARTED 14:35 (`stallstep.sh STALL2 92783bde5591 2 fake ... 1200 300`: RADIANCE_L0_FAKE_APPEND_FAIL=4 makes the
+    first 4 appends fail once each = the drain-and-retry path with plenty of VRAM; a pass says the hang needs the real OOM
+    state, a stall says the retry path itself breaks the step).** STALL2 (14:35-14:45; the first launch mis-ordered its
+    arguments and staged nothing, relaunched): "the engine did not come up" -- the 4 fakes were consumed by ONE append
+    and its three retries (the retry loop's do_append counts too): "tape 1 ... after 3 retries -- this rank's step fails
+    rather than waiting" -> "E stopping: the step loop failed with device error" -> the engine stopped at its warm-up
+    step. So the after-3-retries path ENDS cleanly (a device error, no hang) -- at startup it is fatal to the server. The
+    retry-SUCCEEDS path (one fake: the drain, then the retry) is the form `fake` now (fake4 = this run's); STALL3 next.
+    The stalled rank's stack in STALL1 (tid 428): qwen4exp_fp8.so -> radiance (the issue) -> l0 -> libze spinning: the
+    plugin's layer loop was ISSUING (a pass being RECORDED for the new batch shape -- 2 -> 1 sequences, the tool-call
+    turn), a library launch's glued append failed, then the recorded segment's append (tape 55) failed and the drain
+    never returned; rank 1 had finished issuing and sat at the barrier.**
+  - **STALL3 (14:47-14:5x, `fake` = ONE fake failure, 2 tries): the fake at startup (tape 1, device 1) was drained and
+    retried FINE (the engine came up in 113 s) -- the drain-and-retry path works when the peer is healthy. THEN THE REAL
+    STALL AGAIN at try 1, 22 s in, at the same moment (the tool-call conversation's second turn, prompt 552): this time
+    "tape 56: appending failed out of device memory; draining device 1" + the glued append failed twice + "E op
+    'moe_gemm_q' {...} operand 2: the weight table could not be patched" / "E rank 0 step 72" (rank 0's step FAILED on
+    the same OOM wave: the live prefill's expert table patch) -> "2 of 3 arrived" (rank 0 + the scheduler), rank 1 (tid
+    145, R) spinning in the drain. KEY LINES in the same log: "l0 tape: the driver takes 1.13 MiB a command list on
+    device N (NEO OverrideCmdListCmdBufferSizeInKb not set)" and "lists created 31427, destroyed 28938 (alive 2489)" ->
+    the recorded lists hold ~2.8 GiB of VRAM (762 segments = lists a decode tape, 3 tapes kept), outside the headroom;
+    and "rank 0: under the recordings' floor every one of the 3 tapes was played in the last 2048 passes, so none is
+    dropped: the new shape runs live (RADIANCE_TAPE_KEEP_PASSES)" -> the live pass's glued launches and the expert
+    table patch then fail at the ceiling. engine.cpp l.717-721: a failed step is FATAL ("not recoverable in-process,
+    spec 17") -> fail_loop -> stop; the stop then waits on the rank thread stuck in the unbounded drain -> the engine
+    neither serves nor exits (GEN0's "did not exit on the kill"; SIGKILL works). DIAGNOSIS = (1) the OOM: command-list
+    VRAM at 1.13 MiB a list x ~2.5K live lists at headroom 2048 (the tool-call turn's prefill = a new shape = live
+    launches + expert staging on top); (2) the hang: the retry's zeCommandListHostSynchronize(UINT64_MAX) on a device
+    whose in-flight work waits on the peer (collectives), while the peer's step has already failed -> never returns.
+    STALL4 next: form `cmdbuf256` (OverrideCmdListCmdBufferSizeInKb=256, the knob the engine's own log names) at
+    headroom 2048 -- the prevention probe (the per-list MiB in the log + 10 tries).** STALL4 STARTED 14:53 -- BUT the
+    knob is read only with NEOReadDebugKeys=1 (l0.cpp l.1135-1136 checks both; run 80's X9 measured 0.25 MiB a list with
+    64 vs 1.19 default), which the form lacked: STALL4 is a control (expect "not set" and the stall); the forms are
+    fixed (`cmdbuf64` / `cmdbuf256` with the read key) -> STALL5 = `cmdbuf64`, 10 tries, after STALL4 ends. DESIGN
+    WRITTEN: briefs/2026-11-11-gen0-stall-design.md (the reproducer table, the diagnosis in 5 steps, three tiers: 0
+    prevent -- (a) the command-list size key set by the engine at start-up, (b) the lists counted in the budget + a real
+    drop under the floor, (c) headroom 4096; 1 never hang -- the drain bounded (RADIANCE_L0_DRAIN_S ~20 s) + a shared
+    step-poison flag + barrier abort on any failed step, so the engine stops within the bound and restarts instead of
+    hanging; 2 degrade in-process (503 for the step's requests, no restart; spec 17 relaxed for OOM-class errors --
+    needs a note). Proposal: build 0(a) if STALL5 holds (else 0(b)) + 1. Sent to the coordinator.**
+  - **COORDINATOR GO (14:5x) for Tier 0(a) + Tier 1, Tier 2 parked; conditions: 0(a) sets ONLY the size key + the read
+    key at start-up and logs both, no stray NEO key in the image / service, a perf gate (M-pair cmdbuf64 vs off within
+    -0.5 %, texts = M285, alive-lists x MiB before / after); 0(b) (the lists counted in the headroom / the vram trace)
+    stays the follow-up; Tier 1 = drain slices RADIANCE_L0_APPEND_DRAIN_MS (~10) with the append retried between them,
+    budget RADIANCE_L0_APPEND_DRAIN_BUDGET_MS 20000, tape/slot/dev logged, then RAD_E_DEVICE; step-poison + barrier
+    abort on ANY failed step; the common path byte-identical; gates: >= 10 reproducer tries no hang, a forced one-rank
+    live-pass failure -> both ranks abort within the bound and the engine exits / restarts, texts = M285, the tool-mix
+    rotation, klog. Then MTP v3 (note 239, marker /srv/train/checkpoints/mtp-v3-TRAINED ~16-17 UTC) with note 241
+    (depth 2 AND 3). STALL4 (no read key) = the control: 1.13 MiB a list, STALL at try 1. STALL5 (`cmdbuf64`) RUNNING
+    from 14:57: tries 1-2 PASSED (the stall came at try 1-2 before). FINDING: m3/service/run.sh l.33 ALREADY exports
+    NEOReadDebugKeys=1 OverrideCmdListCmdBufferSizeInKb=64 DisableIndirectAccess=1 -- the SERVICE runs 0.25 MiB lists;
+    the step containers (GEN0, STALL1-4) ran the driver's 1.13 MiB default: the reproductions were at 4.5x the service's
+    list VRAM. Tier 0(a) in the engine aligns every launch with the service (main.cpp: RADIANCE_L0_CMDBUF_KB, default 64,
+    0 = the driver's default; nothing touched when either key is already in the environment, so the service's keys
+    stand, DisableIndirectAccess included). CODE WRITTEN 15:0x: main.cpp (the keys), l0.cpp (the drain loop: slices +
+    budget + poison check + the periodic "still out of memory after N ms" line with the pending slot; the fake hooks
+    RADIANCE_L0_FAKE_APPEND_FAIL_SKIP / _DEV), runtime/step_poison.h + rank_barrier.cpp (step_poison / step_poisoned),
+    engine.cpp rank_loop (fail_step: status, poison, barrier abort, leave the loop; a poisoned rank leaves at the top),
+    docs/OPS.md (the moe_host_experts row, note 240 item 2). BUILDING 15:04 (`l0t 'ops_doc|xe_lane_cpu'`,
+    logs/build-l0neo-l0t-run294-stall.txt).** The first build FAILED on engine.cpp (step_poison undeclared: the
+    include was missing) -> added; REBUILDING 15:16 (logs/build-l0neo-l0t-run294-stall2.txt). COORDINATOR (15:0x):
+    the exit time (drain bound + the all-reduce's ~2 min give-up) acceptable, record as measured; in gate (b) try the
+    exit WITHOUT waiting for device idle (then klog: a context reset is expected, anything beyond is a fault; the peer1
+    probe after) -- DONE in the code: serve() detaches the rank threads when step_poisoned() (the scheduler is joined:
+    fail_loop returns), main() ends with _Exit(1) after flushing, no engine teardown; and the start-up line says which
+    source set the command-buffer size (the engine's default vs the environment's keys). Scripts: stall-serve.sh forms
+    `cmdbuf0` (RADIANCE_L0_CMDBUF_KB=0) and `fakelive` (FAIL=4 SKIP=6000 DEV=1: one rank, inside the requests; the
+    watcher stamps the failure line and times the engine's own exit, keeps serve-fakelive-N.log); m3-tps.sh suffix
+    `-cmdbuf0-` for the perf gate's off half. STALL5: tries 1-8 PASSED at 15:15 (9 running).
+  - **RUN 295 (15:19 UTC): no new owner note (241 is the last), no gating files. STALL5 = 10 OF 10 TRIES, NO STALL
+    (cmdbuf64 at headroom 2048; the stall came at try 1-2 without it); "the driver takes 0.19 MiB a command list ... set
+    to 64: in effect" (1.13 without); live lists 2,475-3,157 -> ~0.5 GiB instead of ~3. FIX BUILT GREEN (15:15, ops_doc +
+    xe_lane_cpu pass) and COMMITTED f7fd715 -- l0.cpp's hunks 1 + 5 only (m3/tools/pick_hunks.py + git apply --cached;
+    the owner's xe_direct hunks 2 / 3 / 4 / 6 stay unstaged), engine.cpp, main.cpp, rank_barrier.cpp, step_poison.h,
+    docs/OPS.md. IMAGES 314 + ri-m3gen:3 building + loading from 15:2x (logs/make-rt-neo2-314.txt, make-gen-3.txt). GATES
+    NEXT, one card step at a time: (b) STALL6 = `stallstep.sh STALL6 <gen3> 2 fakelive` (one rank's live-pass failure ->
+    the engine's own exit time, then klog + the peer1 probe); (a) STALL7 = `stallstep.sh STALL7 <gen3> 10 cmdbuf0`... no:
+    (a) is the fixed engine at its DEFAULT (`svc`) 10 tries = STALL7 `svc`; STALL8 `cmdbuf0` (the driver's default size on
+    the fixed engine: it may fail, it must not hang); (c) the perf gate M412 (`svcmtpx-gnt0-hc8-rp-gnx`, image 314, the
+    default 64 KiB) vs M413 (`...-cmdbuf0`), texts = M285, within -0.5 %; (d) a tool-mix rotation H161 on 314.**
+  - **Images 314 = 9fea21a8f5c9 + ri-m3gen:3 = 971c6b989ef2 (15:30). STALL6 (`fakelive`: 4 fakes on device 1 after 6,000
+    appends): BOTH tries PASSED -- the bounded drain retried and the step RECOVERED live with the peer healthy (all 3
+    documents, 0 errors). STALL7 (`fakelivefail`: every device-1 append after the 6,000th fails, budget 2 s): the step
+    failure fired ("after 37,834,374 retries over 2000 ms" -- the sync on an idle list returns at once: a busy spin)
+    BUT THE ENGINE STALLED: the failure surfaced in a HELD tape play flushed from a library launch's hook (l0.cpp
+    n_hook_device l.~1895 and flush_held_hook l.~2433), which only WARNED ("device: a held tape play failed") -- the
+    rank's step went on, then both rank threads sat in done_wait ("waited 10 s for a ring slot's last play", unbounded,
+    hrtimer_nanosleep) and the barrier showed 1 of 3. FIX 2 (15:4x): (1) those two paths now RAD_ERR + step_poison();
+    (2) step_poison() runs a hook the engine registers at start (engine.cpp after barrier_'s creation: step_status_ =
+    RAD_E_DEVICE + barrier abort), so whichever thread poisons -- rank or device hook -- the ranks leave and the step
+    loop's status check runs fail_loop (the requests get an error); (3) a WATCHDOG started by the first poison:
+    RADIANCE_STEP_POISON_EXIT_S (default 60, 0 off) later the process says so and _Exit(1)s, whatever wait a thread is
+    stuck in; (4) the drain sleeps the rest of each 10 ms slice; (5) rank_loop leaves when poisoned after its
+    run_step. Built green 15:43 (ops_doc, xe_lane_cpu), uncommitted until the gates pass; IMAGE 315 = ea4702a5974a,
+    ri-m3gen:4 = 444a7d067b81 (local 314 / gen 3 removed, / 56 GB). STALL8 (`fakelivefail` on gen:4) STARTED 15:5x.**
+  - **STALL8 (15:47-15:53): THE LOCK-STEP ABORT WORKS -- both tries: rank 1's step failed at +6 s ("after 199 retries
+    over 2004 ms"), the held-play paths poisoned the step, rank 0's appends then failed at once ("the other rank's step
+    has failed ... after 0 retries"), the three requests ended with errors, the engine EXITED BY ITSELF 4 s after the
+    failure line, and the next try's fresh engine came up and served. BUT klog2 FAULT: card 0b (GT0, ccs0, ASID 1026)
+    logged FIVE READ PAGE FAULTS at 15:49:16 = try 1's exit (addresses 0xd556b6400000-0xd556b6408000, "Fault response:
+    Unsuccessful -ENOENT / -EINVAL"), no reset, no devcoredump, no ban; try 2's exit clean; the card served the next
+    try. Diagnosis: the no-wait exit (_Exit with the healthy card's kernels still running -- its all-reduces polling the
+    failed peer) tore the context down under a running kernel. Coordinator's rule ("if the driver complains, keep the
+    wait"): REVERTED to waiting -- serve() joins the rank threads, main returns normally (teardown with the device
+    idle). Making the wait finite needed one more piece: the all-reduce kernels had no early exit after a give-up, so a
+    queued pass's ~100 launches would each spin the full ~2 min budget; xe_allreduce.cpp `ar_spin_now`: once a rank's
+    launch gave up (seq_ctr[3] > 0), later launches poll 1/1024 of the budget (0 in a healthy run: results and order
+    unchanged). Watchdog default 60 -> 300 s. Built green 16:07 (ops_doc, xe_lane_cpu, xe_allreduce_cpu); images 316 +
+    ri-m3gen:5 building. Fault recorded under Reviewed GPU faults.**
   - **RUN 293 (12:00 UTC, 11-11): unchanged (OWNER-NOTES 4,291 lines, no gating files, precheck 12:00 clean, no owner or
     coordinator answer). Same waiting point; the run ends (~$0.5).**
   - **RUN 292 (11:51 UTC, 11-11): unchanged (OWNER-NOTES 4,291 lines, no gating files, precheck 11:50 clean, no owner or

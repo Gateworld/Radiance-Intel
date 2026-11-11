@@ -1,5 +1,94 @@
 # Waiting for the owner (newest first; run 179's section at the top, 2026-11-04 19:00 UTC)
 
+## Run 294-295, 15:3x UTC (11-11): NOTE 236 -- the multi-user + tool-call stall: found, fixed, gates running
+
+- **Reproduced** in 1-2 tries (headroom 2048, GEN0's three documents at once; m3/intel-host/stall-serve.sh +
+  logs/stallstep.sh, each try a fresh engine, a watcher that kills it at the barrier warning, the host step kills the
+  container). Both stalls came when the tool-call conversation's second turn arrived after the others finished.
+- **Cause:** (1) the recorded passes' command lists took 1.13 MiB each at the driver's default, ~2.5-3K of them live =
+  ~3 GiB outside the headroom; free VRAM was already under the recordings' floor, so the new shape ran live and its
+  launches failed out of device memory; (2) one rank's step failed on that (fatal by design), the other rank's retry
+  (note 58) then waited with NO BOUND for device work that needed the dead rank -- the engine neither served nor
+  exited. Nothing grammar-specific.
+- **Your service was already safe from (1):** m3/service/run.sh sets the 64 KiB command buffer (0.19 MiB a list); the
+  step containers (GEN0, my reproducers) ran the driver's default. Since commit f7fd715 the engine sets that key itself
+  at start-up unless the environment already has it (so the service's own keys stand), and logs its source.
+- **The fix (f7fd715, exact, the common path untouched):** the retry's drain is bounded (10 ms slices, 20 s budget, a
+  line every 5 s, then the step fails); any rank's failed step poisons the step and aborts the barrier, so both ranks
+  leave together, the requests end with an error, and the process exits without waiting on the device (the service's
+  systemd restarts it). With the 64 KiB key alone: 10 of 10 tries, no stall (STALL5).
+- **Gates (running, results below as they land):** the fixed engine at its default 10 tries; the driver's default size
+  on the fixed engine (it may fail, it must not hang); a forced one-rank failure inside the requests (the engine's own
+  exit time, then the kernel log and the peer probe); the M-pair at 64 KiB vs the old size (texts = M285, within
+  -0.5 %); a rotation with tool calls. No default changes for you to decide here except the engine-side key, which
+  matches what your service already runs.
+
+## Run 294, 14:3x UTC (11-11): NOTE 237 -- the MTP draft depth re-measured on today's engine; DEFERRED by the owner to after MTP v3 (note 241)
+
+- **Setting:** image ri-m3rtneo:313 (= 311, today's default, plus two off-by-default additions from note 235), config
+  only (`--num-speculative-tokens` 2 / 3 / 4, run 160's substitution), the single prompt M-steps with 2 runs each (run 2 =
+  the warm figure), texts = M285 in every run; then the rotation pair on the same image.
+- **Single prompt (256 tokens):** depth 2 (M409) **96.50 tok/s**, 124 steps, 2.06 tokens a step, drafts 244 kept 133;
+  depth 3 (M411) 90.97, 112 steps, 2.29 a step, drafts 330 kept 146; depth 4 (M410) 91.10, 112 steps, drafts 330 kept 146
+  -- depth 2 is **+6.1 %** over depth 3 here, depth 4 = depth 3 (the drafter offers a fourth token in only 6 of 222
+  verifies, so depth 4 is depth 3 with a wider verify).
+- **Conditional acceptance per draft position (given every earlier one taken; /metrics, both runs pooled):** depth 2:
+  67.6 % / 62.3 % (positions 0 / 1), pooled 54.9 %; depth 3: 70.3 / 60.3 / 51.1 %, pooled 44.2 %; depth 4: 70.3 / 59.6 /
+  50.5 / 33 % (2 of 6), pooled 42.5 %.
+- **The rotation pair (10 min, the mixed prompt set, both cards, same image):** depth 2 (H159) median 109.1 / mean 108.00 /
+  aggregate 107.13 tok/s; depth 3 (H160) **109.8 / 109.92 / 109.26** -- depth 2 is **-0.5 % median, -1.7 % mean, -1.9 %
+  aggregate**; the long high-acceptance answers want the third draft (max 117.2 vs 131.0 tok/s; the 462-token prompt
+  bucket 115.3 vs 130.5); the short prompts split both ways within noise. Texts: 11 / 11 first-rotation responses
+  identical between the two (text, tokens, every logprob, usage). Both kernel logs clean, peak 63 C.
+- **My reading:** the single prompt's +6 % does not carry to the service's shape; depth 3 stays the better default for the
+  rotation (the >= 1 % line was passed on the single prompt only). Recommendation: keep depth 3. Your call.
+
+## Run 294, 13:5x UTC (11-11): NOTE 235 -- the fp16 GDN state cache FAILS the accuracy bar on long contexts; YOUR DECISION
+
+- **What was built (commits 4b00920 + cd982a1, images ri-m3rtneo:312 / 313 on intel-host):** `RADIANCE_GDN_STATE_F16=1` (opt-in,
+  off by default) stores the GDN recurrent state cache in fp16 (the kernels' SDT=1 instances: fp16 storage, fp32
+  arithmetic, chunk scan h0 / ht and the decode update alike; the plugin's one dtype line; the cache halves, 27 MiB a
+  slot against 54). Plus a range probe (`RADIANCE_GDN_STATE_RANGE=1`, off by default) and the replay modes `gsf16` /
+  `gsf16n` / `gsf16d` in kld-gl.sh; m3/kld_buckets.py / kld_onset.py / kld_bins.py read the replay's per-position rows.
+- **Accuracy, note 149's KL replay, fp16 state scored against today's fp32 (image 313, both corpora, deterministic:
+  the run without the probe repeats the run with it to every digit):**
+  - KGS1, the agreement corpus (11 docs, 2,765 positions, every prompt <= 2,051 tokens): mean KL 1.5e-8, top-1 100 %,
+    ppl ratio 1.0000 = the replay's own floor -- BY CONSTRUCTION: each prompt is one prefill step, so the fp16 state is
+    written but never read back. It says nothing about fp16.
+  - **KGS2, the long corpus (7 docs, 54,722 positions): mean KL 0.0449, median 7.8e-5, p99 1.05, max 14.7, top-1 97.14 %,
+    ppl ratio 1.0015.** Lever #3 on the same corpus: 0.0021 / 98.65 %. The bar you set (well inside 0.026-0.042 / >= 96.2
+    %, ideally 0.002 / 98.7 %): the KL is ABOVE the band's upper edge, the top-1 inside it. By position bucket: 0-2K
+    0.0016 / 99.62 % (lever #3 0.0018 / 98.54), 2-8K 0.0723 / 95.56 % (0.0027 / 98.40), 8-20K 0.0203 / 98.60 % (0.0006 /
+    99.64). Per document: prefill-7k 0.0006 / 99.96 %, prefill-20k 0.0022 / 99.96 %, prose-stories 0.0017 / 98.96 %,
+    code-moe 0.0089 / 98.1 %, doc-owner-notes 0.0106 / 96.9 %, code-engine 0.0197 / 95.5 %, **transcript-serve-log 0.229 /
+    90.07 %**.
+  - **Where it breaks:** every document sits at the floor until its first prefill step ends (onsets at positions 1,024 /
+    3,072 / 4,032: the 4,096 budget shared by the documents in flight), i.e. the first time the state is stored in fp16
+    and read back; then the KL jumps at once and does not decay -- the serve-log transcript: 0.63 / 77.7 % top-1 over the
+    first 256 positions after its onset, 0.4-0.8 for the next 2,000; code-engine 0.013 / 94.5 %; owner-notes 0.036 /
+    91.8 %; prefill-7k only 3e-4 / 100 %. Not a layout bug (that would hit every document the same; two documents stay
+    at 100 % top-1 with KL 3e-4 to 2e-3; the fp16 load / store code of both chunk-scan forms was desk-checked): a
+    correct state rounded to fp16 once is enough to flip 5-22 % of the next tokens on repetitive and code documents.
+    The model is far more sensitive to the state's precision than fp16's 2^-11 suggests -- cancellation in q.h, or the
+    small components fp16 cannot hold (subnormal under 6.1e-5, zero under 6e-8). And the replay is the GENTLE case: one
+    rounding per 4,096 tokens; the token loop rounds the state every token.
+  - **The range (your step 1 check):** the fp32 state's max |h| is 0.4-20 a layer (the largest 19.6) -- nowhere near
+    fp16's 65,504; overflow is not the mechanism. (The probe's first form put its cells in one device's context and the
+    other rank wrote across contexts -- half its 72 cells were random words; the second form, one set a device plus
+    counts of the elements below fp16's smallest normal and subnormal, is building; a run with it follows and the
+    precision numbers go here. The KL numbers above are from the engine, unaffected: the run without the probe is
+    identical.)
+- **My reading:** as implemented, the fp16 state cache is not in lever #3's class and not inside your band on KL; on
+  long repetitive contexts it is a quality regression a user would see. The ~+1 % decode it was expected to buy (your
+  note's estimate) does not justify it. Options if you want to go on: (a) a scaled fp16 (store h / 2^k per head with a
+  per-head scale: helps only if the small components are the loss, which the precision counts will tell); (b) bf16
+  storage (range of fp32, 2^-8 precision: worse rounding, so unlikely); (c) fp16 for the decode update only, the chunk
+  scan's boundaries kept fp32 (the token loop rounds every token -- the replay cannot test that path; an M-pair's texts
+  and a rotation would); (d) stop here (my recommendation). No speed work was done, per your note.
+- **Also this run:** note 234 item 1 DONE (above). Note 236 (the GEN0 stall) is next after note 237's depth
+  re-measure (the coordinator's order): the reproducer scripts (m3/intel-host/stall-serve.sh, logs/stallstep.sh, image
+  ri-m3gen:2 = 313 + python3) are written and staged. Note 237's M409 (depth 2) started 13:47.
+
 ANSWERED by owner note 234 (~11:0x 11-11): (1) groups A / B DEFAULT ON -- DONE in run 294: commit 9f2884f, image
 ri-m3rtneo:311 (da817adb670d) on intel-host; the flagless reference M407 91.36 tok/s (texts = M285) and its profiled twin
 M408 84.42 with both paired kernels by default (bf16x2 47.7 a step, x3 + bf16 12.0 a step, the old pair / x3 launches
