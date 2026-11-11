@@ -23,6 +23,23 @@ Host names, paths and the names of unrelated services were replaced with neutral
 (`amd-host`, `intel-host`, `~`, `assistant`, `app`, `database`). Old commit hashes mentioned in the notes are mapped
 to this repository's hashes in `intel-port-docs/COMMIT-MAP.txt`.
 
+## Model
+
+All numbers here are for **Qwen3.8-Flash-Next**, from the checkpoint
+[tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ](https://huggingface.co/tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ)
+(model type `qwen4_exp`, under the Qwen Community License 1.0; the weights are not part of this repository):
+
+- 48 layers, hidden size 2,560, vocabulary 248,320;
+- hybrid attention: Gated DeltaNet (linear attention, 16 key / 48 value heads) in three of every four layers, and full
+  gated attention every fourth layer (24 query heads, 2 KV heads, head dim 256);
+- mixture of experts: 512 routed experts, 10 active per token (expert width 640), plus a shared expert;
+- 4 hyper-connection residual streams;
+- one multi-token-prediction (MTP) layer, used as the draft head for 3-token speculative decoding.
+
+On the B70s the engine converts it to its own `.rad` format: routed experts as 4-bit non-uniform codes with int8
+activations ("format C"), the dense trunk as int8 weights × int8 activations, the draft head's projection at 2 bits,
+split tensor-parallel across the two cards.
+
 ## Status (November 2026)
 
 On 2× Intel Arc Pro B70, single-user decode with MTP: about 91 tokens/s; 7K-token prompt prefill: about 3.1 s.
