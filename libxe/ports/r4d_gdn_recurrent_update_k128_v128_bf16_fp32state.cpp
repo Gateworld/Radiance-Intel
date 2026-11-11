@@ -372,6 +372,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   XE_SHARED(float, nws, (LAT & 4) ? THR / kSplitNormRowsAWave : 1);
   XE_SHARED(float, nred, (LAT & 4) ? THR / RU_V : 1);
   XE_SHARED_VAR(int, nlast);
+  /* brief C (LAT & 8, run 284): the per-token q / k scales once a workgroup -- 8 lanes a token compute the same 16-element
+   * partial sums in the same order and the same xor tree as every row's lanes do, so the scales are the rows' bits */
+  static_assert(!(LAT & 8) || (CV && KT == 8 && 8 * RU_CVT <= THR), "brief C: the conv split at KT 8");
+  XE_SHARED(float, cscl, (LAT & 8) ? RU_CVT * 2 : 1);
   /* The key head's history for the final rewrite (two newest history entries and this step's
    * inputs, one channel per thread), parked in LDS: in registers across the token loop they spill. */
   XE_SHARED(unsigned short, cvh, CV ? (CS - 1 + RU_CVT) * THR : 1);
@@ -638,6 +642,33 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 
   const float alog = __expf(a_log_h);
 
+  if constexpr (LAT & 8) {
+    /* brief C: lanes 8t .. 8t+7 form token t's q / k scales exactly as a row's 8 lanes do below (the 16 bf16 -> f32
+     * converts, the 16 products accumulated in order, ru_row_sum<8> over the same 8 consecutive lanes, the same
+     * rsqrt expressions), once a workgroup instead of once a row */
+    if (tid < 8 * T) {
+      const int ut = tid >> 3, uk0 = (tid & 7) * HK;
+      const unsigned short* qp = cvq + ut * RU_K + uk0;
+      const unsigned short* kp = cvk + ut * RU_K + uk0;
+      float qq[HK], kk[HK];
+#pragma unroll
+      for (int j = 0; j < HK; j += 8) {
+        const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+        const unsigned short* sq8 = (const unsigned short*)&wq;
+        const unsigned short* sk8 = (const unsigned short*)&wk;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { qq[j + e] = bf2f(sq8[e]); kk[j + e] = bf2f(sk8[e]); }
+      }
+      float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+      for (int j = 0; j < HK; ++j) { sq += qq[j] * qq[j]; sk += kk[j] * kk[j]; }
+      sq = ru_row_sum<KT>(sq);
+      sk = ru_row_sum<KT>(sk);
+      if ((tid & 7) == 0) { cscl[ut * 2] = __frsqrt_rn(sq + 1e-6f) * scale; cscl[ut * 2 + 1] = __frsqrt_rn(sk + 1e-6f); }
+    }
+    __syncthreads();
+  }
+
   if (STG) {
     // One lane per (token, half) computes the same sums each v row computes on the STG=0 path.
     if (tid < 2 * T) {
@@ -687,7 +718,9 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 
     // l2 norms: 64 in-lane terms, then one exchange with the lane holding the other half
     float qs, ks;
-    if (STG) {
+    if constexpr (LAT & 8) {
+      qs = cscl[t * 2]; ks = cscl[t * 2 + 1];           /* brief C: the workgroup's per-token scales (the same bits) */
+    } else if (STG) {
       qs = sscl[t * 2]; ks = sscl[t * 2 + 1];
     } else {
       float sq = 0.0f, sk = 0.0f;
@@ -1676,12 +1709,14 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
      * folded norm; L1 is folded into every kernel, L2 dropped), instantiated for the VS 2 split at NT 0 with the f32
      * state and the int8 quantiser (the served form) when its counter block holds N * H; elsewhere ignored. With N1
      * the norm launch below is skipped. */
+    /* run 284, brief C: RADIANCE_XE_GDN_LAT=8 -> the per-token q / k scales once a workgroup (LAT 8), the same bits */
     static const int split_lat = [] {
       const char* e = std::getenv("RADIANCE_XE_GDN_LAT");
-      return (e && std::atoi(e) == 7) ? 7 : 0;
+      const int v = e ? std::atoi(e) : 0;
+      return (v == 7 || v == 8) ? v : 0;
     }();
     int lat = (split_vs == 2 && !nt && !sdt) ? split_lat : 0;
-    if (lat && !(oq && oq_i8 && cv.nctr && (long)N * H <= (long)kMaxConvCtr)) lat = 0;
+    if (lat == 7 && !(oq && oq_i8 && cv.nctr && (long)N * H <= (long)kMaxConvCtr)) lat = 0;
 #define RC_SPLIT_A(VSC, NTC, ANCC, SDTC, LATC)                                                 \
   XE_LAUNCH_GGL_GRF256((r4d_gdn_recurrent_update_kernel<1, 0, VSC, NTC, ANCC, 0, SDTC, 1, RC_KT, LATC>), \
                      sgrid, sblk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,     \
@@ -1696,6 +1731,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #define RC_SPLIT_VS(SDTC) do { if (split_vs == 4) RC_SPLIT_NT(4, SDTC); else RC_SPLIT_NT(2, SDTC); } while (0)
 #define RC_SPLIT_L(LATC) do { if (anc) RC_SPLIT_A(2, 0, 1, 0, LATC); else RC_SPLIT_A(2, 0, 0, 0, LATC); } while (0)
     if (lat == 7) RC_SPLIT_L(4);
+    else if (lat == 8) RC_SPLIT_L(8);
     else { if (sdt) RC_SPLIT_VS(1); else RC_SPLIT_VS(0); }
 #undef RC_SPLIT_L
 #undef RC_SPLIT_VS
