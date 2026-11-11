@@ -1,0 +1,8 @@
+torch 2.9.0+xpu device Intel(R) Graphics [0xe223]
+sycl_arch not recognized: 21483225088
+sycl_arch not recognized: 21483225088
+sycl_arch not recognized: 21483225088
+  T=1 zero=0 gva=1: out vs ref 1.719e-03; with s0 transposed 8.811e-01; state 3.533e-07, state^T 1.407e+00
+T=1 gva=1: rel_l2 out 1.719e-03 state 3.533e-07; wall 381.0 us a call (incl. Python launch), device 6.0 us a call (kernels named fused_recurrent)
+  T=4 zero=0 gva=1: out vs ref 1.681e-03; with s0 transposed 6.943e-01; state 4.544e-07, state^T 1.409e+00
+T=4 gva=1: rel_l2 out 1.681e-03 state 4.544e-07; wall 381.9 us a call (incl. Python launch), device 9.5 us a call (kernels named fused_recurrent)
