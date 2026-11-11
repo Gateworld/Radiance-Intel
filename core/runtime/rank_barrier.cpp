@@ -1,8 +1,10 @@
 /* rank_barrier.cpp -- see rank_barrier.h for why this is a condvar and not an IPC handshake. */
 #include "rank_barrier.h"
+#include "step_poison.h"
 #include "../rad_internal.h"
 #include "../util/stallwatch.h"
 
+#include <atomic>
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -80,5 +82,12 @@ void RankBarrier::abort() {
     }
     cv_.notify_all();
 }
+
+/* step_poison.h (owner note 236) */
+namespace {
+std::atomic<bool> g_step_poisoned{false};
+}
+void step_poison() { g_step_poisoned.store(true, std::memory_order_release); }
+bool step_poisoned() { return g_step_poisoned.load(std::memory_order_acquire); }
 
 }  /* namespace rad */

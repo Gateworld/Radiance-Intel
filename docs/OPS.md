@@ -1906,6 +1906,11 @@ at every size.
 | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
 | `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
 | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
+| `moe_host_experts` | `M` `n` `top_k` `n_expert` `dtype` | `expert_ids`, `expert_w` → `y` |
+
+`moe_host_experts` is the host-side experts step (libref's `ref_moe_host_experts`): the routed experts' partial for
+the rows whose experts live in the host arena, placed per layer and timed; its first form writes zeros (the
+residency view and the computation follow). It takes the row gate's `expert_ids` / `expert_w` and writes `y`.
 
 The arithmetic is the same whether a kernel is handed the tables or the stacked form
 ([Weight operands and weight tables](#weight-operands-and-weight-tables)).

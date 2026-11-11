@@ -7,6 +7,7 @@
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
 #include "kld.h"
+#include "runtime/step_poison.h"   /* owner note 236: a failed step poisons the step for every thread */
 #include "mm/processor.h"
 #include "mm/media.h"
 
@@ -314,9 +315,20 @@ void Engine::rank_loop(int index) {
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
 
+    /* Owner note 236 (Intel port, run 294): a rank whose step fails poisons the step (step_poison.h) and aborts
+     * the barrier at once, so the other rank's thread -- in the Level Zero layer's out-of-memory drain, or about
+     * to join -- leaves within a bound, the scheduler is released at the join and fail_loop runs (the requests
+     * end with an error, the process exits): GEN0 / STALL1-5 had one rank's step fail on an out-of-memory
+     * wave while the other rank waited forever for the device work that needed it. The barrier, once aborted,
+     * lets every arrival through, so a poisoned rank leaves its loop rather than run a stale batch. */
+    auto fail_step = [&](int s) {
+        step_status_.store(s, std::memory_order_release);
+        step_poison();
+        barrier_->abort();
+    };
     for (;;) {
         barrier_->arrive_and_wait();                    /* released against this step's batch */
-        if (stopping_.load(std::memory_order_acquire)) break;
+        if (stopping_.load(std::memory_order_acquire) || step_poisoned()) break;
 
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
         if (b) {
@@ -325,16 +337,16 @@ void Engine::rank_loop(int index) {
             const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
             if (!mine) {
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
-                step_status_.store(RAD_E_STATE, std::memory_order_release);
-                barrier_->arrive_and_wait();
-                continue;
+                fail_step(RAD_E_STATE);
+                break;
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
-                step_status_.store(s, std::memory_order_release);
+                fail_step(s);
+                break;
             } else if (b->n_out > 0 && what != kIssueModel) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
                  * the forward pass enqueued above, so the wait is hidden behind device work. */
@@ -352,7 +364,8 @@ void Engine::rank_loop(int index) {
                     if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
-                        step_status_.store(s, std::memory_order_release);
+                        fail_step(s);
+                        break;
                     }
                 }
             }
@@ -1734,8 +1747,17 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * and an unfinished request still writes there (server.h). */
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
-    if (stepper.joinable()) stepper.join();
-    for (auto& t : rank_threads_) if (t.joinable()) t.join();
+    if (stepper.joinable()) stepper.join();          /* the scheduler: fail_loop returns, it is never stuck on the device */
+    if (step_poisoned()) {
+        /* Owner note 236 (Intel port, run 294): a rank's step failed. The other rank's thread may sit in a device
+         * wait that only the dead rank's collectives would end (the all-reduce's give-up is minutes), so the stop
+         * does not wait for the device: the rank threads are detached and main() leaves at once (_Exit), the
+         * driver tears the context down with the process. */
+        RAD_WARN("stopping after a failed step: not waiting for the ranks' device work (owner note 236)");
+        for (auto& t : rank_threads_) if (t.joinable()) t.detach();
+    } else {
+        for (auto& t : rank_threads_) if (t.joinable()) t.join();
+    }
     rank_threads_.clear();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);

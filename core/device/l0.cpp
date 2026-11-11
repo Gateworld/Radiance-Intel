@@ -24,6 +24,7 @@
 
 #include "device.h"
 #include "../rad_internal.h"
+#include "../runtime/step_poison.h"   /* owner note 236: the other rank's failed step ends the append retry's drain */
 #include "rad_l0_rec.h"
 
 #include <level_zero/ze_api.h>
@@ -1517,31 +1518,98 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
         const char* v = std::getenv("RADIANCE_L0_FAKE_APPEND_FAIL");
         return v ? std::atoi(v) : 0;
     }()};
+    /* Owner note 236 (Intel port, run 294): the fake's placement -- RADIANCE_L0_FAKE_APPEND_FAIL_SKIP=K lets the
+     * first K appends through (a failure inside a live pass, not at start-up), RADIANCE_L0_FAKE_APPEND_FAIL_DEV=d
+     * confines it to one device (one rank's step fails while the other's is healthy: the lock-step abort's test). */
+    static std::atomic<int> fake_skip{[] {
+        const char* v = std::getenv("RADIANCE_L0_FAKE_APPEND_FAIL_SKIP");
+        return v ? std::atoi(v) : 0;
+    }()};
+    static const int fake_dev = [] {
+        const char* v = std::getenv("RADIANCE_L0_FAKE_APPEND_FAIL_DEV");
+        return v ? std::atoi(v) : -1;
+    }();
     auto do_append = [&]() -> ze_result_t {
-        if (fake_left.load(std::memory_order_relaxed) > 0 && fake_left.fetch_sub(1) > 0)
-            return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (fake_left.load(std::memory_order_relaxed) > 0 && (fake_dev < 0 || fake_dev == t.dev)) {
+            if (fake_skip.load(std::memory_order_relaxed) > 0 && fake_skip.fetch_sub(1) > 0) { /* let through */ }
+            else if (fake_left.fetch_sub(1) > 0) return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
         return append_fn()(Z.imm, n, lists, r.ev, (uint32_t)waits.size(), waits.empty() ? nullptr : waits.data());
     };
     if (stg) s3 = clk::now();
     ze_result_t rc = do_append();
     if (stg) s4 = clk::now();
-    for (int attempt = 1; attempt <= 3 && (rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
-                                           rc == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY); ++attempt) {
+    /* Owner note 236 (run 294; note 240's review): the drain in SLICES with the append retried between them, under
+     * a total budget, then note 58's throw. The old form waited for the whole immediate list with no bound
+     * (zeCommandListHostSynchronize(Z.imm, UINT64_MAX)): GEN0 / STALL1 / STALL3 had the other rank's step fail on
+     * the same out-of-memory wave, so this device's in-flight collectives waited on a peer that would issue nothing
+     * more, and the drain never returned -- the engine could neither serve nor stop. The common path (no
+     * out-of-memory result) is untouched: no slice, no wait. step_poisoned() (the other rank has failed) ends the
+     * drain at once. RADIANCE_L0_APPEND_DRAIN_MS (a slice, default 10), RADIANCE_L0_APPEND_DRAIN_BUDGET_MS (the
+     * total, default 20000). */
+    static const int64_t drain_ms = [] {
+        const char* v = std::getenv("RADIANCE_L0_APPEND_DRAIN_MS");
+        const long n = v ? std::strtol(v, nullptr, 10) : 0;
+        return n > 0 ? (int64_t)n : (int64_t)10;
+    }();
+    static const int64_t drain_budget_ms = [] {
+        const char* v = std::getenv("RADIANCE_L0_APPEND_DRAIN_BUDGET_MS");
+        const long n = v ? std::strtol(v, nullptr, 10) : 0;
+        return n > 0 ? (int64_t)n : (int64_t)20000;
+    }();
+    const auto oom = [](ze_result_t x) {
+        return x == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY || x == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+    };
+    if (oom(rc)) {
+        const ze_result_t first = rc;
+        const auto d0 = clk::now();
+        int64_t told_ms = 0, elapsed_ms = 0;
+        int attempts = 0;
+        bool poisoned = false;
         if (!t.oom_told) {
             t.oom_told = true;
             RAD_WARN("l0 tape %llu: appending %u list(s) failed out of %s memory (0x%x); draining device %d's "
-                     "immediate list and retrying (attempt %d of 3; owner note 58)", (unsigned long long)t.id, n,
-                     rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ? "device" : "host", (unsigned)rc, t.dev, attempt);
+                     "immediate list in %lld ms slices and retrying for up to %lld ms (owner notes 58 / 236)",
+                     (unsigned long long)t.id, n, rc == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ? "device" : "host",
+                     (unsigned)rc, t.dev, (long long)drain_ms, (long long)drain_budget_ms);
         }
-        g_append_retries.fetch_add(1, std::memory_order_relaxed);
-        zeCommandListHostSynchronize(Z.imm, UINT64_MAX);
-        rc = do_append();
+        for (;;) {
+            if (rad::step_poisoned()) { poisoned = true; break; }
+            g_append_retries.fetch_add(1, std::memory_order_relaxed);
+            zeCommandListHostSynchronize(Z.imm, (uint64_t)drain_ms * 1000000ull);
+            rc = do_append();
+            ++attempts;
+            if (!oom(rc)) break;
+            elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - d0).count();
+            if (elapsed_ms >= drain_budget_ms) break;
+            if (elapsed_ms - told_ms >= 5000) {
+                told_ms = elapsed_ms;
+                RAD_WARN("l0 tape %llu: still out of memory after %lld ms and %d retries on device %d (slot %d, "
+                         "serial %llu pending before it; the previous play %s)", (unsigned long long)t.id,
+                         (long long)elapsed_ms, attempts, t.dev, dep_slot, (unsigned long long)dep_serial,
+                         dep_slot >= 0 && !n_slot_done(t.dev, dep_slot, dep_serial) ? "still running" : "done");
+            }
+        }
+        if (oom(rc) || poisoned) {
+            char msg[128];
+            std::snprintf(msg, sizeof msg, "zeCommandListImmediateAppendCommandListsExp: 0x%x (%u lists)",
+                          (unsigned)(poisoned ? first : rc), n);
+            if (poisoned)
+                RAD_ERR("l0 tape %llu: %s -- the other rank's step has failed, so this device's work cannot complete; "
+                        "this rank's step fails with it after %d retries (owner note 236)", (unsigned long long)t.id,
+                        msg, attempts);
+            else
+                RAD_ERR("l0 tape %llu: %s after %d retries over %lld ms -- this rank's step fails rather than waiting "
+                        "for commands that never ran (owner notes 58 / 236)", (unsigned long long)t.id, msg, attempts,
+                        (long long)elapsed_ms);
+            throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
+        }
     }
     if (rc != ZE_RESULT_SUCCESS) {
         char msg[96];
         std::snprintf(msg, sizeof msg, "zeCommandListImmediateAppendCommandListsExp: 0x%x (%u lists)", (unsigned)rc, n);
-        RAD_ERR("l0 tape %llu: %s after 3 retries -- this rank's step fails rather than waiting for commands that "
-                "never ran (owner note 58)", (unsigned long long)t.id, msg);
+        RAD_ERR("l0 tape %llu: %s -- this rank's step fails rather than waiting for commands that never ran (owner "
+                "note 58)", (unsigned long long)t.id, msg);
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), msg);
     }
     r.used = true;
