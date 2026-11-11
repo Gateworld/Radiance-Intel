@@ -96,6 +96,14 @@ inline void ar_gave_up(uint32_t* seq_ctr, uint32_t rank, uint32_t s, uint32_t b,
         sycl::ext::oneapi::experimental::printf(fmt, rank, s, b, nblk, n);
     }
 }
+/* Owner note 236 (Intel port, run 295): once one of this rank's launches has given up (seq_ctr[3] > 0), every later
+ * launch polls with 1/1024 of the budget. A give-up means the peer stopped (its step failed: STALL8), and a pass
+ * already queued holds ~100 all-reduces that would each spin the full budget (~2 min) -- the device would stay busy
+ * for hours and the engine could not stop cleanly. The counter is 0 in a healthy run, so the healthy path's polls,
+ * results and order are unchanged (one more uncached load a thread). */
+inline uint32_t ar_spin_now(const uint32_t* seq_ctr, uint32_t spin) {
+    return uc_ld(seq_ctr + 3) != 0u ? (spin >> 10) + 1u : spin;
+}
 
 /* RADIANCE_XE_AR_SKEW (run 122): block 0's failed polls for this launch into the ring (a kernel argument, null when
  * off). One thread, one store a launch. (m3 fault 35: the first form loaded the ring's address from the counter block
@@ -372,6 +380,7 @@ void ar_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uint32_
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     /* the launch's sequence number: every block reads the same counter; block 0 advances it last */
     const uint32_t s = uc_ld(seq_ctr) + 1u;
+    spin = ar_spin_now(seq_ctr, spin);   /* owner note 236: a short budget after an earlier give-up */
     /* owner note 219 B.0 (XE_AR_STAMPS=1, the PR 5 form only): this block's stamp entry, thread 0; null when off */
     uint64_t* se = nullptr;
     const uint32_t par = s & 1u;
@@ -736,6 +745,7 @@ void gather_kernel(const uint32_t* __restrict__ x, uint32_t* __restrict__ y, uin
                    uint32_t spin, uint64_t* ring) {
     const uint32_t b = blockIdx.x, t = threadIdx.x;
     const uint32_t s = uc_ld(seq_ctr) + 1u;
+    spin = ar_spin_now(seq_ctr, spin);   /* owner note 236: a short budget after an earlier give-up */
     const uint32_t par = s & 1u;
     uint32_t* out = peer_slots + par * slot_words;
     const uint32_t* in = my_slots + par * slot_words;

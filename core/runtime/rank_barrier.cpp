@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <thread>
 
 namespace rad {
 
@@ -86,8 +87,30 @@ void RankBarrier::abort() {
 /* step_poison.h (owner note 236) */
 namespace {
 std::atomic<bool> g_step_poisoned{false};
+std::atomic<void (*)(void*)> g_poison_fn{nullptr};
+std::atomic<void*> g_poison_arg{nullptr};
 }
-void step_poison() { g_step_poisoned.store(true, std::memory_order_release); }
+void step_poison_set_hook(void (*fn)(void*), void* arg) {
+    g_poison_arg.store(arg, std::memory_order_release);
+    g_poison_fn.store(fn, std::memory_order_release);
+}
+void step_poison() {
+    if (g_step_poisoned.exchange(true, std::memory_order_acq_rel)) return;   /* once */
+    RAD_ERR("a rank's step failed: every rank leaves the step and the engine stops (owner note 236)");
+    if (void (*fn)(void*) = g_poison_fn.load(std::memory_order_acquire)) fn(g_poison_arg.load(std::memory_order_acquire));
+    const char* e = std::getenv("RADIANCE_STEP_POISON_EXIT_S");
+    /* 300 s: past the all-reduce's first give-up (~2 min) and the queued launches' short ones, so the normal stop
+     * (the device idle, then the teardown) finishes first; the watchdog is for a wait nothing else will end */
+    const long s = e ? std::strtol(e, nullptr, 10) : 300;
+    if (s <= 0) return;
+    std::thread([s] {
+        std::this_thread::sleep_for(std::chrono::seconds(s));
+        RAD_ERR("the engine is still alive %ld s after a rank's step failed (a thread in a device wait the failed "
+                "rank's work would have ended): exit 1 now (RADIANCE_STEP_POISON_EXIT_S; owner note 236)", s);
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }).detach();
+}
 bool step_poisoned() { return g_step_poisoned.load(std::memory_order_acquire); }
 
 }  /* namespace rad */

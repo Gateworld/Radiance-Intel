@@ -343,6 +343,7 @@ void Engine::rank_loop(int index) {
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if (s >= 0 && step_poisoned()) break;   /* another thread failed the step meanwhile: leave, run nothing more */
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 fail_step(s);
@@ -1708,6 +1709,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
     loop_status_.store(RAD_OK, std::memory_order_release);
+    /* Owner note 236: whoever poisons the step (a rank thread, or the device layer when a held play fails inside a
+     * library launch's hook) marks it failed and aborts the barrier -- the rank threads leave, and the scheduler,
+     * released from the join, finds the status and stops the engine with an error for the requests. */
+    step_poison_set_hook([](void* p) {
+        Engine* e = static_cast<Engine*>(p);
+        if (e->step_status_.load(std::memory_order_acquire) >= 0) e->step_status_.store(RAD_E_DEVICE, std::memory_order_release);
+        if (e->barrier_) e->barrier_->abort();
+    }, this);
     done_.reserve((size_t)cfg_.max_seqs);
 
     /* Every host allocation touched once from each rank's mover and compute streams, one rank at a
@@ -1748,16 +1757,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
     if (stepper.joinable()) stepper.join();          /* the scheduler: fail_loop returns, it is never stuck on the device */
-    if (step_poisoned()) {
-        /* Owner note 236 (Intel port, run 294): a rank's step failed. The other rank's thread may sit in a device
-         * wait that only the dead rank's collectives would end (the all-reduce's give-up is minutes), so the stop
-         * does not wait for the device: the rank threads are detached and main() leaves at once (_Exit), the
-         * driver tears the context down with the process. */
-        RAD_WARN("stopping after a failed step: not waiting for the ranks' device work (owner note 236)");
-        for (auto& t : rank_threads_) if (t.joinable()) t.detach();
-    } else {
-        for (auto& t : rank_threads_) if (t.joinable()) t.join();
-    }
+    /* Owner note 236 (Intel port, run 295): after a failed step the other rank's thread may sit in a device wait that
+     * only the failed rank's collectives would end; it ends with the all-reduce's give-up (the first launch's full
+     * budget, the queued ones' 1/1024 after it: xe_allreduce.cpp ar_spin_now). The stop waits for it so the device is
+     * idle at teardown -- STALL8 exited without waiting and card 0b logged five read page faults as the context went
+     * under a running kernel; the poison's watchdog (RADIANCE_STEP_POISON_EXIT_S) bounds the wait. */
+    if (step_poisoned())
+        RAD_WARN("stopping after a failed step: waiting for the ranks' device work to end (the all-reduce's give-up; "
+                 "bounded by RADIANCE_STEP_POISON_EXIT_S; owner note 236)");
+    for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);

@@ -79,15 +79,7 @@ int main(int argc, char** argv) {
         /* serve() can also refuse before listening (e.g. a template default the template
          * rejects, an unholdable thinking budget). */
         if (!engine.startup_report_printed()) engine.print_startup_report(s);
-        if (rad::step_poisoned()) {
-            /* Owner note 236: a rank's step failed and a rank thread may never leave its device wait; no
-             * teardown (the engine's destructor would wait on the streams), the process ends and the driver
-             * tears the context down. */
-            RAD_ERR("exit 1 without the engine's teardown: a rank's step failed and the device may never go idle "
-                    "(owner note 236)");
-            std::fflush(nullptr);
-            std::_Exit(1);
-        }
+        if (rad::step_poisoned()) RAD_ERR("exit 1 after a failed step (owner note 236)");
         return 1;
     }
     return 0;

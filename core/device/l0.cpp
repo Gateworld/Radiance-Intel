@@ -1576,7 +1576,13 @@ void n_play_lists(Tape& t, ze_command_list_handle_t* lists, uint32_t n, bool rep
         for (;;) {
             if (rad::step_poisoned()) { poisoned = true; break; }
             g_append_retries.fetch_add(1, std::memory_order_relaxed);
+            const auto sl0 = clk::now();
             zeCommandListHostSynchronize(Z.imm, (uint64_t)drain_ms * 1000000ull);
+            /* an idle list returns at once: the rest of the slice is slept, so the retries stay one a slice (STALL7:
+             * 37 M retries in 2 s without it) */
+            const auto spent = clk::now() - sl0;
+            if (spent < std::chrono::milliseconds(drain_ms))
+                std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms) - spent);
             rc = do_append();
             ++attempts;
             if (!oom(rc)) break;
@@ -1878,7 +1884,12 @@ int n_hook_device(const void* queue) {
     if (!native_recording() || !queue) {
         /* a library launch reaches the queue without a backend call: a held tape play goes first
          * (N3: a play held past the next libxe launch ran after it) */
-        if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
+        if (flush_held() != RAD_OK) {
+            /* owner note 236 (STALL7): only a warning before, so the rank's step went on with a play that never ran
+             * and both ranks then waited forever on each other's ring slots; now the step is poisoned */
+            RAD_ERR("device: a held tape play failed: %s -- the step fails (owner note 236)", rad_dev_last_error());
+            rad::step_poison();
+        }
         if (queue && glue_on(S((RadStream)queue))) { t_glue_armed = queue; return S((RadStream)queue).dev; }
         if (queue && t_glue_all_armed == queue) { t_glue_armed = queue; return S((RadStream)queue).dev; }
         if (queue && glue_bridge(S((RadStream)queue))) {
@@ -2416,7 +2427,10 @@ int flush_held() {
 }
 /* librad_l0k's hook (it cannot return an error to its caller's caller, so it warns) */
 void flush_held_hook(void) {
-    if (flush_held() != RAD_OK) RAD_WARN("device: a held tape play failed: %s", rad_dev_last_error());
+    if (flush_held() != RAD_OK) {
+        RAD_ERR("device: a held tape play failed: %s -- the step fails (owner note 236)", rad_dev_last_error());
+        rad::step_poison();
+    }
 }
 int z_tape_len(RadTape p) { return p ? (int)static_cast<Tape*>(p)->segs.size() : RAD_E_INVAL; }
 int z_tape_play(RadTape p, int from, int to) {
