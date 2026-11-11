@@ -329,7 +329,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
-        if (rd == 0 && drafted > 0 && cfg_.kld()) RAD_TRY(parity_issue(drafted));
+        /* run 283 (parity2): every round's rows go to the host behind its pass; round 1 is the history pass */
+        if (drafted > 0 && cfg_.kld()) RAD_TRY(parity_issue(drafted, rd == 0 ? 1 : rd));
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 

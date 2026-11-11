@@ -514,7 +514,7 @@ private:
     int  score_rows(const RadBatch* b, const StepOut& so);
     /* RADIANCE_MTP_PARITY (engine_kld.cpp): the MTP head's round-1 logits rows beside the dump, queued after the
      * history pass and written after the step's wait. */
-    int  parity_issue(int drafted);
+    int  parity_issue(int drafted, int round = 1);   /* run 283: the round (1 = the history pass; 2, 3 = the draft passes) */
     int  parity_finish(const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;

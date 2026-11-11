@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,17 +52,27 @@ constexpr int kDumpTop = 32;
  * lm_head, not the 2-bit copy). parity.bin, one record a drafting row:
  *   int32 request id, int32 head index i, int32 the token fed (the trunk's draw at i, i.e. the token at i + 1),
  *   then the head's 32 largest: int32 id x 32, float log-probability x 32 (the ranks' shards merged) */
+/* Run 283 (owner note 224 item 4, briefs/2026-11-11-draft-head-v2-data.md: parity2.bin): RADIANCE_MTP_PARITY_ROUNDS=3
+ * records the head's rounds 1-3 -- the history pass (round 1), then the round-2 and round-3 draft passes, each fed
+ * the previous round's GREEDY draft (the serial drafter's own passes; coupling must be off) -- one record a drafting
+ * row: int32 request id, int32 head index i, int32 rounds, int32 x 3 the tokens fed (t[i+1] = the trunk's draw, then
+ * the round-1 and round-2 drafts), then per round 32 ids + 32 log-probabilities (792 B). ROUNDS=1 (the default)
+ * keeps the 11-04 record (268 B) byte for byte. */
 struct MtpParity {
     bool                  on = false;
-    std::vector<float*>   host;       /* per rank read: max_seqs rows of its logits columns */
+    int                   rounds = 1;  /* rounds recorded a drafting row (1 or 3) */
+    std::vector<float*>   host;       /* [round][rank]: max_seqs rows of the rank's logits columns */
     std::vector<uint64_t> seq;        /* the drafting rows' sequences, in draft order */
     int                   n = 0;      /* rows copied by the last history pass, 0 once written */
+    int                   issued = 0; /* rounds copied this step */
     FILE*                 f = nullptr;
     int64_t               rows = 0;
     /* The step thread writes after a step's commit, and run_kld closes once every document's sink is done -- which
      * commit itself can make true -- so the close and a late write are serialised here (run 187: MD5c's last step's
      * rows were lost to that order, and a write could have met a closed file). */
     std::mutex            mu;
+    float* at(int round, size_t rank) const { return host[(size_t)(round - 1) * nranks + rank]; }
+    size_t                nranks = 0;
 };
 MtpParity g_par;
 
@@ -202,20 +213,44 @@ int Engine::run_kld() {
                 RAD_ERR("kld: RADIANCE_MTP_PARITY needs the serial MTP drafter (--num-speculative-tokens > 0)");
                 return RAD_E_UNSUPPORTED;
             }
-            g_par.host.assign(kld_width_.size(), nullptr);
-            for (size_t r = 0; r < kld_width_.size(); ++r) {
-                g_par.host[r] = static_cast<float*>(rad_dev_alloc(
-                    (int64_t)cfg_.max_seqs * kld_width_[r] * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
-                if (!g_par.host[r]) return RAD_E_NOMEM;
+            /* run 283: RADIANCE_MTP_PARITY_ROUNDS (1 or 3; 3 needs a draft depth of 3 and coupling off, so that
+             * rounds 2-3 are the head's own greedy chain) */
+            g_par.rounds = 1;
+            if (const char* pr = std::getenv("RADIANCE_MTP_PARITY_ROUNDS"); pr && *pr) {
+                const int want = std::atoi(pr);
+                if (want != 1 && want != 3) {
+                    RAD_ERR("kld: RADIANCE_MTP_PARITY_ROUNDS=%s: 1 or 3", pr);
+                    return RAD_E_INVAL;
+                }
+                if (want == 3 && (int)drafter_.depth < 3) {
+                    RAD_ERR("kld: RADIANCE_MTP_PARITY_ROUNDS=3 needs --num-speculative-tokens >= 3 (the depth is %d)",
+                            (int)drafter_.depth);
+                    return RAD_E_INVAL;
+                }
+                if (want == 3 && mtp_couple_) {
+                    RAD_ERR("kld: RADIANCE_MTP_PARITY_ROUNDS=3 needs the coupling off (RADIANCE_MTP_COUPLED=0): rounds "
+                            "2-3 must be the head's own greedy chain");
+                    return RAD_E_INVAL;
+                }
+                g_par.rounds = want;
             }
-            g_par.f = std::fopen((dir + "/parity.bin").c_str(), "wb");
+            g_par.nranks = kld_width_.size();
+            g_par.host.assign((size_t)g_par.rounds * g_par.nranks, nullptr);
+            for (int rd = 1; rd <= g_par.rounds; ++rd)
+                for (size_t r = 0; r < kld_width_.size(); ++r) {
+                    float* p = static_cast<float*>(rad_dev_alloc(
+                        (int64_t)cfg_.max_seqs * kld_width_[r] * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+                    if (!p) return RAD_E_NOMEM;
+                    g_par.host[(size_t)(rd - 1) * g_par.nranks + r] = p;
+                }
+            g_par.f = std::fopen((dir + (g_par.rounds == 1 ? "/parity.bin" : "/parity2.bin")).c_str(), "wb");
             if (!g_par.f) {
-                RAD_ERR("kld: RADIANCE_MTP_PARITY: cannot open %s/parity.bin", dir.c_str());
+                RAD_ERR("kld: RADIANCE_MTP_PARITY: cannot open %s/parity%s.bin", dir.c_str(), g_par.rounds == 1 ? "" : "2");
                 return RAD_E_IO;
             }
             g_par.on = true;
-            RAD_INFO("kld: the MTP head's own round-1 top-%d to %s/parity.bin (the full-logits head)", kDumpTop,
-                     dir.c_str());
+            RAD_INFO("kld: the MTP head's own round-1%s top-%d to %s/parity%s.bin (the full-logits head)",
+                     g_par.rounds == 3 ? " to round-3" : "", kDumpTop, dir.c_str(), g_par.rounds == 1 ? "" : "2");
         }
     }
 
@@ -442,21 +477,28 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
 /* RADIANCE_MTP_PARITY: right after the history pass is issued, before round 2's pass rewrites the logits buffer's
  * first rows, queue each rank's `drafted` rows to the host behind it (the ranks are parked at the barrier, and each
  * stream is in order). */
-int Engine::parity_issue(int drafted) {
-    if (!g_par.on || drafted <= 0) return RAD_OK;
-    const int n = std::min(drafted, (int)std::min<size_t>((size_t)cfg_.max_seqs, serial_row_.size()));
+int Engine::parity_issue(int drafted, int round) {
+    if (!g_par.on || drafted <= 0 || round < 1 || round > g_par.rounds) return RAD_OK;
+    int n = std::min(drafted, (int)std::min<size_t>((size_t)cfg_.max_seqs, serial_row_.size()));
+    if (round > 1) {
+        if (g_par.issued != round - 1 || g_par.n <= 0) return RAD_OK;   /* no round 1 behind it: nothing to pair */
+        n = std::min(n, g_par.n);                                    /* the same rows, in the same order */
+    }
     for (size_t r = 0; r < kld_width_.size(); ++r) {
         Rank& rk = *ranks_[r];
         RAD_TRY(rad_dev_set(rk.device));
         const auto* src = static_cast<const float*>(rk.ctx.buf_ptr(rk.program.logits_buf));
         if (!src) return RAD_E_STATE;
-        RAD_TRY(rad_memcpy_async(g_par.host[r], src, (int64_t)n * kld_width_[r] * (int64_t)sizeof(float),
+        RAD_TRY(rad_memcpy_async(g_par.at(round, r), src, (int64_t)n * kld_width_[r] * (int64_t)sizeof(float),
                                  rk.ctx.stream()));
     }
     RAD_TRY(rad_dev_set(ranks_[0]->device));
-    g_par.seq.resize((size_t)n);
-    for (int k = 0; k < n; ++k) g_par.seq[(size_t)k] = serial_row_[(size_t)k].seq;
+    if (round == 1) {
+        g_par.seq.resize((size_t)n);
+        for (int k = 0; k < n; ++k) g_par.seq[(size_t)k] = serial_row_[(size_t)k].seq;
+    }
     g_par.n = n;
+    g_par.issued = round;
     return RAD_OK;
 }
 
@@ -470,8 +512,10 @@ int Engine::parity_finish(const StepOut& so) {
         RAD_TRY(rad_stream_sync(ranks_[r]->ctx.stream()));
     }
     RAD_TRY(rad_dev_set(ranks_[0]->device));
-    std::vector<KldShard> shards(kld_width_.size());
-    for (size_t r = 0; r < shards.size(); ++r) shards[r] = { g_par.host[r], kld_vocab0_[r], kld_width_[r] };
+    const int rounds = g_par.rounds == 1 ? 1 : g_par.issued;   /* ROUNDS=3 writes the rounds this step really ran */
+    std::vector<std::vector<KldShard>> shards((size_t)rounds, std::vector<KldShard>(kld_width_.size()));
+    for (int rd = 1; rd <= rounds; ++rd)
+        for (size_t r = 0; r < kld_width_.size(); ++r) shards[(size_t)rd - 1][r] = { g_par.at(rd, r), kld_vocab0_[r], kld_width_[r] };
     const StepPlan& plan = sched_.plan();
     for (int k = 0; k < g_par.n; ++k) {
         size_t i = 0;
@@ -488,13 +532,31 @@ int Engine::parity_finish(const StepOut& so) {
         meta[2] = so.token[i];
         int32_t ids[kDumpTop];
         float   lps[kDumpTop];
-        row_top32(shards, k, ids, lps);
-        std::fwrite(meta, 4, 3, g_par.f);
-        std::fwrite(ids, 4, kDumpTop, g_par.f);
-        std::fwrite(lps, 4, kDumpTop, g_par.f);
+        if (g_par.rounds == 1) {   /* the 11-04 record, byte for byte */
+            row_top32(shards[0], k, ids, lps);
+            std::fwrite(meta, 4, 3, g_par.f);
+            std::fwrite(ids, 4, kDumpTop, g_par.f);
+            std::fwrite(lps, 4, kDumpTop, g_par.f);
+        } else {
+            /* parity2: id, i, rounds, the tokens fed at rounds 1-3 (the trunk's draw, then the round-1 and round-2
+             * greedy drafts from the step's slots: StepSlot::tok[0] is the bonus token, tok[r] round r's draft), then
+             * per round the 32 largest; a round the step did not run (rounds < 3) writes -1 tokens and zero rows */
+            int32_t head[6] = { meta[0], meta[1], (int32_t)rounds, meta[2], -1, -1 };
+            const StepSlot& S = slots_host_[e.card];
+            if (rounds >= 2) head[4] = S.tok[1];
+            if (rounds >= 3) head[5] = S.tok[2];
+            std::fwrite(head, 4, 6, g_par.f);
+            for (int rd = 1; rd <= 3; ++rd) {
+                if (rd <= rounds) row_top32(shards[(size_t)rd - 1], k, ids, lps);
+                else { std::memset(ids, 0, sizeof ids); std::memset(lps, 0, sizeof lps); }
+                std::fwrite(ids, 4, kDumpTop, g_par.f);
+                std::fwrite(lps, 4, kDumpTop, g_par.f);
+            }
+        }
         ++g_par.rows;
     }
     g_par.n = 0;
+    g_par.issued = 0;
     return RAD_OK;
 }
 
