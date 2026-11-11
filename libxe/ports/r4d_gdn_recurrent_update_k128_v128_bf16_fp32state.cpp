@@ -1830,7 +1830,10 @@ struct GdnRange {
   std::mutex m;
   std::vector<const void*> layers;
   unsigned* dev = nullptr;
-  sycl::queue* q = nullptr;
+  /* copies of the engine queue's context and device (shared handles, never freed): the exit print must not touch the
+   * engine's queue, which rad_stream_destroy deletes before main returns; a held context keeps the cells' memory alive */
+  sycl::context* ctx = nullptr;
+  sycl::device* devo = nullptr;
   long calls = 0;
 };
 GdnRange& gdn_range() { static GdnRange r; return r; }
@@ -1839,10 +1842,10 @@ bool gdn_range_on() {
   return on;
 }
 void gdn_range_print_locked(GdnRange& r, const char* when) {
-  if (!r.dev || !r.q) return;
+  if (!r.dev || !r.ctx || !r.devo) return;
   std::vector<unsigned> h((size_t)kGdnRangeCells, 0u);
   try {
-    sycl::queue(r.q->get_context(), r.q->get_device()).memcpy(h.data(), r.dev, h.size() * sizeof(unsigned)).wait();
+    sycl::queue(*r.ctx, *r.devo).memcpy(h.data(), r.dev, h.size() * sizeof(unsigned)).wait();
   } catch (...) { return; }
   float worst = 0.0f;
   for (size_t i = 0; i < r.layers.size(); ++i) {
@@ -1865,10 +1868,11 @@ int gdn_range_cell(const void* state, sycl::queue* q) {
   std::lock_guard<std::mutex> lk(r.m);
   if (!r.dev) {
     try {
-      r.dev = sycl::malloc_device<unsigned>((size_t)kGdnRangeCells, *q);
-      sycl::queue(q->get_context(), q->get_device()).memset(r.dev, 0, (size_t)kGdnRangeCells * sizeof(unsigned)).wait();
+      r.ctx = new sycl::context(q->get_context());
+      r.devo = new sycl::device(q->get_device());
+      r.dev = sycl::malloc_device<unsigned>((size_t)kGdnRangeCells, *r.devo, *r.ctx);
+      sycl::queue(*r.ctx, *r.devo).memset(r.dev, 0, (size_t)kGdnRangeCells * sizeof(unsigned)).wait();
     } catch (...) { r.dev = nullptr; return -1; }
-    r.q = q;
     std::atexit(gdn_range_print_exit);
   }
   if (++r.calls % kGdnRangeEvery == 0) gdn_range_print_locked(r, "running");
