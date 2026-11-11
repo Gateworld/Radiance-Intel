@@ -27,3 +27,8 @@ to this repository's hashes in `intel-port-docs/COMMIT-MAP.txt`.
 
 On 2× Intel Arc Pro B70, single-user decode with MTP: about 91 tokens/s; 7K-token prompt prefill: about 3.1 s.
 The notes record what worked, what did not, and why.
+
+**Hardware note:** both cards run at **PCIe 4.0 x8** (about 14 GB/s measured for a card-to-card copy), the limit of the
+board's slots. The B70 itself supports PCIe 5.0 x16, so these numbers are link-limited in two places: prefill streams
+the experts that don't fit in VRAM over this link, and every decode step's all-reduce between the two cards crosses it.
+Results on a PCIe 5.0 x16 platform should be better, prefill especially.
