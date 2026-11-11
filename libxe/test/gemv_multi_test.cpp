@@ -155,6 +155,53 @@ int run_m(void* hx, sycl::queue& q, int64_t M, int which) {
     q.wait_and_throw();
     if (rc != RAD_OK) { std::printf("gemv_multi_test: a paired row refused (rc %d)\n", rc); return 2; }
 
+    /* ---- run 285 (group B of owner note 232's audit): the x3 and a bf16 GEMV in one launch (gemm_nt_q_x3_bf16, listed
+     * under RADIANCE_XE_GEMV_MULTI2=1 or b): its three int8 outputs against the standalone rows' above, its bf16 output
+     * against the bf16 row over a fourth weight (640 wide, the indexer's qk projection's width); skipped when the row is
+     * not listed. */
+    const RadKernelInfo* r_x4 = row_named(hx, "xe_gemm_nt_q_x3_bf16");
+    int64_t d4[4] = { 0, 0, 0, 0 }, nz4 = 0;
+    bool have4 = false;
+    if (r_x4) {
+        const int64_t N4 = 640;
+        uint16_t* w4 = (uint16_t*)sh((size_t)(N4 * K) * 2);
+        for (int64_t i = 0; i < N4 * K; ++i) w4[i] = bf16_of(0.05f * unit(98, (uint64_t)i));
+        uint16_t* y4[2]; uint16_t* y3b[3];
+        for (int f = 0; f < 2; ++f) y4[f] = (uint16_t*)sh((size_t)(M * N4) * 2);
+        for (int s = 0; s < 3; ++s) y3b[s] = (uint16_t*)sh((size_t)(M * N3[s]) * 2);
+        {
+            RadTensor tb[3] = { tn(x, RAD_BF16, M, K), tn(w4, RAD_BF16, N4, K), tn(y4[0], RAD_BF16, M, N4) };
+            RadParam pb[4] = { pint("M", M), pint("N", N4), pint("K", K), pstr("dtype", "bf16") };
+            RadArgs ab{}; ab.t = tb; ab.n_t = 3; ab.p = pb; ab.n_p = 4; ab.world_size = 1;
+            rc |= r_bf->launch(&ab, (RadStream)&q);
+        }
+        q.wait_and_throw();
+        {
+            RadTensor t[14] = { tn(a, RAD_I8, M, K), tn(as, RAD_F32, M, G),
+                                tn(w[0].b, RAD_I8, N3[0], K), tn(w[0].bs, RAD_BF16, N3[0], G), tn(y3b[0], RAD_BF16, M, N3[0]),
+                                tn(w[1].b, RAD_I8, N3[1], K), tn(w[1].bs, RAD_BF16, N3[1], G), tn(y3b[1], RAD_BF16, M, N3[1]),
+                                tn(w[2].b, RAD_I8, N3[2], K), tn(w[2].bs, RAD_BF16, N3[2], G), tn(y3b[2], RAD_BF16, M, N3[2]),
+                                tn(x, RAD_BF16, M, K), tn(w4, RAD_BF16, N4, K), tn(y4[1], RAD_BF16, M, N4) };
+            RadParam p[8] = { pint("M", M), pint("K", K), pint("N1", N3[0]), pint("N2", N3[1]), pint("N3", N3[2]),
+                              pint("N4", N4), pint("group", 128), pstr("dtype", "i8a8") };
+            RadArgs ar{}; ar.t = t; ar.n_t = 14; ar.p = p; ar.n_p = 8; ar.world_size = 1;
+            rc |= r_x4->launch(&ar, (RadStream)&q);
+        }
+        q.wait_and_throw();
+        if (rc != RAD_OK) { std::printf("gemv_multi_test: the x3 + bf16 row refused (rc %d)\n", rc); return 2; }
+        for (int s = 0; s < 3; ++s) d4[s] = count_diff(y3[0][s], y3b[s], (size_t)(M * N3[s]) * 2);
+        d4[3] = count_diff(y4[0], y4[1], (size_t)(M * N4) * 2);
+        for (int64_t i = 0; i < M * N4; ++i) nz4 += y4[1][i] != 0;
+        std::printf("RESULT M %lld K %lld: x3 + bf16 (4096 / 256 / 256 int8 + 640 bf16) bytes differing %lld / %lld / %lld / "
+                    "%lld, %lld nonzero bf16 outputs\n",
+                    (long long)M, (long long)K, (long long)d4[0], (long long)d4[1], (long long)d4[2], (long long)d4[3],
+                    (long long)nz4);
+        sycl::free(w4, q);
+        for (int f = 0; f < 2; ++f) sycl::free(y4[f], q);
+        for (int s = 0; s < 3; ++s) sycl::free(y3b[s], q);
+        have4 = true;
+    }
+
     int64_t d3[3], nz3 = 0;
     for (int s = 0; s < 3; ++s) d3[s] = count_diff(y3[0][s], y3[1][s], (size_t)(M * N3[s]) * 2);
     for (int s = 0; s < 3; ++s) for (int64_t i = 0; i < M * N3[s]; ++i) nz3 += y3[1][s][i] != 0;
@@ -170,7 +217,8 @@ int run_m(void* hx, sycl::queue& q, int64_t M, int which) {
     for (int s = 0; s < 4; ++s) { sycl::free(w[s].b, q); sycl::free(w[s].bs, q); }
     for (int f = 0; f < 2; ++f) { for (int s = 0; s < 3; ++s) sycl::free(y3[f][s], q); sycl::free(yin[f], q); sycl::free(yab[f], q); }
     if (nz3 == 0 || nzin == 0 || nzab == 0) { std::printf("gemv_multi_test: a paired row wrote nothing\n"); return 2; }
-    return (d3[0] || d3[1] || d3[2] || din || dab) ? 1 : 0;
+    if (have4 && nz4 == 0) { std::printf("gemv_multi_test: the x3 + bf16 row wrote nothing\n"); return 2; }
+    return (d3[0] || d3[1] || d3[2] || din || dab || d4[0] || d4[1] || d4[2] || d4[3]) ? 1 : 0;
 }
 
 }  // namespace

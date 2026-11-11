@@ -58,6 +58,13 @@ extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* a, RadStream
 static const RadConstraint cXeRouterGemmQuant[] = { C_DIV("K", 8), C_GE("M", 1), C_LE("M", 16), C_GE("n_expert", 257),
                                                     C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
                                                     C_IN("dtype", "bf16"), C_DIV("n", 128), C_EQ("group", 128) };
+/* run 285 (group A of owner note 232's audit): the fused router op above with the shared expert's gate_up as an int8 set
+ * in its GEMV launch (xe_gemv_i8.cpp); the router op's constraints plus the paired GEMV's K */
+extern "C" int xe_rad_router_gemm_topk_scatter_quant_sh(const RadArgs* a, RadStream s);  /* xe_gemv_i8.cpp */
+static const RadConstraint cXeRouterGemmQuantSh[] = { C_DIV("K", 128), C_GE("M", 1), C_LE("M", 16), C_GE("n_expert", 257),
+                                                      C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
+                                                      C_IN("dtype", "bf16"), C_DIV("n", 128), C_EQ("group", 128),
+                                                      C_GE("N_sh", 1) };
 /* run 274 (pairs 4 / 5 of the decode step's adjacent launches): several projections of one activation in one GEMV
  * launch (xe_gemv_i8.cpp); decode rows only (the GEMV path; the matrix-unit forms serve the prefill chunks) */
 extern "C" int xe_rad_gemm_nt_q_x3(const RadArgs* a, RadStream s);          /* xe_gemv_i8.cpp */
@@ -392,6 +399,21 @@ static bool xe_router_quant_pair_on() { static const bool v = env_on("RADIANCE_X
  * 88.50 vs M393 87.18 = +1.5 % single user, the rotation H154 vs H152 +1.0-1.2 % with every prompt length up,
  * byte-identical on the B70 in GM1, M391's kernel table, the flag-off kernels unchanged in M394); =0 opts out */
 static bool xe_gemv_multi_on() { static const bool v = env_on("RADIANCE_XE_GEMV_MULTI"); return v; }
+/* run 285 (owner note 232's audit, groups A and B): the fused router op with the shared expert's gate_up in its GEMV
+ * launch (A, j 8) and the gated attention's x3 with the QSA indexer's qk projection in one launch (B, j 9); opt-in --
+ * RADIANCE_XE_GEMV_MULTI2=1 lists both, =a / =b one of them (so the M-pair can measure them apart); the defaults are
+ * the owner's call */
+static int xe_gemv_multi2_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_XE_GEMV_MULTI2");
+        if (!e) return 0;
+        return e[0] == '1' ? 3 : e[0] == 'a' ? 1 : e[0] == 'b' ? 2 : 0;
+    }();
+    return m;
+}
+static bool xe_gemv_multi2_on() { return (xe_gemv_multi2_mode() & 1) != 0; }
+static bool xe_gemv_multi2b_on() { return (xe_gemv_multi2_mode() & 2) != 0; }
+extern "C" int xe_rad_gemm_nt_q_x3_bf16(const RadArgs* a, RadStream s);   /* xe_gemv_i8.cpp (group B) */
 static const RadKernelInfo kFlagged[] = {
 /* pair 4 (RADIANCE_XE_GATE_QUANT=1): libr4d's gate_quant_fp8, its port's adapter -- the gated attention's sigmoid, mul
  * and quantiser as one pass, the sigmoid rounded to bf16 before the multiply as the unfused chain's buffer does */
@@ -482,11 +504,39 @@ static const RadKernelInfo kFlagged[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGemvMulti), NOTUNE,
   nullptr, nullptr, xe_rad_gemm_nt_q_bf16_pair, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* group A of owner note 232's audit (RADIANCE_XE_GEMV_MULTI2=1, run 285): the fused router op with the shared expert's
+ * gate_up in its GEMV launch -- the router rows, the gate row and the gate_up rows as one grid (xe_gemv_i8.cpp,
+ * gemv_i8a8_bf16x2_kernel), each row its standalone kernel's; then the selection + sort and the quantiser as the fused
+ * op's launch. The MoE block issues it at the router's slot and skips the shared gate_up's own launch
+ * (rad_block_moe_fp8.h, op_rtq3) */
+{ "xe_router_gemm_topk_scatter_quant_sh", "router_gemm_topk_scatter_quant_sh", "moe",
+  "the router GEMV, the shared expert's gate column and the shared expert's int8 gate_up in one launch, then the "
+  "router's top-k, the stable sort and the block input's rotated int8 quantiser in one launch",
+  "M <= 16 rows; n_expert in 257 .. 512, top_k <= 32; K a multiple of 128; n a multiple of 128, group 128; bf16 weight "
+  "scales on the gate_up (the NX cross-lane form; any other form runs the fused op and the gate_up as two launches)",
+  "bf16 a, router and gate weights, bf16 logits and gate; int8 codes with f32 scales and int8 weights with bf16 scales "
+  "for the gate_up, bf16 y; i32 ids, bf16 weights, int8 codes with an f32 scale per (row, 128 columns) out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeRouterGemmQuantSh), NOTUNE,
+  nullptr, nullptr, xe_rad_router_gemm_topk_scatter_quant_sh, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* group B of owner note 232's audit (RADIANCE_XE_GEMV_MULTI2=1 or b, run 285): the gated attention's q|gate, k, v (the
+ * x3) and the QSA indexer's qk projection over the same connection's two planes as one GEMV launch (xe_gemv_i8.cpp,
+ * gemv_i8a8_x3_bf16_kernel), each row its standalone kernel's; the plugin declares and issues it (qwen4exp_fp8.cpp) and
+ * both blocks skip their own launches */
+{ "xe_gemm_nt_q_x3_bf16", "gemm_nt_q_x3_bf16", "gemm",
+  "three int8 GEMVs over one int8 activation and a bf16 GEMV over its bf16 plane in one launch",
+  "M <= 32 rows (the decode GEMV path); K a multiple of 128 (and of 8 for the bf16 set); bf16 weight scales; the NX form",
+  "int8 a with f32 scales, int8 weights with bf16 scales, bf16 y for the three sets; bf16 x, weight and y for the fourth",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeGemvMulti), NOTUNE,
+  nullptr, nullptr, xe_rad_gemm_nt_q_x3_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 static bool flagged_on(int j) {
     return j == 0 ? xe_gate_quant_on() : j == 1 ? xe_gated_had_on() : j == 2 ? xe_gated_quant_pair_on()
                                         : j == 3 ? xe_qk_prologue_on() : j <= 5 ? xe_router_quant_pair_on()
-                                        : xe_gemv_multi_on();   /* j 6 and 7 */
+                                        : j <= 7 ? xe_gemv_multi_on()   /* j 6 and 7 */
+                                        : j == 8 ? xe_gemv_multi2_on()  /* j 8: group A */
+                                                 : xe_gemv_multi2b_on(); /* j 9: group B */
 }
 static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
 /* the j-th listed flagged entry (counting only those on), or -1 */
@@ -644,6 +694,33 @@ static const RadOperandSpec oXeGemvPair[] = {
     { "b1", RAD_OPD_WEIGHT, 0 },     { "b1_scale", RAD_OPD_WEIGHT, 0 }, { "y1", RAD_OPD_OUT, 0 },
     { "x", RAD_OPD_IN, 0 },          { "b2", RAD_OPD_WEIGHT, 0 },       { "y2", RAD_OPD_OUT, 0 },
 };
+/* router_gemm_topk_scatter_quant_sh (run 285): the fused router op's params and operands, then the shared expert's
+ * gate_up as an int8 set over the block input's codes (a_q, a_scale: the hc read's), its weight pair and its output */
+static const RadParamSpec pXeRouterGemmQuantSh[] = {
+    P_INT("M"), P_INT("K"), P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INT("norm"), P_STR("dtype"),
+    P_INTO("expert_base"), P_STRO("protect"), P_INT("n"), P_INT("group"), P_INT("N_sh"),
+};
+static const RadOperandSpec oXeRouterGemmQuantSh[] = {
+    { "a", RAD_OPD_IN, 0 },             { "b", RAD_OPD_WEIGHT, 0 },       { "gate_b", RAD_OPD_WEIGHT, 1 },
+    { "logits", RAD_OPD_OUT, 0 },       { "expert_ids", RAD_OPD_OUT, 0 }, { "expert_w", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 }, { "expert_count", RAD_OPD_OUT, 0 },
+    { "gate", RAD_OPD_OUT, 1 },
+    { "x", RAD_OPD_IN, 0 },             { "q", RAD_OPD_OUT, 0 },          { "scale", RAD_OPD_OUT, 0 },
+    { "a_q", RAD_OPD_IN, 0 },           { "a_scale", RAD_OPD_IN, 0 },
+    { "b_sh", RAD_OPD_WEIGHT, 0 },      { "b_sh_scale", RAD_OPD_WEIGHT, 0 }, { "y_sh", RAD_OPD_OUT, 0 },
+};
+/* gemm_nt_q_x3_bf16 (run 285, group B): gemm_nt_q_x3's params and operands, then the bf16 set over the activation's
+ * bf16 plane `x` */
+static const RadParamSpec pXeGemvX3Bf[] = {
+    P_INT("M"), P_INT("K"), P_INT("N1"), P_INT("N2"), P_INT("N3"), P_INT("N4"), P_INT("group"), P_STR("dtype"),
+};
+static const RadOperandSpec oXeGemvX3Bf[] = {
+    { "a", RAD_OPD_IN, 0 },          { "a_scale", RAD_OPD_IN, 0 },
+    { "b1", RAD_OPD_WEIGHT, 0 },     { "b1_scale", RAD_OPD_WEIGHT, 0 }, { "y1", RAD_OPD_OUT, 0 },
+    { "b2", RAD_OPD_WEIGHT, 0 },     { "b2_scale", RAD_OPD_WEIGHT, 0 }, { "y2", RAD_OPD_OUT, 0 },
+    { "b3", RAD_OPD_WEIGHT, 0 },     { "b3_scale", RAD_OPD_WEIGHT, 0 }, { "y3", RAD_OPD_OUT, 0 },
+    { "x", RAD_OPD_IN, 0 },          { "b4", RAD_OPD_WEIGHT, 0 },       { "y4", RAD_OPD_OUT, 0 },
+};
 /* kFlagged's schemas, in its order; listed under the same flags */
 static const RadOpSchema kFlaggedSchemas[] = {
     { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
@@ -669,6 +746,12 @@ static const RadOpSchema kFlaggedSchemas[] = {
     { "gemm_nt_q_bf16_pair", ROW(pXeGemvPair), ROW(oXeGemvPair),
       "gemm_nt_q (dtype i8a8, width N1) over an activation's codes and gemm_nt (bf16, width N2) over its bf16 plane "
       "`x` in one launch: the two ops' bytes." },
+    { "router_gemm_topk_scatter_quant_sh", ROW(pXeRouterGemmQuantSh), ROW(oXeRouterGemmQuantSh),
+      "router_gemm_topk_scatter_quant with the shared expert's gate_up (gemm_nt_q at dtype i8a8, width N_sh, over the "
+      "block input's codes a_q / a_scale) in its GEMV launch: the two ops' bytes." },
+    { "gemm_nt_q_x3_bf16", ROW(pXeGemvX3Bf), ROW(oXeGemvX3Bf),
+      "gemm_nt_q_x3 (dtype i8a8, widths N1 / N2 / N3) over an activation's codes and gemm_nt (bf16, width N4) over its "
+      "bf16 plane `x` in one launch: the two ops' bytes." },
 };
 static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");
 static int own_schemas() { return kNumSchemas + flagged_count(); }

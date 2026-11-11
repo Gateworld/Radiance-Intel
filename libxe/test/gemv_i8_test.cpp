@@ -26,6 +26,9 @@
 extern "C" int xe_rad_gemm_i8a8_gemv(const RadArgs* a, RadStream s);
 /* run 274: the paired GEMV ops' bf16 fallback lives in xe_gemv_bf16.cpp, which this standalone test does not link */
 extern "C" int xe_rad_gemm_nt_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+/* run 285: the fused router + shared gate_up adapter's two calls into xe_gemv_bf16.cpp, not exercised by this test */
+extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+extern "C" int xe_router_topk_quant_tail(const RadArgs*, RadStream, long long) { return RAD_E_UNSUPPORTED; }
 
 namespace {
 

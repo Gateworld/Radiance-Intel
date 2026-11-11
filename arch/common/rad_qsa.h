@@ -122,8 +122,10 @@ struct QsaIndexer {
                 const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
     /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
      * score plane (Config::plane_rows); null where no step is. */
+    /* `proj_done` (Intel port, run 285, group B of owner note 232's audit): the caller's one launch already wrote the
+     * qk projection `w.qk` (the plugin's gemm_nt_q_x3_bf16 with the attention's q|gate, k, v), so it is not issued here. */
     void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
-              const int32_t* win_cu = nullptr) const;
+              const int32_t* win_cu = nullptr, bool proj_done = false) const;
     /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
@@ -313,13 +315,13 @@ inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batc
 }
 
 inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
-                             const int32_t* win_cu) const {
+                             const int32_t* win_cu, bool proj_done) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
 
-    proj.step(c_, in, w.qk, T);
+    if (!proj_done) proj.step(c_, in, w.qk, T);   /* run 285 (group B): else the plugin's launch wrote w.qk */
     /* One fused launch or `heads` + 1 unfused. The fused form takes the whole projection at its
      * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
      * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound

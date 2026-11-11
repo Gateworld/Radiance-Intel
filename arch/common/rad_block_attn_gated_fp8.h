@@ -151,8 +151,10 @@ struct AttnGatedFP8 {
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
     /* `own_ar` false: the caller issues the all-reduce itself (GdnFP8::step says when). */
+    /* `qkv_done` (Intel port, run 285, group B of owner note 232's audit): the caller's one launch already wrote the
+     * q|gate, k and v projections (the plugin's gemm_nt_q_x3_bf16 with the QSA indexer's qk), so none is issued here. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
-              ArPieces* pieces = nullptr) const;
+              ArPieces* pieces = nullptr, bool qkv_done = false) const;
     bool issues_ar(int64_t T) const { return op_ar && !ar_taken(g, T, ar_out, ar_out_take); }
     void issue_ar(RadCtx* c, int64_t r0, int64_t rows) const {
         RAD_ISSUE_N(c, op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
@@ -510,7 +512,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
-                               ArPieces* pieces) const {
+                               ArPieces* pieces, bool qkv_done) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
@@ -527,7 +529,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
-    if (op_qkv3 && T <= kGemvMultiRows) {   /* run 274 (pair 5): the three projections in one launch */
+    if (qkv_done) {
+        /* run 285 (group B): the plugin's launch wrote w.qg, w.k and w.v with the indexer's projection */
+    } else if (op_qkv3 && T <= kGemvMultiRows) {   /* run 274 (pair 5): the three projections in one launch */
         RAD_ISSUE_N(c, op_qkv3, T, brows(w.h.q8, T), brows(w.h.s8, T),
                     RAD_W(qg.w), RAD_W(qg.ws), brows(w.qg, T),
                     RAD_W(kp.w), RAD_W(kp.ws), brows(w.k, T),

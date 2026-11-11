@@ -264,6 +264,44 @@ void gemv_i8a8_bf16_pair_kernel(const int8_t* __restrict__ a, long a_ld, const f
         gemv_bf16_set_row<MB>((int)(blk - g1) * rows + sub, lane, s2, K, M);
 }
 
+/* An int8 set and TWO bf16 sets over one activation's two planes (group A of owner note 232's audit, run 285: the FFN
+ * block's router GEMV and the shared expert's gate column over the hc read's bf16 plane, and the shared expert's gate_up
+ * over the same read's int8 codes). Work-groups [0, g1) the int8 set, [g1, g1 + g2) the first bf16 set, the rest the
+ * second; every row is its standalone kernel's row (the two bodies above), so each output row's bytes are the launch's
+ * it replaces (the shared gate_up's gemv_i8a8_kernel row; the router pair's gemv_bf16_pair_kernel row, itself
+ * gemv_bf16_kernel's). */
+template <bool WS_BF16, int MB, int WCC>
+void gemv_i8a8_bf16x2_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld,
+                             int K, int M, long g1, long g2, GvI8Set s1, GvBfSet s2, GvBfSet s3) {
+    const int lane = (int)threadIdx.x & 31, rows = (int)blockDim.x >> 5, sub = (int)threadIdx.x >> 5;
+    const long blk = (long)blockIdx.x;
+    if (blk < g1)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)blk * rows + sub, lane, a, a_ld, as, as_ld, s1, K, M);
+    else if (blk < g1 + g2)
+        gemv_bf16_set_row<MB>((int)(blk - g1) * rows + sub, lane, s2, K, M);
+    else
+        gemv_bf16_set_row<MB>((int)(blk - g1 - g2) * rows + sub, lane, s3, K, M);
+}
+
+/* Three int8 sets and a bf16 set over one activation's two planes (group B of owner note 232's audit, run 285: the gated
+ * attention's q|gate, k and v over the connection's codes -- pair 5's x3 -- and the QSA indexer's qk projection over its
+ * bf16 plane, two independent reads of one hc read that today sit a launch apart only because two blocks issue them).
+ * Work-groups by set as above; every row its standalone kernel's. */
+template <bool WS_BF16, int MB, int WCC>
+void gemv_i8a8_x3_bf16_kernel(const int8_t* __restrict__ a, long a_ld, const float* __restrict__ as, long as_ld, int K,
+                              int M, long g1, long g2, long g3, GvI8Set s1, GvI8Set s2, GvI8Set s3, GvBfSet s4) {
+    const int lane = (int)threadIdx.x & 31, rows = (int)blockDim.x >> 5, sub = (int)threadIdx.x >> 5;
+    const long blk = (long)blockIdx.x;
+    if (blk < g1)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)blk * rows + sub, lane, a, a_ld, as, as_ld, s1, K, M);
+    else if (blk < g1 + g2)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)(blk - g1) * rows + sub, lane, a, a_ld, as, as_ld, s2, K, M);
+    else if (blk < g1 + g2 + g3)
+        gemv_i8a8_set_row<WS_BF16, MB, WCC>((int)(blk - g1 - g2) * rows + sub, lane, a, a_ld, as, as_ld, s3, K, M);
+    else
+        gemv_bf16_set_row<MB>((int)(blk - g1 - g2 - g3) * rows + sub, lane, s4, K, M);
+}
+
 /* The forms the paired launches are built for (the trunk's: NX on, no KC instance for this K, WCC 5 or the default
  * policy, no GL / RT env form). Anything else returns false and the adapter issues the sets' separate launches. */
 static bool gemv_multi_form(int K, int* wcc_out) {
@@ -291,6 +329,23 @@ static void launch_pair_mb(sycl::queue* q, const int8_t* am, long a_ld, const fl
     const int rw = xe::gemv_rows_wg();
     const dim3 grid((unsigned)(g1 + g2)), block(32 * rw);
     XE_LAUNCH(q, (gemv_i8a8_bf16_pair_kernel<true, MB, WCC>), grid, block, 0, am, a_ld, asm_, as_ld, K, mb, g1, s1, s2);
+}
+template <int MB, int WCC>
+static void launch_bf16x2_mb(sycl::queue* q, const int8_t* am, long a_ld, const float* asm_, long as_ld, int K, int mb,
+                             long g1, long g2, long g3, const GvI8Set& s1, const GvBfSet& s2, const GvBfSet& s3) {
+    const int rw = xe::gemv_rows_wg();
+    const dim3 grid((unsigned)(g1 + g2 + g3)), block(32 * rw);
+    XE_LAUNCH(q, (gemv_i8a8_bf16x2_kernel<true, MB, WCC>), grid, block, 0, am, a_ld, asm_, as_ld, K, mb, g1, g2, s1, s2,
+              s3);
+}
+template <int MB, int WCC>
+static void launch_x3bf_mb(sycl::queue* q, const int8_t* am, long a_ld, const float* asm_, long as_ld, int K, int mb,
+                           long g1, long g2, long g3, long g4, const GvI8Set& s1, const GvI8Set& s2, const GvI8Set& s3,
+                           const GvBfSet& s4) {
+    const int rw = xe::gemv_rows_wg();
+    const dim3 grid((unsigned)(g1 + g2 + g3 + g4)), block(32 * rw);
+    XE_LAUNCH(q, (gemv_i8a8_x3_bf16_kernel<true, MB, WCC>), grid, block, 0, am, a_ld, asm_, as_ld, K, mb, g1, g2, g3, s1,
+              s2, s3, s4);
 }
 
 /* RT (RADIANCE_XE_GEMV_RT=1, the 4-row launches; owner note 129 item 3, run 110): the GEMV's mapping, loads and
@@ -968,10 +1023,12 @@ int gm_bf_set(const RadTensor* X, const RadTensor* B, const RadTensor* Y, long l
     return RAD_OK;
 }
 
-/* The shared activation: a int8 [M][K], a_scale f32 [M][K / 128]. */
-int gm_act(const RadArgs* args, long long K, const int8_t** a, long* a_ld, const float** as, long* as_ld, long long* M) {
-    const RadTensor* A = r4d_opt(args, 0);
-    const RadTensor* AS = r4d_opt(args, 1);
+/* The shared activation: a int8 [M][K], a_scale f32 [M][K / 128] at operands `ia`, `ia` + 1 (0 and 1 for the paired
+ * GEMV ops; 13 and 14 for the fused router op with the shared gate_up, run 285). */
+int gm_act_at(const RadArgs* args, int ia, long long K, const int8_t** a, long* a_ld, const float** as, long* as_ld,
+              long long* M) {
+    const RadTensor* A = r4d_opt(args, ia);
+    const RadTensor* AS = r4d_opt(args, ia + 1);
     if (!A || !AS || !A->data || !AS->data) return R4D_NO(RAD_E_INVAL);
     if (A->dtype != RAD_I8 || AS->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (K <= 0 || K % 128 || r4d_geti_or(args, "group", 128) != 128) return R4D_NO(RAD_E_SHAPE);
@@ -982,6 +1039,9 @@ int gm_act(const RadArgs* args, long long K, const int8_t** a, long* a_ld, const
     if ((uintptr_t)A->data % 16 || ald % 16) return R4D_NO(RAD_E_STRIDE);
     *a = (const int8_t*)A->data; *a_ld = (long)ald; *as = (const float*)AS->data; *as_ld = (long)asld; *M = Ma;
     return RAD_OK;
+}
+int gm_act(const RadArgs* args, long long K, const int8_t** a, long* a_ld, const float** as, long* as_ld, long long* M) {
+    return gm_act_at(args, 0, K, a, a_ld, as, as_ld, M);
 }
 
 /* The separate launches (today's kernels) for a form the paired kernels are not built for; said once. */
@@ -1087,6 +1147,129 @@ extern "C" int xe_rad_gemm_nt_q_bf16_pair(const RadArgs* args, RadStream s) {
                            else launch_pair_mb<1, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2); }
             else { if (wcc == 5) launch_pair_mb<kMaxM, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2);
                    else launch_pair_mb<kMaxM, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, t1, t2); }
+        }
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
+}
+
+/* router_gemm_topk_scatter_quant_sh (group A of owner note 232's audit, run 285; RADIANCE_XE_GEMV_MULTI2=1): the fused
+ * router op's 13 operands (xe_gemv_bf16.cpp: a = the block input's bf16 plane, the router weight, the shared gate's
+ * weight, logits, the five of the selection, the gate, then x, q, scale of the input's rotated quantiser), followed by
+ * the shared expert's gate_up as an int8 set over the same input's codes: a_q, a_scale (the hc read's int8 codes and
+ * scales, which the standalone gate_up launch reads today), b_sh, b_sh_scale, y_sh (width N_sh). One launch runs the
+ * router rows, the gate row and the gate_up rows (gemv_i8a8_bf16x2_kernel: each row its standalone kernel's), then the
+ * selection + sort and the quantiser as the fused op does (xe_router_topk_quant_tail). A form the paired kernel is not
+ * built for runs the fused op and the standalone int8 GEMV as separate launches: the same bytes, one launch more. */
+extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* a, RadStream s);   /* xe_gemv_bf16.cpp */
+extern "C" int xe_router_topk_quant_tail(const RadArgs* a, RadStream s, long long E);  /* xe_gemv_bf16.cpp */
+extern "C" int xe_rad_router_gemm_topk_scatter_quant_sh(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 18) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* X  = r4d_opt(args, 0);    /* the block input's bf16 plane */
+    const RadTensor* B  = r4d_opt(args, 1);    /* the router weight [n_expert][K] */
+    const RadTensor* GB = r4d_opt(args, 2);    /* the shared gate's weight [1][K], with G */
+    const RadTensor* LG = r4d_opt(args, 3);    /* logits [M][n_expert] */
+    const RadTensor* G  = r4d_opt(args, 9);    /* the gate [M][1] */
+    if (!X || !B || !LG || !X->data || !B->data || !LG->data) return R4D_NO(RAD_E_INVAL);
+    const bool gate = GB && GB->data;
+    if (gate != (G && G->data)) return R4D_NO(RAD_E_INVAL);   /* together or not at all */
+    const long long K = r4d_geti_or(args, "K", r4d_dim(B, (int)B->rank - 1));
+    const long long E = r4d_geti_or(args, "n_expert", r4d_dim(B, (int)B->rank - 2));
+    const long long Nsh = r4d_geti_or(args, "N_sh", 0);
+    if (K <= 0 || E <= 0 || Nsh <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int8_t* a = nullptr; const float* as = nullptr; long a_ld = 0, as_ld = 0; long long M = 0;
+    int rc = gm_act_at(args, 13, K, &a, &a_ld, &as, &as_ld, &M);
+    if (rc != RAD_OK) return rc;
+    GvI8Set s1; GvBfSet s2, s3;
+    bool fused = true;
+    rc = gm_i8_set(r4d_opt(args, 15), r4d_opt(args, 16), r4d_opt(args, 17), Nsh, K, M, &s1);
+    if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    rc = gm_bf_set(X, B, LG, E, K, M, &s2);
+    if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    if (gate) {
+        rc = gm_bf_set(X, GB, G, 1, K, M, &s3);
+        if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    }
+    int wcc = 5;
+    if (fused && !gemv_multi_form((int)K, &wcc)) fused = false;
+    if (!fused) {
+        gm_fallback_note("router_gemm_topk_scatter_quant_sh", "a GEMV env form, f32 scales or an unaligned bf16 set");
+        rc = xe_rad_router_gemm_topk_scatter_quant(args, s);   /* the first 13 operands: the fused op as today */
+        if (rc != RAD_OK) return rc;
+        RadTensor t[5] = { args->t[13], args->t[14], args->t[15], args->t[16], args->t[17] };
+        RadParam p[4] = { gm_pi("N", Nsh), gm_pi("K", K), gm_pi("group", 128), gm_ps("dtype", "i8a8") };
+        RadArgs sub = *args; sub.t = t; sub.n_t = 5; sub.p = p; sub.n_p = 4;
+        return xe_rad_gemm_i8a8_gemv(&sub, s);
+    }
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        const int rw = xe::gemv_rows_wg();
+        const long g1 = (s1.n + rw - 1) / rw, g2 = (s2.n + rw - 1) / rw, g3 = gate ? (s3.n + rw - 1) / rw : 0;
+        for (long long m0 = 0; m0 < M; m0 += kMaxM) {
+            const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
+            GvI8Set t1 = s1; GvBfSet t2 = s2, t3 = s3;
+            t1.y += (size_t)m0 * t1.y_ld;
+            t2.y += (size_t)m0 * t2.y_ld; t2.a += (size_t)m0 * t2.a_ld;
+            if (gate) { t3.y += (size_t)m0 * t3.y_ld; t3.a += (size_t)m0 * t3.a_ld; }
+            const int8_t* am = a + (size_t)m0 * a_ld;
+            const float* asm_ = as + (size_t)m0 * as_ld;
+            if (mb == 1) { if (wcc == 5) launch_bf16x2_mb<1, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3);
+                           else launch_bf16x2_mb<1, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3); }
+            else { if (wcc == 5) launch_bf16x2_mb<kMaxM, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3);
+                   else launch_bf16x2_mb<kMaxM, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, t1, t2, t3); }
+        }
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+    return xe_router_topk_quant_tail(args, s, E);
+}
+
+/* gemm_nt_q_x3_bf16 (group B of owner note 232's audit, run 285; RADIANCE_XE_GEMV_MULTI2=1 or b): a, a_scale, (b, b_scale,
+ * y) x 3, x, b4, y4; M, K, N1 .. N4, group, dtype i8a8 -- the x3 (the gated attention's q|gate, k, v over the connection's
+ * codes) and a bf16 GEMV (the QSA indexer's qk projection over its bf16 plane) in one launch, else the x3 and the bf16
+ * GEMV as the launches they are today. */
+extern "C" int xe_rad_gemm_nt_q_x3_bf16(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 14) return R4D_NO(RAD_E_INVAL);
+    const long long K = r4d_geti_or(args, "K", 0);
+    const long long N[4] = { r4d_geti_or(args, "N1", 0), r4d_geti_or(args, "N2", 0), r4d_geti_or(args, "N3", 0),
+                             r4d_geti_or(args, "N4", 0) };
+    const int8_t* a = nullptr; const float* as = nullptr; long a_ld = 0, as_ld = 0; long long M = 0;
+    int rc = gm_act(args, K, &a, &a_ld, &as, &as_ld, &M);
+    if (rc != RAD_OK) return rc;
+    GvI8Set st[3]; GvBfSet s4;
+    bool fused = true;
+    for (int i = 0; i < 3; ++i) {
+        rc = gm_i8_set(r4d_opt(args, 2 + 3 * i), r4d_opt(args, 3 + 3 * i), r4d_opt(args, 4 + 3 * i), N[i], K, M, &st[i]);
+        if (rc == RAD_E_UNSUPPORTED) fused = false;
+        else if (rc != RAD_OK) return rc;
+    }
+    rc = gm_bf_set(r4d_opt(args, 11), r4d_opt(args, 12), r4d_opt(args, 13), N[3], K, M, &s4);
+    if (rc == RAD_E_UNSUPPORTED) fused = false; else if (rc != RAD_OK) return rc;
+    int wcc = 5;
+    if (fused && !gemv_multi_form((int)K, &wcc)) fused = false;
+    if (!fused) {
+        gm_fallback_note("gemm_nt_q_x3_bf16", "a GEMV env form, f32 scales or an unaligned bf16 set");
+        for (int i = 0; i < 3; ++i)
+            if ((rc = gm_fallback_i8(args, 2 + 3 * i, N[i], K, s)) != RAD_OK) return rc;
+        return gm_fallback_bf(args, 11, N[3], K, s);
+    }
+    try {
+        sycl::queue* q = (sycl::queue*)s;
+        const int rw = xe::gemv_rows_wg();
+        const long g1 = (st[0].n + rw - 1) / rw, g2 = (st[1].n + rw - 1) / rw, g3 = (st[2].n + rw - 1) / rw,
+                   g4 = (s4.n + rw - 1) / rw;
+        for (long long m0 = 0; m0 < M; m0 += kMaxM) {
+            const int mb = (int)(M - m0 < kMaxM ? M - m0 : kMaxM);
+            GvI8Set t1 = st[0], t2 = st[1], t3 = st[2]; GvBfSet t4 = s4;
+            t1.y += (size_t)m0 * t1.y_ld; t2.y += (size_t)m0 * t2.y_ld; t3.y += (size_t)m0 * t3.y_ld;
+            t4.y += (size_t)m0 * t4.y_ld; t4.a += (size_t)m0 * t4.a_ld;
+            const int8_t* am = a + (size_t)m0 * a_ld;
+            const float* asm_ = as + (size_t)m0 * as_ld;
+            if (mb == 1) { if (wcc == 5) launch_x3bf_mb<1, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, g4, t1, t2, t3, t4);
+                           else launch_x3bf_mb<1, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, g4, t1, t2, t3, t4); }
+            else { if (wcc == 5) launch_x3bf_mb<kMaxM, 5>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, g4, t1, t2, t3, t4);
+                   else launch_x3bf_mb<kMaxM, 0>(q, am, a_ld, asm_, as_ld, (int)K, mb, g1, g2, g3, g4, t1, t2, t3, t4); }
         }
     } catch (const sycl::exception&) {
         return RAD_E_DEVICE;

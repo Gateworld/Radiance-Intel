@@ -114,6 +114,12 @@ struct Layer {
      * graph. Inert (no op) when the deployment has no vector or this layer is outside its range
      * (arch/common/rad_block_hc.h). */
     HcProject    proj;
+    /* Intel port, run 285 (group B of owner note 232's audit): the attention's q|gate, k, v (pair 5's x3) and the QSA
+     * indexer's qk projection as ONE launch at decode rows (`gemm_nt_q_x3_bf16`, libxe under RADIANCE_XE_GEMV_MULTI2):
+     * two independent reads of the connection's two planes, a launch apart today only because two blocks issue them.
+     * Declared by the plugin once both blocks exist (the indexer's weight is declared after the attention block);
+     * unresolved (no row, or the flag off), each block issues its own as before. */
+    rad_op       op_qkv3qk = 0;
 };
 
 struct Model {
@@ -1141,6 +1147,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 qc.emit_sel = lay.attn.qsa_sel != 0;
                 RAD_ARCH_TRY(lay.qsa.declare(b, nm, g, (int)l, qc, m.qsaw, aw.h,
                                              &m.kv_qsa_bkey));
+                /* run 285 (group B): the x3 and the indexer's bf16 qk projection as one launch at decode rows (see
+                 * Layer::op_qkv3qk); the indexer's projection must be the plain bf16 form over the connection's plane */
+                if (lay.attn.op_qkv3 && lay.qsa.proj.op && lay.qsa.proj.bf16 &&
+                    rad_op_declared(b, "gemm_nt_q_x3_bf16")) {
+                    lay.op_qkv3qk = rw(b, RAD_OP(b, "gemm_nt_q_x3_bf16",
+                                           RAD_PARAMS(RAD_RANGE("M", 1, kGemvMultiRows), RAD_INT("K", g.n_embd),
+                                                      RAD_INT("N1", lay.attn.qg.N), RAD_INT("N2", lay.attn.kp.N),
+                                                      RAD_INT("N3", lay.attn.vp.N), RAD_INT("N4", lay.qsa.proj.N),
+                                                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8")),
+                                           RAD_WEIGHTS(lay.attn.qg.w, lay.attn.qg.ws, lay.attn.kp.w, lay.attn.kp.ws,
+                                                       lay.attn.vp.w, lay.attn.vp.ws, lay.qsa.proj.w)),
+                                       {aw.h.q8, aw.h.s8, aw.h.x}, {m.b_qg, m.b_k, m.b_v, m.qsaw.qk});
+                }
             }
         } else {
             GdnFP8::Src gs{};
@@ -1674,8 +1693,21 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
                                       g.n_embd);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
-        else        l.gdn.step(c, batch);
+        if (l.full) {
+            /* run 285 (group B of owner note 232's audit): the x3 and the indexer's qk projection as one launch at
+             * decode rows; both blocks then skip theirs (qkv_done / proj_done). The same operands the two launches take. */
+            const bool x3bf = l.op_qkv3qk && T <= kGemvMultiRows;
+            if (x3bf)
+                RAD_ISSUE_N(c, l.op_qkv3qk, T, brows(l.attn.w.h.q8, T), brows(l.attn.w.h.s8, T),
+                            RAD_W(l.attn.qg.w), RAD_W(l.attn.qg.ws), brows(l.attn.w.qg, T),
+                            RAD_W(l.attn.kp.w), RAD_W(l.attn.kp.ws), brows(l.attn.w.k, T),
+                            RAD_W(l.attn.vp.w), RAD_W(l.attn.vp.ws), brows(l.attn.w.v, T),
+                            brows(l.attn.w.h.x, T), RAD_W(l.qsa.proj.w), brows(m.qsaw.qk, T));
+            l.qsa.step(c, l.attn.w.h, batch, pcu, x3bf);
+            l.attn.step(c, batch, true, nullptr, x3bf);
+        } else {
+            l.gdn.step(c, batch);
+        }
         if (!dbg && l.hc_ffn.fuses_write(l.hc_mix, T, T)) {
             l.hc_ffn.write_read(c, T, 0, T, l.hc_mix);
         } else {

@@ -880,22 +880,28 @@ extern "C" int xe_rad_router_gemm_topk_scatter(const RadArgs* args, RadStream s)
  * (r4d_rad_router_topk_scatter_quant, ports/r4d_moe.cpp: the six router operands and the three of the quantiser,
  * contiguous as that adapter reads them). */
 extern "C" int r4d_rad_router_topk_scatter_quant(const RadArgs* a, RadStream s);
-extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* args, RadStream s) {
-    if (!args || args->n_t < 13) return R4D_NO(RAD_E_INVAL);
-    long long E = 0;
-    int rc = router_gemm_part(args, s, &E);
-    if (rc != RAD_OK) return rc;
+/* The fused router op's tail (run 285; shared with router_gemm_topk_scatter_quant_sh in xe_gemv_i8.cpp, whose first 13
+ * operands are this op's): the selection + sort and the quantiser as one launch over operands 3 .. 8 and 10 .. 12, then
+ * the routing dump. */
+extern "C" int xe_router_topk_quant_tail(const RadArgs* args, RadStream s, long long E) {
     RadTensor t9[9];
     for (int i = 0; i < 6; ++i) t9[i] = args->t[3 + i];
     for (int i = 0; i < 3; ++i) t9[6 + i] = args->t[10 + i];
     RadArgs sub = *args;
     sub.t = t9;
     sub.n_t = 9;
-    rc = r4d_rad_router_topk_scatter_quant(&sub, s);
+    const int rc = r4d_rad_router_topk_scatter_quant(&sub, s);
     if (rc == RAD_OK)
         route_dump((sycl::queue*)s, r4d_opt(args, 3), r4d_opt(args, 4), r4d_opt(args, 5), E,
                    r4d_geti_or(args, "top_k", 0));
     return rc;
+}
+extern "C" int xe_rad_router_gemm_topk_scatter_quant(const RadArgs* args, RadStream s) {
+    if (!args || args->n_t < 13) return R4D_NO(RAD_E_INVAL);
+    long long E = 0;
+    const int rc = router_gemm_part(args, s, &E);
+    if (rc != RAD_OK) return rc;
+    return xe_router_topk_quant_tail(args, s, E);
 }
 
 /* logits_gemm at dtype bf16: x, lm_head, logits. (Production's int8 lm_head is a joined code + scale
