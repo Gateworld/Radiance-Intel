@@ -50,7 +50,14 @@ struct MemReader {
     int64_t  pos = 0;
 };
 
-int mem_write(void* op, const uint8_t* buf, int n) {
+/* Intel port (owner note 259): FFmpeg 7 (libavformat 61) made avio_alloc_context's write callback take a const
+ * buffer; the Intel build images carry Ubuntu 24.04's FFmpeg 6.1 (libavformat 60), whose callback does not. */
+#if LIBAVFORMAT_VERSION_MAJOR < 61
+using AvioWriteBuf = uint8_t*;
+#else
+using AvioWriteBuf = const uint8_t*;
+#endif
+int mem_write(void* op, AvioWriteBuf buf, int n) {
     MemFile* f = static_cast<MemFile*>(op);
     const int64_t end = f->pos + n;
     if (end > (int64_t)f->data.size()) f->data.resize((size_t)end);
