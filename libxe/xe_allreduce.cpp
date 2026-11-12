@@ -691,6 +691,17 @@ int launch(const RadArgs* a, RadStream s, int host_form, const HcW* hw = nullptr
      * B70 holds ~80 work-groups of 256 at SIMD16 (1,280 hardware threads); 64 leaves room for the
      * compute the all-reduce overlaps. The CPU device (16 cores) needs XE_AR_BLOCKS=4 or so. */
     if (nblk > (uint32_t)kResidentBlocks) nblk = kResidentBlocks;
+    /* XE_AR_MIN_BLOCKS=N (run 323, owner note 248 item 2; opt-in): a FLOOR on the block count, so a small message (the
+     * decode sizes: 2 / 3 / 5 blocks by the rule above) spreads over more blocks while a large one keeps its own count.
+     * ARB1 (5,000-launch pitches, both cards): 4-8 blocks took rows 1 / 2 / 4 from 11.7 / 23.0 / 12.1 us to ~7.6-7.9 /
+     * ~10.0 / ~11.4-11.6, every correctness case exact at forced counts 1-8. Capped so a block keeps >= 128 words. */
+    static const long env_min_blocks = [] { const char* v = std::getenv("XE_AR_MIN_BLOCKS"); return v ? std::strtol(v, nullptr, 10) : 0L; }();
+    if (env_min_blocks > 0 && nblk < (uint32_t)env_min_blocks) {
+        uint32_t floor_blk = (uint32_t)(env_min_blocks < (long)kResidentBlocks ? env_min_blocks : (long)kResidentBlocks);
+        const uint32_t by_words = n32 / 128u > 0 ? n32 / 128u : 1u;
+        if (floor_blk > by_words) floor_blk = by_words;
+        if (floor_blk > nblk) nblk = floor_blk;
+    }
     /* XE_AR_BLOCKS: a fixed block count (the CPU-device probe: its runtime schedules the two ranks'
      * kernels one after the other unless each is one work-group, round 2 M2b's shape) */
     static const long env_blocks = [] { const char* v = std::getenv("XE_AR_BLOCKS"); return v ? std::strtol(v, nullptr, 10) : 0L; }();
