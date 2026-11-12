@@ -396,6 +396,19 @@ if(RAD_BUILD_TESTS)
         ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RI_MTP_NCAND=${_w};RADIANCE_XE_MTP_COOP=${_coop}" TIMEOUT 600)
     endforeach()
   endforeach()
+  # Run 323 (owner note 248 item 1): the bounded walk (to the last live slot) against the host reference's full walk,
+  # on a top_k-shaped plane (a 1,000-slot dead tail), with in-place holes before live slots (typical / xtc), and past
+  # the cooperative form's LDS plane (1,025: its serial fallback), both device forms.
+  foreach(_case "1024;1000;0" "1024;1000;1" "1025;1000;0")
+    list(GET _case 0 _w)
+    list(GET _case 1 _t)
+    list(GET _case 2 _h)
+    foreach(_coop 0 1)
+      add_test(NAME xe_mtp_couple_w${_w}_t${_t}_h${_h}_c${_coop}_cpu COMMAND xe_mtp_couple_test $<TARGET_FILE:libxe> $<TARGET_FILE:spechub>)
+      set_tests_properties(xe_mtp_couple_w${_w}_t${_t}_h${_h}_c${_coop}_cpu PROPERTIES LABELS "xe"
+        ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RI_MTP_NCAND=${_w};RI_MTP_TAIL=${_t};RI_MTP_HOLES=${_h};RADIANCE_XE_MTP_COOP=${_coop}" TIMEOUT 600)
+    endforeach()
+  endforeach()
   # Milestone 2, owner note 28: the feasibility probe for tapes on direct Level Zero command lists (a
   # launch_as kernel launched natively, and the cost of a submission: SYCL graphs vs native lists).
   add_executable(xe_native_launch_test test/native_launch_test.cpp)

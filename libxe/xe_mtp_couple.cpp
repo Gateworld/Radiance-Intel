@@ -30,9 +30,24 @@ void mtp_couple_propose_kernel(RadMtpCoupleProposeCall c) {
     if (row < c.M) rad_mtp_couple_propose_row(c, row);
 }
 
+/* Owner note 248 item 1 (run 323): the row's walk ends after its LAST live slot (id >= 0). Every loop of the verify
+ * skips a slot whose id is negative (the validity scan, the sums, the residual mass, both CDF walks), so the slots
+ * past it change nothing and the token is the full walk's bit for bit -- for any plane, compacted or not (sample_typical
+ * and sample_xtc drop in place, so a -1 may sit before a live slot; this bound never assumes otherwise). */
+int64_t live_end(const RadMtpCoupleVerifyCall& c, int64_t row) {
+    const int32_t* ids = c.idx + row * c.ld[0];
+    int64_t e = c.n_cand;
+    while (e > 0 && ids[e - 1] < 0) --e;
+    return e;
+}
+
 void mtp_couple_verify_kernel(RadMtpCoupleVerifyCall c) {
     const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < c.M) rad_mtp_couple_verify_row(c, row);
+    if (row < c.M) {
+        RadMtpCoupleVerifyCall b = c;
+        b.n_cand = live_end(c, row);
+        rad_mtp_couple_verify_row(b, row);
+    }
 }
 
 constexpr int kRowsPerBlock = 16;
@@ -64,18 +79,37 @@ void mtp_couple_verify_coop_kernel(const int32_t* idx, const float* values, cons
     XE_SHARED(int, first, 8);
     XE_SHARED_VAR(int, ix);
     XE_SHARED_VAR(int, dominated);
+    XE_SHARED(int, lastv, kCoopThreads);
     RadMtpCoupleVerifyCall c{ idx, values, params, state, token, M, n_cand, vocab,
                               { ld0, ld1, ld2, ld3, ld4 } };
     const int64_t row = blockIdx.x;
     if (row >= M) return;
     if (n_cand > kMaxCand) {
-        if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
+        if (threadIdx.x == 0) {
+            RadMtpCoupleVerifyCall b = c;
+            b.n_cand = live_end(c, row);
+            rad_mtp_couple_verify_row(b, row);
+        }
         return;
     }
     const auto& s = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
     const auto& p = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
     const int32_t* ids = c.idx + row * c.ld[0];
     const float*   val = c.val + row * c.ld[1];
+    /* Owner note 248 item 1: the walk ends after the row's last live slot (live_end above), found 128 wide -- each
+     * thread's last live index over its stride, then every thread takes the maximum, so no second barrier. */
+    {
+        int my = -1;
+        for (int64_t j = threadIdx.x; j < c.n_cand; j += blockDim.x)
+            if (ids[j] >= 0) my = (int)j;
+        lastv[threadIdx.x] = my;
+    }
+    __syncthreads();
+    {
+        int e = -1;
+        for (int t = 0; t < kCoopThreads; ++t) e = lastv[t] > e ? lastv[t] : e;
+        c.n_cand = (int64_t)e + 1;
+    }
     if (threadIdx.x == 0) {
         eligible = 0;
         if (s.status == 1 && !(p.flags & RAD_SP_GREEDY) && s.draw.seed == p.seed &&

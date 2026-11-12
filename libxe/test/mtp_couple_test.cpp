@@ -179,6 +179,17 @@ int main(int argc, char** argv) {
         for (int64_t j = 8; j < n_cand; ++j)
             for (int k = 0; k < 8; ++k)
                 if (cidx[(size_t)(r * n_cand + j)] == cidx[(size_t)(r * n_cand + k)]) cidx[(size_t)(r * n_cand + j)] = (cidx[(size_t)(r * n_cand + j)] + 500) % (int32_t)vocab;
+        /* RI_MTP_TAIL=N (run 323, owner note 248 item 1): the last N slots dropped (-1, -inf), the shape a top_k plane
+         * has; RI_MTP_HOLES=1: also every 5th slot past the head's 8 dropped in place, as sample_typical / sample_xtc
+         * do -- the device's bounded walk must still equal the host reference's full one */
+        const char* tls = std::getenv("RI_MTP_TAIL");
+        const int64_t tail = tls ? std::atoll(tls) : 0;
+        const bool holes = std::getenv("RI_MTP_HOLES") && *std::getenv("RI_MTP_HOLES") == '1';
+        for (int64_t j = 8; j < n_cand; ++j)
+            if (j >= n_cand - tail || (holes && j % 5 == 0)) {
+                cidx[(size_t)(r * n_cand + j)] = -1;
+                cval[(size_t)(r * n_cand + j)] = -INFINITY;
+            }
         RadSampleParams sp{};
         sp.seed = 90210ull + (uint64_t)r; sp.pos = 0; sp.temp = 1.0f; sp.top_k = (int32_t)n_cand; sp.mask_row = -1;
         static_assert(sizeof(RadSampleParams) <= 24 * 4, "the sampler's parameter row is 24 words");
