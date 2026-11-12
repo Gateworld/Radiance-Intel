@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <queue>
@@ -489,6 +490,7 @@ int Mover::prefetch_to_op(int32_t op_index) {
 
         const int64_t slot = pools_[(size_t)us.klass].slab.take();
         if (slot < 0) { ++stats_.starved_slab; break; }
+        trace_tag(pools_[(size_t)us.klass], slot, 1, pf.unit);
         const int rc = start_stage(pf.unit, slot);
         if (rc < 0) {
             pools_[(size_t)us.klass].slab.add_free(slot);
@@ -839,6 +841,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         if (promote) {
             const int64_t slot = cp.slab.take();
             if (slot < 0) { ++stats_.starved_slab; return false; }
+            trace_tag(cp, slot, 2, unit);
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
             return true;
         }
@@ -1159,6 +1162,7 @@ bool Mover::migrate(int32_t unit, HeatEngine* heat) {
         cp.slab.add_free(to);
         return false;
     }
+    trace_tag(cp, to, 3, unit);
     const int rec = free_move_record();
     if (rec < 0 || record_gate() < 0) {
         if (rec < 0) ++stats_.no_record;
@@ -1248,6 +1252,7 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
              * returns it, so the reserve would be lost. */
             const int64_t slot = pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
             if (slot < 0) return RAD_OK;
+            trace_tag(pools_[klass], slot, 4, u);
             if (heat) heat->set_busy(u, true);
             if (promote_to(u, slot) < 0) {                   /* no record left: next time */
                 pools_[klass].slab.add_free(slot);
@@ -1423,6 +1428,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                 cp.slab.add_free(to);
                 to = -1;
             }
+            if (to >= 0) trace_tag(cp, to, 5, u);
             const int64_t g = to < 0 ? cp.pool.take() : -1;
             if (to >= 0) {
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
@@ -1501,6 +1507,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         RAD_ERR("mover: recalled the %s loan to %lld and a slot at %lld is still held",
                 lender_name(lender), (long long)loan_[lender],
                 (long long)loan_held(lender));
+        if (trace_on()) trace_dump(lender);
         return RAD_E_STATE;
     }
     return RAD_OK;
@@ -1540,6 +1547,11 @@ int Mover::retire(HeatEngine* heat) {
         UnitState& us = unit_[(size_t)m.unit];
         switch (m.kind) {
             case Move::Kind::Promote:
+                /* RADIANCE_MOVER_TRACE: a second promotion of a unit that already holds a slot would leave the
+                 * first slot held by nobody (the recall's "still held") -- say so where it happens */
+                if (trace_on() && us.slab_slot >= 0 && us.slab_slot != m.slab_slot)
+                    RAD_ERR("mover trace: unit %d promoted into slot %lld while it holds slot %lld (dispatch %d)",
+                            (int)m.unit, (long long)m.slab_slot, (long long)us.slab_slot, dispatch_);
                 us.slab_slot = m.slab_slot;
                 /* The source pool slot is freed after quarantine, unless the destination was
                  * lent, in which case the unit keeps it (see promote_to). */
@@ -1619,6 +1631,76 @@ int Mover::retire(HeatEngine* heat) {
     }
     count_flex();
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ RADIANCE_MOVER_TRACE (owner note 256) */
+/* The v1 soak stopped twice on a recall of the arena's loan that left a slot held past the loan with no unit in it
+ * (reclaim's last check). The trace records, per slab slot, the last take (site, unit, dispatch); at that check it
+ * dumps every held slot past the loan with the units and the move records that name it. Off by default; nothing else
+ * changes with it on. */
+bool Mover::trace_on() {
+    static const bool on = [] { const char* v = std::getenv("RADIANCE_MOVER_TRACE"); return v && v[0] == '1'; }();
+    return on;
+}
+
+void Mover::trace_tag(ClassPools& cp, int64_t slot, uint8_t site, int32_t unit) {
+    if (!trace_on() || slot < 0) return;
+    const size_t n = (size_t)cp.slab.capacity();
+    if (cp.tag_op.size() < n) {
+        cp.tag_op.resize(n, 0);
+        cp.tag_unit.resize(n, -1);
+        cp.tag_disp.resize(n, -1);
+    }
+    if ((size_t)slot >= n) return;
+    cp.tag_op[(size_t)slot] = site;
+    cp.tag_unit[(size_t)slot] = unit;
+    cp.tag_disp[(size_t)slot] = dispatch_;
+}
+
+void Mover::trace_dump(int lender) const {
+    static const char* site_name[] = { "init / unknown", "prefetch stage", "swap promote", "migrate", "fill",
+                                       "recall donor" };
+    static const char* kind_name[] = { "Promote", "Demote", "Stage", "Release", "Drop", "Migrate" };
+    static const char* state_name[] = { "Free", "Copying", "Published", "Quarantine" };
+    int shown = 0;
+    for (size_t c = 0; c < pools_.size(); ++c) {
+        const ClassPools& cp = pools_[c];
+        for (const ClassPools::Lent& l : cp.lent) {
+            if (l.lender != lender) continue;
+            const int64_t top = cp.slab.top_held(l.seg);
+            for (int64_t s = top; s >= l.first && shown < 12; --s) {
+                if (!cp.slab.is_held(s) || cp.slab.covered(s)) continue;
+                ++shown;
+                const size_t i = (size_t)s;
+                const uint8_t site = i < cp.tag_op.size() ? cp.tag_op[i] : 0;
+                RAD_ERR("mover trace: class %zu slot %lld (need %lld > loan %lld) held; last take: %s, unit %d, "
+                        "dispatch %d (now %d)", c, (long long)s, (long long)l.need[(size_t)(s - l.first)],
+                        (long long)loan_[lender], site_name[site < 6 ? site : 0],
+                        i < cp.tag_unit.size() ? (int)cp.tag_unit[i] : -1,
+                        i < cp.tag_disp.size() ? (int)cp.tag_disp[i] : -1, dispatch_);
+                int owners = 0;
+                for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
+                    const UnitState& us = unit_[(size_t)u];
+                    if (us.klass != (int32_t)c || us.slab_slot != s) continue;
+                    ++owners;
+                    RAD_ERR("mover trace:   unit %d holds it: tier %d site %d pool slot %lld, in flight %d", (int)u,
+                            (int)us.tier, (int)us.site, (long long)us.pool_slot, (int)copying_[(size_t)u]);
+                }
+                for (size_t r = 0; r < moves_.size(); ++r) {
+                    const Move& m = moves_[r];
+                    if (m.state == Move::State::Free || m.unit < 0) continue;
+                    if (unit_[(size_t)m.unit].klass != (int32_t)c || (m.slab_slot != s && m.to_slot != s)) continue;
+                    ++owners;
+                    RAD_ERR("mover trace:   record %zu names it: %s, %s, unit %d (its slab slot now %lld), slab %lld "
+                            "to %lld pool %lld, event done %d", r, kind_name[(int)m.kind], state_name[(int)m.state],
+                            (int)m.unit, (long long)unit_[(size_t)m.unit].slab_slot, (long long)m.slab_slot,
+                            (long long)m.to_slot, (long long)m.pool_slot, rad_event_query(m.ev));
+                }
+                if (!owners) RAD_ERR("mover trace:   NO unit and NO record names it (a leaked hold)");
+            }
+        }
+    }
+    if (!shown) RAD_ERR("mover trace: no held slot past the %s loan was found by the dump", lender_name(lender));
 }
 
 std::string Mover::report() const {

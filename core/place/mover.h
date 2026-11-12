@@ -185,6 +185,8 @@ public:
             if (held_[(size_t)s]) return s;
         return -1;
     }
+    /* Whether something holds `slot` (RADIANCE_MOVER_TRACE's dump reads it; owner note 256). */
+    bool is_held(int64_t slot) const { return slot >= 0 && slot < n_ && held_[(size_t)slot]; }
     /* How many existing slots at or past `from` something holds, over every segment. */
     int64_t held_from(int64_t from) const {
         int64_t k = 0;
@@ -639,7 +641,17 @@ private:
                                   : flex_ptr[(size_t)(slot - n_fixed)];
         }
         bool is_flex(int64_t slot) const { return slot >= n_fixed; }
+        /* RADIANCE_MOVER_TRACE=1 (owner note 256): per slab slot, the last take -- the site, the unit
+         * and the dispatch. Sized at the first take; empty while the trace is off. */
+        std::vector<uint8_t> tag_op;
+        std::vector<int32_t> tag_unit;
+        std::vector<int32_t> tag_disp;
     };
+    /* RADIANCE_MOVER_TRACE=1: tag a slot just taken (site: 1 prefetch stage, 2 swap promote, 3 migrate, 4 fill,
+     * 5 recall donor), and at a recall that leaves a slot held past the loan, dump every such slot's owners. */
+    static bool trace_on();
+    void trace_tag(ClassPools& cp, int64_t slot, uint8_t site, int32_t unit);
+    void trace_dump(int lender) const;
 
     const Program* prog_ = nullptr;
     const Plan*    plan_ = nullptr;
