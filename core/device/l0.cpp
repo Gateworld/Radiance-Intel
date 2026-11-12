@@ -869,7 +869,21 @@ void stop_recording(const std::string& why);
 int ntape_sync();
 /* the sleeping wait's constants (owner note 25; defined here for the native waits above their use) */
 constexpr int64_t kWaitSpinUs = 100;
-constexpr int64_t kWaitSleepMinUs = 20, kWaitSleepMaxUs = 200;
+constexpr int64_t kWaitSleepMinUs = 20;
+/* Intel port, run 272 (owner note 214 item 3; the coordinator's A/B at 50 and 100): RADIANCE_L0_WAIT_SLEEP_MAX_US caps
+ * the sleeping wait's nap (20..200 us; 200 = today's). M373's tape timeline charged ~221 us a step of device idle to
+ * the step boundary, where the host sleeps in 200-us naps at the end of a ~30 ms step and wakes ~100 us late on
+ * average; a shorter cap trades a few hundred polls a step for that latency. Still a sleeping wait: no busy spin. */
+inline int64_t kWaitSleepMaxUs_() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_L0_WAIT_SLEEP_MAX_US");
+        long n = e ? std::strtol(e, nullptr, 10) : 200L;
+        if (n < 20) n = 20;
+        if (n > 200) n = 200;
+        return (int64_t)n;
+    }();
+    return v;
+}
 
 /* The ring's size: RADIANCE_L0_RING (run 127; default 256, 64-8192). With the glue a step appends a few hundred
  * times and the host runs a step ahead, so a slot can come round before its last append has completed: ring_take
@@ -1157,7 +1171,7 @@ void done_wait(ze_event_handle_t done) {
         const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
         if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs_());
         if (!told && us > 10000000) {
             told = true;
             RAD_WARN("l0 tape: a thread on device %d has waited 10 s for a ring slot's last play to complete (slot reuse; plays so far %lld)",
@@ -1240,7 +1254,7 @@ void n_slot_wait(int dev, int slot, uint64_t serial, const char* who) {
         const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
         if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs_());
         if (!told && us > 10000000) {
             told = true;
             RAD_WARN("l0 tape: a thread on device %d is waiting 10 s for a play on device %d, slot %d, serial %llu (%s; plays so far %lld): %s",
@@ -3044,7 +3058,7 @@ void sleepy_wait(const sycl::event& e) {
         if (us < kWaitSpinUs) { std::this_thread::yield(); continue; }
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
         g_wait_sleeps.fetch_add(1, std::memory_order_relaxed);
-        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs);
+        sleep_us = std::min<int64_t>(sleep_us * 2, kWaitSleepMaxUs_());
         if (!told && us > 10000000) {   /* M1: which host wait holds a rank (a stream or event sync) */
             told = true;
             RAD_WARN("l0: a thread on device %d has waited 10 s in a sleeping wait for the runtime's event (a stream or event sync; plays so far %lld)",

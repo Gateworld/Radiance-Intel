@@ -567,7 +567,13 @@ void Builder::resolve_bands(OpInfo& oi) {
                 else if (s > r.scratch_bytes)
                     r.scratch_bytes = s;
             }
-            if (r.scratch_bytes > prog_.scratch_bytes) prog_.scratch_bytes = r.scratch_bytes;
+            if (r.scratch_bytes > prog_.scratch_bytes) {
+                /* run 112 (owner note 128 item 4): which op sizes the plan's scratch regions */
+                RAD_DEBUG("scratch: %s (kernel %s, %s) raises the plan's scratch to %.2f MiB", oi.op.c_str(),
+                          r.row && r.row->info ? r.row->info->name : "?", r.geom.str().c_str(),
+                          (double)r.scratch_bytes / 1048576.0);
+                prog_.scratch_bytes = r.scratch_bytes;
+            }
 
             record_tune_request(r);
         }

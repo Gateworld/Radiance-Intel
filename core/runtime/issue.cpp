@@ -398,6 +398,12 @@ static long   g_iss_n   = 0;
  * recorded. */
 /* Run 173 (Intel port, RADIANCE_DEBUG_STAGE): a prefill-sized pass's host time per op, by part (ctx.h hst_*). */
 static bool hst_on() { static const bool on = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr; return on; }
+/* Intel port, run 272 (owner note 214 item 3; the coordinator's order): RADIANCE_TAPE_CUT_HOST_TOUCH=1 ends the play
+ * segment after a device op that wrote the host arena (see the launch path), opt-in until measured */
+static bool tape_cut_host_touch() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_TAPE_CUT_HOST_TOUCH"); return e && e[0] == '1'; }();
+    return on;
+}
 static double hst_ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -1074,6 +1080,14 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         const int er = rad_event_record(host_touch_ev_[l], cur_stream());
         if (er < 0) return abort_step(h, b, dom, ip, n, er);
         host_touch_pending_[l] = true;
+        /* Intel port, run 272 (owner note 214 item 3, the coordinator's order; RADIANCE_TAPE_CUT_HOST_TOUCH=1): when
+         * recording, end the play segment right after a device op that wrote the host arena. The host op that later
+         * joins on this touch (the PLE gather, `embed_lookup_q`, issued at the PLE layer while `ngram_ids` ran at the
+         * top of the step) then waits for a segment that holds little more than the producer, and the device plays
+         * the segment in between (layer 0) while the host gathers -- M373's tape timeline charged 184 us a step of
+         * device idle to that join at hc_write -> (copy). Only the list boundaries move: the same kernels in the same
+         * order on the same data, so the outputs are bit for bit the same. */
+        if (rec_ && !host_paused && tape_cut_host_touch()) tape_cut();
     }
     if (horacle) oracle_after(h, *horacle, ip, n_opd);
     return RAD_OK;
