@@ -166,7 +166,8 @@ static const Flag g_flags[] = {
     { "--host",               "ADDR",   "listen address" },
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but /health,\n"
-    "                                    /v1/health, /ping and the dashboard page" },
+    "                                    /v1/health, /ping and the dashboard page; without it the key comes from\n"
+    "                                    RADIANCE_API_KEY, which keeps it off the command line" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
@@ -999,6 +1000,12 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+
+    /* Intel port, run 325 (owner note 249 item 3: the key never on a command line, where every user's `ps` reads it):
+     * with no --api-key, the key comes from RADIANCE_API_KEY, as the service's environment file passes it. --api-key
+     * still wins; an empty variable sets nothing. */
+    if (c->api_key.empty())
+        if (const char* k = std::getenv("RADIANCE_API_KEY"); k && *k) c->api_key = k;
 
     return RAD_OK;
 }
