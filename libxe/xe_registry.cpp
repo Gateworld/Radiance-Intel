@@ -122,6 +122,17 @@ static const RadConstraint cXeMoeW4nlI8[] = {
     C_GE("M", 1), C_DIV("K", 128), C_LE("K", 4096), C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1),
     C_EQ("group", 128), C_IN("dtype", "w4nl64i8h"),
 };
+/* the gate_up epilogue fold (owner note 254, run 341; RADIANCE_XE_GU_EPI=1): format C gate_up's decode instance (K in
+ * 2049 .. 2560: 5 chunks a lane), two parts of a multiple of 128 columns each, at most 16 tokens of at most 16 slots (so
+ * the run form, never the matrix-unit form), with gated_quant_pair's shared arm (n2 a multiple of 4) */
+extern "C" int xe_rad_moe_gemm_w4nl_i8_gq(const RadArgs* a, RadStream s);   /* xe_moe_i4i8.cpp (format C's file) */
+extern "C" int xe_gq_init(const RadParam* p, int n_p, int rank, int world_size, void** out);
+extern "C" void xe_gq_fini(void* inst);
+static const RadConstraint cXeMoeGq[] = {
+    C_GE("M", 1), C_LE("M", 16), C_DIV("K", 128), C_GE("K", 2049), C_LE("K", 2560), C_DIV("N", 256), C_EQ("parts", 2),
+    C_GE("n_expert", 1), C_LE("n_expert", 65536), C_GE("top_k", 1), C_LE("top_k", 16), C_EQ("group", 128),
+    C_IN("dtype", "w4nl64i8h"), C_DIV("n2", 4), C_IN("act", "silu"),
+};
 /* the MTP coupling (owner note 47 item 2): the rows' launches in xe_mtp_couple.cpp, the shape hooks the spechub
  * plugin's (plugin/spechub/spechub.h, compiled into libxe) */
 extern "C" int xe_rad_mtp_couple_propose(const RadArgs* a, RadStream s);
@@ -531,13 +542,41 @@ static const RadKernelInfo kFlagged[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cXeGemvMulti), NOTUNE,
   nullptr, nullptr, xe_rad_gemm_nt_q_x3_bf16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+/* the gate_up epilogue fold (owner note 254, run 341; RADIANCE_XE_GU_EPI=1, opt-in): format C gate_up and the decode
+ * step's gated_quant_pair as one launch -- gate_up's columns as moe_gemm_q writes them, the routed rows quantised by
+ * the last work-group of each 128-column group to finish, the shared expert's rows by work-groups of their own
+ * (xe_moe_i4i8.cpp, moe_i4i8_run_ep_kernel); the MoE block issues it for op_gu + op_gqp when the router launch ran the
+ * shared gate and gate_up (rad_block_moe_fp8.h, op_gugq) */
+{ "xe_moe_gemm_w4nl_i8_gq", "moe_gemm_q_gq", "moe",
+  "format C's grouped gate_up (moe_gemm_q, w4nl64i8h, two parts) with gated_quant_pair over its output and the shared "
+  "expert's gate_up in the same launch: the routed rows' silu x up, a 128-wide Hadamard and int8 codes, the shared "
+  "rows' silu x up and plain int8 codes",
+  "M <= 16 tokens, top_k <= 16; K 2049 .. 2560 (gate_up's decode instance), N a multiple of 256 in two parts; n2 a "
+  "multiple of 4; group 128; silu",
+  "i8 activation with f32 scales, the w4nl64a8h joined entries; bf16 gate_up out, int8 codes with an f32 scale per "
+  "(row, 128 columns) and optional bf16 products for both arms",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cXeMoeGq), NOTUNE,
+  xe_gq_init, xe_gq_fini, xe_rad_moe_gemm_w4nl_i8_gq, nullptr, xe_moe_planes_layout, xe_moe_planes_relayout, nullptr,
+  xe_moe_planes_unrelayout, nullptr },
 };
+/* RADIANCE_XE_GU_EPI=1 (run 341, owner note 254): opt-in; not with the tail skip (RADIANCE_XE_TAIL_SKIP), which the
+ * fold's kernel does not take -- the row then stays unlisted and the step issues gate_up and the pair */
+static bool xe_gu_epi_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_XE_GU_EPI");
+        const char* ts = std::getenv("RADIANCE_XE_TAIL_SKIP");
+        return e && e[0] == '1' && !(ts && std::atol(ts) > 0);
+    }();
+    return v;
+}
 static bool flagged_on(int j) {
     return j == 0 ? xe_gate_quant_on() : j == 1 ? xe_gated_had_on() : j == 2 ? xe_gated_quant_pair_on()
                                         : j == 3 ? xe_qk_prologue_on() : j <= 5 ? xe_router_quant_pair_on()
                                         : j <= 7 ? xe_gemv_multi_on()   /* j 6 and 7 */
                                         : j == 8 ? xe_gemv_multi2_on()  /* j 8: group A */
-                                                 : xe_gemv_multi2b_on(); /* j 9: group B */
+                                        : j == 9 ? xe_gemv_multi2b_on() /* j 9: group B */
+                                                 : xe_gu_epi_on();      /* j 10: the gate_up epilogue fold */
 }
 static constexpr int kNumFlagged = (int)(sizeof(kFlagged) / sizeof(kFlagged[0]));
 /* the j-th listed flagged entry (counting only those on), or -1 */
@@ -722,6 +761,20 @@ static const RadOperandSpec oXeGemvX3Bf[] = {
     { "b3", RAD_OPD_WEIGHT, 0 },     { "b3_scale", RAD_OPD_WEIGHT, 0 }, { "y3", RAD_OPD_OUT, 0 },
     { "x", RAD_OPD_IN, 0 },          { "b4", RAD_OPD_WEIGHT, 0 },       { "y4", RAD_OPD_OUT, 0 },
 };
+/* moe_gemm_q_gq (run 341, owner note 254): moe_gemm_q's params and operands (libref's pMoeGemmQ / oMoeGemmQ), then
+ * gated_quant_pair's -- the routed set's gate_up is this op's own `y` -- and its params */
+static const RadParamSpec pXeMoeGq[] = {
+    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"), P_STR("a_order"),
+    P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"), P_INTO("parts"), P_INT("n2"), P_STRO("act"),
+};
+static const RadOperandSpec oXeMoeGq[] = {
+    { "a", RAD_OPD_IN, 0 },          { "a_scale", RAD_OPD_IN, 1 },      { "w", RAD_OPD_WTAB, 0 },
+    { "w_scale", RAD_OPD_WTAB, 0 },  { "sorted_tok", RAD_OPD_IN, 0 },   { "expert_offset", RAD_OPD_IN, 0 },
+    { "w_odd", RAD_OPD_WTAB, 0 },    { "w_odd_scale", RAD_OPD_WTAB, 0 }, { "y", RAD_OPD_OUT, 0 },
+    { "q", RAD_OPD_OUT, 0 },         { "scale", RAD_OPD_OUT, 0 },       { "out_bf16", RAD_OPD_OUT, 1 },
+    { "gate_up2", RAD_OPD_IN, 0 },   { "q2", RAD_OPD_OUT, 0 },          { "scale2", RAD_OPD_OUT, 0 },
+    { "out_bf16_2", RAD_OPD_OUT, 1 },
+};
 /* kFlagged's schemas, in its order; listed under the same flags */
 static const RadOpSchema kFlaggedSchemas[] = {
     { "gate_quant_fp8", ROW(pXeGateQuant), ROW(oXeGateQuant),
@@ -753,6 +806,9 @@ static const RadOpSchema kFlaggedSchemas[] = {
     { "gemm_nt_q_x3_bf16", ROW(pXeGemvX3Bf), ROW(oXeGemvX3Bf),
       "gemm_nt_q_x3 (dtype i8a8, widths N1 / N2 / N3) over an activation's codes and gemm_nt (bf16, width N4) over its "
       "bf16 plane `x` in one launch: the two ops' bytes." },
+    { "moe_gemm_q_gq", ROW(pXeMoeGq), ROW(oXeMoeGq),
+      "moe_gemm_q (format C gate_up, `parts` 2) and then gated_quant_pair over its `y` (rotated int8 into q / scale) "
+      "and over `gate_up2` (plain int8 at width `n2` into q2 / scale2), silu, in one launch: the two ops' bytes." },
 };
 static_assert(sizeof(kFlaggedSchemas) / sizeof(kFlaggedSchemas[0]) == kNumFlagged, "a schema for each flagged row");
 static int own_schemas() { return kNumSchemas + flagged_count(); }

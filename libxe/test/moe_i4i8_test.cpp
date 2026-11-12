@@ -69,9 +69,15 @@ double e4m3(uint8_t v) {
     return s ? -x : x;
 }
 
+/* The gate_up epilogue fold (owner note 254, run 341): `gq` 1 runs gate_up then libxe's gated_quant_pair over its
+ * output and a shared-arm operand [tokens][2 n2]; 2 runs the fused moe_gemm_q_gq row (RADIANCE_XE_GU_EPI=1) on the
+ * same inputs. Either appends y, the routed codes and scales and the shared codes, scales and bf16 product to RI_DUMP,
+ * so ctest compares the two runs' bytes. */
+LaunchFn g_pair = nullptr, g_fused = nullptr;
+
 /* One call. `ptr`: the classes as pointer tables (stride 0), as the engine's weight tables pass them. `fc`: format C. */
 bool run_case(sycl::queue& q, LaunchFn fn, bool sorted_a, int tokens, int top_k, int n_expert, int N, int N1, int K,
-              int parts, bool ptr, uint64_t seed, bool fc = false) {
+              int parts, bool ptr, uint64_t seed, bool fc = false, int gq = 0, int n2 = 0) {
     const int T = tokens * top_k, AR = sorted_a ? T : tokens;
     const int ne0 = (n_expert + 1) / 2, ne1 = n_expert / 2;
     const int Ncl[2] = { N, N1 };
@@ -207,8 +213,76 @@ bool run_case(sycl::queue& q, LaunchFn fn, bool sorted_a, int tokens, int top_k,
     RadArgs args{};
     args.t = t; args.n_t = 9; args.p = all; args.n_p = 11;
     if (std::getenv("RI_VERBOSE")) std::printf("  launch: T %d N %d/%d K %d %s\n", T, N, N1, K, fc ? "format C" : "B");
-    const int rc = fn(&args, (RadStream)&q);
+    /* gq: the pair's operands -- the routed set over y ([T][2F], F = Nmax / 2), the shared set over its own operand */
+    const int F = Nmax / 2, G = F / 128, Mb = tokens, G2 = (n2 + 127) / 128;
+    std::vector<uint8_t> gq_out;
+    int8_t* dqa = nullptr; float* dsa = nullptr; uint16_t* dgb = nullptr; int8_t* dqb = nullptr; float* dsb = nullptr;
+    uint16_t* dyb = nullptr;
+    if (gq) {
+        std::vector<uint16_t> hgb((size_t)Mb * 2 * n2);
+        for (size_t i = 0; i < hgb.size(); ++i) hgb[i] = to_bf(4.0f * ((float)(h32(seed + 31, i) % 2000001u) / 1000000.0f - 1.0f));
+        dqa = sycl::malloc_device<int8_t>((size_t)T * F, q);
+        dsa = sycl::malloc_device<float>((size_t)T * G, q);
+        dgb = sycl::malloc_device<uint16_t>(hgb.size(), q);
+        dqb = sycl::malloc_device<int8_t>((size_t)Mb * n2, q);
+        dsb = sycl::malloc_device<float>((size_t)Mb * G2, q);
+        dyb = sycl::malloc_device<uint16_t>((size_t)Mb * n2, q);
+        q.memcpy(dgb, hgb.data(), hgb.size() * 2);
+        q.memset(dqa, 0x5A, (size_t)T * F); q.memset(dsa, 0x5A, (size_t)T * G * 4);
+        q.memset(dqb, 0x5A, (size_t)Mb * n2); q.memset(dsb, 0x5A, (size_t)Mb * G2 * 4); q.memset(dyb, 0x5A, (size_t)Mb * n2 * 2);
+        q.wait();
+    }
+    RadTensor tq[16];
+    for (int i = 0; i < 9; ++i) tq[i] = t[i];
+    tq[9] = tn(dqa, RAD_I8, { T, F });
+    tq[10] = tn(dsa, RAD_F32, { T, G });
+    tq[11] = RadTensor{};
+    tq[12] = tn(dgb, RAD_BF16, { Mb, 2 * n2 });
+    tq[13] = tn(dqb, RAD_I8, { Mb, n2 });
+    tq[14] = tn(dsb, RAD_F32, { Mb, G2 });
+    tq[15] = tn(dyb, RAD_BF16, { Mb, n2 });
+    int rc = RAD_OK;
+    if (gq == 2) {
+        RadParam pf[13];
+        for (int i = 0; i < 11; ++i) pf[i] = all[i];
+        pf[11] = RadParam{}; pf[11].key = "n2"; pf[11].kind = RAD_P_INT; pf[11].ival = n2;
+        pf[12] = RadParam{}; pf[12].key = "act"; pf[12].kind = RAD_P_STR; pf[12].sval = "silu";
+        RadArgs af{};
+        af.t = tq; af.n_t = 16; af.p = pf; af.n_p = 13;
+        rc = g_fused(&af, (RadStream)&q);
+    } else {
+        rc = fn(&args, (RadStream)&q);
+        if (gq == 1 && rc == RAD_OK) {
+            RadTensor tp[8] = { tn(dy + kCanary, RAD_BF16, { T, 2 * F }), tq[9], tq[10], RadTensor{}, tq[12], tq[13],
+                                tq[14], tq[15] };
+            RadParam pp[8]{};
+            const char* pk[] = { "M", "n", "n2", "group", "rot", "rot2" };
+            const long long pv[] = { T + Mb, F, n2, 128, 1, 0 };
+            for (int i = 0; i < 6; ++i) { pp[i].key = pk[i]; pp[i].kind = RAD_P_INT; pp[i].ival = pv[i]; }
+            pp[6].key = "dtype"; pp[6].kind = RAD_P_STR; pp[6].sval = "bf16";
+            pp[7].key = "act"; pp[7].kind = RAD_P_STR; pp[7].sval = "silu";
+            RadArgs ap{};
+            ap.t = tp; ap.n_t = 8; ap.p = pp; ap.n_p = 8;
+            rc = g_pair(&ap, (RadStream)&q);
+        }
+    }
     q.wait_and_throw();
+    if (gq) {
+        const size_t nq = (size_t)T * F, ns = (size_t)T * G * 4, nqb = (size_t)Mb * n2, nsb = (size_t)Mb * G2 * 4;
+        gq_out.resize(nq + ns + nqb + nsb + nqb * 2);
+        size_t o = 0;
+        q.memcpy(gq_out.data() + o, dqa, nq); o += nq;
+        q.memcpy(gq_out.data() + o, dsa, ns); o += ns;
+        q.memcpy(gq_out.data() + o, dqb, nqb); o += nqb;
+        q.memcpy(gq_out.data() + o, dsb, nsb); o += nsb;
+        q.memcpy(gq_out.data() + o, dyb, nqb * 2);
+        q.wait();
+        size_t nz = 0, pat = 0;
+        for (size_t i = 0; i < nq; ++i) nz += gq_out[i] != 0;
+        for (uint8_t b : gq_out) pat += b == 0x5A;
+        std::printf("  gq %d: %zu of %zu routed codes nonzero, %zu bytes still 0x5A of %zu\n", gq, nz, nq, pat, gq_out.size());
+        for (void* x : { (void*)dqa, (void*)dsa, (void*)dgb, (void*)dqb, (void*)dsb, (void*)dyb }) sycl::free(x, q);
+    }
     if (std::getenv("RI_VERBOSE")) std::printf("  returned rc %d\n", rc);
     std::vector<uint8_t> hy(ybytes + 2 * kCanary);
     if (std::getenv("RI_VERBOSE")) std::printf("  host buffer\n");
@@ -216,7 +290,11 @@ bool run_case(sycl::queue& q, LaunchFn fn, bool sorted_a, int tokens, int top_k,
     if (std::getenv("RI_VERBOSE")) std::printf("  copied\n");
     /* run 205: RI_DUMP=FILE appends every case's raw output bytes, so two forms' runs can be compared byte for byte */
     if (const char* dp = std::getenv("RI_DUMP")) {
-        if (FILE* df = std::fopen(dp, "ab")) { std::fwrite(hy.data(), 1, hy.size(), df); std::fclose(df); }
+        if (FILE* df = std::fopen(dp, "ab")) {
+            std::fwrite(hy.data(), 1, hy.size(), df);
+            if (!gq_out.empty()) std::fwrite(gq_out.data(), 1, gq_out.size(), df);
+            std::fclose(df);
+        }
     }
     bool canary = true;
     for (size_t i = 0; i < kCanary; ++i) canary &= hy[i] == kPat && hy[kCanary + ybytes + i] == kPat;
@@ -478,6 +556,25 @@ int main(int argc, char** argv) {
                                                     : sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order());
     std::printf("moe_i4i8_test on %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     int fails = 0;
+    /* RI_GQ=1 / 2 (run 341, owner note 254): the gate_up epilogue fold's cases only -- gate_up + gated_quant_pair, or the
+     * fused row -- at the decode shapes: 1 / 2 / 4 / 8 / 16 tokens, a narrower odd class, runs of more than 4 rows of an
+     * expert (4 experts), shared widths that are not a multiple of 128 */
+    if (const char* gv = std::getenv("RI_GQ")) {
+        const int gq = std::atoi(gv);
+        LaunchFn fcl = (LaunchFn)dlsym(h, "xe_rad_moe_gemm_w4nl_i8");
+        g_pair = (LaunchFn)dlsym(h, "r4d_rad_gated_quant_pair");
+        g_fused = (LaunchFn)dlsym(h, "xe_rad_moe_gemm_w4nl_i8_gq");
+        if (!fcl || !g_pair || !g_fused || (gq != 1 && gq != 2)) { std::printf("RI_GQ: a symbol is missing\n"); return 2; }
+        struct C { int tokens, top_k, ne, N, N1; bool ptr; int seed, n2; };
+        const C cs[] = { { 1, 10, 16, 768, 512, true, 41, 512 },  { 2, 10, 16, 768, 768, true, 42, 388 },
+                         { 4, 10, 16, 768, 512, true, 43, 512 },  { 8, 8, 32, 1024, 768, false, 44, 260 },
+                         { 8, 4, 4, 768, 768, true, 46, 512 },    { 16, 16, 64, 768, 512, true, 45, 1024 } };
+        for (const C& c : cs)
+            fails += !run_case(q, fcl, false, c.tokens, c.top_k, c.ne, c.N, c.N1, 2560, 2, c.ptr, (uint64_t)c.seed, true, gq,
+                               c.n2);
+        std::printf("%s (%d failing case(s))\n", fails ? "FAIL" : "PASS", fails);
+        return fails ? 1 : 0;
+    }
     /* RI_SKIP_B=1: format C's cases only; RI_VERBOSE=1: a line before and after each launch */
     const bool skip_b = std::getenv("RI_SKIP_B") != nullptr;
     if (skip_b) goto format_c;

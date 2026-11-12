@@ -394,6 +394,13 @@ struct MoeFP8 {
      * different pairs, so the one launch, issued where op_egq8 was (after both gate_up GEMMs), keeps every
      * dependency; each row's arithmetic is its own kernel's, so the codes are the two launches'. */
     rad_op op_gqp = 0;
+    /* Intel port, run 341 (owner note 254, the gate_up epilogue fold): format C's op_gu and op_gqp as one `moe_gemm_q_gq`
+     * launch where a loaded library declares it (libxe under RADIANCE_XE_GU_EPI=1), up to `gugq_rows` rows, for a pass
+     * whose router launch (op_rtq3 with the gate) ran the shared gate and gate_up -- nothing is issued between the two
+     * ops then. The routed groups are quantised by gate_up's own last work-groups, the shared rows by work-groups of
+     * their own; the bytes are the two ops'. */
+    rad_op  op_gugq = 0;
+    int64_t gugq_rows = 0;
     /* The caller's read writes the rotated pair (HyperConn::Config::rotate), so this block declares
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
@@ -1663,6 +1670,36 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                 rad_op_writes(b, op_rtq3, wr, 10);
             }
         }
+        /* run 341 (owner note 254): the gate_up epilogue fold, op_gu + op_gqp as one launch, for the passes op_rtq3 serves
+         * with the gate (shared_up then issues nothing between the two). Its operands are the two ops' -- declared by
+         * them, so their planned lifetimes cover it. Unresolved (no row, or the flag off), the step issues the two. */
+        if (op_rtq3 && router_fused_gate && op_gqp && ncls == 2 && !c.expert_bf16 && c.expert_c8 &&
+            !std::strcmp(edtype[0], "w4nl64i8h") && rad_op_declared(b, "moe_gemm_q_gq")) {
+            gugq_rows = rtq3_rows < c.rows ? rtq3_rows : c.rows;
+            if (gugq_rows > 16) gugq_rows = 16;
+            /* op_gu's table, in its operand order (declare's `tables`): even experts' codes and scales, then odd */
+            std::vector<rad_weight> tab;
+            tab.reserve((size_t)n_reg * 2);
+            for (int q = 0; q < 2; ++q) {
+                for (int64_t s = q; s < n_reg; s += 2) tab.push_back(w_gu[(size_t)s]);
+                for (int64_t s = q; s < n_reg; s += 2) tab.push_back(w_gus[(size_t)s]);
+            }
+            op_gugq = rad_decl_op(b, "moe_gemm_q_gq",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, gugq_rows), RAD_INT("N", 2 * wq[0]),
+                                             RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                             RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+                                             RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
+                                             RAD_INT("N_odd", 2 * wq[1]), RAD_INT("K_odd", g.n_embd),
+                                             RAD_INT("parts", 2), RAD_INT("n2", c.n_ff_shared),
+                                             RAD_STR("act", "silu")),
+                                  tab.data(), (int)tab.size());
+            if (op_gugq) {
+                const rad_buf rd[5] = { w.hr.q8, w.hr.s8, w.sorted, w.eoff, w.sgu };
+                const rad_buf wr[6] = { w.egu, w.eff.q8, w.eff.s8, gq_sh.a.cq(), gq_sh.a.cs(), gq_sh.a.x };
+                RAD_ARCH_TRY(rad_op_reads (b, op_gugq, rd, 5));
+                RAD_ARCH_TRY(rad_op_writes(b, op_gugq, wr, gq_sh.want_x ? 6 : 5));
+            }
+        }
     }
 
     /* GLM's selection and the sort as one op, plus the ungated shared arm's gate fill. Declared
@@ -1920,7 +1957,22 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
-    if (c.expert_bf16)
+    /* run 341 (owner note 254): the gate_up epilogue fold, when this pass's router launch ran the shared gate and
+     * gate_up (shared_up would issue nothing between op_gu and op_gqp) */
+    const bool gugq = op_gugq && shared && rqf3 && router_fused_gate && gu_fused && rows <= gugq_rows;
+    if (gugq) {
+        const int64_t n2 = gq_sh.n;
+        RAD_ISSUE_N(c_, op_gugq, rows,
+                    brow_slice(gq, r0, rows, g.n_embd),
+                    brow_slice(gs, r0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+                    brows(w.egu, rows * k), brows(w.eff.q8, rows * k), brows(w.eff.s8, rows * k), RAD_NONE,
+                    brow_slice(w.sgu, r0, rows, 2 * n2), brow_slice(gq_sh.a.cq(), r0, rows, n2),
+                    brow_slice(gq_sh.a.cs(), r0, rows, n2 / RAD_FP8_BLOCK),
+                    gq_sh.want_x ? brow_slice(gq_sh.a.x, r0, rows, n2) : RAD_NONE);
+    } else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
@@ -1942,10 +1994,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
                     brows(w.egu, rows * k));
-    if (shared) shared_up(c_, T, r0, rows,
-                          ((rfused || rqf || rqf3) && router_fused_gate) || (sfused && sigmoid_scatter_gate),
-                          gu_fused);
-    if (op_gqp) {   /* run 273: the routed and the shared gated quantisers as one launch */
+    if (shared && !gugq) shared_up(c_, T, r0, rows,
+                                   ((rfused || rqf || rqf3) && router_fused_gate) || (sfused && sigmoid_scatter_gate),
+                                   gu_fused);
+    if (gugq) {
+        /* the quantisers ran in op_gugq's launch */
+    } else if (op_gqp) {   /* run 273: the routed and the shared gated quantisers as one launch */
         const int64_t n2 = gq_sh.n;
         RAD_ISSUE_N(c_, op_gqp, rows * k + rows, brows(w.egu, rows * k), brows(w.eff.q8, rows * k),
                     brows(w.eff.s8, rows * k), RAD_NONE,

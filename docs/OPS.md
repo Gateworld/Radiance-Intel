@@ -658,6 +658,13 @@ copy.
 | `router_gemm_topk_scatter_quant` | `router_gemm_topk_scatter`'s, then `n` `group` | `router_gemm_topk_scatter`'s ten, then `x` → `q`, `scale` |
 | `gemm_nt_q_x3` | `M` `K` `N1` `N2` `N3` `group` `dtype` | `a`, `a_scale`, `b1`w, `b1_scale`w → `y1`; `b2`w, `b2_scale`w → `y2`; `b3`w, `b3_scale`w → `y3` |
 | `gemm_nt_q_bf16_pair` | `M` `K` `N1` `N2` `group` `dtype` | `a`, `a_scale`, `b1`w, `b1_scale`w → `y1`; `x`, `b2`w → `y2` |
+| `moe_gemm_q_gq` | `moe_gemm_q`'s, then `n2` `act`:str/opt | `moe_gemm_q`'s nine → `y`; `q`, `scale`, `out_bf16`?; `gate_up2` → `q2`, `scale2`, `out_bf16_2`? |
+
+`moe_gemm_q_gq` (the Intel port's libxe, listed under `RADIANCE_XE_GU_EPI=1`; owner note 254) is a
+format C gate_up (`moe_gemm_q` at `parts` 2) with `gated_quant_pair` in the same launch: `y` as
+`moe_gemm_q` writes it, the pair's first set over `y` (rotated int8 into `q` / `scale`) and its
+second over `gate_up2` (plain int8 at width `n2`). The bytes of the two ops in that order. A MoE
+layer issues it in place of the two when the router launch ran the shared expert's gate and gate_up.
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.

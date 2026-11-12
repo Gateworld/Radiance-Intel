@@ -186,12 +186,136 @@ constexpr uint32_t kMaxK = 4096;
  * The same reads and sums in the same order, so the same bits. */
 /* WCC (run 211, owner note 206 item 2, RADIANCE_XE_I4I8_WCC=2 / 5 / 6): the expert codes' 16-byte loads with an LSC
  * cache-control hint (xe_lsc.h; the codes are read once a step); 0 the default policy. The same bytes. */
-template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0, int WCC = 0>
-void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+/* The gate_up epilogue fold (owner note 254, run 341; RADIANCE_XE_GU_EPI=1, the `moe_gemm_q_gq` row; brief
+ * 2026-11-12-gate-up-epilogue-fold.md): gate_up with the decode step's gated_quant_pair folded in. The routed arm (the
+ * rows' silu x up, the width-128 Hadamard, int8 codes: gated_had_quant_i8g's) is quantised by the last of a group's
+ * work-groups to finish, the shared expert's arm (plain int8: gated_quant_fp8's at int8) by work-groups of its own at the
+ * front of the grid. The arithmetic is r4d_fused_quant_fp8.cpp's gated_quant_row + quant_group, element for element. */
+struct GqEpi {
+    uint32_t* cnt;         /* the routed groups' arrival counters, [T][F / 128]; zero between launches */
+    uint8_t*  qa;          /* routed: int8 codes [T][F], scales [T][F / 128], optional bf16 product [T][F] */
+    float*    sa;
+    uint16_t* ya;
+    uint32_t  qa_ld, sa_ld, ya_ld, F, ng;
+    const uint16_t* gub;   /* shared: the gated operand [mb][2 nb], codes [mb][nb], scales [mb][nkbb], optional bf16 */
+    uint8_t*  qb;
+    float*    sb;
+    uint16_t* yb;
+    uint32_t  mb, nb, nkbb, gub_ld, qb_ld, sb_ld, yb_ld;
+};
+/* r4d_fused_quant_fp8.cpp's bf16 helpers, as they are (its f2bf has no NaN case, unlike to_bf16 above) */
+inline float gq_bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
+inline uint16_t gq_f2bf(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+/* silu(g) x u rounded to bf16, gated_quant_row's ACT 0 */
+inline uint16_t gq_silu_mul(uint16_t gb, uint16_t ub) {
+    const float g = gq_bf2f(gb);
+    const float a = g / (1.0f + expf(-g));
+    return gq_f2bf(a * gq_bf2f(ub));
+}
+/* quant_group<true> over a 16-lane sub-group holding 8 values a lane (the port: 32 lanes of 4): the max of |v| (order
+ * free), the scale and the codes at q8_pack4<true>'s rounding; each lane's two dwords written where `live` says, the
+ * scale by lane 0 */
+inline uint32_t gq_pack4(const float* v, float inv) {
+    const int ia = (int)rintf(fminf(fmaxf(v[0] * inv, -127.0f), 127.0f));
+    const int ib = (int)rintf(fminf(fmaxf(v[1] * inv, -127.0f), 127.0f));
+    const int ic = (int)rintf(fminf(fmaxf(v[2] * inv, -127.0f), 127.0f));
+    const int id = (int)rintf(fminf(fmaxf(v[3] * inv, -127.0f), 127.0f));
+    return ((uint32_t)ia & 0xFFu) | (((uint32_t)ib & 0xFFu) << 8) | (((uint32_t)ic & 0xFFu) << 16) |
+           (((uint32_t)id & 0xFFu) << 24);
+}
+inline void gq_quant8(const float v[8], uint8_t* q, float* s, uint32_t lane, bool live0, bool live1) {
+    float m = fmaxf(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))),
+                    fmaxf(fmaxf(fabsf(v[4]), fabsf(v[5])), fmaxf(fabsf(v[6]), fabsf(v[7]))));
+    m = fmaxf(m, __shfl_xor(m, 8));
+    m = fmaxf(m, __shfl_xor(m, 4));
+    m = fmaxf(m, __shfl_xor(m, 2));
+    m = fmaxf(m, __shfl_xor(m, 1));
+    const float sc = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+    if (lane == 0) *s = sc;
+    const float inv = 1.0f / sc;
+    if (live0) *(uint32_t*)q = gq_pack4(v, inv);
+    if (live1) *(uint32_t*)(q + 4) = gq_pack4(v + 4, inv);
+}
+/* r4d_fwht_wave<128> at 8 values a lane on 16 lanes: the butterflies at strides 1, 2, 4 in the lane, then 8, 16, 32,
+ * 64 across it -- the port's strides in the port's order, each pair low a + b, high a - b (the port's cross-lane form,
+ * (-b) + a, is the same IEEE result) */
+inline void gq_fwht128(float v[8], uint32_t lane) {
+#pragma unroll
+    for (int h = 1; h < 8; h <<= 1)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const float a = v[j], b = v[j + h];
+                v[j] = a + b;
+                v[j + h] = a - b;
+            }
+#pragma unroll
+    for (int mk = 1; mk < 16; mk <<= 1) {
+        const uint32_t sm = (lane & (uint32_t)mk) ? 0x80000000u : 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float o = __shfl_xor(v[j], mk);
+            v[j] = __uint_as_float(__float_as_uint(v[j]) ^ sm) + o;
+        }
+    }
+}
+/* One routed row's group g (columns 128 g .. 128 g + 127 of each half of Y's row), one sub-group: rotated int8 */
+inline void gq_routed_group(const GqEpi& ep, const uint16_t* __restrict__ Y, uint32_t y_ld, uint32_t row, uint32_t g,
+                            uint32_t lane) {
+    const uint16_t* yr = Y + (size_t)row * y_ld;
+    const uint32_t c0 = g * 128u + lane * 8u;
+    uint16_t gb[8], ub[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { gb[j] = yr[c0 + j]; ub[j] = yr[ep.F + c0 + j]; }
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint16_t h = gq_silu_mul(gb[j], ub[j]);
+        if (ep.ya) ep.ya[(size_t)row * ep.ya_ld + c0 + j] = h;
+        v[j] = gq_bf2f(h);
+    }
+    gq_fwht128(v, lane);
+    gq_quant8(v, ep.qa + (size_t)row * ep.qa_ld + c0, ep.sa + (size_t)row * ep.sa_ld + g, lane, true, true);
+}
+/* One shared-arm row, a work-group of kWG threads: its sub-groups take the groups in turn (gated_quant_row's loop);
+ * plain int8, a ragged last group as the port's (n a multiple of 4: each half of a lane's 8 columns is live or not) */
+inline void gq_shared_row(const GqEpi& ep, uint32_t row, uint32_t tid, uint32_t nthr) {
+    const uint32_t lane = tid & 15u, sgi = tid >> 4, nsg = nthr >> 4;
+    const uint16_t* gr = ep.gub + (size_t)row * ep.gub_ld;
+    for (uint32_t kb = sgi; kb < ep.nkbb; kb += nsg) {
+        const uint32_t c0 = kb * 128u + lane * 8u;
+        const bool live0 = c0 < ep.nb, live1 = c0 + 4u < ep.nb;
+        float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            const uint32_t c = c0 + 4u * (uint32_t)hf;
+            if (hf ? live1 : live0) {
+                uint16_t gb[4], ub[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) { gb[j] = gr[c + j]; ub[j] = gr[ep.nb + c + j]; }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint16_t h = gq_silu_mul(gb[j], ub[j]);
+                    if (ep.yb) ep.yb[(size_t)row * ep.yb_ld + c + j] = h;
+                    v[4 * hf + j] = gq_bf2f(h);
+                }
+            }
+        }
+        gq_quant8(v, ep.qb + (size_t)row * ep.qb_ld + c0, ep.sb + (size_t)row * ep.sb_ld + kb, lane, live0, live1);
+    }
+}
+
+template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0, int WCC = 0, bool EP = false>
+inline __attribute__((always_inline)) void moe_i4i8_run_body(
+                         const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
                          uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
                          uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows,
-                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound, uint32_t sel) {
+                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound, uint32_t sel,
+                         const GqEpi& ep) {
     XE_SHARED(uint4, s_a, kMT * (kMaxK / 16));     /* (even, odd) dwords a block of eight; a chunk = two uint4 */
     /* each group's activation sum (exact); FC, which needs none: the 256-entry table, a byte -> two levels (bits).
      * (A separate FC-only array, declared and unused in format B's instantiation, crashed the CPU device: run 116.) */
@@ -199,8 +323,40 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
     static_assert(kMT * (kMaxK / 64) >= 256, "FC's table lives in s_g");
     XE_SHARED(float, s_as, kMT * (kMaxK / 128));   /* the per-128 scales */
     const int tid = (int)threadIdx.x;
-    const uint32_t i = blockIdx.y, nb = blockIdx.x;
+    uint32_t yrow = blockIdx.y;
+    if constexpr (EP) {   /* the shared arm's rows first in the grid, one work-group a row */
+        if (yrow < ep.mb) {
+            if (blockIdx.x == 0) gq_shared_row(ep, yrow, (uint32_t)tid, (uint32_t)kWG);
+            return;
+        }
+        yrow -= ep.mb;
+    }
+    const uint32_t i = yrow, nb = blockIdx.x;
     if (i >= T) return;
+    /* EP: the routed epilogue, after this work-group's columns n0 .. n0 + 31 of rows i .. i + rn - 1 are written (every
+     * thread of the work-group reaches it). Each thread releases its stores, the barrier joins them, one arrival is
+     * counted; the group's 8th arrival (2 halves x 128 / 32 work-groups) quantises the group for the run's rows -- a
+     * sub-group a row -- and zeroes the counter for the next launch. s_g is free here: the barrier comes after every
+     * thread's last read of it. */
+    constexpr uint32_t kCpw = (uint32_t)((kWG / LPR) * R);
+    static_assert(!EP || (FC && 128u % kCpw == 0u && kMT <= kWG / 16), "the epilogue's grouping");
+    auto ep_tail = [&](uint32_t n0, uint32_t rn_) {
+        const uint32_t fy_ = N / parts, g = (n0 % fy_) / 128u;
+        uint32_t* const ctr = ep.cnt + (size_t)i * ep.ng + g;
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        __syncthreads();
+        if (tid == 0) {
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+            s_g[0] = atomicAdd(ctr, 1u) == 2u * (128u / kCpw) - 1u ? 1.0f : 0.0f;
+        }
+        __syncthreads();
+        if (s_g[0] == 0.0f) return;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        const uint32_t sgi = (uint32_t)tid >> 4;
+        if (sgi < rn_) gq_routed_group(ep, Y, y_ld, i + sgi, g, (uint32_t)tid & 15u);
+        if (tid == 0) *ctr = 0u;
+    };
+    (void)ep_tail;
     const int32_t flat = sorted[i];
     int32_t e = -1;
     /* bound (run 202, RADIANCE_XE_I4I8_RUN_BOUND=1; run 108's MX_BOUND for this form): a row at or past off[n_expert]
@@ -285,6 +441,7 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
                         if (n < N) Y[(size_t)(i + q) * y_ld + n] = 0;
                     }
                 }
+            if constexpr (EP) ep_tail(n0, rn);   /* zeros are quantised too, as the unfused quantiser reads them */
             return;
         }
     }
@@ -493,7 +650,34 @@ void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__
             if (l == 0 && n < N) Y[(size_t)(i + q) * y_ld + n] = to_bf16(rowok[r] && liver[q] && !skipr[q] ? v : 0.0f);
         }
     }
+    if constexpr (EP) ep_tail(nb * kCpw, rn);
 }
+
+/* The run form's kernel: the body as it was (EP off), so the default instances' code is unchanged */
+template <int UPL, int LPR, int R, bool GL, bool FC = false, bool SEL = false, int KC = 0, int WCC = 0>
+void moe_i4i8_run_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                         const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+                         uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld,
+                         uint32_t y_ld, uint32_t a_sorted, uint32_t parts, uint32_t a_rows,
+                         uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound, uint32_t sel) {
+    const GqEpi none{};
+    moe_i4i8_run_body<UPL, LPR, R, GL, FC, SEL, KC, WCC, false>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k,
+                                                                a_ld, as_ld, y_ld, a_sorted, parts, a_rows, sk_cfg,
+                                                                sk_stats, bound, sel, none);
+}
+#if XE_I4I8_FC
+/* The fold's kernel (moe_gemm_q_gq): gate_up's decode instance <5, 16, 1> with the epilogue; grid.y = ep.mb + T */
+void moe_i4i8_run_ep_kernel(const int8_t* __restrict__ A, const float* __restrict__ As, ICls c0, ICls c1,
+                            const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+                            uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+                            uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, uint32_t parts,
+                            uint32_t a_rows, uint64_t sk_cfg, uint32_t* __restrict__ sk_stats, uint32_t bound,
+                            uint32_t sel, GqEpi ep) {
+    moe_i4i8_run_body<5, 16, 1, false, true, false, 0, 0, true>(A, As, c0, c1, sorted, off, Y, T, N, n_expert, top_k,
+                                                                a_ld, as_ld, y_ld, a_sorted, parts, a_rows, sk_cfg,
+                                                                sk_stats, bound, sel, ep);
+}
+#endif
 
 #if XE_I4I8_FC
 /* The matrix-unit form at prefill (owner note 168 item 2, run 164; RADIANCE_XE_I4I8_DPAS=1, format C only): the
@@ -1216,7 +1400,9 @@ int table_of(const RadTensor* t, long long cnt, const uint8_t** base, const void
 
 /* moe_gemm_q (two classes): a, a_scale, w, w_scale, sorted, offsets, w_odd, w_scale_odd, y. fc: format C, the
  * joined w4nl64a8h entries (codes,table; scale,scale.1 -- xe_moe_planes.cpp's layout) against int8 activations. */
-int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
+/* `ep` (format C only): the gate_up epilogue fold's operands (xe_rad_moe_gemm_w4nl_i8_gq): the run form's decode
+ * instance with the epilogue, never the matrix-unit form; any other geometry is refused */
+int moe_i4i8(const RadArgs* a, RadStream s, bool fc, const GqEpi* ep = nullptr) {
     const RadTensor* Aq = r4d_opt(a, 0);
     const RadTensor* As = r4d_opt(a, 1);
     const RadTensor* sorted = r4d_opt(a, 4);
@@ -1289,7 +1475,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
         sycl::queue* qq = (sycl::queue*)s;
 #if XE_I4I8_FC
         /* the matrix-unit form at prefill (owner note 168 item 2): the same bits as the run form, from 64-row tiles */
-        if (fc && dpas_on() && T >= dpas_min_rows() && K % 64 == 0) {
+        if (fc && !ep && dpas_on() && T >= dpas_min_rows() && K % 64 == 0) {
             const bool rt16 = dpas_rows() == 16;
             /* RADIANCE_XE_I4I8_HIST=1 (run 262, owner note 210 item 1; the supervisor's approval): the routing histogram
              * of each prefill launch, one line on stderr -- the sort's run lengths (off[e + 1] - off[e]) in buckets, the
@@ -1445,6 +1631,25 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
                                  a_sorted ? "sorted" : "token", (long long)M, grid.x, grid.y, kWG);
                 }
             }
+#if XE_I4I8_FC
+            /* the epilogue fold: gate_up's decode instance only (16 lanes a column, 5 chunks a lane, one column a team),
+             * two parts of F columns each, F a multiple of 128; the shared arm's rows first in the grid. No tail skip. */
+            if (ep) {
+                if (gl || upl != 5 || rpt != 1 || cpw != 32u || parts != 2 || N % 256 || (uint32_t)(N / 2) != ep->F ||
+                    run_grf() || run_sel() || run_kc() || run_wcc())
+                    return R4D_NO(RAD_E_UNSUPPORTED);
+                const dim3 egrid((unsigned)(N / cpw), (unsigned)(ep->mb + T));
+                XE_LAUNCH_SG(16, qq, moe_i4i8_run_ep_kernel, egrid, block, 0, (const int8_t*)Aq->data,
+                             (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data,
+                             (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
+                             (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, a_sorted ? 1u : 0u,
+                             (uint32_t)parts, (uint32_t)M, (uint64_t)0, (uint32_t*)nullptr, run_bound() ? 1u : 0u, 0u,
+                             *ep);
+                return RAD_OK;
+            }
+#else
+            if (ep) return R4D_NO(RAD_E_UNSUPPORTED);
+#endif
             /* the tail skip's instance (format C's row has the init; format B's has none) */
             const TskipInst* ti = fc ? (const TskipInst*)a->instance : nullptr;
             const uint64_t sk_cfg = ti ? ti->cfg : 0u;
@@ -1513,6 +1718,7 @@ int moe_i4i8(const RadArgs* a, RadStream s, bool fc) {
 #undef XE_I4I8_RUN_ARGS
             return RAD_OK;
         }
+        if (ep) return R4D_NO(RAD_E_UNSUPPORTED);
         XE_LAUNCH(qq, moe_i4i8_kernel, dim3((unsigned)((N + 7) / 8), (unsigned)T), dim3(256), 0,
                   (const int8_t*)Aq->data, (const float*)As->data, cl[0], cl[1], (const int32_t*)sorted->data,
                   (const int32_t*)off->data, (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)n_expert,
@@ -1619,6 +1825,139 @@ extern "C" void xe_tskip_report(int rank, void* stream, const void* key) {
     std::fprintf(stderr, "%s; runs with an off-device expert %u, skipped whole %u (both GEMMs of a layer count)\n", line,
                  cur[49] - t->last[49], cur[48] - t->last[48]);
     std::memcpy(t->last, cur, sizeof cur);
+}
+
+/* ------------------------------------------------------------------ the gate_up epilogue fold (owner note 254)
+ * moe_gemm_q_gq (RADIANCE_XE_GU_EPI=1): moe_gemm_q's nine operands at format C gate_up's shape (parts 2), then
+ * gated_quant_pair's (9 q, 10 scale, 11 out_bf16: the routed arm's, rotated int8 over y; 12 gate_up2, 13 q2, 14 scale2,
+ * 15 out_bf16_2: the shared arm's, plain int8), `n2` the shared arm's width. The bytes of moe_gemm_q followed by
+ * gated_quant_pair (moe_i4i8_run_ep_kernel). The routed groups' counters are the row instance's, [M x top_k][F / 128]
+ * u32 zeroed at init; a launch with no instance (a test calling the row cold) takes a process-wide buffer, zeroed when
+ * it is made. */
+namespace {
+struct GqInst {
+    uint32_t*            cnt = nullptr;
+    long long            cap = 0;   /* counters */
+    const sycl::context* ctx = nullptr;
+};
+long long gq_param(const RadParam* p, int n, const char* k, long long dflt, bool hi = false) {
+    for (int i = 0; i < n; ++i)
+        if (p[i].key && !std::strcmp(p[i].key, k)) return hi && p[i].kind == RAD_P_RANGE ? p[i].ihi : p[i].ival;
+    return dflt;
+}
+std::mutex g_gq_mu;
+GqInst g_gq_cold;   /* the instance-less launches' (tests): grown with a wait, never in an engine pass */
+}  // namespace
+
+extern "C" int xe_gq_init(const RadParam* p, int n_p, int rank, int, void** out) {
+    if (out) *out = nullptr;
+    if (!out) return RAD_OK;
+    long long N = gq_param(p, n_p, "N", 0);
+    const long long N1 = gq_param(p, n_p, "N_odd", N);
+    if (N1 > N) N = N1;
+    const long long cap = gq_param(p, n_p, "M", 0, true) * gq_param(p, n_p, "top_k", 0) * (N / 256);
+    const sycl::device* dev = nullptr;
+    const sycl::context* ctx = nullptr;
+    if (cap <= 0 || rad_l0k_device(rank, &dev, &ctx) != 0 || !dev || !ctx) return RAD_OK;   /* the cold buffer then */
+    GqInst* g = new GqInst;
+    try {
+        g->cnt = sycl::malloc_device<uint32_t>((size_t)cap, *dev, *ctx);
+        if (g->cnt) {
+            sycl::queue q(*ctx, *dev, sycl::property::queue::in_order());
+            q.memset(g->cnt, 0, (size_t)cap * sizeof(uint32_t));
+            q.wait_and_throw();
+            g->cap = cap;
+            g->ctx = ctx;
+        }
+    } catch (const sycl::exception& x) {
+        std::fprintf(stderr, "[xe] moe_gemm_q_gq: no counters on rank %d (%s); the row takes the cold buffer\n", rank, x.what());
+        g->cnt = nullptr;
+    }
+    if (!g->cnt) { delete g; return RAD_OK; }
+    *out = g;
+    return RAD_OK;
+}
+extern "C" void xe_gq_fini(void* inst) {
+    GqInst* g = (GqInst*)inst;
+    if (!g) return;
+    try { if (g->cnt && g->ctx) sycl::free(g->cnt, *g->ctx); } catch (const sycl::exception&) {}
+    delete g;
+}
+
+extern "C" int xe_rad_moe_gemm_w4nl_i8_gq(const RadArgs* a, RadStream s) {
+    const RadTensor* Y = r4d_opt(a, 8);
+    const RadTensor* qa = r4d_opt(a, 9);
+    const RadTensor* sa = r4d_opt(a, 10);
+    const RadTensor* ya = r4d_opt(a, 11);
+    const RadTensor* gb = r4d_opt(a, 12);
+    const RadTensor* qb = r4d_opt(a, 13);
+    const RadTensor* sb = r4d_opt(a, 14);
+    const RadTensor* yb = r4d_opt(a, 15);
+    if (!Y || !qa || !sa || !gb || !qb || !sb) return R4D_NO(RAD_E_INVAL);
+    if (!Y->data || !qa->data || !sa->data || !gb->data || !qb->data || !sb->data) return R4D_NO(RAD_E_INVAL);
+    if (qa->dtype != RAD_I8 || sa->dtype != RAD_F32 || (ya && ya->dtype != RAD_BF16) || gb->dtype != RAD_BF16 ||
+        qb->dtype != RAD_I8 || sb->dtype != RAD_F32 || (yb && yb->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    long long N = r4d_geti_or(a, "N", 0);
+    const long long N1 = r4d_geti_or(a, "N_odd", N);
+    if (N1 > N) N = N1;
+    const long long F = N / 2, ng = F / 128, n2 = r4d_geti_or(a, "n2", 0), nkb2 = (n2 + 127) / 128;
+    if (N <= 0 || N % 256 || n2 <= 0 || n2 % 4 || r4d_geti_or(a, "parts", 1) != 2) return R4D_NO(RAD_E_SHAPE);
+    long long T = 0, rows = 0, Mb = 0;
+    if (r4d_rows_pitch(Y, N, &T) < 0 || T <= 0) return R4D_NO(RAD_E_STRIDE);
+    const long long qa_ld = r4d_rows_pitch(qa, F, &rows);
+    if (qa_ld < 0 || rows < T) return R4D_NO(RAD_E_SHAPE);
+    const long long sa_ld = r4d_rows_pitch(sa, ng, &rows);
+    if (sa_ld < 0 || rows < T) return R4D_NO(RAD_E_SHAPE);
+    const long long ya_ld = ya ? r4d_rows_pitch(ya, F, &rows) : 0;
+    if (ya && (ya_ld < 0 || rows < T)) return R4D_NO(RAD_E_SHAPE);
+    const long long gb_ld = r4d_rows_pitch(gb, 2 * n2, &Mb);
+    if (gb_ld < 0 || Mb <= 0) return R4D_NO(RAD_E_STRIDE);
+    const long long qb_ld = r4d_rows_pitch(qb, n2, &rows);
+    if (qb_ld < 0 || rows < Mb) return R4D_NO(RAD_E_SHAPE);
+    const long long sb_ld = r4d_rows_pitch(sb, nkb2, &rows);
+    if (sb_ld < 0 || rows < Mb) return R4D_NO(RAD_E_SHAPE);
+    const long long yb_ld = yb ? r4d_rows_pitch(yb, n2, &rows) : 0;
+    if (yb && (yb_ld < 0 || rows < Mb)) return R4D_NO(RAD_E_SHAPE);
+    /* the codes are stored a dword at a time, as the pair's quantiser stores them */
+    if ((((uintptr_t)qa->data | (uintptr_t)qb->data) & 3u) || (qa_ld | qb_ld) % 4) return R4D_NO(RAD_E_STRIDE);
+    /* the counters */
+    const long long need = T * ng;
+    uint32_t* cnt = nullptr;
+    const GqInst* gi = (const GqInst*)a->instance;
+    if (gi && gi->cnt && gi->cap >= need) {
+        cnt = gi->cnt;
+    } else if (gi && gi->cnt) {
+        return R4D_NO(RAD_E_SHAPE);   /* more rows than the declared M x top_k */
+    } else {
+        std::lock_guard<std::mutex> lk(g_gq_mu);
+        sycl::queue* qq = (sycl::queue*)s;
+        try {
+            if (g_gq_cold.cap < need || g_gq_cold.ctx == nullptr || *g_gq_cold.ctx != qq->get_context()) {
+                qq->wait_and_throw();
+                if (g_gq_cold.cnt) sycl::free(g_gq_cold.cnt, *g_gq_cold.ctx);
+                delete g_gq_cold.ctx;
+                g_gq_cold.ctx = new sycl::context(qq->get_context());
+                g_gq_cold.cnt = sycl::malloc_device<uint32_t>((size_t)need, *qq);
+                g_gq_cold.cap = g_gq_cold.cnt ? need : 0;
+                if (g_gq_cold.cnt) qq->memset(g_gq_cold.cnt, 0, (size_t)need * sizeof(uint32_t)).wait_and_throw();
+            }
+        } catch (const sycl::exception&) {
+            return RAD_E_DEVICE;
+        }
+        if (!g_gq_cold.cnt) return RAD_E_NOMEM;
+        cnt = g_gq_cold.cnt;
+    }
+    GqEpi ep{};
+    ep.cnt = cnt;
+    ep.qa = (uint8_t*)qa->data; ep.sa = (float*)sa->data; ep.ya = ya ? (uint16_t*)ya->data : nullptr;
+    ep.qa_ld = (uint32_t)qa_ld; ep.sa_ld = (uint32_t)sa_ld; ep.ya_ld = (uint32_t)ya_ld;
+    ep.F = (uint32_t)F; ep.ng = (uint32_t)ng;
+    ep.gub = (const uint16_t*)gb->data; ep.qb = (uint8_t*)qb->data; ep.sb = (float*)sb->data;
+    ep.yb = yb ? (uint16_t*)yb->data : nullptr;
+    ep.mb = (uint32_t)Mb; ep.nb = (uint32_t)n2; ep.nkbb = (uint32_t)nkb2;
+    ep.gub_ld = (uint32_t)gb_ld; ep.qb_ld = (uint32_t)qb_ld; ep.sb_ld = (uint32_t)sb_ld; ep.yb_ld = (uint32_t)yb_ld;
+    return moe_i4i8(a, s, true, &ep);
 }
 #else
 extern "C" int xe_rad_moe_gemm_i4i8(const RadArgs* a, RadStream s) { return moe_i4i8(a, s, false); }

@@ -232,6 +232,12 @@ if(RAD_BUILD_TESTS)
     "rm -f i4i8_tab.bin i4i8_sel.bin && RI_DUMP=i4i8_tab.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> > /dev/null && RADIANCE_XE_I4I8_RUN_SEL=1 RI_DUMP=i4i8_sel.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> > /dev/null && cmp i4i8_tab.bin i4i8_sel.bin && echo 'i4i8 run SEL: bit-identical'")
   set_tests_properties(xe_moe_i4i8_sel_cpu PROPERTIES LABELS "xe"
     ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu" TIMEOUT 1200)
+  # run 341 (owner note 254): the gate_up epilogue fold (moe_gemm_q_gq, RADIANCE_XE_GU_EPI=1) against gate_up +
+  # gated_quant_pair, every output byte compared (y, the routed codes and scales, the shared codes, scales and product)
+  add_test(NAME xe_moe_gu_epi_cpu COMMAND sh -c
+    "rm -f gq_pair.bin gq_fused.bin && RI_GQ=1 RI_DUMP=gq_pair.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> && RI_GQ=2 RI_DUMP=gq_fused.bin $<TARGET_FILE:xe_moe_i4i8_test> $<TARGET_FILE:libxe> && cmp gq_pair.bin gq_fused.bin && echo 'gate_up epilogue fold: bit-identical'")
+  set_tests_properties(xe_moe_gu_epi_cpu PROPERTIES LABELS "xe"
+    ENVIRONMENT "RI_DEVICE=cpu;ONEAPI_DEVICE_SELECTOR=opencl:cpu;RADIANCE_XE_GU_EPI=1" TIMEOUT 1800)
   # Run 169 (owner note 173 item 1): attn_qsa_fmha's checks and prep kernels on the CPU device with the operands in the
   # engine's forms (RADIANCE_XE_ATTN_QSA_PREP_ONLY=1: the flash-attention kernel itself is card-only).
   add_executable(xe_attn_qsa_test test/attn_qsa_test.cpp)
