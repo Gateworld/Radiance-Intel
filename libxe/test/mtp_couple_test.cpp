@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
     const int64_t n_cand = ncs && std::atoll(ncs) > 8 ? std::atoll(ncs) : 64;
     const int64_t M = 6, vocab = 1000, rounds = 3, round = 1;
     std::printf("verify width %lld, device form %s\n", (long long)n_cand,
-                (std::getenv("RADIANCE_XE_MTP_COOP") && *std::getenv("RADIANCE_XE_MTP_COOP") == '1') ? "cooperative" : "serial");
+                (std::getenv("RADIANCE_XE_MTP_COOP") && *std::getenv("RADIANCE_XE_MTP_COOP") == '0') ? "serial" : "cooperative");
     const int64_t DW = RAD_MTP_COUPLE_DRAW_WORDS, SW = RAD_MTP_COUPLE_STATE_WORDS;
     /* ---- propose: the head's top-8 a row, the draw rows, the state plane; rows 4 (mode 0) and 5 (card
      * mismatch) must stay untouched */

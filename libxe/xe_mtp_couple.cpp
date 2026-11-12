@@ -41,9 +41,10 @@ constexpr int kRowsPerBlock = 16;
  * work-group a row, the candidates' exps 128 wide into LDS, then every sum and both CDF walks on thread 0 in ascending
  * order, so the token equals the serial row's bit for bit (the same exp((double)v - top) a slot, computed once
  * instead of up to three times; the first-occurrence rule for Q ids is the serial `seen` mask). Ineligible rows write
- * nothing, as the serial row. Wider planes than kMaxCand run the serial row on thread 0. Off by default; =0 serial. */
+ * nothing, as the serial row. Wider planes than kMaxCand run the serial row on thread 0. ON by default since run 323
+ * (owner note 247: the coupling is the Intel images' default); RADIANCE_XE_MTP_COOP=0 keeps the serial row. */
 bool coop_on() {
-    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MTP_COOP"); return s && *s == '1'; }();
+    static const bool v = [] { const char* s = std::getenv("RADIANCE_XE_MTP_COOP"); return !(s && *s == '0'); }();
     return v;
 }
 
