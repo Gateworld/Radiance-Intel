@@ -1407,6 +1407,25 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
      * donor_slot). Nothing goes on the compute stream from here to the end of the recall. */
     RAD_TRY(rad_stream_sync(compute_));
     RAD_TRY(retire(heat));
+    /* RADIANCE_MOVER_TRACE (owner note 256, V1R1): the soak's leaked slots were promotions still Copying here, after
+     * both drains, which the record sweep below then clears without freeing their slot. Name every such record. */
+    if (trace_on()) {
+        int n = 0;
+        for (size_t r = 0; r < moves_.size(); ++r) {
+            const Move& m = moves_[r];
+            if (m.state != Move::State::Copying) continue;
+            if (++n > 16) continue;
+            const ClassPools& cp = pools_[(size_t)unit_[(size_t)m.unit].klass];
+            const size_t i = (size_t)(m.slab_slot >= 0 ? m.slab_slot : 0);
+            RAD_ERR("mover trace: after the recall's drains record %zu is still Copying: kind %d unit %d slab %lld (flex %d, "
+                    "covered %d) pool %lld, event done %d; the slot's last take dispatch %d (now %d); %zu copies unflushed",
+                    r, (int)m.kind, (int)m.unit, (long long)m.slab_slot, (int)cp.is_flex(m.slab_slot),
+                    (int)cp.slab.covered(m.slab_slot), (long long)m.pool_slot, rad_event_query(m.ev),
+                    i < cp.tag_disp.size() ? (int)cp.tag_disp[i] : -1, dispatch_, move_segs_.size());
+        }
+        if (n) RAD_ERR("mover trace: %d record(s) still Copying after the recall's drains (lender %s, loan %lld)", n,
+                       lender_name(lender), (long long)loan_[lender]);
+    }
 
     /* Every unit past the loan goes back to its host copy. A donor has none, so it moves into a
      * free budgeted slot or else across the link into a free pool slot, published once the
