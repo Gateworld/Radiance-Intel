@@ -1,9 +1,9 @@
 <!-- runner:begin (written by run.sh after every run; do not edit) -->
-Milestone 3 usage: $3428.55 of $4000 budget (240 session(s)). Today (2026-11-11, America/New_York): $154.60 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 73. Updated 2026-11-11 15:19 UTC.
+Milestone 3 usage: $3474.48 of $4000 budget (241 session(s)). Today (2026-11-11, America/New_York): $200.53 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 80. Updated 2026-11-12 00:20 UTC.
 <!-- runner:end -->
 # STATE — Radiance on Intel, milestone 3
 
-Session ID: fe4731fc-c246-4640-800e-1ce506039e7c
+Session ID: 30cc9946-fcd1-4ced-a07e-477c33800637
 
 ## Step
 **Run 164 (17:14 UTC-, 2026-11-03): no new owner note (170 is the last; no PAUSED, no AMD-HOST-CONSTRAINED). The
@@ -4717,6 +4717,230 @@ reviewed-fault: klog@2026-11-09T14:26:01Z=0000:0f:00.0 | fault-response | the su
     launch gave up (seq_ctr[3] > 0), later launches poll 1/1024 of the budget (0 in a healthy run: results and order
     unchanged). Watchdog default 60 -> 300 s. Built green 16:07 (ops_doc, xe_lane_cpu, xe_allreduce_cpu); images 316 +
     ri-m3gen:5 building. Fault recorded under Reviewed GPU faults.**
+  - **PAUSED 16:1x (run 295): TWO FAULT EVENTS IN ONE RUN (15:38:59 STALL7's kill, both cards; 15:49:16 STALL8's
+    no-wait exit, card0) -> UNATTENDED l.255 / l.277; OWNER-NOTES keep the fault rules. Cards recovered (both bound,
+    klog clean since 15:49:20). All four kill-time faults reviewed (11-10 23:37:36, 11-11 14:32:53 / 15:38:59 /
+    15:49:16). The follow-up COMMITTED 04a6312 (built green, ops_doc / xe_lane_cpu / xe_allreduce_cpu pass; my l0.cpp
+    hunks 4-6 only, the owner's stay unstaged), NOT card-tested. Images 316 + ri-m3gen:5 were building at the pause
+    (logs/make-rt-neo2-316.txt, make-gen-5.txt; no card use).
+    NEXT (after the owner's `rm PAUSED`): (1) STALL9 = `timeout 1700 bash logs/stallstep.sh STALL9 ae4224bb40fb 2
+    fakelivefail M285 logs/mtp-v2/prompts-gen0.jsonl 1200 300` -- expect: the abort, the engine's own exit after the
+    healthy card's all-reduces give up (~2 min; the watcher's 240 s window in stall-serve.sh), klog CLEAN at the exit;
+    then the peer probe (`bash logs/peer1.sh PR9 375be6b79cca`, the coordinator's ask); (2) STALL10 `svc` 10 tries on gen:5 ae4224bb40fb
+    (the default engine, 64 KiB lists: no hang, expect no failure); (3) M412 `mstep.sh M412 375be6b79cca svcmtpx-gnt0-hc8-rp-gnx
+    M285 svcmtpx-gnt0-hc8-rp-gnx` vs M413 `...-cmdbuf0` (the perf gate: within -0.5 %, texts = M285, the live-list x
+    MiB lines); (4) a tool-mix rotation `hstep.sh H161 375be6b79cca bestrxgrf3w16p4 10` (staged from H160 + today's m2-heat.sh);
+    report all in WAITING + the coordinator; then note 239 (MTP v3, marker /srv/train/checkpoints/mtp-v3-TRAINED) with
+    note 241 (depth 2 and 3). 0(b) (the lists' VRAM in the headroom / the vram trace) stays the follow-up.**
+  - **RUN 296 (16:20 UTC, model claude-opus-5-5): OWNER NOTE 242 -- RESUME (PAUSED removed, copy in
+    logs/PAUSED-run295-*.txt); the two faults reviewed and explained; continue NEXT; A NEW FAULT AT STALL9'S EXIT (the
+    waiting stop) = STOP AND REPORT, DO NOT RETRY. stall-serve.sh's exit window 240 -> 330 s (past the 300 s
+    watchdog). STALL9 STARTED 16:2x (`stallstep.sh STALL9 ae4224bb40fb 2 fakelivefail ... 1500 300`).**
+  - **STALL9 (16:21-16:34, image 316 / ri-m3gen:5): the abort as before (rank 1's step failed at +6 s, the requests got
+    errors, the next try's engine served) -- BUT THE WAITING STOP NEVER FINISHED: "stopping after a failed step:
+    waiting ..." then "a thread on device 0 has waited 10 s for a ring slot's last play to complete", NO all-reduce
+    "gave up" line in 300 s, and the 300 s watchdog _Exit()ed both tries (303 / 300 s after the failure). klog2 FAULT:
+    card0 5 read faults at 16:28:02 = try 1's watchdog exit (same addresses as 15:49:16); try 2's exit clean. Cards
+    present, klog clean after. OWNER NOTE 242: a new fault at STALL9's exit = STOP AND REPORT, DO NOT RETRY -> card work
+    on note 236 STOPPED; reviewed-fault line added.
+    DIAGNOSIS: the healthy device's in-flight list waits DEVICE-SIDE on a ring event of the failed rank's play (the
+    plays chain across devices on the backend's own events, l0.cpp n_slot_event / the slot consumers), and that event is
+    never signalled because the play's append failed; a device-side event wait has no timeout, so ar_spin_now (which
+    shortens the all-reduce's polls) never comes into play. PROPOSED FIX (not built, for the owner / coordinator): at
+    the first poison, the host signals (zeEventHostSignal) every ring event on every device that is in use and not yet
+    signalled, so the peers' device-side waits release; the queued work then runs out (garbage results, all-reduces
+    giving up, the later ones at 1/1024), the device goes idle, the normal teardown runs; the watchdog stays as the
+    bound. Gate: STALL9 again, clean klog at exit. Remaining gates (STALL10 svc x10, M412 / M413, the rotation) and note
+    239 / 241 wait for the owner's answer. Commits f7fd715 + 04a6312 stand (the default path: STALL5 10/10 with 64 KiB
+    lists; the abort releases the requests in 6 s; only the exit after a failed step is unclean -- the old engine
+    hung forever there instead).**
+  - **RUN 297 (16:38 UTC): no owner answer on STALL9 yet; NEW NOTE 243 (coordinator): measure the MTP COUPLING on
+    SAMPLED requests (the LoRA agent's held-out numbers: 2.827 tokens a step uncoupled vs 3.085 coupled = +9 %), config
+    only, AFTER note 236's gates (may share the slot with note 239): M-pair + rotation, RADIANCE_MTP_COUPLED=1 vs off,
+    every request sampled at production settings; report tokens a step, per-position acceptance, tok/s, and
+    mtp_couple_verify_kernel's share of the step from -prof; port the cooperative verify only if the coupling wins AND
+    the serial verify is >= 1 % of the step; a default change is the owner's. DESK PREP DONE (no card use): every staged
+    body is GREEDY ("temperature":0 in tps.body and all 11 rotation bodies -- why runs 54-56 saw nothing); production
+    clients that send no settings get the container's defaults, which the engine logs as "temperature 1.00, top_k 20,
+    top_p 0.95, min_p 0.00 (from the container)" -> the sampled form = the same bodies without the temperature field.
+    m3/intel-host/sample-bodies.sh did that on intel-host into m3/M285S (M285's card + args) and m3/HSMP (H160's card + args):
+    0 bodies left with a temperature. Suffixes: m3-tps.sh `-cpl-` and m2-heat.sh `-cpl` (RADIANCE_MTP_COUPLED=1).
+    READY (when the owner releases the cards): M414 `mstep.sh M414 375be6b79cca svcmtpx-gnt0-hc8-rp-gnx M285S
+    svcmtpx-gnt0-hc8-rp-gnx` vs M415 `...-gnx-cpl` (the texts differ by design: sampled), the -prof twins M416 / M417
+    for the verify kernel's share; the rotation pair H162 / H163 staged from m3/HSMP + today's m2-heat.sh,
+    `bestrxgrf3w16p4` vs `bestrxgrf3w16p4-cpl`. Card work stays stopped until the owner answers on STALL9 (note 242).**
+  - **NOTE 244 (coordinator, ~17:1x): GO -- at the first poison host-signal every unsignalled ring event on both devices,
+    then the normal teardown, watchdog 300 s; gate = ONE STALL9 step (2 tries): clean klog at both exits, done_wait time,
+    next engine served, peer probe OK; ANY exit fault = stop this item, f7fd715 + 04a6312 with the watchdog exit
+    accepted as a known limitation, and the queue goes on (STALL10, M412/M413, rotation, 239 / 241 / 243); the
+    no-poison path unchanged. Coordinator on 243: a fixed seed per request in both arms, >= 3 runs a single-prompt arm,
+    judge on tokens a step + per-position acceptance first, tok/s second, rotations 10 min, report the logged sampling.
+    DONE: l0.cpp `step_poison_release_device()` (every ring event of every device whose status is not signalled ->
+    zeEventHostSignal; the pool is HOST_VISIBLE, the events' signal / wait scope HOST, l.1077-1081), called by
+    step_poison() after the engine hook (logged count) and again by serve()'s stop before the join (logged count + the
+    join's seconds). Built green 16:42 (ops_doc, xe_lane_cpu); uncommitted until the gate. Images 317 = ad9cd80a6c92,
+    ri-m3gen:6 = 70d50cec34c1. STALL9B STARTED 17:0x. Note 243 prep: m3/intel-host/seed-bodies.sh gave every sampled body a
+    seed (tps 1234, rotation 1001-1011; M285S and HSMP); mstep.sh takes MSTEP_REPS (4 = 3 warm runs).**
+  - **STALL9B (16:53-17:07, image 317): BOTH EXITS FAULTED (card0 16:59:56 / 17:06:52, 5 read faults each, no reset /
+    dump) -- the release signalled 2 + 63 events but card0's thread began a fresh 10 s ring-slot wait right after
+    (ring_take re-arms the reused slots' events: a real fix must also stop slot reuse / reset after the poison) and the
+    300 s watchdog exited both tries. NOTE 244: item STOPPED, the release reverted (logs/note244-ring-release.patch),
+    f7fd715 + 04a6312 with the watchdog exit after a failed step = ACCEPTED KNOWN LIMITATION (the coordinator agrees).
+    The tree = HEAD 04a6312 + the owner's files; image 316 is that build. STALL10 (`svc` x10, gen:5 = 316) from 17:0x.
+    NOTE 239 CLOSED (coordinator, 17:2x): the v3 marker (15:32) names picker winner B (mtp-v3-B .../out/mtp-trained),
+    offline far under the +1.5 % bar -- greedy proxy 2.8615 vs 2.8579 (+0.13 %), uncoupled 2.8334 vs 2.8276 (+0.2 %),
+    SAMPLED 3.0471 vs 3.0847 (-1.2 %), held-out top-1 +0.005 / +0.001 / +0.002; convert + engine test SKIPPED. NOTE 241
+    CLOSED: depth 3 stays. Note 243 runs with the BASE head. Queue: STALL10 -> M412 / M413 -> rotation -> 243.**
+  - **STALL10 (17:0x-17:30, gen:5 = image 316, `svc` = the engine's own defaults, headroom 2048): 10 OF 10 TRIES, NO
+    STALL, klog2 clean; "the driver takes 0.20 MiB a command list ... set to 64: in effect" (the engine set it: the
+    svc form sends no NEO key). M412 (17:3x, 316, `svcmtpx-gnt0-hc8-rp-gnx`): run 2 92.96 tok/s, 112 steps, TEXTS
+    IDENTICAL to M285, klog clean (M407 on 311: 91.36). M413 (`-cmdbuf0`) DID NOT OPT OUT: the svcmtpx configs export
+    NEOReadDebugKeys=1 OverrideCmdListCmdBufferSizeInKb=64 themselves (m3-tps.sh l.121-137, the service's form) and
+    the engine leaves present keys alone ("left as they are"): 93.07, identical texts = the same config. So every svc
+    M-step reference (M285, M407 ...) and the service already ran 64 KiB lists -- the engine default changes nothing
+    there. M413B (the suffix fixed to drop those keys too -> the driver's 1.13 MiB): the warm-up ran the cards to
+    driver free 0 MiB, the step failed after the 20 s drain, the CPU heated to 80 C, the heat guard killed it ->
+    FAULT (17:42:36, card1). The perf gate's answer: the 1.13 MiB default cannot even serve the single prompt here; the
+    64 KiB key costs nothing measurable (M412 vs M413 = -0.1 %, same config both) and is required.
+    PAUSED 17:4x (two fault events in this run outside note 244's exemption; see the decision line).
+    NEXT after `rm PAUSED`: (1) the tool-mix rotation on 316 (`hstep.sh H161 375be6b79cca bestrxgrf3w16p4 10`, staged
+    from H160 + today's m2-heat.sh) = note 236's last gate; (2) note 243 with the BASE head on 316: M414 `MSTEP_REPS=4
+    bash m3/mstep.sh M414 375be6b79cca svcmtpx-gnt0-hc8-rp-gnx M285S svcmtpx-gnt0-hc8-rp-gnx` vs M415 `...-gnx-cpl`
+    (sampled, seeded bodies: 3 warm runs each), -prof twins M416 / M417, rotation H162 / H163 staged from m3/HSMP
+    (`bestrxgrf3w16p4` vs `-cpl`); judge tokens a step + per-position acceptance first, tok/s second; report the
+    logged sampling (temperature 1.00, top_k 20, top_p 0.95, min_p 0 from the container).**
+  - **RUN 298 (18:10 UTC): the owner removed PAUSED at 18:10 ("faults before now are not judged again"); no new note
+    (244 the last). H161 STAGED (H160's card + args + today's m2-heat.sh) and STARTED 18:1x (`hstep.sh H161 375be6b79cca
+    bestrxgrf3w16p4 10`: the tool-mix rotation on 316 = note 236's last gate; compare with H160 109.8 / 109.92 / 109.26
+    on 313 and texts via rot_texts.sh H160 H161).**
+  - **H161 (18:10-18:23, image 316, 10 min, both cards; klog2 clean, peak 56 C): 308 requests (84 tool calls), median
+    111.8 / mean 112.00 / aggregate 111.40 tok/s (H160 on 313: 109.8 / 109.92 / 109.26, +1.8-2.0 %), ttft 0.32 s;
+    rot_texts H160 vs H161 11 / 11 identical. NOTE 236 COMPLETE: reproducer 10 / 10 at headroom 2048 (STALL10), texts
+    = M285 (M412), the tool-mix rotation clean (H161), klogs clean on every healthy-path step; the forced-failure exit
+    stays the accepted watchdog limitation (note 244).
+  - **NOTE 243, single prompt (image 316, base head, sampled + seeded tps.body: the engine logged "temperature 1.00,
+    top_k 20, top_p 0.95, min_p 0.00 (from the container)"; mstep.sh's new 7th argument = 4 runs): M414 (off) warm runs
+    90.27 / 91.12 / 92.03 tok/s at 113 / 111 / 111 steps, drafts 333 / 327 / 327 kept 147 / 149 / 149; M415 (`-cpl`,
+    "MTP coupled LIVE ... fixed-seed tokens are NOT preserved", verify kernel xe_mtp_couple_verify on the device) 86.41
+    / 81.66 / 95.34 at 115 / 116 / 101 steps, kept 144 / 141 / 156. Per-position acceptance over all 4 runs: off 75.6 /
+    52.7 / 50.0 % (334/442, 176/334, 88/176) = 2.353 tokens a step; coupled 72.3 / 53.3 / 60.0 % (319/441, 170/319,
+    102/170) = 2.340. NO GAIN on the single prompt (one prompt, noisy); the rotation pair H162 (off) / H163 (`-cpl`) from
+    m3/HSMP (seeds 1001-1011) STARTED 18:3x. klogs clean.**
+  - **NOTE 243 ROTATION PAIR (image 316, base head, every request sampled at the container defaults, seeded; 10 min
+    each, both cards, klogs clean, peaks 61-62 C): H162 (off) 307 requests, median 102.0 / mean 102.98 / aggregate
+    99.84 tok/s, finish length 55 / stop 168 / tool_calls 84; H163 (`-cpl`) 289 requests, median 109.1 / mean 106.42 /
+    aggregate 103.17 (+7.0 / +3.3 / +3.3 %), finish length 131 / stop 80 / tool_calls 78. TOKENS A STEP (metrics-final,
+    the judge per the coordinator): off 2.813 (p0 76.75 %, p1 76.90 %, p2 77.17 %: 12,537/16,335, 9,641/12,537,
+    7,440/9,641), coupled 2.994 (p0 81.83 %, p1 81.58 %, p2 76.11 %: 13,303/16,257, 10,853/13,303, 8,260/10,853) =
+    +6.4 % -- the LoRA agent's offline 2.827 -> 3.085 (+9 %) nearly reproduced. CAVEAT: tok/s is confounded by the
+    answer-length mix (the off arm's fixed seeds give 11 fixed samples repeated ~27 times; the coupled draws differ every
+    repeat, so the finish mix differs by chance, not by distribution -- the coupling keeps the distribution exact by
+    design). M417 (`-cpl-prof`, 2 runs; klog clean): the verify kernel is NOT in the tape profile's top 30 (the 30th =
+    26.9 ms of 9,254.9 = 0.29 %) -- under 0.29 % if taped, or live in the sampler chain the tape profile does not cover;
+    so note 243 item 2's condition (the serial verify >= 1 % of the step) is NOT SHOWN -> the cooperative verify port is
+    NOT started. The visible coupling cost is elsewhere: "between plays" gaps of ~320-390 us after mtp_couple_propose_kernel
+    (6 patterns x 50-64 per device), host time between the draft rounds -- the next lever if the owner adopts the coupling.
+    DEFAULT = the owner's (sampled tokens not seed-preserved). Coordinator told: the MTP head objective wants 'tv'.**
+  - **RUN 298 END (19:2x): the queue is EMPTY -- note 236 done (+ 244 closed as the known limitation), 239 / 241 closed,
+    243 done (the coupling default and any 'tv' head work are the owner's). progress.tsv's rotation row -> 111.8 (H161
+    :316). Images on intel-host: 316 = 375be6b79cca (today's code, commit 04a6312 + the owner's files), ri-m3gen:5. NEXT:
+    idle-skip until a new owner note (no busy work, note 234's rule). Open candidates for the owner: the coupling as a
+    default; its ~0.33 ms host gaps after each coupled draft round; note 236 0(b) (the lists' VRAM in the headroom);
+    a clean post-failure exit (stop ring-slot reuse and reset after the poison, then release the events).**
+  - **RUN 299 (19:07 UTC): OWNER NOTE 245 (~18:0x, written before run 298 ran): resume after run 297's pause; the
+    17:42:36 fault reviewed (an opt-out test); SETTLED: the 64 KiB command buffers are REQUIRED (no more opt-out tests);
+    its "continue" items (H161, note 243) are DONE in run 298. Its follow-up is "desk, with the next build, NOT NOW": the
+    bounded drain should not spin the host CPU. Desk note for that build: 04a6312 already sleeps the rest of each
+    10 ms slice (l0.cpp l.1599), but the slice itself is `zeCommandListHostSynchronize(Z.imm, 10 ms)` (l.1594), which
+    the driver busy-waits (M413B's stack: libze "state R, running") -- the change: replace it with a zeEventQueryStatus
+    of the pending slot's event (or HostSynchronize with timeout 0) and sleep the whole slice, keeping the 20 s budget;
+    no change to the healthy path. Not built now (the note's word). Nothing else queued: idle-skip until a new note.**
+  - **RUN 322 (00:11 UTC 11-12): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 321 (00:00 UTC 11-12): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 320 (23:50 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 319 (23:40 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 318 (23:30 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 317 (23:20 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 316 (23:11 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 315 (23:01 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 314 (22:50 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
+  - **RUN 313 (22:41 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip: note 246
+    item 3 (the coupling default) is the owner's.**
+  - **RUN 312 (21:10 UTC): NEW OWNER NOTE 246 (OK for the coupling: cut its host gap, check greedy, then the default
+    question). DESK: M417's steady window against M408 (uncoupled, greedy, same config), per ~63 steps: idle between
+    plays 141.5 vs 67.2 ms (2.25 vs 1.07 ms a step); the step boundary (last draft pass -> the next trunk's
+    embed_lookup) 330 us coupled vs 53 uncoupled; verify logits -> draft round 1 846 vs 258 us (but M408 is GREEDY, M417
+    SAMPLED: the sampler chain differs, so M416 = the uncoupled SAMPLED -prof is the missing baseline); hc_write ->
+    copy 244 vs 164. CAUSE of the step-boundary gap (code): issue_serial_drafter reads the coupled states back with
+    rad_memcpy_2d_async, and l0.cpp's z_memcpy_2d_async calls enter() -- which SETTLES (a host wait for the stream's
+    native play, here the draft chain) before a SYCL ext_oneapi_memcpy2d -- while 1D copies use enter_g (the glue
+    appends behind the play, no wait). So the host blocked on the draft chain, then issued the slots copy and the
+    issue-ahead trunk late. FIX (exact by construction, engine_draft.cpp): one dense rad_memcpy_async of rounds 1..done,
+    whole rows (both pitches are the row's, so the host layout is the same and the bind reads only the first n a row);
+    plus an init check that the state plane holds >= depth rounds. Exactness gate: the coupling's draw is keyed on
+    (seed, output position, sequence id), so a same-order rerun (M415's runs 1-4 vs the new image's) must give the same
+    token ids. Build 2640 l0t ('mtp_couple|sched_test|ops_doc') from 21:2x; M416 (`mstep.sh M416 375be6b79cca
+    svcmtpx-gnt0-hc8-rp-gnx-prof M285S ...`, image 316) from 21:2x.**
+  - **Build green (logs/build-l0neo-l0t-20261111T211451.txt: mtp_couple_plan, xe_mtp_couple_cpu, sched, ops_doc pass);
+    image 318 = ca214f4b6ddc (the copy fix) loaded on intel-host. M416 (316, uncoupled SAMPLED -prof; klog clean, 66 C):
+    the steady window's idle between plays 83.1 ms (1.32 ms a step), the boundary 53 us, verify logits -> draft round
+    1 551 us, hc_write -> copy 180. So against the FAIR baseline the coupling's gaps are +277 us (the boundary: the 2D
+    copy's settle), +295 us (logits -> round 1: the coupled verify, a serial FP64 walk of up to 1,024 candidates on one
+    work-item a row, live in the sampler chain, so the tape profile's top 30 never showed it) and +64 us. M418 (318,
+    `-cpl`, klog clean, 63 C): runs 1 and 2 TEXT IDENTICAL to M415's runs 1 and 2 at the same 115 steps (the exactness
+    gate; mstep fetches only runs 1-2), run 2 86.41 -> 87.39 tok/s (+1.1 %, one run). M419 (318, `-cpl-prof`) from
+    21:3x. DECISION: port the cooperative verify now (note 243 item 2's condition: the coupling won, +6.4 % tokens a
+    step, and the serial verify's attributed ~295 us is ~1.1 % of a ~25.6 ms step) | alternative: stop at the copy fix |
+    why: it is the larger half of the coupling's remaining gap and the draft exists. Done (uncommitted): the
+    coordinator-checked draft kernel into libxe/xe_mtp_couple.cpp behind RADIANCE_XE_MTP_COOP=1 (off by default), the
+    CPU test's width from RI_MTP_NCAND, ctest xe_mtp_couple_w{64,129,1024,1025}_c{0,1}_cpu (both forms against the
+    host reference bytes); build from 21:3x.**
+  - **M419 (318, `-cpl-prof`, klog clean, 64 C): the boundary gap GONE -- propose -> embed_lookup 330 -> 54.8 us (uncoupled
+    53); idle between plays 141.5 -> 121.7 ms (device 0, steady window); logits -> round 1 still 848 us (the serial
+    verify). Coop build green: 10 / 10 tests incl. xe_mtp_couple_w{64,129,1024,1025}_c{0,1}_cpu (both device forms =
+    the host reference bytes; logs/build-l0neo-l0t-20261111T212056.txt). Image 319 = f21c6eb3e20d (copy fix + coop
+    opt-in). Suffixes: m3-tps.sh `-coop-`, m2-heat.sh `-coop` (NAME-coop-cpl), both `bash -n` clean. M420 (319,
+    `-cpl-coop`, klog clean, 63 C; serve.log lists RADIANCE_XE_MTP_COOP): runs 1-2 TEXT IDENTICAL to M418 at 115
+    steps, run 2 87.76 tok/s (M418 87.39: noise). M421 (`-cpl-coop-prof`, klog clean, 62 C): logits -> round 1
+    848 -> 750 us (device 0) / 805 -> 709 (device 1), idle between plays 121.7 -> 120.3 / 115.2 -> 105.9 ms: the coop
+    form saves ~0.1 ms a step; the ~0.2 ms left over the uncoupled 551 us is thread 0's ascending FP64 sums (kept
+    serial for bit-exactness). ROTATIONS (HSMP bodies, sampled + seeded): H164 = 319 `bestrxgrf3w16p4-coop-cpl` from
+    21:4x, then H165 = 319 `bestrxgrf3w16p4-cpl` (the copy fix alone); both against H163 (316 `-cpl`, before).**
+  - **H164 (319, coupled + coop, klog clean, 58 C): 293 requests, median 110.5 / mean 108.02 / aggregate 104.78 tok/s
+    (after the first rotation), finish length 132 / stop 83 / tool_calls 78; tokens a step 2.997 (32,781 accepted over
+    16,419 verifies; p0 81.9 / p1 81.6 / p2 76.3 %). H165 (319, coupled only = the copy fix, klog clean, 61 C): 292
+    requests, 110.2 / 107.55 / 104.32, finish 132 / 82 / 78. Against H163 (coupled, before; 109.1 / 106.42 / 103.17):
+    the copy fix +1.0 / +1.1 / +1.1 %, + coop +1.3 / +1.5 / +1.6 %; against H162 (off): +8.3 / +4.9 / +4.9 %. NOTE 246
+    ITEM 1's bar (>= +2 % coupled-after vs before) is NOT MET: the boundary gap is gone (M419) and the coop form takes
+    ~0.1 ms of the verify's ~0.3 ms; what is left (~0.2 ms a step) is thread 0's ascending FP64 sums, which stay
+    serial so the tokens stay bit-exact. Item 2 (greedy no-loss, same image 319, H161's greedy bodies): H166
+    `bestrxgrf3w16p4-coop-cpl` from 22:0x, then H167 `bestrxgrf3w16p4` (off).**
+  - **H166 (319, greedy, coupled + coop, klog clean, 61 C): 308 requests, 111.9 / 112.03 / 111.40; rot_texts H161 vs
+    H166 11 / 11 identical. H167 (319, greedy, off, klog clean, 61 C): 111.8 / 111.96 / 111.34; rot_texts H166 vs H167
+    11 / 11 identical. NOTE 246 ITEM 2 PASSES (+0.1 %, bar -0.5 %; texts identical). COMMITS (src, intel-l0): cfd1e85
+    (the dense readback -- AND, staged by an earlier failed commit, the coop kernel + tests; no history rewritten) and
+    d05b4c0 (an empty commit recording the coop part and its tests). The owner's uncommitted files (l0.cpp, issue.cpp,
+    rad_builder.cpp, xe_direct*) untouched. ITEM 3: WAITING (run 312 section): the default RADIANCE_MTP_COUPLED=1 (and
+    RADIANCE_XE_MTP_COOP=1) or not -- the owner's. Images on intel-host: 318 = ca214f4b6ddc (cfd1e85's copy fix), 319 =
+    f21c6eb3e20d (+ coop opt-in; the same tree as d05b4c0). NEXT: idle-skip until the owner answers note 246 item 3;
+    on "default on": flip RADIANCE_MTP_COUPLED (and COOP if asked) default-on in the Intel builds (=0 opts out), one
+    revertable commit, an image, one flagless M-step on sampled + greedy bodies (texts: greedy = M285; sampled =
+    M420's) and its -prof twin. Note 245's drain-sleep change still waits for a build that touches l0.cpp (the
+    owner's uncommitted l0.cpp hunks are in that file: commit only the drain hunk then).**
+  - **RUN 311 (21:00 UTC; new session 30cc9946, the runner started fresh because the old transcript passed 20 MB):
+    unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 310 (20:51 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 309 (20:41 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 308 (20:30 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 307 (20:20 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 306 (20:10 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 305 (20:00 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 304 (19:50 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 303 (19:40 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 302 (19:30 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 301 (19:20 UTC): unchanged (OWNER-NOTES 4,432 lines, 245 the last; no gating files). Idle-skip.**
+  - **RUN 300 (19:10 UTC): unchanged -- OWNER-NOTES 4,432 lines (245 the last), no PAUSED / AMD-HOST-CONSTRAINED. Idle-skip
+    (no card step, no build); NEXT as above.**
   - **RUN 293 (12:00 UTC, 11-11): unchanged (OWNER-NOTES 4,291 lines, no gating files, precheck 12:00 clean, no owner or
     coordinator answer). Same waiting point; the run ends (~$0.5).**
   - **RUN 292 (11:51 UTC, 11-11): unchanged (OWNER-NOTES 4,291 lines, no gating files, precheck 11:50 clean, no owner or
@@ -14675,6 +14899,18 @@ reviewed-fault: klog@2026-11-03T21:42:19Z=0000:0f:00.0 | CAT:ccs | run 167, B97 
 reviewed-fault: klog@2026-11-03T22:08:21Z=0000:0f:00.0 | CAT:ccs | run 167, B98 (image 190, the context word read by a one-work-item kernel instead): the kernel left the op's sentinel untouched (the op then refused the chunk: "shape") and a CCS job faulted the same way (CAT error, timed-out job, resets). Same cause as the line above; PAUSED by the two-faults rule, lifted by the owner before run 168.
 reviewed-fault: klog@2026-10-29T13:55:02Z=0000:0b:00.0+0000:0f:00.0 | CAT:ccs | m3 fault 23 (run 89, HB2 case b, xe_hostbind_probe import mode): a SYCL kernel reading host memory registered with zexDriverImportExternalPointer page-faulted on both cards (CAT error class=ccs guc_id 2, timed-out job, devcoredumps); case d repeated it on card0 at 13:55:53 (guc_id 3, engine reset). The probe's experiment: such memory is not mapped for kernels on this stack. The import mode is not to be used again; no fix-claimed line
 reviewed-fault: klog@2026-10-29T13:55:49Z=0000:0b:00.0 | GT reset | m3 fault 24 (run 89, HB2 case c): "Schedule disable failed to respond, guc_id=2", reset from guc_exec_queue_timedout_job, GT0 reset done. Case c's kernel (USM, 9 x 2 GiB, card0) never finished; it ran seconds after fault 23 on the same card and the reset names fault 23's guc_id, so it is most likely fault 23's aftermath, but this is not shown. No fix-claimed line
+reviewed-fault: klog@2026-11-10T23:37:36Z=0000:0f:00.0 | fault-response | run 292-293, HC1 (the hc 2.42.6 module probe, 4,096 rows): the test hung, the 120 s host timeout killed it, and card1 logged a read fault (0xd556aa1d0000, -ENOENT) in that second: a kernel still running as its process was killed (STATE l.6025-6030); card recovered (run.log 23:47:36). No fix needed for the kill-time fault itself.
+reviewed-fault: klog@2026-11-11T14:32:53Z=0000:0f:00.0 | fault-response | run 294, STALL1 try 2 (note 236's reproducer, the old engine): the stalled engine (one rank in the unbounded out-of-memory drain) was SIGKILLed by the watcher with its kernels in flight; card1 logged 5 read faults (-EINVAL / -ENOENT) as the context went; no reset, no dump; the next steps ran clean. The stall itself is fixed in f7fd715 + the run-295 follow-up.
+reviewed-fault: klog@2026-11-11T15:38:59Z=0000:0f:00.0 | fault-response | run 295, STALL7, card1's half of the event below (same kill, same diagnosis).
+reviewed-fault: klog@2026-11-11T15:38:59Z=0000:0b:00.0 | fault-response | run 295, STALL7 (the forced one-rank failure on image 314): the engine stalled (a held tape play's failure was only a warning, both ranks then waited on ring slots), the watcher SIGKILLed it with kernels in flight; card0 5 + card1 8 read faults at the kill; no reset, no dump; cards served the next steps. Fixed by the run-295 follow-up (held-play failures poison the step).
+reviewed-fault: klog@2026-11-11T15:49:16Z=0000:0b:00.0 | fault-response | run 295, STALL8 try 1 (image 315): the lock-step abort worked but the process exited without waiting (_Exit) while card0's all-reduces still polled the failed peer; 5 read faults (0xd556b6400000-08000, ASID 1026, ccs0) as the context went; no reset, no dump; try 2's identical exit was clean and the card served it. Fix (uncommitted at the pause): the stop waits again, the all-reduce polls 1/1024 of its budget after a give-up (ar_spin_now), the watchdog at 300 s.
+reviewed-fault: klog@2026-11-11T16:28:02Z=0000:0b:00.0 | fault-response | run 296, STALL9 try 1 (image 316, the waiting stop): the stop waited, but card0's rank thread sat 300 s in done_wait ("waited 10 s for a ring slot's last play") with NO all-reduce give-up logged -- card0's in-flight list waited device-side on an event of the failed rank's play that is never signalled (a device-side event wait has no timeout; ar_spin_now does not reach it); the 300 s watchdog then _Exit()ed and the context went under that waiting list: 5 read faults (0xd556b6400000-08000, ASID 1034, ccs0, the same addresses as 15:49:16); no reset, no dump; try 2's identical watchdog exit was clean. Owner note 242: a new fault here = stop and report, no retry. Not fixed (design reported).
+reviewed-fault: klog@2026-11-11T16:59:56Z=0000:0b:00.0 | fault-response | run 297, STALL9B try 1 (image 317, note 244's ring-event release): the release signalled 2 + 63 events, yet card0's rank thread started a new 10 s ring-slot wait right after (ring_take re-arms -- zeEventHostReset -- the slots the release let it reuse, so the queued list's device-side wait was armed again); the 300 s watchdog exited; 5 read faults (0xd556b8c00000-08000, ASID 1042) as the context went. No reset, no dump; the next try's engine served.
+reviewed-fault: klog@2026-11-11T17:06:52Z=0000:0b:00.0 | fault-response | run 297, STALL9B try 2: the same (ASID 1046, the same addresses). Note 244: any exit fault = stop the item; the release reverted (logs/note244-ring-release.patch), f7fd715 + 04a6312 with the watchdog exit after a failed step ACCEPTED as a known limitation.
+reviewed-fault: klog@2026-11-11T17:42:36Z=0000:0f:00.0 | fault-response | run 297, M413B (the perf gate's "off" half on image 316: the svc config's own NEO keys dropped, the driver's 1.13 MiB lists): the single prompt's warm-up ran the cards to "driver free 0 MiB" (870-929 live segment lists), tape 12's append failed out of device memory, the bounded drain retried 1,376 times over 20 s and failed the step (as designed); the spinning threads (libze HostSynchronize "state R", the drain) drove Tctl to 80 C and the heat guard STOPPED the container at 17:42:36 -> 5 read faults on card1 as the context went under running kernels; no reset, no dump. Diagnosis: the 1.13 MiB default does not fit the M-step's config at all -- the 64 KiB key is required, and it has been in every svc M-step and the service all along.
+decision (run 297): PAUSED after M413B's fault (17:42:36) -- the run's second fault event outside note 244's exemption | alternative: count it with STALL9B's as note-244 territory and run the rotation + note 243 | why: note 244 exempts STALL9B's exit faults only; M413B was a separate step (the perf gate), so UNATTENDED's "two faults in one run" applies; the rule names no exception.
+decision (run 297): continue note 244's queue after STALL9B's two exit faults | alternative: PAUSED (UNATTENDED's "two faults in one run") | why: note 244 (OWNER-NOTES override UNATTENDED) names this case -- "any exit fault = stop this item ... and the queue goes on"; both faults are the reviewed kill-time pattern of a deliberate failure test (no reset, no dump, cards bound and quiet after); the remaining queue runs only the healthy path. run.sh may still pause on its own after the run.
+decision (run 295): PAUSED after the faults at 15:38:59 and 15:49:16 (two faults in one run, UNATTENDED l.255 / l.277; OWNER-NOTES keep the fault rules) | alternative: treat kill-time read faults during a deliberate failure test as one event and continue the gates | why: the rule names no exception, the owner's notes say "fault rules unchanged", and the coordinator's note-236 instruction said anything beyond a context reset is a fault per the rules.
 decision (run 89): PAUSED after m3 faults 23 and 24 | alternative: count HB2 as one event (one step) and rerun case c alone | why: UNATTENDED's "two faults in one run": 23 (both cards, case b) and 24 (card0's GT reset, case c) are separate events in separate processes, and 23 recurred in case d. The cards recovered (the GT reset completed, nothing wedged), but the rule is the rule. The next step is in PAUSED
 
 ## Run 88 (13:10 UTC-): owner notes 84-85 -- the engine-side prebind, and the root EBUSY catcher

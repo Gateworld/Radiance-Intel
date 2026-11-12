@@ -4392,3 +4392,62 @@ Depth 3 stays the default for now (run 294's report: no change). When note 239's
 measure it at depth 2 AND depth 3 (single prompt 2 runs each, then the rotation pair at the better pair-up), reporting
 per-position acceptance, tokens a step and tok/s -- the owner decides the depth on those numbers. No v3 winner = depth 3
 stays and this note closes.
+
+## 242. Owner: RESUME after run 295's pause (owner, ~16:2x UTC 11-11, via coordinator)
+The two fault events (15:38:59, 15:49:16) are reviewed and explained by note 236's forced-failure tests (the 15:49 one by
+the coordinator's no-wait-exit try, now reverted). PAUSED removed (copy in logs/PAUSED-run295-*.txt). Continue with
+STATE's NEXT: STALL9 on image 316 + the peer probe, STALL10 svc x10, M412 / M413, the tool-mix rotation; then note 239
+with note 241. A NEW fault at STALL9's exit (the waiting stop) = stop and report, do not retry.
+
+## 243. Coordinator: measure the MTP COUPLING on SAMPLED requests before any cooperative-verify port (~16:4x UTC 11-11)
+Why now: the LoRA agent's held-out numbers (base head) give tokens a step 2.827 uncoupled (served) vs **3.085 coupled**
+(the maximal coupling's sum-min acceptance) = +9 % on sampled requests, more than v2 / v3's top-1 work targets.
+Run 54-56 measured the coupling only on GREEDY prompts (no temperature), where it is a no-op by design.
+1. Config only, after note 236's gates (and it may share the card slot with note 239): M-pair on the current default
+   image, RADIANCE_MTP_COUPLED=1 vs off, the single prompt AND the rotation with every request SAMPLED at the service's
+   usual settings (temperature / top_p / top_k as production clients send; state which). Report tokens a step,
+   per-position acceptance, tok/s, and the verify kernel's share of the step from -prof (mtp_couple_verify_kernel us).
+2. Only if the coupling wins AND the serial verify is >= 1 % of the step: port the cooperative form (outside draft
+   in briefs/drafts/2026-11-11-coop-verify-dispatch.diff + -kernel.cpp (the full kernel; coordinator desk-checked it
+   against rad_mtp_couple_decide / _mass: same arithmetic, only the exps parallel); + -mtp_couple_wide_test.cpp, the wide / hostile
+   parity test run with RADIANCE_XE_MTP_COOP=0 and =1; also update xe_mtp_couple.cpp's header comment), spechub.hip's work-group walk, FP64 sums / CDF on one thread in ascending order = byte-identical to the serial row; CPU parity test widths
+   64 / 129 / 1024 / 1025 + tests/spechub_cooperative_test.cpp's claim) behind its own switch.
+3. A default change is the owner's: the coupling keeps the sampling DISTRIBUTION exact but not fixed-seed tokens.
+   If it wins, tell the coordinator: the MTP head objective then wants the 'tv' variant (LoRA agent's note), not top1.
+
+## 244. Coordinator: STALL9's exit fault -> release the ring events at poison, ONE gate try (~17:1x UTC 11-11)
+Run 296: the abort works (requests released in 6 s), but the waiting stop hangs 300 s and try 1's exit faulted: the healthy
+card's queued list waits device-side on a ring event of the failed rank's never-appended play (no device-side timeout).
+GO: at the first poison, host-signal every in-use unsignalled ring event on both devices (check host-visible pool / host
+signal scope), then the normal teardown; watchdog 300 s stays. Gate: ONE STALL9 step (2 tries): clean klog at both exits,
+done_wait time reported, next engine served, peer probe OK. Any exit fault = stop this item; the fallback (f7fd715 +
+04a6312, watchdog exit after a failure) is accepted as a known limitation and the queue goes on (STALL10, M412/M413,
+rotation, notes 239 / 241 / 243). The no-poison path must not change.
+
+## 245. Owner: RESUME after run 297's pause (owner, ~18:0x UTC 11-11, via coordinator)
+The 17:42:36 card1 fault is reviewed: the heat guard killed M413B (driver-default 1.13 MiB lists, VRAM 0 MiB free) after
+the bounded drain failed the step -- a test of the opt-out, not the default. PAUSED removed (copy in logs/). Settled:
+the 64 KiB command buffers are REQUIRED (no more opt-out tests). Continue: H161 (tool-mix rotation on 316, note 236's last
+gate) -> note 243 (coupling, base head, sampled + seeded bodies). Small follow-up (desk, with the next build, not now):
+the bounded drain should sleep / yield between its slices instead of spinning the host CPU (M413B reached Tctl 80 C).
+
+## 246. Owner OK: the MTP coupling -- cut its host gap, check greedy, then the default (owner, ~19:xx UTC 11-11, via coordinator)
+Note 243's result (run 298): sampled rotation +6.4 % tokens a step, +3.3 % tok/s (mean / aggregate); the verify kernel is
+< 0.3 % of device time (cooperative port NOT needed); the visible cost = ~320-390 us host gaps after each
+mtp_couple_propose_kernel play (~3 a step, ~1 ms of ~27 ms).
+1. Desk first: find what the host waits on after each propose play (a host read of the coupled state / q planes, an event
+   sync, an unrecorded segment boundary, a host-touch in the tape?) -- profile + code, then the fix that keeps the plays
+   recorded and the host off the step's critical path. Exact: tokens unchanged for the same seeds (compare token ids of a
+   seeded coupled run before / after). Gate: the -cpl-prof twin shows the gap gone; sampled rotation pair coupled-before vs
+   coupled-after (same seeds) >= +2 % tok/s; target: tok/s gain close to the +6.4 % tokens a step.
+2. Greedy no-loss: the GREEDY rotation (today's bodies, temperature 0) coupled vs off on the same image (after item 1's
+   fix if it lands): tok/s within -0.5 %, texts identical (greedy rows are untouched by design).
+3. Then a WAITING line for the owner: default RADIANCE_MTP_COUPLED=1 or not (fixed-seed texts change; distribution exact).
+   Not in scope now: the 'tv' MTP head (decide after the default).
+
+## 247. Owner: BOTH ON by default -- RADIANCE_MTP_COUPLED=1 and RADIANCE_XE_MTP_COOP=1 (owner, ~00:2x UTC 11-12, via coordinator)
+Make both the Intel default (engine default or the images' / service run.sh environment, whichever the tree uses for such
+defaults; an explicit =0 must still opt out). Then: one confirming pass on the new default image -- sampled rotation
+(seeded) and greedy rotation, each vs today's H164 / H166 within noise, texts identical where they should be, klog clean
+-- and record the new default image + figures in STATE and WAITING. Note in the docs that fixed-seed requests no longer
+reproduce pre-coupling tokens (the sampled distribution is exact). The 'tv' MTP head: still parked (owner decides later).

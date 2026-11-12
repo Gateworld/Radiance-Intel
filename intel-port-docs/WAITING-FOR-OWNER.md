@@ -1,5 +1,99 @@
 # Waiting for the owner (newest first; run 179's section at the top, 2026-11-04 19:00 UTC)
 
+## Run 312, 22:3x UTC (11-11): note 246 -- the coupling's host gap cut, greedy clean; ANSWERED: BOTH ON (note 247)
+
+- **Item 1 (the host gap), exact:**
+  - **The step-boundary gap is fixed** (commit cfd1e85). The engine read the coupled states back with a 2D copy, and on
+    the Intel backend a 2D copy makes the host wait for the draft passes to finish before it can submit. So the next
+    step's forward pass started ~0.3 ms late. One plain copy of the same rows removes the wait: the gap fell from
+    330 µs to 55 µs, the uncoupled figure.
+  - **The rest of the gap is the coupled verify itself,** a serial FP64 walk over up to 1,024 candidates. The
+    cooperative form (opt-in `RADIANCE_XE_MTP_COOP=1`, commit cfd1e85 + d05b4c0) computes the exps in parallel: verify
+    stretch 848 → 750 µs. The remaining ~0.2 ms is the ordered FP64 sums, which stay serial so the tokens stay
+    bit-exact.
+  - **Exactness:** with the same seeds, the coupled single-prompt texts are identical before and after both changes.
+    Both device forms equal the host reference at widths 64 / 129 / 1,024 / 1,025.
+  - **Sampled rotation, 10 min each, against coupled-before (H163: 109.1 / 106.42 / 103.17):**
+
+    | Run | Median | Mean | Aggregate | vs H163 |
+    |---|---|---|---|---|
+    | H165, copy fix | 110.2 | 107.55 | 104.32 | +1.0 / +1.1 / +1.1 % |
+    | H164, + coop | 110.5 | 108.02 | 104.78 | +1.3 / +1.5 / +1.6 % |
+
+    **Note 246's +2 % bar is NOT met.** Tokens a step are unchanged (2.997 vs 2.994), as expected. Against uncoupled
+    sampled (H162): +8.3 / +4.9 / +4.9 %.
+- **Item 2 (greedy no-loss), same image 319, H161's greedy bodies:**
+  - Coupled + coop (H166): 111.9 / 112.03 / 111.40.
+  - Off (H167): 111.8 / 111.96 / 111.34.
+  - So +0.1 % (the bar was within −0.5 %), with 11 of 11 texts identical (text, tokens, logprobs, usage).
+  - All klogs this run were clean; the peak was 66 °C.
+- **Item 3, your call:**
+  - **`RADIANCE_MTP_COUPLED=1` as the Intel images' default, or keep it off?** Sampled traffic gains about +5 % mean /
+    aggregate tok/s and +6.4 % tokens a step; greedy is unchanged. The sampled distribution stays exact, but
+    fixed-seed requests no longer reproduce their old tokens.
+  - **`RADIANCE_XE_MTP_COOP=1` as the default?** It is exact, but worth only ~+0.3–0.4 % (noise level). It matters
+    only if the coupling is on.
+  - The 'tv' MTP head stays out of scope until you decide (note 246).
+
+## Run 298, 19:1x UTC (11-11): note 236 DONE; note 243 -- the MTP coupling wins on sampled traffic; YOUR DEFAULT DECISION
+
+- **Note 236 is complete.** The reproducer ran 10 of 10 tries with no stall, the single prompt's texts equal M285, and
+  the tool-mix rotation on image 316 was clean: median 111.8 / mean 112.00 / aggregate 111.40 tok/s, 84 tool calls,
+  11 of 11 texts identical to the previous rotation. The watchdog exit after a forced failure stays the known limitation.
+- **Note 243 (the coupling on SAMPLED requests, the base head, image 316):** every request sent no sampling settings, so
+  the engine applied the model's defaults, which it logged as temperature 1.0, top_k 20, top_p 0.95, min_p 0. Each
+  request had a fixed seed, the same in both arms.
+  - **Rotation, 10 min each (the judge):** tokens a step **2.81 off vs 2.99 coupled (+6.4 %)**; acceptance per draft
+    position 76.8 / 76.9 / 77.2 % off vs 81.8 / 81.6 / 76.1 % coupled. Tok/s median 102.0 vs 109.1 (+7.0 %), mean
+    102.98 vs 106.42 (+3.3 %), aggregate 99.84 vs 103.17 (+3.3 %). Tok/s is confounded by the answer lengths: the
+    uncoupled arm's fixed seeds repeat 11 fixed answers, the coupled arm draws new ones every time.
+  - **Single prompt, 3 warm runs each:** no difference (2.35 vs 2.34 tokens a step); one prompt is too small a sample.
+  - **The verify kernel is under 0.3 % of device time**, so the cooperative-verify port (note 243 item 2) is not
+    justified and was not started. The coupling's visible cost is host gaps of about 0.33 ms after each coupled draft
+    round, a possible next lever.
+- **Your call:** make `RADIANCE_MTP_COUPLED=1` the default for sampled traffic, or keep it off. The sampled
+  distribution stays exact, but fixed-seed requests no longer reproduce the same tokens. Greedy requests are unaffected
+  by design. The LoRA agent's note: with the coupling, the MTP head should be trained for the 'tv' objective, not top-1.
+
+## Run 297, 17:5x UTC (11-11): PAUSED again (a second fault outside note 244); note 236 nearly closed
+
+- **Note 244 (release the ring events at a failed step):** the one STALL9 gate faulted at both exits, the same
+  kill-time read faults as before. The released events were re-armed when their slots were reused, so the card stayed
+  blocked until the 300 s watchdog. As note 244 says, the item stopped: the change is reverted (kept as
+  logs/note244-ring-release.patch). Commits f7fd715 + 04a6312 stand, with the watchdog exit after a failed step as the
+  accepted known limitation.
+- **Note 236's gates:** the default engine (image 316) at headroom 2048 with GEN0's three documents ran **10 of 10
+  tries with no stall** and a clean kernel log. The single prompt's texts are identical to M285 (92.96 tok/s).
+- **The 64 KiB command-buffer key:** every service-form M-step and your service already set it, so the engine's new
+  default changes nothing there. To compare against the driver's own size I ran one step without the key (M413B). Its
+  warm-up ran both cards out of memory, the step failed after the 20 s drain as designed, and the CPU reached 80 C, so
+  the heat guard killed the container, and card1 logged 5 read faults at the kill. So the key is required, not just
+  cheaper. That fault is this run's second outside note 244's exemption, hence the pause. Both cards recovered.
+- **Closed by the coordinator:** note 239 (the v3 picker winner is far under the bar offline: uncoupled +0.2 %, sampled
+  -1.2 %), and with it note 241 (depth 3 stays).
+- **To resume: `rm PAUSED`.** Left: the tool-mix rotation (note 236's last gate), then note 243 (the MTP coupling on
+  sampled requests, with the base head). The sampled, seeded request bodies are staged on intel-host.
+
+## Run 296, 16:4x UTC (11-11): NOTE 242 -- STALL9 faulted at its exit; STOPPED as you said. YOUR DECISION
+
+- **STALL9 (image 316, the waiting stop):** a lasting failure forced on one rank inside live requests. The abort worked
+  as before: that rank's step failed at +6 s, the three requests got errors, and the next engine came up and served.
+  **But the waiting stop never finished.** The healthy card's thread waited on a ring slot for 300 s, no all-reduce
+  gave up, and the 300 s watchdog ended the process. At try 1's exit card0 logged 5 read page faults (16:28:02, the
+  same addresses as 15:49:16); try 2's exit was clean. No reset, no dump, both cards present and quiet after.
+- **Why:** the healthy card's queued work waits on the device for an event of the failed card's play. That event is
+  never signalled because the play was never appended, and a device-side event wait has no timeout. My all-reduce
+  change could not help: the work never reached an all-reduce.
+- **Proposed fix (not built):** at the first failed step, the host signals every outstanding ring event on both cards,
+  so the healthy card's waits release, its queued work runs out (its results are discarded), the card goes idle, and
+  the normal teardown runs. The watchdog stays as the outer bound. Gate: STALL9 again with a clean kernel log at exit.
+- **What already stands (commits f7fd715 + 04a6312):** the stall itself is gone on the default path (10 of 10 tries
+  with 64 KiB lists), and after a forced failure the requests get errors in about 6 s, where the old engine hung
+  forever. Only the exit after such a failure is still unclean.
+- **Your call:** build the event-signal fix and rerun STALL9, or accept the watchdog exit and go on to the remaining
+  gates (the default engine 10 tries, the 64 KiB speed pair, a tool-mix rotation) and then MTP v3. Nothing runs on
+  the cards until you answer.
+
 ## Run 294-295, 15:3x UTC (11-11): NOTE 236 -- the multi-user + tool-call stall: found, fixed, gates running
 
 - **Reproduced** in 1-2 tries (headroom 2048, GEN0's three documents at once; m3/intel-host/stall-serve.sh +
@@ -17,11 +111,19 @@
   line every 5 s, then the step fails); any rank's failed step poisons the step and aborts the barrier, so both ranks
   leave together, the requests end with an error, and the process exits without waiting on the device (the service's
   systemd restarts it). With the 64 KiB key alone: 10 of 10 tries, no stall (STALL5).
-- **Gates (running, results below as they land):** the fixed engine at its default 10 tries; the driver's default size
-  on the fixed engine (it may fail, it must not hang); a forced one-rank failure inside the requests (the engine's own
-  exit time, then the kernel log and the peer probe); the M-pair at 64 KiB vs the old size (texts = M285, within
-  -0.5 %); a rotation with tool calls. No default changes for you to decide here except the engine-side key, which
-  matches what your service already runs.
+- **Gates so far:** a forced short failure on one rank inside the requests was retried and RECOVERED (both tries, all
+  documents served). A forced lasting failure (STALL8): the engine stopped by itself 4 s after it, the three requests
+  got errors, the next engine served -- the lock-step abort works. **But it exited without waiting for the healthy
+  card's all-reduces, and card0 logged 5 read page faults at one of the two exits** (no reset, no dump, the card served
+  the next try). With the earlier test's kill (15:38:59, both cards) that is **two fault events in one run: PAUSED per
+  your fault rules.** Both cards recovered; all kill-time faults are reviewed in STATE.md.
+- **The fix for that exit is committed (04a6312, built green, CPU tests pass) but not yet card-tested:** the stop waits
+  for the device again; the all-reduce gives later launches a short budget after a give-up so that wait ends in ~2 min
+  instead of hours; a 300 s watchdog bounds everything.
+- **To resume: `rm PAUSED`.** The next steps (STATE.md NEXT): the same forced-failure gate on image 316 (expect a clean
+  kernel log at the exit), the peer probe, the default engine 10 tries, the M-pair perf gate for the 64 KiB key, a
+  tool-mix rotation. Then MTP v3 (note 239) with note 241. No default changes for you to decide here except the
+  engine-side key, which matches what your service already runs.
 
 ## Run 294, 14:3x UTC (11-11): NOTE 237 -- the MTP draft depth re-measured on today's engine; DEFERRED by the owner to after MTP v3 (note 241)
 
