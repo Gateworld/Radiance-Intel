@@ -42,8 +42,44 @@ split tensor-parallel across the two cards.
 
 ## Status (November 2026)
 
-On 2× Intel Arc Pro B70, single-user decode with MTP: about 91 tokens/s; 7K-token prompt prefill: about 3.1 s.
+All figures are on 2× Intel Arc Pro B70, single user (one request at a time), with 3-token MTP speculative decoding:
+
+| Measurement | Result |
+|---|---|
+| Decode, fixed test prompt | about 91–93 tokens/s |
+| Decode, 11-prompt mixed set, greedy (temperature 0) | median about 112 tokens/s |
+| Decode, mixed set, sampled (temperature 1.0, top_k 20, top_p 0.95), MTP coupling on | median 110.5, mean 108.0 tokens/s |
+| Prefill, 5,604-token prompt | about 3.1 s to the first token |
+| Prefill, 20K-token prompt | about 6.4 s |
+
 The notes record what worked, what did not, and why.
+
+### Recent changes (11 November 2026)
+
+- **MTP coupling on sampled traffic.** Upstream's coupled speculative sampling (`RADIANCE_MTP_COUPLED=1`) accepts a draft
+  token whenever the target's own sampled draw matches it under a maximal coupling. That is more often than requiring the
+  draft to be the target's top token. On the sampled mixed set it raised tokens per step from 2.81 to 3.00 (+6.4 %) and
+  mean tokens/s by +4.9 %. Greedy requests are unchanged by design (measured +0.1 %, identical texts). Two Intel-side
+  fixes made the gain show up in tokens/s:
+  - the coupled state is read back with one dense copy; a 2D copy made the host wait about 0.3 ms per step;
+  - an opt-in cooperative verify (`RADIANCE_XE_MTP_COOP=1`) spreads its FP64 `exp` work over a work-group and keeps the
+    sums in the serial order, so its tokens are bit-identical to the serial form.
+
+  Both are being made the default. With coupling on, the sampled distribution is exact, but a request with a fixed seed
+  no longer reproduces the tokens it gave without coupling.
+- **Multi-user stall fix.** Under memory pressure, a failed command-list append on one card could hang the two-card step
+  forever. Three changes fix it:
+  - the engine now sets 64 KiB command buffers; the driver's default 1.13 MiB per list cost about 3 GiB of VRAM in
+    recorded lists;
+  - the drain after a failed append is bounded;
+  - a failed step aborts on both cards together, and the requests get an error within about 6 s.
+
+  Known limitation: after such a failure, the engine's exit is ended by a 300 s watchdog and can log GPU read faults
+  while it tears down.
+- **Tried and not adopted:**
+  - an fp16 GDN state cache: it fails the accuracy bar on long contexts;
+  - three retrained MTP draft heads: no gain on held-out text;
+  - draft depth 2 or 4: depth 3 stays.
 
 **Hardware note:** both cards run at **PCIe 4.0 x8** (about 14 GB/s measured for a card-to-card copy), the limit of the
 board's slots. The B70 itself supports PCIe 5.0 x16, so these numbers are link-limited in two places: prefill streams
