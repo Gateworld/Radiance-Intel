@@ -3780,7 +3780,12 @@ int Engine::start() {
      * The guard (1 MiB) catches a kernel writing past its rows, which would otherwise corrupt a
      * resident expert's weights. */
     arena_rows_.clear();
-    if (!ranks_.empty() && !ranks_[0]->arena_levels.empty() && ranks_[0]->heat.enabled()) {
+    /* Intel port, run 337 (v1's soak): RADIANCE_ARENA_LEND=0 lends nothing of the arena to the expert slab, so no step
+     * ever recalls it. The soak's 04:31:59 stop was a recall that left a slot held ("recalled the arena loan ... a slot
+     * ... is still held", Mover::reclaim). The default is unchanged. */
+    static const bool arena_lend = [] { const char* v = std::getenv("RADIANCE_ARENA_LEND"); return !(v && v[0] == '0'); }();
+    if (!arena_lend) RAD_INFO("arena: RADIANCE_ARENA_LEND=0 -- nothing of the activation arena is lent to the expert slab");
+    if (arena_lend && !ranks_.empty() && !ranks_[0]->arena_levels.empty() && ranks_[0]->heat.enabled()) {
         bool ok = true;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
