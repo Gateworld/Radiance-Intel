@@ -340,6 +340,8 @@ struct MoverStats {
     /* Host copies given to budgeted victims (Mover::donor_slot); donors moved rather than
      * dropped by a recall or shrink; recalls that found no free slot for a donor. */
     uint64_t donated = 0, relocated = 0, stranded = 0;
+    /* v1.0.1 (owner note 256): recalls that had to wait for a copy into a lent slot past the loan to land, and how long */
+    uint64_t recall_waits = 0, recall_wait_us = 0;
     uint64_t ssd_reads = 0, ssd_bytes = 0;
     /* The prefill stager (stage_units). `stage_overflow`: units no buffer had room for, read in
      * place. `stage_copies`: copies issued; neighbouring pool slots go as one. */

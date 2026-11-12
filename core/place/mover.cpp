@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 
 namespace rad {
@@ -1407,6 +1408,39 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
      * donor_slot). Nothing goes on the compute stream from here to the end of the recall. */
     RAD_TRY(rad_stream_sync(compute_));
     RAD_TRY(retire(heat));
+    /* v1.0.1 (owner note 256; V1R1 / V1R2 with RADIANCE_MOVER_TRACE): the drains above do NOT guarantee the mover's copies
+     * have landed -- V1R2 found dozens of records still Copying here at every recall, their events not done. A promotion
+     * still in flight into a slot past the loan was then cleared by the record sweep without its slot being freed (the
+     * soak's "still held" stop), and its copy could still land in memory the lender takes back. So wait here, sleeping,
+     * until every record whose copy touches an uncovered lent slot has landed and is retired: exact (it only waits).
+     * Bounded at ~10 s; past that the recall fails as before. */
+    {
+        auto pending = [&]() {
+            for (const Move& m : moves_) {
+                if (m.state != Move::State::Copying || m.unit < 0) continue;
+                const ClassPools& cp = pools_[(size_t)unit_[(size_t)m.unit].klass];
+                const auto past = [&](int64_t s) { return s >= 0 && cp.is_flex(s) && !cp.slab.covered(s); };
+                if (past(m.slab_slot) || past(m.to_slot)) return true;
+            }
+            return false;
+        };
+        int64_t waited_us = 0, sleep_us = 50;
+        while (pending()) {
+            if (waited_us > 10000000) {
+                RAD_ERR("mover: a copy into a lent slot past the %s loan has not landed after 10 s of the recall",
+                        lender_name(lender));
+                return RAD_E_STATE;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+            waited_us += sleep_us;
+            sleep_us = std::min<int64_t>(sleep_us * 2, 1000);
+            RAD_TRY(retire(heat));
+        }
+        if (waited_us > 0) {
+            ++stats_.recall_waits;
+            stats_.recall_wait_us += (uint64_t)waited_us;
+        }
+    }
     /* RADIANCE_MOVER_TRACE (owner note 256, V1R1): the soak's leaked slots were promotions still Copying here, after
      * both drains, which the record sweep below then clears without freeing their slot. Name every such record. */
     if (trace_on()) {
@@ -1736,6 +1770,9 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    if (stats_.recall_waits)
+        s += fmt("  %llu loan recalls waited for a copy into a lent slot to land (%.1f ms in all)\n",
+                 (unsigned long long)stats_.recall_waits, (double)stats_.recall_wait_us / 1000.0);
     if (stats_.donated)
         s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
                  "by a recall, %llu left past one with no free slot\n",
