@@ -40,6 +40,32 @@ On the B70s the engine converts it to its own `.rad` format: routed experts as 4
 activations ("format C"), the dense trunk as int8 weights × int8 activations, the draft head's projection at 2 bits,
 split tensor-parallel across the two cards.
 
+## Releases
+
+Release tags carry an `-intel` suffix, because upstream radiance already uses `v1.0.0` through `v1.12.0`.
+
+- **`v1.0.1-intel` (12 November 2026): the current release.** It fixes a rare engine stop under concurrent load. When a
+  step took back the activation-arena memory lent to the expert cache, an expert copy could still be in flight into a
+  lent slot. The slot was then left marked as held, and the engine stopped. The take-back now waits, bounded at 10 s,
+  until every such copy has landed. Served tokens are unchanged.
+- **`v1.0-intel`:** the first release. It made MTP coupling and the cooperative verify the defaults, and set 64 KiB
+  command buffers. The API key is read from `RADIANCE_API_KEY`, never from the command line.
+
+How `v1.0.1-intel` was validated, running as a service on 2× B70:
+
+- **2-hour soak with 3 concurrent users:** 4,128 requests, all answered (median 5.2 s, p90 7.4 s). One engine process ran
+  throughout with no restarts and no GPU faults; the GPUs peaked at 68 °C. `v1.0-intel` had stopped at 19.5 minutes on
+  the same soak.
+- **Feature checks:**
+
+| Feature | Result |
+|---|---|
+| Tool calls | pass |
+| Reasoning on / off (reasoning returned in its own field) | pass |
+| 18K-token prompt, fact retrieval | pass (25.9 s) |
+| 64K-token prompt, fact retrieval | pass (95.1 s) |
+| Image input | **not yet**: the vision encoder loads, but the Intel build has no FFmpeg media decoder, so image requests are refused. Adding it is in progress. |
+
 ## Status (November 2026)
 
 All figures are on 2× Intel Arc Pro B70, single user (one request at a time), with 3-token MTP speculative decoding:
@@ -48,13 +74,20 @@ All figures are on 2× Intel Arc Pro B70, single user (one request at a time), w
 |---|---|
 | Decode, fixed test prompt | about 91–93 tokens/s |
 | Decode, 11-prompt mixed set, greedy (temperature 0) | median about 112 tokens/s |
-| Decode, mixed set, sampled (temperature 1.0, top_k 20, top_p 0.95), MTP coupling on | median 110.5, mean 108.0 tokens/s |
+| Decode, mixed set, sampled (temperature 1.0, top_k 20, top_p 0.95), MTP coupling on | median about 111, mean 108.7 tokens/s |
 | Prefill, 5,604-token prompt | about 3.1 s to the first token |
 | Prefill, 20K-token prompt | about 6.4 s |
 
 The notes record what worked, what did not, and why.
 
-### Recent changes (11 November 2026)
+### Recent changes (11–12 November 2026)
+
+- **Shorter coupled verify.** The verify now stops after each row's last live candidate instead of walking the full
+  1,024-slot plane. Results are bit-identical, and sampled decode is about 0.5 % faster.
+- **Opt-in, measured but not adopted:**
+  - an all-reduce block-count floor (`XE_AR_MIN_BLOCKS`): faster in isolation, no gain inside the engine;
+  - the gate_up epilogue fold (`RADIANCE_XE_GU_EPI=1`), which folds SwiGLU and int8 quantisation into the expert kernel:
+    its card tests are pending.
 
 - **MTP coupling on sampled traffic.** Upstream's coupled speculative sampling (`RADIANCE_MTP_COUPLED=1`) accepts a draft
   token whenever the target's own sampled draw matches it under a maximal coupling. That is more often than requiring the
@@ -65,7 +98,7 @@ The notes record what worked, what did not, and why.
   - an opt-in cooperative verify (`RADIANCE_XE_MTP_COOP=1`) spreads its FP64 `exp` work over a work-group and keeps the
     sums in the serial order, so its tokens are bit-identical to the serial form.
 
-  Both are being made the default. With coupling on, the sampled distribution is exact, but a request with a fixed seed
+  Both are now the default (`v1.0-intel`). With coupling on, the sampled distribution is exact, but a request with a fixed seed
   no longer reproduces the tokens it gave without coupling.
 - **Multi-user stall fix.** Under memory pressure, a failed command-list append on one card could hang the two-card step
   forever. Three changes fix it:

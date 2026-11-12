@@ -4451,3 +4451,179 @@ defaults; an explicit =0 must still opt out). Then: one confirming pass on the n
 (seeded) and greedy rotation, each vs today's H164 / H166 within noise, texts identical where they should be, klog clean
 -- and record the new default image + figures in STATE and WAITING. Note in the docs that fixed-seed requests no longer
 reproduce pre-coupling tokens (the sampled distribution is exact). The 'tv' MTP head: still parked (owner decides later).
+
+## 248. Owner YES: two cheap exact levers, after note 247's confirming pass (owner, ~00:5x UTC 11-12, via coordinator)
+1. **The coupled verify's walk length.** With top_k 20 the verify walks up to n_cand = 1,024 slots, most of them -1 /
+   -inf. Desk first: are the surviving candidates COMPACTED at the front of the plane (sample_pick's output order)? If
+   yes, bound every loop (serial row and the coop kernel) by the survivor count (a count written by sample_pick, or the
+   first -1 when the plane is compacted) -- same order, same sums, so tokens stay bit-identical. If not compacted, say so
+   and stop (a compaction changes the walk order = not exact -> coordinator). Gates: the CPU row tests at widths 64 /
+   129 / 1,024 / 1,025 both forms + a compacted-with-tail case; seeded coupled single prompt texts identical to M420;
+   -cpl-coop-prof shows logits -> round 1 down from ~750 us; sampled rotation pair vs the note-247 image >= +0.5 %
+   (adopt as the default if exact and not slower).
+2. **The all-reduce block count (XE_AR_BLOCKS), the bench you proposed in run 2xx and never ran.** Config only: the
+   stamps bench (XE_AR_STAMPS=1) at M = the current default and 2-3 even / power-of-two alternatives at the decode
+   sizes, then the M-pair of the best vs the default (texts identical, >= +0.5 % to go on), then the rotation; a default
+   change -> owner via WAITING. 5,000-launch steady-clock rule applies to any bench.
+Order: note 247's confirming pass first, then 1, then 2. Report both in one WAITING section.
+
+## 249. Owner: RADIANCE-INTEL v1 -- freeze after notes 247 + 248, then install it OFFICIALLY on intel-host (owner, ~01:0x UTC 11-12, via coordinator)
+Owner's answers: access = **local network + API key**; runner after v1 = **keep optimizing in booked windows**.
+1. **Freeze (after 247's confirming pass and 248's results, with whatever 248 adopts):** annotated tag `v1.0` on intel-l0
+   (message: the defaults + the figures), the final image by digest = the v1 image, kept forever (exempt from the
+   cleanup timer's pruning: add it to PROTECT lists on intel-host). m3/service refreshed to it: run.sh environment = every
+   default incl. coupling + coop + 64 KiB command buffers; headroom 4096 for v1 (the stall's margin; 2048 only after a
+   soak shows the room). Record the v1 manifest (tag, image digest, model .rad sha, args, env) in m3/service/V1.md.
+2. **The watchdog's fault rule vs note 244's known limitation:** today watchdog.sh stops the unit for good on ANY GPU fault.
+   Change: a fault within 6 min AFTER a logged step poison / failed-step abort (the known post-failure exit) -> one restart,
+   at most one per hour, and a notification; any other fault, or a second within the hour -> stop and leave stopped +
+   notify (the existing rule). Test it once with the forced-failure hook against the installed unit (in the install window).
+3. **Network + key:** listen on intel-host's LAN / VPN address, port 8030 unless taken (check `ss -ltn`), never 0.0.0.0 on a
+   public interface. A NEW random API key: generated on intel-host into the unit's env file (0600, outside any repo), and one
+   copy for the owner at amd-host:~/.radiance_intel_api_key (0600). The key never goes on a command line, into a log, a note,
+   STATE, WAITING or git. Check reachability from amd-host (curl /health; an authenticated /v1/models with the key read
+   inside Python) and that a request without the key is refused.
+4. **Install (Quadlet + watchdog timer, enabled at boot; linger on for the user):** first check that nothing else on intel-host
+   uses the B70s (comfyui / chatterbox-vllm units inactive or not on the cards; queuebot has no devices). Then start,
+   /health, one greedy + one sampled request, klog clean.
+5. **Soak: 2 h, 1-3 users (soak.sh), on the installed unit.** Gates: no stall, no GPU fault, MemAvailable >= 20 GiB, heat
+   rules held, per-request tok/s in line with the rotation (sampled median ~110). Pass -> WAITING "v1 INSTALLED" with the
+   endpoint (address:port, not the key), the figures and the operations lines (start / stop / logs / rollback). Fail ->
+   stop the unit, report, no retry beyond one fix.
+6. **After v1 (owner: booked windows):** the service is the default state of intel-host. A card step needs a window booked in
+   ~/code/SCHEDULE.md (default 03:00-07:00 UTC = 19:00-23:00 PST, at most one a day, <= 2 h unless the owner books more):
+   stop the unit -> steps -> start it -> /health + one request -> log it. New versions = v1.1, v1.2 ... only on the owner's
+   OK, swapped by image digest with v1 kept for rollback.
+The coordinator tags the GitHub copy (v1.0 release, re-scrubbed) once step 5 passes.
+
+## 250. Coordinator: v1 INSTALLED on intel-host (owner: "yes, you run them"; ~02:1x UTC 11-12) -- runner, do items 4-5's checks + the soak
+Installed by the coordinator: ri-m3-flashnext.container -> intel-host ~/.config/containers/systemd/, ri-m3-watchdog.{service,timer}
+-> ~/.config/systemd/user/, daemon-reload, the service started (healthy ~120 s), the watchdog timer enabled. Owner also OK'd:
+comfyui / qwen36 / app-embed no longer start at boot (WantedBy commented, backups *.bak-v1-1112; still startable by hand).
+Two watchdog.sh fixes (on both hosts): (a) a 15-min START GRACE -- no health restart within 15 min of the unit's start (the
+load takes ~2 min; OnBootSec 2 min would have restarted every boot mid-load); (b) the kernel-log look-back is capped at
+10 min -- the stale watchdog.state from the 11-05 soak made the first run read a week of klog and STOP the new service at
+02:12:12 on long-reviewed test faults (state reset, logged). Checked from amd-host: no key -> 401, key -> /v1/models 200
+(qwen4exp), a greedy chat answer 200. Startup notes: power cap differs (card 0f:00.0 230 W, 0b:00.0 275 W) -- report
+whether that is deliberate (heat rules) or should be equal; 7.95 GiB of experts a rank live in the host pool.
+NEXT for the runner (the service is now intel-host's normal state; card steps only in a booked window, note 249 item 6):
+the sampled request, klog, the watchdog's forced-failure test against the installed unit (in a booked window), then the
+2 h soak (soak.sh 1-3 users) -> WAITING "v1 INSTALLED" with the figures; the coordinator then publishes v1.0 on GitHub.
+
+## 251. Owner YES: desk comparison -- the fused MoE decode megakernel paper vs our expert kernels (owner, ~02:4x UTC 11-12, via coordinator)
+DESK ONLY (no card time, no build), ~$10-20, after note 250's soak (the service owns the cards; this needs none).
+Read arXiv 2609.04244 ("An Efficient Fused Mega-kernel for Quantized MoE Decoding", https://arxiv.org/html/2609.04244v1;
+its code if linked) and compare its design, item by item, with our decode expert path: format C gate_up / down
+(moe_i4i8_run_kernel, ~29 % of device time at 2-4x their floors, scoreboard rows 1 + 3), the router -> scatter -> experts
+-> combine launches, and our earlier megakernel attempt (megakernel 1b, opt-in / off; the megakernel brief) -- what it
+did, why it stayed off. For each technique the paper uses (persistent CTAs / work queue, gate+up+SwiGLU in registers, down
+fused with the routing-weight scale + scatter-add, block-quantized dequant layout, outstanding-load depth / bank
+parallelism, launch count per layer at B <= 8) say: already done here / tried and why it failed / NOT done -> the expected
+gain from our own profile numbers (us a step, with the arithmetic) and what it needs on Xe2 (SLM, sub-groups, L0
+constraints, exactness vs format C's order). Output: briefs/2026-11-12-moe-megakernel-paper-vs-ours.md with a ranked list;
+a build proposal only for an item worth >= 2 % of the step, sent to the coordinator first. Exact-path rules as always.
+
+## 252. Owner: try a higher power cap on card 0f:00.0 (Intel reference B70, 230 W) -- CONDITIONAL (owner, ~03:0x UTC 11-12, via coordinator)
+Revises note 77's "no power cap changes" for this one test. The owner first checks by hand (root) whether the firmware
+keeps power1_cap = 250 W on 0f:00.0 (then restores 230 W for the soak). ONLY if the owner reports it sticks: in a booked
+window after note 250's soak -- the owner (or a root step the owner runs) sets 250 W; the runner runs the M-pair (single
+prompt, 2 runs) + the sampled rotation, 230 W vs 250 W on the same image, recording each card's power, act_freq and
+temperature during decode (hwmon / sysfs reads only), the all-reduce wait skew, tok/s and texts. Heat rules unchanged
+(80 / 85 C; stop the step at the limit). Report the gain and the temperatures; keeping 250 W (and making it survive a
+reboot) is the owner's decision. Never write power1_cap yourself.
+  RESULT (~03:1x UTC): the owner's write of 250 W reached both cards; the firmware KEPT 230 W on 0f:00.0 (refused: 230 W is
+  the reference board's hard limit) and set 0b:00.0 to 250 W (from its stock 275), restored to 275 W by the owner. Note 252
+  is CLOSED: no higher cap is possible on 0f:00.0; note 77's caps stand. (If 0b:00.0 reads 250 W in any step log of
+  ~03:0x-03:2x UTC, that is this test.)
+
+## 253. Coordinator: v1 RESTARTED on image 323 + tag moved (owner: "yes, you restart it" / "move v1.0 to the fix"; ~04:2x UTC 11-12)
+Done by the coordinator: daemon-reload + restart ri-m3-flashnext on intel-host (healthy ~135 s); the engine's /proc cmdline has
+no --api-key; from amd-host: no key -> 401, the NEW key -> 200, a sampled chat 200. Watchdog timer active. Tag v1.0 MOVED
+(annotated, -f) from 97f897d to 8c48ea1, its Image line = ri-m3rtneo:323 (a421a7f0a177, sha256:055421c7...). The amd-host
+cleanup script protects ri-m3rtneo 322 + 323. Coordinator's miss on record: the --api-key in v1.0's run.sh was read and
+passed at the install review; run 325 caught it -- thanks.
+NEXT for the runner: V1.md to image 323 / 8c48ea1 if not already; klog; the watchdog's forced-failure test against the
+installed unit in a booked window (today's 03:00-07:00 UTC window is open now); then the 2 h soak -> WAITING "v1 INSTALLED".
+
+## 254. Owner YES: build the gate_up epilogue fold (note 251's item 1) -- a v1.1 candidate (owner, ~04:3x UTC 11-12, via coordinator)
+Fold SwiGLU + the per-128-column-group int8 quantiser into format C gate_up's epilogue (moe_i4i8_run_kernel<5,16,..>), so
+down reads gate_up's int8 rows directly and the separate act / quant launches go (brief 2026-11-12-moe-megakernel-paper-
+vs-ours.md, item 1: ~0.2-0.3 ms a step, ~1 %). EXACT or nothing: the same SwiGLU arithmetic in the same order, the same
+group max / scale / rounding as today's quantiser -- the int8 rows and their scales byte-identical to the unfused pair.
+Behind its own switch (opt-in first). Desk + build any time (no card); CARD STEPS ONLY IN A BOOKED WINDOW (note 249 item 6:
+stop the v1 service -> steps -> start it -> /health + one request -> log), AFTER the v1 soak passes.
+Gates: CPU row tests (fused vs unfused bytes, the decode shapes incl. 1 / 2 / 4 rows and the prefill chunk shapes if the
+kernel serves them, else decode only); the card row check (bytes / hashes identical); -prof twin (the launches gone, the
+step's device time down); M-pair (texts = M285, >= +0.5 %); the sampled + greedy rotation pair (texts identical where
+deterministic). Pass -> WAITING: make it the default as v1.1 (owner decides; the service moves by image digest, v1.0 kept
+for rollback). Fail -> record and stop (no second variant without the coordinator).
+
+## 255. Owner OK: the soak's mover error (run 337) -- root cause at the desk first, mitigation as the fallback (owner, ~04:5x UTC 11-12, via coordinator)
+1. Let the running soak client finish (~06:12 UTC); record every recurrence (time, step size, the mover lines, restart).
+2. DESK NOW (no card time): root-cause the 04:31:59 "arena-loan recall with a slot still held" (mover.cpp ~1500) from the
+   serve log + the mover code: who holds the slot at recall time (an in-flight move record, a staged / quarantined slot, the
+   busy-prefill chunk + prefill-interleave 8 path the service uses and no rotation did?), why the 456-token step recalls the
+   loan, and why the recall treats a held slot as fatal instead of waiting for / draining it. Write it in
+   briefs/2026-11-12-arena-recall.md. A reproducer on the CPU device or the tiny model if one is possible.
+3. If found and the fix is EXACT (no change to any served token; the recall waits for / releases the slot correctly): build
+   it as v1.0.1 (commit, image), CPU tests + a reproducer pass; then in a booked window: install it (the coordinator
+   restarts the unit on the owner's standing OK for v1 fixes), the watchdog's forced-failure test, and a fresh 2 h soak
+   (the same 3-user client) -> WAITING.
+4. If not found within ~$20 of desk work: fallback (a) = image 324's RADIANCE_ARENA_LEND=0 in run.sh, after ONE quick
+   M-pair in a booked window (single prompt + sampled rotation, lend on vs off: the tok/s cost and the slab's room), then
+   the same install + watchdog test + 2 h soak. (c) dropping the interleave flags only if neither holds.
+Tell the coordinator before any service restart (the coordinator does restarts; the runner's session cannot).
+
+## 255. Coordinator: CPT-week gates for v1 (owner OK in principle for a 1-week amd-host production-off block; ~06:3x UTC 11-12)
+Plan: ~/code/lora-stack/cpt/SWITCHOVER.md (v1 serves production's traffic for a week via a amd-host :8000 forwarder, under
+production's name + key). Runner's part, in booked intel-host windows, AFTER note 253's soak and BEFORE note 254's card steps:
+G2 feature parity on v1: an image request shaped like ~/code/app-images/labeler/flashnext.py's (IMAGE INPUT was never
+tested on the Intel port -- report exactly what happens), a tool call, reasoning on / off, an 18k and a 60k prompt; G3 the
+alias rehearsal (v1 restarted with --served-model-name Qwen3.8-Flash-Next + production's key via the coordinator's script;
+a temp amd-host 127.0.0.1:18000 forwarder; production stays up) -- the coordinator runs the amd-host side; G4 1 h at 2 users with
+the real mix (chat, tools, images if G2 passes, one long prompt). Report each in WAITING. If image input fails: say what is
+missing (encoder kernels? plugin?) and an estimate, no build without the coordinator. Do NOT print or log any key.
+
+## 256. Owner: (b) ROOT CAUSE FIRST for the soak failures; intel-host's cards free until the k8 week (owner, ~06:1x UTC 11-12, via coordinator)
+Two engine exits in the v1 soak (04:31:59 and 05:21:22, image 323, no GPU fault, both `E mover: recalled the activation
+arena loan to 1063264256 and a slot at ... is still held` -> `taking the arena back ... called in the wrong phase` -> exit 1
+-> systemd restart). The owner chose: find the leaked slot before any mitigation (RADIANCE_ARENA_LEND=0 / image 324 stays an
+unused option). Card time: ANY TIME until the k8 week (owner) -- note 249 item 6's windows are suspended until v1 has real
+users. Unit control: the runner cannot stop / start ri-m3-flashnext; it asks the COORDINATOR (cross-session message, or a
+"QUESTION FOR COORDINATOR: stop v1" / "start v1" line at the top of WAITING), who stops v1 before a step and starts + checks
+it after. Engine steps meanwhile run as today's step containers (the service args: --busy-prefill-chunk 1024
+--prefill-interleave 8, headroom 4096, max-num-seqs 2, the v1 env).
+1. Desk: every path that takes or keeps a slab slot inside the lent strip (promote, demote, migrate, quarantine, staged
+   moves, pins held across a step, the prefill-interleave chunks' expert residency) -- who can still hold one when
+   Mover::reclaim runs. Add an opt-in trace (RADIANCE_MOVER_TRACE=1): per slot in the lent strip, the last owner / op /
+   step / sequence, dumped at the failing check (mover.cpp ~1500).
+2. Reproduce with the trace on: 3 users, the soak's bodies, the service args; cap 90 min. A/B: the same without
+   --busy-prefill-chunk / --prefill-interleave (is the interleave the trigger?).
+3. Fix in the engine, exact (numerics untouched). Gates: the reproducer x2 clean at its cap; CPU tests; texts = M285;
+   then v1.0.1 (tag + image) installed by the coordinator, the 2 h soak again (then the CPT-week gates, note 255).
+Stop rule: if the trace shows no owner after 3 reproductions, report and propose (a) instead.
+
+## 257. Owner: Intel release names carry "-intel" (owner, ~13:4x UTC 11-12, via coordinator)
+Upstream radiance owns v1.0.0 .. v1.12.0, so ours are: v1.0-intel (= 8c48ea1, image 323; the local tag "v1.0" was renamed by
+the coordinator, same message), v1.0.1-intel (= c5339bf, image 327, the soak-fix), and the gate_up epilogue fold (note 254)
+ships as v1.1-intel. Use these names in V1.md, WAITING, commit messages and the GitHub release; never create bare vX.Y tags.
+
+## 258. Coordinator: amd-host / disk freed to 65 GB (owner OK, ~13:5x UTC 11-12)
+Removed images (owner OK): ri-m1rocm:2, tcclaviger/vllm:29.04.9, lora-unsloth:1, lora-peft:1, layout-rocm:1 (~4 GB net:
+shared layers). Then ALL 63 igcdump-* folders (11.7 GB) moved to /srv/bulk/ri/archive/igcdump/ (each copy diff-verified
+before the local copy was removed) with a SYMLINK left at every old path, so notes and scripts still resolve. (The
+intended ">2 days untouched" filter failed on this host's find, so recent ones moved too -- harmless: the links work.)
+Write NEW igcdump output straight to /srv/bulk (m3/igc-dump.sh's output root), not into ~/code/radiance-intel. Free / = 65 GB.
+
+## 259. Owner: BUILD IMAGE SUPPORT for the Intel engine (owner, ~16:1x UTC 11-12, via coordinator)
+G2 found image input refused (501): the build has no FFmpeg (RAD_WITH_FFMPEG off). Owner chose to build it.
+1. Build image: add FFmpeg dev packages (libavformat, libavcodec, libavutil, libswscale, libswresample + pkg-config) to a NEW
+   build image (keep ri-m1buildneo:2 / :4 untouched for reproducibility); runtime image gets the runtime libs. amd-host / has
+   65 GB free now (note 258). Rebuild the engine with media on; CPU tests (images_test / videos_test, the "known four" that
+   need FFmpeg should now pass -- report which).
+2. Card: after G4 (ends ~16:42 UTC), in a coordinated v1 stop (ask the coordinator): one image request in the labeler's exact
+   shape, then the labeler's evals against production's answers (~/code/app-images/labeler: say which eval / how many
+   items), plus the encoder's time per image. Correctness first; speed reported.
+3. Exactness: text-only requests must stay byte-identical to v1.0.1-intel (texts = M285 + a seeded sampled check). If the
+   encoder kernels on Xe2 are wrong or slow, report and size the fix -- no kernel work without the coordinator.
+4. Pass -> a v1.0.2-intel candidate (owner decides the switch); v1.0.1-intel stays the rollback.

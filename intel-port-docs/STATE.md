@@ -1,5 +1,5 @@
 <!-- runner:begin (written by run.sh after every run; do not edit) -->
-Milestone 3 usage: $3474.48 of $4000 budget (241 session(s)). Today (2026-11-11, America/New_York): $200.53 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 80. Updated 2026-11-12 00:20 UTC.
+Milestone 3 usage: $3564.61 of $4000 budget (241 session(s)). Today (2026-11-12, America/New_York): $55.15 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 80. Updated 2026-11-12 13:30 UTC.
 <!-- runner:end -->
 # STATE — Radiance on Intel, milestone 3
 
@@ -4855,6 +4855,317 @@ reviewed-fault: klog@2026-11-09T14:26:01Z=0000:0f:00.0 | fault-response | the su
     the driver busy-waits (M413B's stack: libze "state R, running") -- the change: replace it with a zeEventQueryStatus
     of the pending slot's event (or HostSynchronize with timeout 0) and sleep the whole slice, keeping the 20 s budget;
     no change to the healthy path. Not built now (the note's word). Nothing else queued: idle-skip until a new note.**
+  - **RUN 340 (06:40 UTC 11-12): the coordinator STOPPED v1 (unit + watchdog timer inactive at 06:40; precheck 06:40:39
+    card clients 0 / 0, no dri containers). V1R1 STARTED 06:41 (`hstep.sh V1R1 3a1cc3f7af96 v1svc-u3 90`: image 325,
+    the v1 env + RADIANCE_MOVER_TRACE=1, the service's args, 3 concurrent loops over H7's 11 bodies, both cards, the
+    guard --hot 80); the first requests 200 (06:4x). WAITING's top line: v1 stopped, do not start until "start v1".**
+  - **V1R1 REPRODUCED (reproduction 1 of note 256's 3; klog to be read): the engine exited 1 after ~31 min (06:41 ->
+    07:12; 982 requests counted by the summary, 1,875 lines; 3-user tok/s median 59.8, ttft median 2.24 s) on the same
+    error at a 350-token step: `recalled the activation arena loan to 1063264256 and a slot at 1134661632 is still
+    held`. THE TRACE (results-m3/card01/V1R1/serve.log l.27685-27709): 12 held slots past the loan dumped (the cap),
+    class 7 slots 9836-9847, EVERY ONE last taken by a SWAP PROMOTE in the CURRENT dispatch (44103 = now), units 13284 /
+    7872 / 12254 / ..., and for each "NO unit and NO record names it"; no double-promotion line anywhere -> case (i): the
+    promotions were still Copying when reclaim's record sweep ran, and the sweep clears a Promote record without
+    freeing its slot (frees_slab() false). The open question: why still Copying after flush_moves + sync(mover) +
+    retire + sync(compute) + retire -- the backend's glued appends (RADIANCE_L0_GLUE_ALL=2: the mover's copies and
+    events on the transfer list ximm) do advance npend and settle() waits on it, so by reading they should be done.
+    Freeing such a slot blindly could let the arena reuse memory a copy still writes -> not done. NEXT: the trace
+    extended (reclaim logs every record still Copying right after the drains: kind, unit, slot, flex / covered, event
+    done, the slot's take dispatch, unflushed copies) -> build -> image 326 -> reproduction 2 (V1R2, same config).**
+  - **V1R1's klog clean, peak 59 C; the failing step was a new request's 348-token prefill admitted mid-decode (the
+    soak's pattern; every failure coincides with a new prompt = new shapes = tape recordings on the rank thread). The
+    extended trace committed (see git log), image 326 = 94ade0ccf5aa (sha256:4e7c117e...151; amd-host's :325 removed for
+    disk, 53.8 -> 56.4 GB). V1R2 STARTED 07:3x (`hstep.sh V1R2 94ade0ccf5aa v1svc-u3 90`), v1 still stopped.**
+  - **V1R2 (07:39-08:09, image 326; klog clean, peak 60 C): NO stop in 90 min (server exit 124 = the time limit; 2,674
+    requests) -- a non-reproduction -- BUT THE MECHANISM IS SHOWN: at EVERY recall the after-drain dump lists records
+    STILL Copying (36 at once at the first recall; 3 at another), event done 0, 0 copies unflushed -- promotions (kind 0)
+    and demotions (kind 1) in budgeted slots this time (covered, so the check passes). So rad_stream_sync(mover_) +
+    retire does NOT mean the mover's copies have landed (a backend question: the L0 transfer list under GLUE_ALL=2 --
+    n_slot_wait / settle look sound by reading; left open as a separate item). When such a promotion targets an
+    uncovered lent slot, the sweep orphans the slot (V1R1, the soak), and its copy can land in memory the arena takes
+    back. THE FIX (exact: it only waits; v1.0.1 candidate): Mover::reclaim, after the drains, waits (sleeping, 50 us
+    -> 1 ms steps, retiring each time, bounded 10 s -> the old error) until no Copying record touches an uncovered lent
+    slot; counters recall_waits / recall_wait_us in the mover report. Build l0t from 08:1x -> image 327 -> V1R3 / V1R4
+    (the reproducer x2 clean at its cap, note 256 item 3), then the M-pair texts (= M285) and v1.0.1.**
+  - **The fix: built green (mover / mem / sched CPU tests 3/3, logs/build-l0neo-l0t-20261112T081120.txt), COMMITTED
+    c5339bf (src). Image 327 = 777c6e07a4aa (sha256:b397ff5b...087), loaded on intel-host. V1R3 STARTED 08:13:52 (cool 40 C)
+    (`hstep.sh V1R3 777c6e07a4aa v1svc-u3 90`), v1 inactive. Next: V1R4 the same way, then the M-pair texts, v1.0.1.**
+  - **V1R3 (08:13-09:04, image 327): CLEAN AT ITS CAP (server exit 124; 2,558 requests; klog clean; peak 60 C; tok/s
+    median 60.2). No mover error (the only E lines: two "Jinja Exception: No messages provided" near startup). The fix
+    engaged ONCE, exactly the failing case: rank 0 "1 loan recalls waited for a copy into a lent slot to land (6.5 ms
+    in all)" -- that recall would have stopped the engine before; rank 1 never needed it. 66 recalls still list
+    records Copying after the drains (the separate open item; desk reading in the brief §4b). V1R4's first start (09:05)
+    exited 127 at once: its step dir was never staged (my slip; nothing ran, klog clean). Staged from V1R3 (card, args,
+    m2-heat.sh) and RESTARTED ~09:1x, same command. NEXT if clean: the texts gate M426 = `bash m3/mstep.sh M426
+    777c6e07a4aa svcmtpx-gnt0-hc8-rp-gnx M285 svcmtpx-gnt0-hc8-rp-gnx` (greedy body; coupling default on, greedy
+    unchanged per note 246's check), then tag v1.0.1 = c5339bf and the V1.md / run.sh / unit image 327, and "start v1"
+    in WAITING.**
+  - **V1R4 (09:06-09:56, image 327): CLEAN AT ITS CAP (server exit 124; 2,783 requests; klog clean; peak 61 C; tok/s
+    median 59.9). Only the two startup Jinja lines; rank 0 "1 loan recalls waited ... (9.6 ms in all)", rank 1 none.
+    NOTE 256 GATE "the reproducer x2 clean at its cap": MET (V1R3 + V1R4). M426 (texts vs M285) STARTED ~09:5x.**
+  - **M426 (327, greedy, klog clean, 65 C): TEXTS IDENTICAL to M285 (both runs), run 2 92.99 tok/s. EVERY NOTE 256 GATE
+    BEFORE v1.0.1 PASSED. Tag: upstream already owns v1.0.1 (8ddb77e; also v1.0.0-v1.12.0 incl. v1.1.0) -> ours is
+    v1.0.1-intel = c5339bf (annotated, local; naming flagged in WAITING). V1.md (a v1.0.1 row; rollback -> :323) and the
+    unit (Image = :327 sha256:b397ff5b...087) updated on amd-host AND in intel-host's service folder; NOT installed (the
+    coordinator's). WAITING's top: "QUESTION FOR COORDINATOR: start v1 -- as v1.0.1". NEXT: when the unit is active and
+    /health answers -> the fresh 2 h soak (soak.sh 120 3, as run 337's) + the klog; then the watchdog forced-failure
+    test if the coordinator allows; then note 255's CPT-week gates, then note 254's fold.**
+  - **RUN 341 (~10:2x UTC 11-12): no new note (256 the last); v1 still inactive, WAITING's "start v1 -- as v1.0.1"
+    unanswered. DESK + BUILD of note 254's fold (allowed any time; card steps only after the soak, in a booked window).
+    Design: briefs/2026-11-12-gate-up-epilogue-fold.md. KEY FINDING: gated_quant_pair is the default (run 279), so the
+    routed quantiser shares ONE launch with the shared expert's -- folding the routed arm alone saves no launch. So the
+    fused op takes both arms: `moe_gemm_q_gq` (libxe, RADIANCE_XE_GU_EPI=1 opt-in, not with RADIANCE_XE_TAIL_SKIP) = format
+    C gate_up <5,16,1> + a counter epilogue (each work-group counts in once a (run, 128-col group); the 8th arrival
+    quantises the group: silu x up, the 128-wide Hadamard as 8 values x 16 lanes, int8 at amax/127 -- the port's
+    arithmetic op for op) + work-groups for the shared rows at the front of the grid. The default kernel is unchanged (the
+    body is an always-inline template; moe_i4i8_run_kernel calls it with EP off). The arch (rad_block_moe_fp8.h) declares
+    op_gugq after op_rtq3 and issues it in place of op_gu + op_gqp when rqf3 && router_fused_gate && gu_fused. CPU test
+    xe_moe_gu_epi_cpu: gate_up + gated_quant_pair vs the fused row, every byte cmp'd, 6 decode cases (1-16 tokens, a narrow
+    class, runs > 4 rows, shared widths 260 / 388). Uncommitted. Build l0t ('moe_i4i8|gu_epi|gate_quant') from 10:2x.
+    DISK: / at 50 GB (< note 23's 55): `podman image prune -f` was DENIED in this session (no approval surface); the
+    compile build writes /srv/bulk (9.9 TB) so it runs, but the NEXT RUNTIME IMAGE (~3.3 GB on /) waits for a prune.**
+  - **FOLD BUILD GREEN: xe_moe_gu_epi_cpu BIT-IDENTICAL over all 6 cases (logs/build-l0neo-l0t-20261112T102407.txt;
+    the few 0x5A bytes are equal in both runs, at the 1/256 chance rate of a real code); xe_moe_i4i8_cpu / _kc / _sel /
+    _downr1 / _downr4, xe_gate_quant_cpu, xe_gated_quant_pair_cpu, arch_test, ops_doc pass (-104916.txt, after fixing
+    the arch declaration: `tables` was out of scope, the table is built inline). COMMITTED 3a89271 (opt-in; card gates
+    pending). NEXT for the fold, all after the v1.0.1 soak passes, in a booked window: image (needs / >= 55 GB first) ->
+    card row check (the CPU test on the B70: RI_DEVICE unset) -> M-pair `-gqe-` vs plain (texts = M285, >= +0.5 %) + -prof
+    twin -> rotation pair. Suffix `-gqe-` (m3-tps.sh) / `-gqe` (m2-heat.sh, stripped after -u3 / -noint) =
+    RADIANCE_XE_GU_EPI=1; both `bash -n` clean. v1 still inactive at ~10:5x.**
+  - **RUN 342: no new note (256 the last); v1 inactive, WAITING's "start v1 -- as v1.0.1" unanswered; / still 50 GB.
+    Idle-skip: the soak, the fold's card gates and its image all wait (see above).**
+  - **RUN 343: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 344: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 345: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 346: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 347: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 348: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 349: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 350: unchanged (256 the last note; v1 inactive; "start v1" unanswered; / 50 GB). Idle-skip.**
+  - **RUN 351: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 352: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 353: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 354: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 355: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 356: unchanged (256 the last note; v1 inactive; "start v1" unanswered). Idle-skip.**
+  - **RUN 357 (13:32 UTC 11-12): NOTE 257 (Intel release names carry -intel: v1.0-intel = 8c48ea1 / 323, the coordinator
+    renamed the local v1.0; v1.0.1-intel = c5339bf / 327; the fold ships as v1.1-intel; never bare vX.Y tags) -- applied in
+    V1.md (copied to intel-host), the fold's brief and WAITING. WAITING ANSWERED: the coordinator (radiance-test-e2) started
+    v1.0.1-intel ~13:3x (image 327 healthy ~135 s, watchdog timer active, no --api-key on the cmdline, keyless 401 / key
+    200, a chat 200; the v1.0 unit kept as ~/.config/containers/systemd/ri-m3-flashnext.container.v1.0-323). The failed
+    v1.0 soak's request log + stats 0-14 copied to m3/service/soak-1112-v10/ on intel-host. THE 2 h SOAK STARTED 13:32:2x:
+    `timeout 7500 ssh intel-host bash .../m3/service/soak.sh 120 3` (logs/soak-v101.txt) + the guard `timeout 7800
+    intel-host-engine-guard.sh --hot 80 ri-m3-flashnext 60` (logs/guard-SOAKV101.txt); klog baseline @1794490334 (13:32:14);
+    the first requests 200 from all 3 users. Gates (note 249 item 5 / 256 item 3): no stop, no GPU fault, MemAvailable
+    >= 20 GiB, heat held, tok/s near the rotation; plus no "still held" error and the recall-wait counter.**
+  - **THE v1.0.1-intel 2 h SOAK PASSES (13:32:28-15:32:26 UTC). The harness cut both background jobs at exactly 2 h (its
+    background cap is 7.2e6 ms, not the 7.5e6 / 7.8e6 I asked), so soak.sh's own end summary was not printed; its log
+    covers the full 120 min. soak_sum (logs/soak-v101-requests.txt): 4,128 requests, ALL 200, 0 failure windows; wall
+    median 5.20 s / p90 7.37 / max 11.08; every one of the 11 bodies 373-376 times. Kernel log since @1794490334: clean
+    (ri-klog2 SOAKV101). Sampler (logs/cpu-SOAKV101.csv): peak Tctl 68.0 C, lowest MemAvailable 39,699 MiB. Journal
+    (logs/journal-SOAKV101.txt, 112,972 lines): 0 E lines, ONE engine PID throughout (no restart), no "still held" / "wrong
+    phase"; the only W lines are two "rank barrier: a thread has waited 10 s at the step barrier (generation 747380, 2 of 3
+    arrived)" at 15:32:36, 10 s after the load ended -- nothing after it, no stall exit (60 s), and v1_check PASS afterwards
+    on both addresses (keyless 401 / key 200; greedy 130 tokens 69.0 tok/s, sampled 92 tokens 82.8 tok/s). (The v1.0 soak
+    on 323 stopped at 19.5 min.) The recall-wait counters print only at engine exit, so not read. NEXT: note 255's CPT-week
+    gates (G2 feature parity on the running v1 -- image input, a tool call, reasoning on / off, 18k and 60k prompts; G3 the
+    alias rehearsal, the coordinator's; G4 1 h at 2 users), then note 254's fold card steps.**
+  - **NOTE 255 G2 (15:35-15:40, the running v1.0.1-intel; m3/tools/g2_parity.py; guard --hot 80, klog2 G2 clean):
+    tool call PASS (finish tool_calls, get_weather {"city":"Paris"}); reasoning on PASS (126 chars in the reasoning
+    field, none in content), off PASS; 18k PASS (18,710 prompt tokens, 25.9 s, needle exact); 60k PASS (63,940 tokens,
+    95.1 s, needle exact). IMAGE FAIL: HTTP 501 "image input requires a vision encoder; this model was loaded without one"
+    -- misleading: the tower IS loaded (856.68 MiB a rank, 48.27 MiB pass staging); every start logs "W media: the
+    'vision' encoder is loaded but this build has no media decoder (RAD_WITH_FFMPEG)"; the build image ri-m1buildneo:2
+    has no FFmpeg dev libs ("no libavformat" at every configure). Missing + estimate in WAITING (decoder ~half a day + ~0.5-1
+    GB on /; the encoder's kernels on the B70 never exercised, ~1 day to check vs production's answers). No build without
+    the coordinator. Decision there: build the decoder, or a text-only CPT week. G4 can run text-only now.**
+  - **G4 STARTED 15:41:3x (text-only: G2 refused images): m3/tools/g4_mix.py, 2 users x 60 min against
+    <lan-ip>:8030 (the LAN path), the soak's 11 bodies alternating greedy / the service's sampled defaults, every
+    25th request of each user an ~18k prompt with a needle; logs/g4-requests.txt; guard logs/guard-G4.txt (timeout
+    3900); klog baseline @1794498092. Smoke run (1 min, a long prompt every 3rd): 6 / 6 200, needles right.**
+  - **RUN 339 (06:31 UTC 11-12): no new note (256 the last); v1 still active -- the coordinator has not stopped it yet
+    (WAITING's top line). Idle-skip; V1R1 stays staged.**
+  - **RUN 338 (06:20 UTC 11-12): NOTES 253-256. 253: the coordinator restarted v1 on 323 (healthy) and MOVED tag v1.0
+    to 8c48ea1; the amd-host cleanup script protects 322 + 323 (I had removed amd-host's :322 at 04:4x, before reading 253 --
+    intel-host keeps its 322; recorded in WAITING). 254: owner YES to the gate_up epilogue fold as a v1.1 candidate (after the
+    soak passes). 255 (x2): the soak error -- root cause first; the CPT-week gates (after the soak). 256: (b) ROOT CAUSE
+    FIRST; image 324 / ARENA_LEND stays UNUSED; cards free until the k8 week; the coordinator stops / starts v1.
+    DONE: reverted the staged mitigation (run.sh no longer sets RADIANCE_ARENA_LEND; the unit -> 323 on both copies;
+    V1.md -> 323 / 8c48ea1); desk brief briefs/2026-11-12-arena-recall.md (every take / free path; two candidates: (i) a
+    Promote record not retired at the recall's sweep -- frees_slab() is false for Promote, the slot is orphaned; (ii)
+    a double promotion -- fill() checks busy, not unit_in_flight(); the soak's 3 users vs the rotations' 1 and the
+    interleave flags); COMMIT ad9553c RADIANCE_MOVER_TRACE=1 (tags takes, logs a double promotion at retire, dumps the
+    held slots past the loan at the failing check; mover / mem / sched tests pass); image 325 = 3a1cc3f7af96
+    (sha256:599cc186...ee1) on intel-host. m2-heat.sh: config `v1svc` (run.sh's env + the trace), suffixes `-u3` (3
+    concurrent loops, each ends once the engine exits) and `-noint` (drops the interleave flags); bash -n clean. Step
+    V1R1 staged on intel-host (H7's card, the service's args, today's m2-heat.sh). (An older m3/R1 got the same three files
+    added beside its e2e results before I switched to the new name -- nothing in it was replaced.) amd-host disk pruned
+    (amd-host's :324; 53.5 -> 56.1 GB). WAITING: "QUESTION FOR COORDINATOR: stop v1" at the top. NEXT: when
+    `systemctl --user is-active ri-m3-flashnext` = inactive: `timeout 7000 bash logs/hstep.sh V1R1 3a1cc3f7af96
+    v1svc-u3 90`, then read serve.log's "mover trace" lines; A/B v1svc-noint-u3; fix (exact) -> v1.0.1; then
+    "start v1" in WAITING.**
+  - **RUN 337 (04:11 UTC 11-12): v1 RESTARTED at 04:09:17 (the owner): image 323 + the new key. Checks: the engine's own
+    /proc cmdline has NO --api-key (0) and --gpu-headroom-mib 4096; v1_check PASS with the NEW key on <lan-ip>:8030
+    and <vpn-ip>:8030 (/health 200, keyless /v1/models 401, keyed 200, greedy 130 tokens 2.12 s = 61.4 tok/s incl.
+    first token, sampled 94 tokens 1.20 s = 78.3); 322 cannot read the env key and run.sh would refuse it, so this is
+    323. Kernel log since 04:08:00 (@1794456480): 0 fault lines. soak.sh KEYED (the key read from the unit's env file
+    into a variable, sent by printf: never on a command line; /stats too); the 11-05 soak's request log + stats copied to
+    m3/service/soak-1105/ (34 files) before the overwrite. THE 2 h SOAK STARTED 04:12:3x: soak.sh 120 3 (H7's 11 greedy
+    bodies, 3 users) from amd-host via ssh (logs/soak-v1.txt), the heat guard on ri-m3-flashnext at --hot 80
+    (logs/guard-SOAKV1.txt); ri-sample.sh SOAK beside it (cpu-SOAK.csv on intel-host); the first requests 200. Gates (note
+    249 item 5): no stall, no GPU fault, MemAvailable >= 20 GiB, heat held, tok/s near the rotation. The watchdog's
+    forced-failure test needs a unit restart with the fault hook -- not possible from this session: the owner's.**
+  - **SOAK FAILURE 1 (04:31:59, ~19.5 min in; image 323; NO GPU fault -- klog clean since 04:30, guard peak 63 C,
+    lowest MemAvailable 39.9 GiB): `E mover: recalled the activation arena loan to 1063264256 and a slot at
+    1072189440 is still held` (Mover::reclaim's last check, mover.cpp:1500) -> `E rank 0: taking the arena back from the
+    expert slab for a 456-token step: called in the wrong phase` (engine.cpp:1267, RAD_E_STATE) -> the step loop failed,
+    every request 500, the engine exited 1; systemd (Restart=on-failure) restarted it at 04:32:29 and it serves again.
+    The watchdog did not act (no kernel fault). NEW: not seen before this milestone. A held slab slot in the arena
+    loan's strip that no unit owns after the recall -- a leak in some path (not found by reading: promote / demote /
+    migrate / quarantine all return or free theirs). A difference from every rotation: the service's args carry
+    --busy-prefill-chunk 1024 --prefill-interleave 8 (the HSMP / H161 args do not), so interleaved prefill chunks
+    meet decode at the arena levels. I could not stop the soak client (TaskStop ended the local ssh; `pkill` refused):
+    its loops waited through the restart and carry on to ~06:12, which shows whether it recurs. MITIGATION built
+    (opt-in, default unchanged): RADIANCE_ARENA_LEND=0 (engine_bringup.cpp) lends nothing of the arena, so no recall
+    ever runs; build l0t from 04:3x -> image 324 for the owner's choice. WAITING + app-notify.**
+  - **THE SOAK FAILED its stability gate (m3/tools/soak_sum.py on results-m3/card01/soak-v1-requests.txt):
+    04:12:37-06:12:35, 3,930 served 200, 19 x 500, two 155 s outages (04:31:56 and 05:21:19, the SAME error: `recalled
+    the activation arena loan to 1063264256 and a slot at 1096568832 is still held` for a 464-token step), served wall
+    median 5.15 / p90 7.45 / max 10.57 s, 354-360 a request type; NO GPU fault the whole soak (klog 0 since 04:08);
+    cpu-SOAK.csv: 1,206 samples, peak Tctl 70.5 C, lowest MemAvailable 39,894 MiB. The guard ended at the first
+    restart (it follows one container). soak.sh's main process died with the stopped ssh (no summary); its user loops
+    ran to the end; the sampler flag removed at 06:1x. THE ONE FIX (note 249), STAGED: commit 6d68645 (mover / mem /
+    sched tests pass), image 324 = cebe875914ee (sha256:0b36bea4...e2a) on intel-host; run.sh exports RADIANCE_ARENA_LEND=0
+    (=${RADIANCE_ARENA_LEND:-0}); the unit (installed + folder) -> 324; V1.md updated; amd-host's :322 removed before the
+    build (54.1 -> 56.7 GB). Needs the owner's daemon-reload + restart (WAITING run 337, 06:2x). NEXT: on a start after
+    06:2x with image 324: v1_check, the cmdline check, then the 2 h soak again (the one retry) with soak.sh's output
+    to a file ON intel-host (so a stopped local ssh does not kill its main process) and the guard re-armed after any
+    restart. The root cause (the leaked slot in the arena recall) needs a booked mover-debug window.**
+  - **RUN 336 (04:01 UTC 11-12): NOTE 252 (a higher power cap on 0f:00.0) arrived CLOSED -- the owner's 250 W write was
+    refused by 0f:00.0's firmware (230 W is the reference board's hard limit) and 0b:00.0's 250 W was restored to 275 W;
+    note 77's caps stand; a 250 W reading on 0b:00.0 in a ~03:0x-03:2x UTC log is that test. Nothing to run. The service
+    still from 02:12:32 (image 322): the restart is the owner's. Idle-skip.**
+  - **RUN 335 (03:50 UTC 11-12): NEW NOTE 251 (owner YES, desk only): the fused MoE decode megakernel paper (arXiv
+    2609.04244, MonoMoE, FlashInfer) against our expert path. decision: do it now | alternative: wait for note 250's soak
+    | why: the soak waits on the owner's restart (the service still from 02:12:32, image 322), and this uses no card or
+    build. DONE: briefs/2026-11-12-moe-megakernel-paper-vs-ours.md. Verdict: NO item >= 2 % of the step -> no build
+    proposal. Ranked: (1) SwiGLU + the int8 quantiser into gate_up's epilogue -- not done, reachable EXACTLY (the
+    quantiser is per 128-column group, no row reduction), ~0.2-0.3 ms net (~1 %), recorded for the owner; (2) down +
+    routing weight + atomicAdd -- rejected (nondeterministic order, the combine is 0.26 ms); (3) one persistent launch a
+    layer -- tried (megakernels / hc merge / coop: -2.7 to -4.2x on Xe2), and its boundary saving here is ~0.13 ms
+    (0.5 %); (4) routing in-kernel -- partly done (rqp), 0.1 %; (5) unpadded weight-major -- we never pad, the paper's
+    biggest win has no counterpart; (6) FP8 tensor cores -- not on Xe2, our gap to the paper's ~49 % of peak (ours
+    32-34 %) is the 4-bit decode's instruction stream; (7) deeper loads / prefetch -- T1c no gain. WAITING: one line.**
+  - **RUN 334 (03:40 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 333 (03:30 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 332 (03:20 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 331 (03:11 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 330 (03:01 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 329 (02:50 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 328 (02:41 UTC 11-12): unchanged (250 the last; the service from 02:12:32, image 322). Idle-skip.**
+  - **RUN 327 (02:31 UTC 11-12): no new note (250 the last); the service still started 02:12:32 (image 322, the first
+    key): the restart is the owner's. Idle-skip.**
+  - **RUN 326 (02:20 UTC 11-12): NOTE 250 (coordinator): v1 installed by the coordinator (the unit, the watchdog units,
+    reload, started; the timer enabled); comfyui / qwen36 / app-embed off boot-start; watchdog.sh fixes (a 15-min start
+    grace; the klog look-back capped at 10 min -- a stale 11-05 state had stopped the service at 02:12:12). The service's
+    ActiveEnterTimestamp is 02:12:32, BEFORE run 325's fix: still image 322, the first key on argv; v1_check with the new
+    key: /health 200, keyless 401, keyed 401 (the old process). daemon-reload refused again; per the SendMessage rule no
+    peer is asked to run a command my session is denied -- the restart is the owner's (WAITING run 326). Answered note
+    250's questions in WAITING (power caps: the boards' stock caps, note 77; the host-pool experts: headroom 4096).
+    NEXT: on a start time after 02:4x: v1_check (new key), ps without a key, klog, then (a booked window) the watchdog's
+    forced-failure test and the 2 h soak.**
+  - **RUN 325 (02:10 UTC 11-12): the OWNER INSTALLED v1 (ri-m3-flashnext active since 02:10:07, image 322; the watchdog
+    timer inactive). FOUND: v1.0's run.sh passed --api-key, so the key sat on the engine's command line (ps /
+    systemctl status; it also reached this session's output) -- against note 249 item 3. My session may not stop /
+    restart / daemon-reload the unit (refused, plain and timeout). FIX (note 249's one fix): commit 8c48ea1 (config.cpp:
+    with no --api-key, the key from RADIANCE_API_KEY; config / server / gen_config tests PASS), image 323 = a421a7f0a177
+    (digest sha256:055421c7...682) loaded on intel-host; run.sh exports the variable, passes no flag, and REFUSES to start
+    an engine whose --help lacks RADIANCE_API_KEY (322's: 0 matches, 323's: 1 -- checked in containers on amd-host; so an
+    old image fails closed, never keyless); the unit -> 323 (installed copy + the service folder, timeout scp);
+    V1.md updated. KEY ROTATED: a new key in the env file (600, 61 B), scp -p to amd-host (v1_check: mode 0o600). v1_check
+    (m3/tools/v1_check.py, the key read inside python, never printed) on the RUNNING 322 with the first key: /health 200
+    on <lan-ip>:8030 and <vpn-ip>:8030, /v1/models 401 keyless / 200 keyed, greedy 200 (130 tokens, 2.60 s),
+    sampled 200 (94 tokens, 1.26 s) -> PASS; after the rotation the keyed request is 401 (the old process), as
+    expected. `git tag -d v1.0` refused: v1.0 stays at 97f897d; v1 = v1.0 + 8c48ea1 (the owner's call). Disk: amd-host
+    pruned (dangling probe layers, amd-host's :321; 316-320 were already gone) 51.5 -> 56.8 GB before the build. app-notify
+    sent (no secret). WAITING run 325 has the owner's restart commands. NEXT: on a restart (the process older than
+    02:4x, or `ps` without --api-key): v1_check PASS with the new key, `ps` shows no key, klog, the watchdog's
+    forced-failure test, the 2 h soak.**
+  - **RUN 324 (02:01 UTC 11-12): no new note (249 the last), no gating files; ri-m3-flashnext and its watchdog timer
+    inactive (not installed: the owner's step, WAITING run 323 note-249 section). Idle-skip.**
+  - **RUN 323 (00:20 UTC 11-12): NEW OWNER NOTE 247 -- BOTH ON by default (RADIANCE_MTP_COUPLED=1 and
+    RADIANCE_XE_MTP_COOP=1), explicit =0 opts out; one confirming pass (sampled + greedy rotation vs H164 / H166);
+    docs: fixed seeds no longer reproduce pre-coupling tokens. decision: COOP default-on in libxe (Intel-only code:
+    coop_on() reads !="0"); the COUPLING via the environment of the service (m3/service/run.sh exports
+    RADIANCE_MTP_COUPLED=${RADIANCE_MTP_COUPLED:-1}) and of the step scripts (m3-tps.sh / m2-heat.sh add =1 when ARGS
+    drafts, i.e. --num-speculative-tokens is not 0; `-cpl0-` / `-cpl0` sets =0) | alternative: the engine's own default
+    in arch/common/rad_spechub_config.h, or the image's ENV | why: that header is shared with the AMD build and the
+    plugin / tests, and the engine REFUSES the flag where there is no linear draft chain (engine_draft.cpp step_state_init
+    RAD_E_UNSUPPORTED; the arch at max_spec < 1), so an image-wide =1 would break every MTP-off run (the nomtp M-halves,
+    all the prefill B-runs) and the tiny model; note 247 allows the service / image environment. Docs:
+    m3/service/README.md "The MTP coupling is on". Build green (logs/build-l0neo-l0t-20261112T002417.txt: 10 / 10,
+    incl. the unset-env xe_mtp_couple_cpu now running the coop form); image 320 building; the libxe flip staged, NOT
+    committed until the pass. Staged H168 (sampled, HSMP) / H169 (greedy, H161 bodies), config `bestrxgrf3w16p4` (no
+    suffix: the new defaults).**
+  - **NOTE 247 DONE. Image 320 = c3d77a10cdbb (aa4672c: the coop verify default-on; the coupling from the step /
+    service environment). H168 (sampled, klog clean, 58 C; serve.log has RADIANCE_MTP_COUPLED, "MTP coupled LIVE", no
+    COOP variable = libxe's default): 293 requests, 110.7 / 108.11 / 104.83 tok/s (H164 110.5 / 108.02 / 104.78), finish
+    132 / 83 / 78, rot_texts H164 vs H168 11 / 11 identical. H169 (greedy, klog clean, 61 C): 308 requests, 111.9 /
+    112.06 / 111.45 (H166 111.9 / 112.03 / 111.40), rot_texts H166 vs H169 11 / 11 identical. COMMIT aa4672c (src,
+    intel-l0). New references: image 320; sampled rotation H168, greedy rotation H169; every MTP-on step from here runs
+    coupled (`-cpl0` / `-cpl0-` = the uncoupled control). The service unit's image is unchanged (note 96); its run.sh
+    now exports the coupling. NEXT: idle-skip until a new owner note; the 'tv' head stays parked (note 247).**
+  - **NEW OWNER NOTES 248 (two cheap exact levers: the coupled verify's walk length; the all-reduce block count) and 249
+    (v1: freeze after 247 + 248, install officially on intel-host -- LAN + key, Quadlet + watchdog, a 2 h soak). NOTE 248
+    ITEM 1, desk: the candidate plane is NOT always compacted -- libref's narrow() drops in place (id -1, -inf):
+    top_k / top_p / min_p leave a descending prefix, but sample_typical and sample_xtc drop in the middle, so "stop at
+    the first -1" would not be exact. The EXACT bound for any plane: walk to the row's LAST slot with id >= 0 (every
+    verify loop -- validity, sums, mass, both CDF walks -- skips id < 0, so the slots past it change nothing). Done in
+    libxe only (rad_spechub.h untouched): live_end() for the serial row and the fallback (a copy of the call with the
+    shorter n_cand; rows are addressed by ld[], not n_cand), a 128-wide max-index scan in the coop kernel. Test:
+    RI_MTP_TAIL / RI_MTP_HOLES; ctest w1024_t1000_h{0,1}, w1025_t1000_h0 x both forms against the host reference's FULL
+    walk: 16 / 16 PASS (logs/build-l0neo-l0t-20261112T010631.txt). Image 321 building. ITEM 2: m3/intel-host/ar-blocks.sh
+    (ar-stamps.sh's bench with XE_AR_BLOCKS forced: per count 0(default) / 1 / 2 / 4 / 8 the correctness cases at 20
+    iterations, then rows 1 / 2 / 4 AR_BENCH 5000 with the stamps ON); logs/arstep.sh's 5th argument SCRIPT (ar-stamps.sh
+    | ar-blocks.sh). ARB1 (`arstep.sh ARB1 c3d77a10cdbb 5000 <2640 tree> ar-blocks.sh`) from 01:1x.**
+  - **Image 321 = 96625c520a31 (the bounded walk). ARB1 (01:19-01:20, both cards, image 320 + the 2640 tree's test /
+    libxe; guard 40 s, 47 C, klog2 clean; results-m3/card01/ARB1-out.txt): EVERY forced count 1 / 2 / 4 / 8 and the
+    default passes every correctness case (5 x allreduce_test PASS, worst |diff| 0). The 5,000-launch pitch (median of
+    the rank pair's minimum over 3 reps): rows 1 default (2 blocks) 11.71 / 1: 9.95 / 2: 10.45 / 4: 7.62 / 8: 7.85 us;
+    rows 2 default (3) 23.00 / 1: 12.23 / 2: 11.15 / 4: 10.04 / 8: 9.96; rows 4 default (5) 12.09 / 1: 15.81 / 2:
+    12.32 / 4: 11.61 / 8: 11.36. The stamps' self-calibrated tick was unstable this run (spans above the pitch), so the
+    pitch is the judge. Rows 2's 3-block default is the odd size AR1 / AR2 saw (its last block waits). XE_AR_BLOCKS
+    forces a count for EVERY message (prefill's larger ones too), so the form tried is a FLOOR: XE_AR_MIN_BLOCKS=N
+    (xe_allreduce.cpp, the all-reduce only; opt-in; capped at the resident cap and 128 words a block) -- build l0t
+    ('mtp_couple|allreduce') from 01:2x -> image 322. M422 (321, the plain config = coupled + coop by default; klog clean,
+    61 C): runs 1-2 TEXT IDENTICAL to M420 at 115 steps, run 2 88.40 tok/s (M420 87.76). M423 (`-prof`): logits ->
+    round 1 750 -> 591 us (device 0) / 709 -> 512 (device 1) -- at the uncoupled sampled figure (M416 551); idle
+    between plays 93.2 ms (device 1; M421 105.9). H170 (321, sampled HSMP, vs H168) from 01:3x.**
+  - **H170 (321, sampled, klog clean, 63 C): 295 requests, 111.3 / 108.68 / 105.42 (H168 110.7 / 108.11 / 104.83:
+    +0.5 / +0.5 / +0.6 %), rot_texts H168 vs H170 11 / 11 identical -> ITEM 1 ADOPTED (exact, at the bar): COMMIT
+    f048e4e. Image 322 = 404b352bf33b (f048e4e + XE_AR_MIN_BLOCKS opt-in). Suffixes `-arb8-` (m3-tps) / `-arb8` (m2-heat).
+    M424 (322, default; klog clean, 64 C): run 2 88.16, text = M422; M425 (`-arb8`, klog clean, 67 C): run 2 87.95,
+    texts identical -> ITEM 2 below the +0.5 % bar: no rotation, no default; COMMIT bc5505c (the floor as an opt-in
+    record). (No log line confirms the floor reached the engine: it logs RADIANCE_* only; the script path is the same
+    as -coop-'s.) WAITING: run 323's note-248 section. NEXT: note 249 (v1 freeze + install) in its order.**
+  - **NOTE 249: v1.0 FROZEN, INSTALL BLOCKED.** Commit 97f897d records run 272's opt-in hunks (rad_builder / l0 / issue,
+    default-neutral; every image since carried them); annotated tag v1.0 = 97f897d (the untracked xe_direct tests stay
+    untracked, notes 63 / 64). v1 image = ri-m3rtneo:322, ID 404b352bf33b, digest sha256:3975d6d7491a...255c4.
+    m3/service (copied to intel-host): run.sh (+ RADIANCE_MTP_COUPLED=1, headroom 1280 -> ${RI_HEADROOM_MIB:-4096}; keeps
+    GLUE_ALL=2, the soak's leak fix the rotations did not set), the unit (322's digest; PublishPort 127.0.0.1:18421 +
+    <lan-ip>:8030 + <vpn-ip>:8030 -- 8030 free, never 0.0.0.0 / nordwg), watchdog.sh (note 249 item 2: a
+    fault within 6 min after a logged failed step -> one restart an hour + app-notify; else stop + notify; state's
+    3rd field = the last fault restart), V1.md (the manifest), README. Key: generated on intel-host inside python into
+    ri-m3-flashnext.env (600, 61 B); `scp -p` to amd-host:~/.radiance_intel_api_key (its mode unverifiable from this
+    session). Checks: model 121,969,901,568 B on intel-host; linger yes; card clients 0; comfyui / image-service / modeltest
+    / qwen36 / app-embed inactive, queuebot active (no devices) -- BUT comfyui, qwen36, app-embed map /dev/dri AND
+    have WantedBy=default.target (a reboot starts them beside v1): the owner's. REFUSED: scp of the watchdog units to
+    intel-host:~/.config/systemd/user/ and `systemctl --user daemon-reload`, plain and with timeout (note 41: logged as an
+    owner blocker); the Quadlet file had copied (timeout form) and was REMOVED again (a boot-start without its watchdog,
+    untested). No PROTECT list visible from this session. WAITING (run 323, note 249 section) has the owner's install
+    commands. NEXT: on the unit's existence (systemctl --user is-active ri-m3-flashnext): /health, greedy + sampled
+    request with the key read inside python, a keyless request refused, klog, the watchdog's forced-failure test, the
+    2 h soak (soak.sh) with the guard at --hot 80, then WAITING "v1 INSTALLED".**
   - **RUN 322 (00:11 UTC 11-12): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
   - **RUN 321 (00:00 UTC 11-12): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
   - **RUN 320 (23:50 UTC): unchanged (OWNER-NOTES 4,446 lines, 246 the last; no gating files). Idle-skip.**
