@@ -4627,3 +4627,67 @@ G2 found image input refused (501): the build has no FFmpeg (RAD_WITH_FFMPEG off
 3. Exactness: text-only requests must stay byte-identical to v1.0.1-intel (texts = M285 + a seeded sampled check). If the
    encoder kernels on Xe2 are wrong or slow, report and size the fix -- no kernel work without the coordinator.
 4. Pass -> a v1.0.2-intel candidate (owner decides the switch); v1.0.1-intel stays the rollback.
+
+## 260. Coordinator: v1.0.1 HUNG during G4b -> restarted; G4 = FAIL; GO on the watchdog liveness fix + the root cause (~18:0x UTC 11-12)
+Hang 17:18:12 (G4b: 2 users, chat/tool + a unique ~18k prompt every 25th request, 35 min in): /health stayed 200, both
+ranks at the step barrier, "l0 tape: a thread on device 0 is waiting 10 s for a play on device 0, slot 146 ... a glued append
+(RADIANCE_L0_GLUE) after slot 145 (pending)"; thread dump hang-1112T1749 on intel-host (39 threads, all S = a sleeping wait).
+Restart: podman's SIGTERM failed -> SIGKILL -> kill-time faults 17:50:03 -> the WATCHDOG stopped the fresh start mid-load
+(17:50:29; more kill-time faults 17:50:40) and left it stopped; the coordinator restarted with the timer held (healthy
+~18:0x, chat 200). GO, in order:
+1. Watchdog (desk + build now; test against the installed unit in one coordinated stop):
+   (a) LIVENESS by progress: running requests > 0 and the engine's step / generated-token counter (/stats or /metrics) not
+       advancing for 120 s -> hung -> restart; when idle, a keyed 1-token completion with a 60 s limit. Not a bare probe
+       alone (max-num-seqs 2: a probe can queue behind two 60k prefills, 95 s). The key is read inside Python from the env
+       file, never on a command line.
+   (b) The fault rule must not fight our own restarts: faults within 90 s after the watchdog or the coordinator stopped a
+       HUNG engine (a marker line the watchdog reads) = expected teardown -> do not stop the new start; any other fault
+       keeps today's rule.
+2. Root cause: reproduce the G4b mix in a step container with the glue-chain diagnostics -> an exact fix -> v1.0.2-intel
+   candidate (with note 259's media decoder if timing allows; do not hold one for the other). Ask the coordinator to stop /
+   start v1 (QUESTION FOR COORDINATOR line). The k8 week's switch-over waits for this fix + a G4 re-run.
+
+## 261. Coordinator: the v1 fix and the k8 CPT run in PARALLEL -- one shared-host rule (owner question, ~18:1x UTC 11-12)
+The v1 hang fix (note 260) and note 259 proceed now on intel-host's cards (any time; v1 stops via the coordinator). The k8 CPT uses
+amd-host's 4 R9700s + ~111 GB of amd-host's RAM + its CPU (the CPU-offloaded optimizer). RULE: NO builds or other heavy CPU / RAM
+work on amd-host during a CPT pilot window or the CPT week's training (check: systemctl --user is-active cpt-pilot-window
+or the SCHEDULE line). Next window: 2026-11-13 03:00 UTC, ~1 h 45 min. Outside windows: builds as usual (nice, <= 16 threads).
+During the CPT WEEK itself v1 is production: no v1 restarts / tests then except to repair a failure -- so v1.0.2-intel
+(the hang fix) + a G4 re-run with long prompts + a soak with long prompts in the mix must land BEFORE the week.
+
+## 262. Owner: RESUME + milestone budget RAISED to $5,000 (owner, ~18:2x UTC 11-12, via coordinator)
+The pause (two GPU faults, 17:50:03 both cards) = the kill-time teardown of the hung v1.0.1 engine and of the reload the
+watchdog stopped (17:50:40): reviewed (STATE "reviewed-fault:" lines), PAUSED removed (copy in logs/). budget.txt 4000 -> 5000
+(usage was $3,585). Order: note 260 (watchdog liveness, then the hang's root cause -> v1.0.2-intel) with note 259 (media) in
+parallel; note 261's rule (no amd-host builds in CPT windows; next 03:00-04:45 UTC 11-13). Also measure, as part of v1.0.2, the
+service's long-prompt prefill (18.7k in 25.9 s, ~4x slower than the benchmark): busy-prefill-chunk 1024 vs larger, and
+headroom 4096 vs 2048 now that command buffers are 64 KiB -- report the trade-offs, defaults stay the owner's.
+
+## 263. Owner: test the vision encoder on AMD-HOST first (owner, ~18:4x UTC 11-12, via coordinator) -- refines note 259
+Do on amd-host, in parallel with the v1 hang work, AFTER the CPT pilot window ends (~20:00 UTC; note 261's rule):
+1. The FFmpeg build (note 259 item 1) -- the build image + engine with media on; images_test / videos_test should pass.
+2. CORRECTNESS of the Intel vision-encoder path on the SYCL CPU device (RI_DEVICE=cpu, as the libxe row tests): every op the
+   'vision' tower resolves to on libxe (patch embed, the encoder's attention + MLP + norms, the merger / projector, any
+   resize / normalise kernel) checked against libref on the same bytes at the real shapes (one 448x448-class image, and the
+   labeler's image sizes), per-op tolerances as the existing oracle tests; then, if feasible on CPU memory, the whole tower
+   on one image vs libref (the tower's output embedding: cosine / max abs). Report which ops have NO libxe row (refused).
+3. REFERENCE answers from production (amd-host :8000, Flash-Next on AMD, which already serves images): the labeler's eval set
+   (~/code/app-images/labeler -> the real path on amd-host: ~/code/app-images/labeler; say which eval file and how many
+   items), at the labeler's settings, saved with the request bodies -- light load only (one request at a time, never in a
+   CPT window). The key is read inside Python.
+Then on intel-host (one coordinated v1 stop, together with the hang reproduction if possible): the end-to-end image requests on the
+media build vs those references + the encoder's time per image. v1.0.2-intel = the hang fix + media, if both pass.
+
+## 264. Owner: "update everything to the newest" (owner, ~19:3x UTC 11-12, via coordinator)
+Version audit (coordinator): CURRENT -- radiance on amd-host 1.17.0 (= upstream latest), NEO 26.40.40196.8, IGC 2.42.6 (both latest
+releases), kernels. BEHIND: (a) the k8 training image (torch 2.14 -> 2.15, fla 0.5.2 -> 0.6.0) -- the coordinator is building
+lora-peft:3 for a pilot-3 A/B; (b) intel-host's intel-opencl-icd 26.05 (L0 is 26.40; the engine uses L0) -- the owner updates it
+by apt in a v1 stop; (c) THIS PORT'S ENGINE BASE: upstream radiance v1.11.0 (merge-base) vs upstream 1.17.0 -- six releases.
+For the runner, AFTER v1.0.2-intel ships (do not let it delay notes 259 / 260 / 263):
+1. Desk: inventory upstream v1.11.0..v1.17.0 (fetch the upstream tags; release notes + diffstat by area: core / scheduler /
+   spec decoding / mover / arch plugins / API / tests): what is new, what touches the files the Intel port changed
+   (core/device, core/runtime, issue, mover, sched, arch qwen4exp, plugin/spechub), the expected conflicts, and what upstream
+   fixed that we also fixed (or hit). A brief: briefs/2026-11-1x-upstream-1.17-rebase.md with a plan and a size estimate.
+2. Then (owner OK first): a rebased branch intel-l0-u117 -- upstream 1.17.0 + the Intel commits replayed (or a merge, the
+   brief decides), the full CPU suite, the card gates (texts = M285 where the model path is unchanged, the rotation, the
+   KL bar if numerics move), then a soak. Release name decided then (-intel suffix, note 257).

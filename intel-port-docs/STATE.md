@@ -1,9 +1,9 @@
 <!-- runner:begin (written by run.sh after every run; do not edit) -->
-Milestone 3 usage: $3564.61 of $4000 budget (241 session(s)). Today (2026-11-12, America/New_York): $55.15 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 80. Updated 2026-11-12 13:30 UTC.
+Milestone 3 usage: $3614.97 of $5000 budget (242 session(s)). Today (2026-11-12, America/New_York): $105.51 of the $1000 daily cap. CLI estimates at API list prices: largest total_cost_usd per session, summed; a day counts each run's increase. GPU faults on intel-host this milestone: 84. Updated 2026-11-12 22:44 UTC.
 <!-- runner:end -->
 # STATE — Radiance on Intel, milestone 3
 
-Session ID: 30cc9946-fcd1-4ced-a07e-477c33800637
+Session ID: 0d7e1aab-ae1c-49ee-988f-22c9eac0eab3
 
 ## Step
 **Run 164 (17:14 UTC-, 2026-11-03): no new owner note (170 is the last; no PAUSED, no AMD-HOST-CONSTRAINED). The
@@ -4983,6 +4983,163 @@ reviewed-fault: klog@2026-11-09T14:26:01Z=0000:0f:00.0 | fault-response | the su
     <lan-ip>:8030 (the LAN path), the soak's 11 bodies alternating greedy / the service's sampled defaults, every
     25th request of each user an ~18k prompt with a needle; logs/g4-requests.txt; guard logs/guard-G4.txt (timeout
     3900); klog baseline @1794498092. Smoke run (1 min, a long prompt every 3rd): 6 / 6 200, needles right.**
+  - **G4 (15:41-16:41): 2,058 requests, ALL 200 (greedy 990 median 3.80 s; sampled 986 median 3.58 s; long 82, needle
+    82 / 82); finish length 700 / stop 821 / tool_calls 537; klog2 G4 clean. BUT the long prompts were ONE fixed prompt
+    that G2 had already sent: every one came back in 0.3-0.4 s from the checkpoint slots, no prefill -- so G4 did not
+    load long prefills under traffic. g4_mix.py now gives each long prompt a unique first line (smoke: 62 s each, 2 at
+    once = real prefills). G4b STARTED ~16:43 (same command, logs/g4b-requests.txt, guard logs/guard-G4b.txt, klog
+    baseline @1794501810).**
+  - **G4b: v1.0.1 HUNG at 17:18:12 (35 min in): 658 requests, 654 answered 200 before it (25 long prefills, needles
+    25 / 25, median 42.9 s), then 4 requests timed out at 900 s each (2 x 2). The trigger: an 18,734-token prompt admitted at
+    17:18:09 with a 7-token completion admitted beside it at 17:18:11. Journal (logs/journal-G4b.txt), 17:18:22: "rank
+    barrier: a thread has waited 10 s at the step barrier (generation 1464702, 2 of 3 arrived)" x2, and "l0 tape: a thread on
+    device 0 is waiting 10 s for a play on device 0, slot 146, serial 89513363 (rad_event_sync; plays so far 28248772): a
+    glued append (RADIANCE_L0_GLUE) after slot 145 serial 89513362 (pending), its signal ... pending". Same PID, 0 E
+    lines, klog2 G4b clean. /health stayed 200 throughout. RADIANCE_STALL_EXIT_S is STARTUP-ONLY (main.cpp: the
+    StallWatch ends when the server listens), and watchdog.sh checks only /health + the klog, so nothing fired.
+    QUESTION at WAITING's top + a cross-session message to radiance-test-e2 -> the coordinator RESTARTED v1 at 17:50:04
+    after taking a thread dump (m3/service/hang-1112T1749: threads.txt = 2 threads in hrtimer_nanosleep, the rest
+    futex; journal.txt). My /stats capture failed (connection reset: the restart). Desk lead: the L0 glue machinery
+    (the open short-sync item; the GA3 hazard: a native wait on a runtime barrier needs the queue prodded). Proposals in
+    WAITING: (1) a watchdog liveness probe (a keyed 1-token completion, 60 s) or a serve-time stall exit; (2) reproduce
+    in a step container with L0 glue-chain diagnostics, then fix exactly. G4 = FAIL. Sending nothing more to v1 until the
+    coordinator / owner answers. New tools: m3/tools/g2_parity.py, g4_mix.py (unique long prompts), v1_stats.py.**
+  - **RUN 358 (18:2x UTC 11-12; session 0d7e1aab): NOTES 258-262 (262: resumed, budget $5,000; order note 260 then 259;
+    note 261: no amd-host builds in CPT windows -- one ACTIVE 18:22-~20:00 UTC per the coordinator).**
+    - **Note 260 item 1 DONE: the watchdog's liveness** (m3/service/watchdog.sh): after /health 200 it reads /metrics with
+      the key (from the 0600 env file, sent by printf); with requests running / waiting, radiance:engine_steps_total must
+      move within 120 s; idle -> a 1-token /v1/completions probe (60 s), 2 failures in a row = hung. Hung -> writes
+      m3/service/hung-stop.marker, restart, notify; a second hang within the hour -> stop + stays stopped. Item 1(b):
+      kernel-log lines (journalctl -k -o short-unix) within 90 s after the marker = expected teardown, logged only.
+      Test hooks RI_WD_DRY / RI_WD_STATE / RI_WD_PORT. Tests: two dry runs against the live v1 (steps 17 -> 19, probe
+      200), m3/service/watchdog-test.sh against a fake /metrics (5 cases all as designed), the teardown filter on
+      synthetic lines. **INSTALLED by the coordinator (e2) on intel-host 18:25** (backup watchdog.sh.bak-pre260); the coordinator
+      writes hung-stop.marker before any manual stop of a hung engine. The forced test rides on the reproduction's stop.
+    - **Note 260 item 2, desk: a candidate root cause, the ring-slot reuse race** (src/core/device/l0.cpp, UNCOMMITTED,
+      not built -- the CPT window). The explicit cross-stream waits register their waiter as the slot's consumer, so
+      ring_take waits for it before zeEventHostReset; the IMPLICIT device-side waits on a predecessor slot -- a play's
+      wait on Z.prev_slot (l.~1521), a glued append's on the previous slot (compute list) or on the transfer stream's
+      pending compute slot (GLUE_ALL=2's ximm path), xlist_wait's own pending slot -- were never registered. So the host
+      could reset a completed slot's event and give it to a later command before the waiter had evaluated its wait; the
+      waiter then waits on that later command (on the transfer list behind a long expert copy, a cycle with the compute
+      list's wait on the transfer list) -- a hang with no fault, under long prefills (expert staging on ximm) only. Fix:
+      RADIANCE_L0_RING_GUARD (default on; =0 the old rule): those waiters registered (ring_watch, only after a successful
+      append) and waited for at reuse; both forms count "reuses with a waiter still running" (warns the first 4, then
+      every 10,000; in the tape summary line). The 10 s warning now walks the chain to its root (slot_chain): the root =
+      the first pending slot whose predecessor completed / moved on = this hazard's signature. Exact (no command, list or
+      argument changes). NOT yet shown to be THE cause: G4b's story (146 behind a pending 145) fits the chain but its root
+      was never printed.
+    - **Reproducer staged in m3/intel-host/m2-heat.sh: `-g4`** = G4b's mix (2 loops, every 25th request a unique ~18k prompt,
+      g4_mix.py's body; JSON checked by logs/g4body-test.sh: 60,184 chars, needle in) with the server cap MIN*60+900;
+      `-rg0` (outermost) = RADIANCE_L0_RING_GUARD=0. Plan once built (image 328, after the window): v1 stopped by the
+      coordinator (marker first) -> R1 `hstep.sh V1G1 <328> v1svc-g4-rg0 90` (the old rule: hazard count, chain root if it
+      hangs) -> R2 `v1svc-g4 90` (the guard) -> M-pair texts = M285 -> v1.0.2-intel candidate.
+      **Built 19:34-~19:5x (l0b, 2640 tree, rc 0, logs/build-l0neo-l0b-20261112T193359.txt); image ri-m3rtneo:328 =
+      77ee2c3c7b31 (Containerfile.neo2640l0135; HEAD c5339bf + the uncommitted guard) loaded on intel-host ~20:0x. Stop
+      asked of the coordinator.** The coordinator stopped v1 + the watchdog timer ~19:4x (clean). **V1G1 STARTED ~19:5x**
+      (`hstep.sh V1G1 77ee2c3c7b31 v1svc-g4-rg0 90`; up after 109 s). Early (+7 min, 102 requests, all 200): 4
+      CROSS-LIST reuses under the old rule ("compute slot 158 is reused while transfer slot 166, which waited on it
+      device-side, has not completed ... NOT waited for"; 14,028-14,929 reuses with ANY waiter running, the same-list
+      kind, an expected overcount) -- the race window does open in G4b's mix (an upper bound: the waiter may have passed
+      its wait). Also E "mover trace: N record(s) still Copying after the recall's drains" (34 at +17 min; c5339bf's
+      recall-wait path, which waits) -- copies on the transfer list outliving the drains. +19 min: 346 requests, all 200.
+      **V1G1 HUNG ~20:09 (35 min in, 598 requests all 200 before it; the G4b mix) -- THE HANG REPRODUCED UNDER THE OLD RULE,
+      AND THE CHAIN NAMES THE RACE:** "waiting 10 s for a play on device 0, slot 135 (settle) ... <- slot 134 (pending) <-
+      slot 133 (pending) <- slot 132 a glued append after slot 131 (completed) | root: device 0 slot 132 (pending, kind 2,
+      1 wait) -- its predecessor has completed or moved on (reuses with a waiter still running 3,237,549, across the lists
+      1,707; guard off)", both ranks at the step barrier (2 of 3). Reading: 132 waits on 131's event, and 131 is done or
+      moved on; the ring can come round to 131 past the pending 132-135 (Z.next order: 136..255, 0..131 taken by the
+      device's other appends -- the transfer list -- while the compute list sat in the long prefill), so a thread blocked
+      on 131 in ring_take reset its event the moment it signalled, before the GPU evaluated 132's wait; 132 then waits
+      for 131's NEXT use, behind the stuck work. Exactly what RADIANCE_L0_RING_GUARD closes (131's reuse waits for 132).
+      Saved m3/V1G1/serve-at-hang.log; stopped by `intel-host-engine-guard.sh --stop ri-m3-V1G1` at 20:12:10 (no point holding
+      a hung engine the remaining 55 min); teardown faults 20:12:09 on both cards (reviewed-fault lines below), the same
+      signature as 17:50; peer probe PR35 next (note 175), then V1G2 (the guard on). V1G1's figures before the hang
+      (hstep): tok/s median 57.9 (2 users + long prompts, not comparable to the rotation), long 18,736-token prompts 22.
+    - **Owner notes 263 / 264 read (the precheck flagged 257-264).** 263: after the FFmpeg build, the vision tower's ops on
+      the SYCL CPU device vs libref (RI_DEVICE=cpu, real shapes), then production's reference answers (the coordinator is
+      doing those), then on intel-host the end-to-end image requests. 264: the upstream 1.11 -> 1.17 inventory brief AFTER
+      v1.0.2-intel ships.
+    - **Media build 1 (fresh tree /srv/bulk/ri/build-m1l0neo2640m, ri-m1buildneo:5 = f51350c73f51, FFmpeg 6.1: "media
+      decoding via libavformat 60.16.100") failed on one error: src/core/mm/mp4.cpp's mem_write takes `const uint8_t*`
+      (FFmpeg 7 / libavformat 61's avio_alloc_context); 6.1's callback is non-const. Fixed (uncommitted): the buffer type
+      by LIBAVFORMAT_VERSION_MAJOR (< 61 non-const), the body unchanged. Rebuild 2 running ~20:2x.**
+      **Rebuild 2 rc 0 (logs/build-l0neo-l0b-20261112T201356.txt); l0t "images|videos|audio|media|mp4": audio_gen_test,
+      images_test, videos_test 3 / 3 PASS (note 263 item 1).**
+    - **PR35 (20:13-20:14, peer1 on 328, both cards; klog2 clean, canaries 182 / 0): every CHECK PASS, the known LL 8 B /
+      4 KiB stall item only (as PR33) -> the cards are healthy after the teardown. V1G2 STARTED ~20:2x (`hstep.sh V1G2
+      77ee2c3c7b31 v1svc-g4 90`, the guard on).** +7 min: 98 requests all 200; the same 4 cross-list reuses now "waited
+      for, RADIANCE_L0_RING_GUARD".
+      **V1G2 PASSES (20:14-21:46, image 328, the guard ON, G4b's mix): 90 min, 1,703 requests ALL 200 (68 long ~18.7k
+      prompts interleaved with decode), 0 stall / step-barrier warnings, a clean server exit (exit 0, NO teardown faults),
+      klog2 clean, peak Tctl 65 C, lowest MemAvailable 38.9 GiB; tok/s median 59.3 (V1G1 under the old rule 57.9 before
+      its hang: no measurable cost). Past V1G1's hang point (35 min) by 55 min.** With V1G1 (the old rule: the hang at
+      35 min, the chain root = a wait on a reset-and-reused slot), this closes note 260 item 2's root cause: the
+      unregistered device-side waits on ring slots. VMED1 (the labeler eval, image 329) started 21:4x.
+      **VMED1 at +10 min: image input WORKS (13 of 122 answered, all 200) but SLOW: "encoder: 1 item(s) encoded in
+      24614.5 ms", "3 item(s) in 65397.9 ms" (~22 s an image, 4096 patches -> 1,369 prompt tokens); each point request
+      thinks ~1,887 tokens -> ~150 s a request, 2 at a time (production ~9 s each). The 122 need ~2.5 h; the step's cap
+      (60 min) gives ~40-45 (choose + ~7 names). Asked the coordinator: (a) to the cap, score the partial, M-pair, v1
+      back ~23:15, or (b) stop, M-pair, v1 back ~22:30, a night window for the full eval; continuing (a) meanwhile. New
+      item: the encoder pass's profile (the ops are correct, VK4; suspects: attn_vit_h72_bf16 = a mechanical HIP port at
+      seqlen 4096, or attn_dense's libavx host band).** The coordinator: (a), no early stop (my in-container SIGTERM
+      via `podman exec` is denied; a podman stop risks teardown faults). Partial at +15 min (scored on amd-host): both names
+      reached INSIDE within ~5 px of production (Brachiocephalic trunk [432,182] vs [436,181]; Left common carotid
+      [516,186] vs [520,184]); choose_structures = production's set, other order. Desk, for the encoder item: the
+      engine encodes BETWEEN steps (engine_mm.cpp: "a pass runs with no step"), so a 22 s pass stalls every running
+      sequence; no encoder-output cache found, and v1 runs --prefix-cache-mib 0, so each request re-encodes the same
+      image. Next: VMED1 to its cap (~22:47) -> score -> M427 = `mstep.sh M427 6ff7b931567f svcmtpx-gnt0-hc8-rp-gnx M285
+      svcmtpx-gnt0-hc8-rp-gnx` -> "start v1 on 329".
+      **VMED1 ENDED 22:38 at the server cap (exit 124, a clean SIGTERM; klog2 clean; peak 62 C): 76 of 122 answered, all
+      200; decode median 61.8 tok/s, but ttft median 104 s (the encoder between steps), gen median 1,561 tokens.
+      Scored (m3/media/VMED1-score.json): EVERY NAME REACHED MATCHES PRODUCTION'S OUTCOME, 13 / 13** -- 12 inside (each
+      within ~5-25 px of production's point) + Mitral valve OUTSIDE onto the same wrong region as production
+      (AMBIG:aortic valve); Left ventricular wall had only 2 of its 6 answers (no agreement yet), the last 5 names /
+      ambiguous not reached. choose_structures = production's set. M427 (texts gate on 329) started ~22:4x.
+      **M427 (22:39-22:41, image 329, klog2 clean, 67 C): TEXTS IDENTICAL to M285 (both runs), run 2 93.02 tok/s (M426
+      92.99). EVERY GATE PASSES -> committed 55a73b0 (l0: the ring guard) + 9ef957a (mm/mp4: FFmpeg 6.1), annotated tag
+      v1.0.2-intel = 9ef957a; image 329 = 6ff7b931567f, digest sha256:3ecf88fd...122ac; V1.md (both hosts) has the row.
+      "Start v1 on 329" asked of the coordinator ~22:5x (Image= the digest, the 327 copy kept, 329 in PROTECT, the
+      watchdog's forced test on that restart). No fix-claimed line: the hang was not a GPU fault signature (and one for
+      fault-response would turn a later teardown into a "recurrence").** Open: the encoder's ~22 s an image (profile next).
+    - **Note 263 item 2: the vision tower's ops on the SYCL CPU device (m3/vkbench.sh; the coordinator's OK ~20:4x with
+      limits: production's .rad mounted :ro, nice 19 / ionice idle / 8 CPUs / no GPU / MemAvailable > 40 GiB / prod
+      /health 200, a watcher stops it otherwise).** VK1 failed (--kernels libxe alone: libref carries the schemas); VK2 on
+      the host backend crashed (bad_variant_access) -- the L0 backend's CPU device needs RADIANCE_L0_DEVICE=cpu. **VK3
+      (rad-kbench --kernels libxe:libref --ref libref, the six ops, --mm-max-patches 4096): 467 / 467 PASS, every resolved
+      kernel agrees with libref on the container's bytes, 0 guarded-allocation escapes; worst rel_l2 1.6e-3.** Per op
+      (kernel, cases, max abs, worst rel_l2): attn_dense attn_vit_h72_bf16 40 7.8e-3 1.6e-3; gemm_nt_bias
+      gemm_bf16_nt_bias_tiled 190 3.1e-2 9.9e-5; grid_embed grid_embed_bf16 10 0 0; layernorm layernorm_bf16 40 3.1e-2
+      9.1e-5; rope rope_bf16 160 1.6e-2 1.5e-5; rope_table rope_table_f32 7 1.2e-7 2.9e-8; scatter_rows scatter_rows_bf16
+      20 exact. **No vision op without a libxe row.** The M sweep stopped at 512 (kbench's default --max-tok); "capped"
+      = duplicate cases. **VK4 (--max-tok 4096, 212 s): 601 / 601 PASS, every kernel agrees with libref, worst rel_l2
+      1.7e-3, 0 escapes; every vision op reached M = 4096** (attn_dense 52 cases max abs 7.8e-3 / rel_l2 1.7e-3;
+      gemm_nt_bias 243, 3.1e-2 / 9.9e-5; layernorm 52, 1.25e-1 / 9.1e-5; rope 208, 1.6e-2 / 1.5e-5; grid_embed 13 and
+      scatter_rows 26 exact; rope_table 7, M 64, 1.2e-7). The whole-tower comparison on one image is left to the
+      end-to-end check on intel-host against production's answers (the coordinator's production-answers/).
+    - **Image 329 = 6ff7b931567f** (the media tree: the ring guard + FFmpeg 6.1 + the mp4.cpp fix;
+      Containerfile.neo2640l0135media) loaded on intel-host ~21:1x: the v1.0.2-intel candidate. Disk: local rtneo:328 and
+      ri-m3gen:6 (the closed MTP v2 image) removed, dangling ri-probe layers pruned -> 59-62 GB.
+    - **The labeler eval, prepared (production-answers/ from the coordinator: 122 requests, structures 14 inside / 1
+      outside (Mitral valve) / 2 skipped, ambiguous 2 labeled / 1 skipped, critic 'serious').** m3/media/build_replay.py:
+      production's 122 requests rebuilt exactly as flashnext.chat() builds them (the gold image's sha256 checked) ->
+      m3/media/replay-card/ (NNN-*.body + index.json). m3/media/score_replay.py: the labeler's own flashnext.parse_json /
+      point_2d and labeling.vote (PIL / draw_labels stubbed: unused) + pointing.py's outcome rule on the masks.
+      **Self-test (selftest_score.py: production's own responses as .http files) reproduces production exactly** (14 / 1
+      / 2, 2 / 1, the same points). m2-heat.sh `-once4` = every body once by 4 loops; VMED1 staged on intel-host (card + the
+      service args). Run after V1G2: `hstep.sh VMED1 6ff7b931567f v1svc-once4 60`; the encoder ms from the -v log
+      ("encoder: N item(s) encoded in X ms").
+      Run 358 later: the 10 s chain + counters also tag each slot's list (Ring::xl) and count the cross-list reuses
+      separately (g_ring_hazards_x: the realistic case; same-list waiters run right behind and overcount). Steps V1G1 /
+      V1G2 staged on intel-host (V1R3's card + args, today's m2-heat.sh). The coordinator approved the stop (ask with a
+      "QUESTION FOR COORDINATOR: stop v1 for V1G1/V1G2" line or a message once image 328 is on intel-host).
+    - **Note 259 (media), prepared:** images/m1buildneo2640media/Containerfile (ri-m1buildneo:5 = :2 + FFmpeg dev, a NEW
+      tag) and images/m1rt/Containerfile.neo2640l0135media (+ libavformat60 / libavcodec60 / libavutil58 / libswscale7 /
+      libswresample4); a fresh media tree (pkg_check_modules caches a "not found", so the 2640 tree is not reused).
+      Built after image 328, one at a time. The eval (owner OK, coordinator 18:5x): m3/media/labeler-ref/ (PRIVATE, never
+      exported: m3/media/EXPORT-EXCLUDE): the gold image + key + masks, the labeler's code (flashnext.py = request
+      shape; labeling.py; pointing.py = the score: inside the mask). production-answers/ follows from the coordinator;
+      the Intel side = the same calls on the media build, compared by score, not text.
   - **RUN 339 (06:31 UTC 11-12): no new note (256 the last); v1 still active -- the coordinator has not stopped it yet
     (WAITING's top line). Idle-skip; V1R1 stays staged.**
   - **RUN 338 (06:20 UTC 11-12): NOTES 253-256. 253: the coordinator restarted v1 on 323 (healthy) and MOVED tag v1.0
@@ -16753,3 +16910,9 @@ Engine switch (ctx.cpp pass_key, uncommitted): `RADIANCE_TAPE_SKIP=<draft_pass v
    one-list-per-stretch play from kept descriptors (the hybrid cache's shape; ~2 ms a step at 1,036 lists x 1.9 us).
 5. Record the acceptance list (note 28) in STATE.md: tests on CPU + card, tiny tokens, tok/s, pool before/after,
    klog. Then stage A item 2 (the MTP draft passes under recording).
+reviewed-fault: klog@2026-11-12T17:50:03Z=0000:0f:00.0 | fault-response | coordinator e2 11-12 18:2x: kill-time teardown -- podman SIGKILL of the HUNG v1.0.1 engine (17:50:03) and the watchdog's stop of the reload mid-load (17:50:40); no reset, no devcoredump, cards bound, klog clean after; OWNER-NOTES 260 / 262
+reviewed-fault: klog@2026-11-12T17:50:03Z=0000:0b:00.0 | fault-response | coordinator e2 11-12 18:2x: kill-time teardown -- podman SIGKILL of the HUNG v1.0.1 engine (17:50:03) and the watchdog's stop of the reload mid-load (17:50:40); no reset, no devcoredump, cards bound, klog clean after; OWNER-NOTES 260 / 262
+reviewed-fault: klog@2026-11-12T17:50:40Z=0000:0f:00.0 | fault-response | coordinator e2 11-12 18:2x: kill-time teardown -- podman SIGKILL of the HUNG v1.0.1 engine (17:50:03) and the watchdog's stop of the reload mid-load (17:50:40); no reset, no devcoredump, cards bound, klog clean after; OWNER-NOTES 260 / 262
+reviewed-fault: klog@2026-11-12T17:50:40Z=0000:0b:00.0 | fault-response | coordinator e2 11-12 18:2x: kill-time teardown -- podman SIGKILL of the HUNG v1.0.1 engine (17:50:03) and the watchdog's stop of the reload mid-load (17:50:40); no reset, no devcoredump, cards bound, klog clean after; OWNER-NOTES 260 / 262
+reviewed-fault: klog@2026-11-12T20:12:09Z=0000:0f:00.0 | fault-response | run 358: kill-time teardown -- my `intel-host-engine-guard.sh --stop ri-m3-V1G1` of the deliberately REPRODUCED hang (V1G1, RADIANCE_L0_RING_GUARD=0, hung ~20:09: ring-slot reuse race, owner note 260), the same signature as 17:50:03; Fault response -ENOENT / -EINVAL in the stop's second, no reset, no devcoredump; peer probe next (note 175)
+reviewed-fault: klog@2026-11-12T20:12:09Z=0000:0b:00.0 | fault-response | run 358: kill-time teardown -- my `intel-host-engine-guard.sh --stop ri-m3-V1G1` of the deliberately REPRODUCED hang (V1G1, RADIANCE_L0_RING_GUARD=0, hung ~20:09: ring-slot reuse race, owner note 260), the same signature as 17:50:03; Fault response -ENOENT in the stop's second, no reset, no devcoredump; peer probe next (note 175)

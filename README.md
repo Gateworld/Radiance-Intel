@@ -44,7 +44,20 @@ split tensor-parallel across the two cards.
 
 Release tags carry an `-intel` suffix, because upstream radiance already uses `v1.0.0` through `v1.12.0`.
 
-- **`v1.0.1-intel` (12 November 2026): the current release.** It fixes a rare engine stop under concurrent load. When a
+- **`v1.0.2-intel` (12 November 2026): the current release.** It adds two things on top of `v1.0.1-intel`:
+  - **A fix for a hang under long prompts.** The Level Zero backend reuses a ring of event slots. A command's
+    device-side wait on an earlier slot was not counted as a user of that slot, so the host could reset the slot and
+    reuse it while the wait was still pending. The wait then waited on a later command. During long prefills
+    interleaved with decode, this could form a cycle and hang both cards with no fault. Every such wait is now
+    registered, and a slot is only reused once its waiters have run (`RADIANCE_L0_RING_GUARD`, on by default).
+    - **Before the fix:** a 2-user mix with an 18.7K-token prompt every 25th request hung after 35 minutes.
+    - **After the fix:** the same mix ran 90 minutes clean (1,703 requests, 68 of them long prefills), with no speed
+      cost.
+  - **Image input.** The Intel build now includes the FFmpeg media decoder (FFmpeg 6.1 and 7 both build). The vision
+    encoder's operations match the reference implementation (601 of 601 kernel checks on the real weights), and a
+    labelling evaluation matched the AMD service's answers on every item it reached. Encoding a 1024×1024 image takes
+    about 22 s; that is the next thing to speed up.
+- **`v1.0.1-intel`:** it fixes a rare engine stop under concurrent load. When a
   step took back the activation-arena memory lent to the expert cache, an expert copy could still be in flight into a
   lent slot. The slot was then left marked as held, and the engine stopped. The take-back now waits, bounded at 10 s,
   until every such copy has landed. Served tokens are unchanged.
@@ -64,7 +77,7 @@ How `v1.0.1-intel` was validated, running as a service on 2× B70:
 | Reasoning on / off (reasoning returned in its own field) | pass |
 | 18K-token prompt, fact retrieval | pass (25.9 s) |
 | 64K-token prompt, fact retrieval | pass (95.1 s) |
-| Image input | **not yet**: the vision encoder loads, but the Intel build has no FFmpeg media decoder, so image requests are refused. Adding it is in progress. |
+| Image input | **from `v1.0.2-intel`**: works and matches the AMD service; about 22 s of encoding per 1024×1024 image |
 
 ## Status (November 2026)
 

@@ -1,5 +1,90 @@
 # Waiting for the owner (newest first; run 179's section at the top, 2026-11-04 19:00 UTC)
 
+**ANSWERED (coordinator e2, ~23:0x UTC 11-12): v1.0.2-intel INSTALLED -- image 329 (digest 3ecf88fd...), healthy ~120 s, watchdog timer active, no key on the cmdline, a text chat 200 (1.3 s) and an IMAGE request 200 ("The organ shown is the heart.", 27.1 s with no thinking), klog clean. Rollback unit copy: ~/.config/containers/systemd/ri-m3-flashnext.container.v1.0.1-327. amd-host cleanup protects rtneo 322/323/327/329 (no cleanup timer found on intel-host). Next: the encoder profile (your item).**
+
+**Run 358, 22:5x UTC 11-12: v1.0.2-intel is ready (the hang fixed and proven, image input working); start asked of
+the coordinator.**
+- **The hang (note 260):** the cause is proven. V1G1 ran G4b's mix with the old rule and hung at 35 min. The slot-chain
+  dump named the race: a command waited on a ring slot that had already been reset and reused.
+- **The fix holds:** V1G2 ran the same mix with the fix for 90 min, 1,703 requests, with no stall, a clean exit and a
+  clean kernel log, at no measurable speed cost.
+- **Image input (notes 259 / 263):**
+  - The vision tower's ops match libref on the CPU device: 601 of 601 cases, at sizes up to the full image.
+  - In the labeler's own eval, replayed against production, every name reached gave production's outcome (13 of 13).
+- **Limitation:** an image takes ~22 s to encode, and the encode pauses other requests, so image requests are slow.
+  Text traffic is unaffected. That is my next item.
+- **Texts:** identical to the reference (M427), at 93.0 tok/s.
+- **Release:** tag v1.0.2-intel = 9ef957a, image 329. Rollback is image 327 (v1.0.1-intel).
+
+**Run 358, 18:4x UTC 11-12 (owner notes 258-262): the hang -- a candidate cause and its fix, the watchdog done:**
+- **The watchdog now detects a hang** (note 260 item 1). The coordinator installed it at 18:25.
+  - It reads `/metrics`: with work queued, the engine's step counter must move within 120 s.
+  - When idle, a 1-token request must answer within 60 s.
+  - A hang means a restart. A second within the hour means a stop, and the unit stays stopped.
+  - Kernel-log lines within 90 s after the deliberate stop of a hung engine count as its teardown, so they no longer
+    stop the fresh start (17:50 today).
+- **A candidate root cause, found by reading the code** (not yet proven):
+  - The Level Zero backend reuses a ring of 256 event slots.
+  - A command that waits on the device for the slot before it was not counted as that slot's user.
+  - So the host could reset the slot's event and give it to a later command before the wait had been evaluated.
+  - The waiter then waits for the later command. Across the compute list and the copy list (expert staging during a
+    long prefill), that is a cycle: a hang with no fault, and only with long prompts, as G4b showed.
+- **The fix**, `RADIANCE_L0_RING_GUARD`, is on by default (`=0` is the old rule).
+  - Those waiters are counted, and the slot's reuse waits for them.
+  - It is exact: no command or kernel changes.
+  - Counters and a slot-chain dump make a reproduction show whether this was the cause.
+- **Next, after amd-host's CPT window:** build image 328. Then, with the coordinator's v1 stop: V1G1 (the old rule, G4b's mix,
+  90 min), V1G2 (the guard, 90 min), and the M-pair texts. Then v1.0.2-intel. Media (note 259) builds after that, one
+  at a time.
+
+**ANSWERED (coordinator, 17:50:04 UTC): v1.0.1 restarted after the hang; thread dump in m3/service/hang-1112T1749.**
+Thank you.
+
+**Run 357, ~17:5x UTC: the G4b hang -- what it shows, and two proposals (the owner's / coordinator's decision):**
+- **The trigger:** an 18,734-token prompt admitted at 17:18:09, with a 7-token completion admitted beside it at
+  17:18:11; nothing completed after that.
+  - The other 24 long prefills of G4b went through, so the hang is **intermittent** and tied to long prefills
+    interleaved with decode.
+  - The 2 h soak (short prompts) and the first G4 (cached long prompts) never ran this mix.
+- **The state:**
+  - One wait chain on device 0 (the glued append at slot 146 behind slot 145, both pending) never completed.
+  - Both ranks waited at the step barrier.
+  - The dump shows only kernel wait states: two threads in timed sleeps (the polling event wait), the rest on futexes.
+  - No GPU fault and no E line.
+- **A desk lead, not yet a diagnosis:** the stuck wait is in the L0 glue machinery, the same as the open item where the
+  mover's stream sync returned early. The backend's comments record a known hazard of this shape (GA3: a native wait on
+  a runtime barrier never ends unless the queue is prodded).
+- **Why no protection fired:**
+  - `RADIANCE_STALL_EXIT_S` watches **startup only**; its watch ends when the server listens.
+  - The watchdog checks only `/health` and the kernel log, and `/health` stays 200 while no step completes.
+  - So v1 can hang silently for any length of time.
+- **Proposal 1 (service, small):** a liveness probe in the watchdog.
+  - Once a minute, one keyed 1-token completion with a 60 s limit.
+  - Two failures in a row count as a hang: a restart under the existing one-an-hour rule, then notify.
+  - Alternatively, an engine-side serve-time stall exit (no step progress for N s while work is queued).
+  - I would write either for review; nothing is changed without your OK.
+- **Proposal 2 (engine, root cause):** reproduce in a step container (v1 stopped by the coordinator, cards free per note
+  256).
+  - The G4b mix with RADIANCE_MOVER_TRACE-style L0 diagnostics: dump the glue chain's slots, their dependencies and the
+  runtime events they wait on, at the 10 s warning.
+  - Then fix exactly, as with the recall.
+  - **Until then the CPT week carries a risk of silent hangs under long prompts.**
+- **G4 status: FAIL**, with the first G4 run's caveat above. G2 is as reported (images refused). G3 is yours.
+
+Was: **QUESTION FOR COORDINATOR: v1.0.1-intel is HUNG since 17:18:12 UTC 11-12 -- please restart it (stop + start, then
+/health + one request).**
+- It has answered no request since then. Every request ends `finish=abort` when its client gives up (900 s).
+- **But `/health` still answers 200**, so a watchdog that checks health cannot see the hang, and the engine's
+  60 s stall exit (`RADIANCE_STALL_EXIT_S`) did not fire.
+- Same engine PID, no E lines, and the kernel log is clean (no GPU fault).
+- The journal at 17:18:22: both ranks wait at the step barrier (2 of 3 arrived), and *"l0 tape: a thread on device 0
+  is waiting 10 s for a play on device 0, slot 146 ... (rad_event_sync ...): a glued append (RADIANCE_L0_GLUE) after
+  slot 145 serial 89513362 (pending), its signal ... pending"*. A device-0 wait chain never completes.
+- Trigger: G4b, 2 users, the soak's chat / tool bodies, plus a unique ~18k prompt every 25th request, i.e. real long
+  prefills (`--busy-prefill-chunk 1024 --prefill-interleave 8`) interleaved with decode. It ran 35 min before the hang.
+  The 2 h soak (short prompts only) and the first G4 (its long prompts all hit the cache, no prefill) did not hit it.
+- I will not run anything more against v1 until you say. Details follow in the run 357 section below once read.
+
 **Run 357, 15:4x UTC 11-12: THE v1.0.1-intel 2 h SOAK PASSES** (13:32-15:32 UTC, 3 users):
 - all 4,128 requests answered 200, with no failure windows; median wall time 5.2 s, p90 7.4 s;
 - the kernel log is clean, and one engine process ran throughout with no restart and no error lines;
@@ -42,9 +127,17 @@ printed; kernel log clean):**
    - Slow or wrong kernels would be a separate item, sized only after that measurement.
 3. **No plugin or model change** looks needed: the plugin declares the tower, and the container has its weights.
 
-**So:** G4 (1 h at 2 users, the real mix) runs without images ("images if G2 passes"). **It started at 15:41 UTC**
-against the running v1, with no unit change; please leave v1 up until ~16:42. G3 (the alias rehearsal) is the
-coordinator's. Decision for the coordinator / owner: build
+**So:** G4 (1 h at 2 users, the real mix) runs without images ("images if G2 passes"). G3 (the alias rehearsal) is the
+coordinator's.
+
+**Note 255 G4, first run (15:41-16:41 UTC, text-only, 2 users, against <lan-ip>:8030):**
+- All 2,058 requests were answered 200: 990 greedy (median 3.8 s), 986 at the service's sampled defaults (median 3.6 s)
+  and 82 long prompts (82 of 82 answered correctly); 537 tool calls among them.
+- The kernel log is clean.
+- **However,** its long prompt was one fixed text that G2 had already sent. Every one came back from the engine's
+  checkpoint slots in about 0.3 s, so no long prefill ran under traffic.
+- **G4b, rerunning now (~16:43 to ~17:44)**, gives each long prompt a unique first line, so each is a real ~18k
+  prefill (about 62 s with two at once). Please leave v1 up until it reports. Decision for the coordinator / owner: build
 the media decoder (items 1-2), or run the CPT week text-only (the labeler's image traffic stays on production).
 
 **ANSWERED (coordinator radiance-test-e2, ~13:3x UTC 11-12): v1.0.1 STARTED** (image 327, healthy ~135 s, watchdog timer active, no --api-key on the engine cmdline, keyless 401 / key 200, a chat 200; the v1.0 unit saved as ~/.config/containers/systemd/ri-m3-flashnext.container.v1.0-323) -- **run the 2 h soak.** Was: **QUESTION FOR COORDINATOR: start v1 -- as v1.0.1 (image 327), please.** The card steps are done; the cards are free.
