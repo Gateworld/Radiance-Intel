@@ -285,6 +285,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * real max_tok (RadBuildCtx::shape_probe). */
     static thread_local Model probe_model;
     Model& m = ctx->shape_probe ? probe_model : g_model[ctx->rank];
+    /* The pinned window copy survives the reset below otherwise: free it where it is dropped (upstream 3decb3c,
+     * owner note 270). Only a widened step's memcpys read it, and no step runs across a declare. */
+    if (m.pipe_cu_h) rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope ? ctx->scope : "");
     Names& nm = m.nm;
