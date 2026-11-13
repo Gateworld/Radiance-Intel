@@ -485,6 +485,7 @@ int Engine::step_loop() {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
+            barrier_->set_idle(true);   /* owner note 267: the ranks' wait from here is for work, not a stall */
             drain_completed();
             sched_.publish(/*idle=*/true);
             /* Work is waiting only on the encoder: loop immediately. */
@@ -511,6 +512,7 @@ int Engine::step_loop() {
             continue;
         }
         idle = 0;
+        barrier_->set_idle(false);
         if (t_on) phase_mark(PH_PLAN);
 
         /* Zero freshly assigned recurrent slots before the step that reads them. The manager

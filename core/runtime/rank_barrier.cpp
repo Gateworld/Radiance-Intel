@@ -57,10 +57,17 @@ void RankBarrier::arrive_and_wait() {
         cv_.notify_all();
         return;
     }
-    /* a 10 s wait says so once (milestone 3, run 18: which thread holds a stalled step) */
+    /* a 10 s wait says so once (milestone 3, run 18: which thread holds a stalled step) -- counted from when the
+     * engine last left idle: a rank waiting while the engine has no step to issue is not stalled (owner note 267) */
     bool told = false;
+    const int64_t t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
     while (!cv_.wait_for(lk, std::chrono::seconds(10), [&] { return aborted_ || gen_ != my_gen; })) {
         if (told) continue;
+        const int64_t busy = busy_since_ns_.load(std::memory_order_relaxed);
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (busy < 0 || now - (busy > t0 ? busy : t0) < 10'000'000'000LL) continue;   /* idle, or not 10 s busy yet */
         told = true;
         RAD_WARN("rank barrier: a thread has waited 10 s at the step barrier (generation %llu, %d of %d arrived)",
                  (unsigned long long)my_gen, waiting_, n_);

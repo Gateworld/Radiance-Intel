@@ -12,7 +12,10 @@
 #pragma once
 #include "../rad_core.h"
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 
 namespace rad {
@@ -31,8 +34,20 @@ public:
      * an exited rank can no longer complete; the engine must be able to exit (spec §17). */
     void abort();
 
+    /* The engine thread is idle (no step to issue) or busy again. While it is idle the ranks wait at
+     * the barrier for work, not for a stalled step, so the 10 s warning holds off; it counts a wait
+     * from the moment the engine last left idle (owner note 267, Intel port: the v1 service logged
+     * the warning once a minute at idle, timed by the watchdog's probe). */
+    void set_idle(bool idle) {
+        if (idle) busy_since_ns_.store(-1, std::memory_order_relaxed);
+        else if (busy_since_ns_.load(std::memory_order_relaxed) < 0)
+            busy_since_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count(),
+                                 std::memory_order_relaxed);
+    }
 
 private:
+    std::atomic<int64_t>    busy_since_ns_{0};   /* -1 while the engine is idle */
     std::mutex              m_;
     std::condition_variable cv_;
     int                     n_;
