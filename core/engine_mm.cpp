@@ -15,6 +15,7 @@
  */
 #include "engine_priv.h"
 
+#include "mm/encoder_cache.h"
 #include "mm/processor.h"
 
 #include <chrono>
@@ -76,10 +77,31 @@ int Engine::run_encodes() {
             name.compare(name.size() - want.size(), want.size(), want) != 0) return false;
         return name.size() == want.size() || name[name.size() - want.size() - 1] == '.';
     };
+    /* The encoder-output cache (owner note 266, Intel port; RADIANCE_MM_ENCODER_CACHE_MIB, off by
+     * default): an item whose key and geometry an earlier pass encoded takes those rows and skips the
+     * pass. What a pass encodes below is stored after it. */
+    static mm::EncoderCache cache(mm::EncoderCache::cap_from_env());
+    static const bool cache_said = [] {
+        if (cache.enabled())
+            RAD_INFO("encoder cache: %lld MiB of encoder rows kept by content key (RADIANCE_MM_ENCODER_CACHE_MIB)",
+                     (long long)(cache.cap() >> 20));
+        return true;
+    }();
+    (void)cache_said;
+    int cached = 0;
+    std::vector<mm::Item*> fresh;
     for (auto& ip : items) {
         if (ip->encoded) continue;
         const RadEncoderDecl& e = ip->kind == mm::Kind::Audio ? prog.audio_encoder : prog.encoder;
+        if (cache.lookup(*ip, e.n_embd)) {
+            ip->encoded = true;
+            ip->pixels.clear();
+            ip->pixels.shrink_to_fit();
+            ++cached;
+            continue;
+        }
         ip->embd.assign((size_t)(ip->n_rows() * e.n_embd), 0);
+        fresh.push_back(ip.get());
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());
     }
 
@@ -220,9 +242,17 @@ int Engine::run_encodes() {
         it.pixels.shrink_to_fit();
         if (dump_dir && *dump_dir) dump(it, ".bf16", it.embd.data(), it.embd.size());
     }
+    for (mm::Item* it : fresh)
+        cache.insert(*it, (it->kind == mm::Kind::Audio ? prog.audio_encoder : prog.encoder).n_embd);
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
-    RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(), ms);
+    if (cache.enabled())
+        RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms, %d of them from the encoder cache "
+                  "(%lld item(s), %lld MiB held; %lld hits, %lld misses, %lld evictions so far)",
+                  items.size(), ms, cached, (long long)cache.items(), (long long)(cache.bytes() >> 20),
+                  (long long)cache.hits(), (long long)cache.misses(), (long long)cache.evictions());
+    else
+        RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(), ms);
     return RAD_OK;
 }
 
