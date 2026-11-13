@@ -1435,6 +1435,29 @@ TEST(prefix_cache_hits_the_shared_prefix_only) {
     CHECK_EQ(f.pc.lookup(p1, {}).n_attn_tokens, 48);
 }
 
+/* Upstream 74e701e, ported for owner note 268 item 3: CacheHit::branch_at names where a prompt leaves a head
+ * that at least two cached prompts already left differently -- one is not enough. */
+TEST(prefix_cache_branch_at_a_head_two_prompts_left) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    auto head = tok_run(10, 32);                 /* 2 blocks every prompt starts with */
+    auto with = [&](int base) { auto p = head; auto t = tok_run(base, 32); p.insert(p.end(), t.begin(), t.end()); return p; };
+    const auto p1 = with(100), p2 = with(200), p3 = with(300);
+
+    publish(f, 1, p1, 64);
+    CHECK_EQ(f.pc.lookup(p3, {}).branch_at, 0);  /* one prompt past the head: could be one conversation */
+    CHECK_EQ(f.pc.lookup(p3, {}).n_attn_tokens, 32);
+
+    publish(f, 2, p2, 64);
+    CacheHit h = f.pc.lookup(p3, {});
+    CHECK_EQ(h.branch_at, 32);                   /* two ways on from the head: a snapshot there serves both */
+    CHECK_EQ(h.n_attn_tokens, 32);
+
+    CHECK_EQ(f.pc.lookup(p1, {}).branch_at, 0);  /* a prompt that goes on in the cache leaves nothing */
+    auto other = tok_run(5000, 64);              /* a prompt sharing nothing has no head */
+    CHECK_EQ(f.pc.lookup(other, {}).branch_at, 0);
+}
+
 TEST(prefix_cache_lru_eviction_order) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/false));

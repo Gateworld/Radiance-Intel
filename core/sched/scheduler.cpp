@@ -1196,6 +1196,24 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             }
         }
 
+        /* A head other prompts share (CacheHit::branch_at) that no snapshot lets this request skip:
+         * it takes one there on its way past (Request::checkpoint_at), and every later request with
+         * the same head skips it -- the same picture and instructions in front of a different
+         * question, as the evaluation asks six of one image (owner note 268 item 3). The interval and
+         * tail snapshots miss it: the head is shorter than an interval, and each prompt's tail is its
+         * own. Upstream 74e701e (radiance 1.14), on by default there; opt-in in the Intel port
+         * (RADIANCE_PREFIX_SHARED_HEAD=1) until its card gates pass. */
+        static const bool shared_head = [] {
+            const char* v = std::getenv("RADIANCE_PREFIX_SHARED_HEAD");
+            return v && v[0] == '1';
+        }();
+        constexpr int64_t kSharedHeadMin = 256;   /* the least recompute a snapshot there must save */
+        if (shared_head && geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+            r.checkpoint_at = h.branch_at;
+            RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
+                      (unsigned long long)r.id, (long long)h.branch_at);
+        }
+
         r.n_computed = reuse;
         r.n_cached = reuse;
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
