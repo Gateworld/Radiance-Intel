@@ -4691,3 +4691,71 @@ For the runner, AFTER v1.0.2-intel ships (do not let it delay notes 259 / 260 / 
 2. Then (owner OK first): a rebased branch intel-l0-u117 -- upstream 1.17.0 + the Intel commits replayed (or a merge, the
    brief decides), the full CPU suite, the card gates (texts = M285 where the model path is unchanged, the rotation, the
    KL bar if numerics move), then a soak. Release name decided then (-intel suffix, note 257).
+
+## 265. Coordinator: amd-host was rebooted (owner, 23:3x UTC 11-12)
+(Reduced in the public copy: the rest is about the AMD host, not the Intel port.) intel-host and v1.0.2-intel
+were not touched. Next for you as planned: the encoder profile (desk first, then one coordinated stop).
+
+## 266. Owner OK: v1.0.3-intel = image speed via caching (coordinator diagnosis, ~00:2x UTC 11-13)
+Diagnosis (coordinator): v1's service args have `--prefix-cache-mib 0` and `--checkpoint-interval 4096 --checkpoint-slots 2`;
+the AMD service (amd-host, upstream 1.17.0) runs a 16 GiB prefix cache, checkpoints every 2048, 64 slots, retention keep-all. The engine already
+keys every media item by content (core/mm/processor.h key_hi/key_lo) so a prefix-cache hit skips the ENCODER and the prefill --
+but with the cache off, VMED1 re-encoded the same test image on every request ("2 item(s) encoded in 44.5 s" again and again;
+~22 s an item) and re-prefilled its ~1,400 tokens. The image evaluation asks 6x per name on one image: the AMD service answers in ~9 s.
+In order:
+1. CONFIG (exact): find why v1 runs the prefix cache off (OWNER-NOTES / STATE history: a measurement-repeatability choice? an
+   Intel-port issue with the cache or the linear checkpoints?) and say so first. Then a candidate: --prefix-cache-mib 8192,
+   --checkpoint-interval 2048, --checkpoint-slots 16-32 (56 MiB a slot a rank, pinned host; intel-host has ~118 GiB free), retention
+   as the AMD service's if the option exists. Gates: texts = M285 (and a seeded sampled check); the VMED replay (the 122 evaluation
+   requests, outcomes vs the AMD service's answers, plus per-request time and encoder count); a 2 h soak with long prompts in the mix
+   (G4b's mix) -- the cache must not bring back a hang or a memory leak; MemAvailable trend reported.
+2. CODE (exact): an encoder-output cache keyed by the item's content key (LRU, host-side bf16 embd, cap ~256 MiB, ~7 MB per
+   1024x1024 image), consulted before the encoder queue -- covers the same image under different text when the prefix cache
+   cannot (checkpoint alignment). CPU tests: a hit returns byte-identical embd; eviction; two different images never collide.
+3. Then profile a first-time encode (the ~22 s for a new image) and fix the dominant op -- desk first.
+v1.0.3-intel = 1 (+ 2 if ready); default changes and the switch on v1 are the owner's (via WAITING); coordinated stops via the
+coordinator. Owner priority note: amd-host's other booked work comes first -- your amd-host builds avoid its windows (note 261).
+
+## 267. Owner: RESUME (owner "yes", ~04:2x UTC 11-13, via coordinator)
+
+- The two-fault pause (22:44 UTC 11-12) was run 358's deliberate hang reproduction (RADIANCE_L0_RING_GUARD=0): the
+  20:12:09 kill-time teardown faults, already reviewed. PAUSED removed by the coordinator on the owner's OK.
+- Next: note 266 (v1.0.3-intel image caching). Book the v1 stop/start through the coordinator as before.
+- Also check: the v1.0.2 service logs "rank barrier: a thread has waited 10 s at the step barrier (2 of 3 arrived)"
+  about once a minute (312 in 3 h); the step counter advances and the timing matches the watchdog's 1-min probe, so
+  probably idle-time noise. Confirm it is idle-only (not under load) and, if so, quiet it at idle in v1.0.3.
+
+## 268. Owner: "can it improve even more" (image path, ~08:2x UTC 11-13, via coordinator) -- AFTER v1.0.3 ships
+
+Next image-speed work, in this order (desk first, card time in booked windows):
+1. **Where VMED2's 32 s median first token goes, with the cache HIT** (encode < 1 ms): queueing behind the evaluation client's own
+   concurrent requests vs prefill of the ~1,400-token prompt vs anything else. Break it down from the engine's own
+   timestamps; if it is queueing, say so (then it is the client's concurrency, not the engine).
+2. **The vision encoder itself: ~22 s per 1024x1024 image on a cache miss.** Profile it per op (the encoder profile from
+   note 266) and list the top kernels; the target is the dense ViT GEMMs (int8 / XMX path like the trunk) and a fused
+   attention for the encoder. Report the expected floor vs the AMD service's encode time for the same image.
+3. **Media-boundary snapshot (design only first):** a linear-state checkpoint taken exactly at the end of an image's tokens,
+   so a repeated image+prefix skips the image prefill too (your 266 finding: the 4096/2048 grid never lands there). Check
+   upstream radiance first for an existing feature.
+Keep each change opt-in, bit-identical text gates as before.
+
+## 269. Owner: "improvement?" for v1 stability (~10:1x UTC 11-13, via coordinator) -- DESK ONLY during HOLD-INTEL-HOST
+
+v1 becomes the only production service for ~5 days (the AMD host's cards are booked for other work).
+No card work on intel-host until HOLD-INTEL-HOST is lifted; prepare these at the desk, test them after (~11-19):
+1. **Recover a failed step without exiting.** Today a failed step aborts both cards and the exit ends via the 300 s
+   watchdog (GPU read faults at teardown). Design an in-process recovery (drain, reset the lists/events, fail only the
+   affected requests, keep serving), or at least a fast clean exit + restart (target: back within ~3 min).
+2. **Faster start** (~135 s today): what dominates (load, warm-up, list recording)? Cut it where safe.
+3. **Overload behaviour:** with --max-num-seqs 2 behind the forwarder, what happens to request 3, 4, ...? (queue depth,
+   timeouts, 429). Make it explicit and log it; no OOM path from many queued long prompts.
+4. **Long-run drift:** from V1G3, the MemAvailable / VRAM / step-time trend over 2 h; any slope -> find it.
+5. Keep the watchdog's notification on every restart, with the reason.
+Text gates bit-identical as always; nothing goes live without the coordinator.
+
+## 270. Owner: OK on upstream order (owner "ok", ~14:1x UTC 11-13, via coordinator)
+1. **v1.0.4 = cherry-picks only:** 9560780 + 8df9240 (preempted prefill parks engine / request never readmitted),
+   64c652f (MTP first-draft read), 3decb3c (qwen4exp pinned-copy leak on re-declare; check vs v1 memory creep).
+   Desk prep now; card tests only after HOLD-INTEL-HOST lifts (~11-19). Text gates bit-identical.
+2. **Then** the full 1.17 rebase as its own release (per briefs/2026-11-13-upstream-1.17-inventory.md).
+Nothing changes on intel-host while v1 serves production.

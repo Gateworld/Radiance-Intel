@@ -44,7 +44,24 @@ split tensor-parallel across the two cards.
 
 Release tags carry an `-intel` suffix, because upstream radiance already uses `v1.0.0` through `v1.12.0`.
 
-- **`v1.0.2-intel` (12 November 2026): the current release.** It adds two things on top of `v1.0.1-intel`:
+- **`v1.0.3-intel` (13 November 2026): the current release.** It runs as the production service. It adds two things on
+  top of `v1.0.2-intel`, and text output is bit-identical to `v1.0.2-intel`:
+  - **An encoder-output cache for repeated images (opt-in).** On this hybrid model, a prefix-cache hit only reaches the
+    last linear-state checkpoint, so a ~1,400-token image prompt has no reusable snapshot, and the same image was encoded
+    again on every request (about 22 s per 1024×1024 image). The engine now keeps the vision encoder's output, keyed by
+    the image's content key and its geometry, least recently used within a byte cap. It is set with
+    `RADIANCE_MM_ENCODER_CACHE_MIB`: the default is 0 (off) in the engine, and the service script sets 512.
+    - **Replay of 122 image requests about the same image:** 1 encode and 121 cache hits (under 1 ms each). All 122
+      were answered in 35 minutes; before, 76 were answered in 50. The median time to the first token fell from 104 s
+      to 32 s; what is left is queueing behind the client's own concurrent requests, not the engine. The answers scored at
+      least as well as the AMD service's.
+  - **The step barrier's 10 s warning is quiet while the engine is idle.** At idle the rank threads wait at the barrier
+    for work, so the warning printed about once a minute without anything being stalled. A step that really stalls still
+    warns.
+  - **Validation:** the fixed test prompt gives texts identical to `v1.0.2-intel` (93.0 tokens/s), prefill log-probs
+    are bit for bit the same, a 2-hour soak with long prompts in the mix ran clean (2,278 requests, 90 of them 18.7K
+    tokens, no errors and no stalls), and a 30-minute run on the exact service settings ran clean (581 requests).
+- **`v1.0.2-intel`:** it adds two things on top of `v1.0.1-intel`:
   - **A fix for a hang under long prompts.** The Level Zero backend reuses a ring of event slots. A command's
     device-side wait on an earlier slot was not counted as a user of that slot, so the host could reset the slot and
     reuse it while the wait was still pending. The wait then waited on a later command. During long prefills
@@ -77,7 +94,7 @@ How `v1.0.1-intel` was validated, running as a service on 2× B70:
 | Reasoning on / off (reasoning returned in its own field) | pass |
 | 18K-token prompt, fact retrieval | pass (25.9 s) |
 | 64K-token prompt, fact retrieval | pass (95.1 s) |
-| Image input | **from `v1.0.2-intel`**: works and matches the AMD service; about 22 s of encoding per 1024×1024 image |
+| Image input | **from `v1.0.2-intel`**: works and matches the AMD service; about 22 s of encoding per 1024×1024 image (a repeated image is served from the encoder cache from `v1.0.3-intel`) |
 
 ## Status (November 2026)
 
