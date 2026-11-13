@@ -24,6 +24,11 @@
 
 #include <cstdint>
 
+/* xe_gemv_bf16.cpp: the matrix-unit form of gemm_nt_bias (owner note 268 item 2, RADIANCE_XE_VIT_DPAS=1) */
+extern "C" int xe_vit_gemm_nt_bias_dpas(const uint16_t* a, long a_ld, const uint16_t* w, long w_ld, const void* bias,
+                                        int bias_f32, const uint16_t* r, long r_ld, uint16_t* c, long c_ld, int M, int K,
+                                        int N, int act, RadStream s);
+
 namespace {
 
 constexpr int kThr = 256;
@@ -667,6 +672,17 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
         else if (std::strcmp(act_s, "none")) return R4D_NO(RAD_E_SCHEMA);
     }
     const bool res = R != nullptr, bf32 = B->dtype == RAD_F32;
+
+    /* Owner note 268 item 2 (Intel port, run 368): RADIANCE_XE_VIT_DPAS=1 sends the product to the matrix unit
+     * (xe_gemv_bf16.cpp's gemm_bf16_dpas_bias_kernel: the same store, the three roundings in this order); off, or on
+     * the CPU device, it answers RAD_E_UNSUPPORTED and the WMMA forms below serve as before. */
+    {
+        const int rc = xe_vit_gemm_nt_bias_dpas((const uint16_t*)r4d_p(A), (long)lda, (const uint16_t*)r4d_p(W), (long)K,
+                                                r4d_p(B), bf32 ? 1 : 0, res ? (const uint16_t*)r4d_p(R) : nullptr,
+                                                (long)ldr, (uint16_t*)r4d_wp(Y), (long)ldc, (int)M, (int)K, (int)N, act,
+                                                stream);
+        if (rc != RAD_E_UNSUPPORTED) return rc;
+    }
 
     /* The 128 x 128 kernel once its grid reaches 32 workgroups, as gemm_bf16_nt_tiled chooses;
      * below that the 64 x 64 tile, whose four times the blocks fill more of the card. */

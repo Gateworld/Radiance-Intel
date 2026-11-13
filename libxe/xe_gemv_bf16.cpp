@@ -296,6 +296,115 @@ void gemm_bf16_dpas_kernel(const void* __restrict__ a, long a_ld, const uint16_t
     }
 }
 
+/* ---- the vision tower's gemm_nt_bias on the matrix unit (owner note 268 item 2, run 368; opt-in RADIANCE_XE_VIT_DPAS=1) ----
+ *
+ * The tower's GEMMs (libxe/ports/r4d_vit_bf16.cpp: vit_gemm_kernel / vit_gemm_wa_kernel) are libr4d's AMD kernels on
+ * wave32 WMMA fragments, which the port runs through xe_lanes.h's sub-group-shuffle emulation: ~0.26 TFLOP/s for an
+ * image's ~5.7 TFLOP, ~22 s an image (briefs/2026-11-13-vision-encoder-desk.md). This is gemm_bf16_dpas_kernel's tile
+ * above (bf16 A only) with that row's store: t = bf16(acc + bias), then for act 1 / 2 t = bf16(gelu(t)), then with a
+ * residual t = bf16(R + t) -- the same three roundings in the same order, R read by the thread that stores the element
+ * (so R may alias C). The products are exact in f32 and only the summation order differs from the WMMA form's: a
+ * tolerance check against libref, not bit identity. */
+inline float vit_gelu_erf(float x) { return 0.5f * x * (1.0f + sycl::erf(x * 0.70710678118654752f)); }
+inline float vit_gelu_tanh(float x) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    return 0.5f * x * (1.0f + sycl::tanh(k0 * (x + k1 * x * x * x)));
+}
+
+template <int ACT, bool RES, bool BF32>
+void gemm_bf16_dpas_bias_kernel(const uint16_t* __restrict__ a, long a_ld, const uint16_t* __restrict__ b, long b_ld,
+                                const void* __restrict__ bias, const uint16_t* r, long r_ld, uint16_t* y, long y_ld,
+                                int N, int K, int M) {
+    XE_SHARED(uint16_t, sA, kBfRT * kBfAP);
+    XE_SHARED(uint32_t, sB, 4 * 4 * 128);
+    XE_SHARED(float, sC, kBfWaves * 8 * 16);
+    const int tid = (int)threadIdx.x, wave = tid / kBfSG, lane = tid % kBfSG;
+    const int m0 = (int)blockIdx.y * kBfRT;
+    const int n0 = (int)blockIdx.x * kBfNT;
+    sycl::sub_group sg = xe::sg();
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::a, 8, 16, jm::layout::row_major> Am;
+    jm::joint_matrix<sycl::sub_group, sycl::ext::oneapi::bfloat16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> Bm;
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> Cm[4];
+    auto lptr = [](auto* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+#pragma unroll
+    for (int t = 0; t < 4; ++t) jm::joint_matrix_fill(sg, Cm[t], 0.0f);
+    const int G = (K + 63) / 64;
+    const int sr = tid / 32, kp = (tid % 32) * 2;
+    const int k2 = tid % 32, bstep = k2 / 8, bkw = k2 % 8;
+    for (int g = 0; g < G; ++g) {
+        const int k0 = g * 64;
+        xe::syncthreads();
+        uint32_t wa[16];
+        {
+            const int kk = k0 + kp;
+            const int kc0 = kk < K ? kk : K - 1, kc1 = kk + 1 < K ? kk + 1 : K - 1;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int mm = m0 + sr + 4 * i, mc = mm < M ? mm : M - 1;
+                const uint16_t* ar = a + (size_t)mc * a_ld;
+                const uint16_t v0 = ar[kc0], v1 = ar[kc1];
+                const uint16_t lo = kk < K ? v0 : (uint16_t)0, hi = kk + 1 < K ? v1 : (uint16_t)0;
+                const uint32_t w = (uint32_t)lo | ((uint32_t)hi << 16);
+                wa[i] = mm < M ? w : 0u;
+            }
+        }
+        uint32_t wb[16];
+        {
+            const int kk = k0 + 2 * k2;
+            const int kc0 = kk < K ? kk : K - 1, kc1 = kk + 1 < K ? kk + 1 : K - 1;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int nn = n0 + sr + 4 * i, nc = nn < N ? nn : N - 1;
+                const uint16_t* br = b + (size_t)nc * b_ld;
+                const uint16_t v0 = br[kc0], v1 = br[kc1];
+                const uint16_t lo = kk < K ? v0 : (uint16_t)0, hi = kk + 1 < K ? v1 : (uint16_t)0;
+                const uint32_t w = (uint32_t)lo | ((uint32_t)hi << 16);
+                wb[i] = nn < N ? w : 0u;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) *(uint32_t*)(sA + (sr + 4 * i) * kBfAP + kp) = wa[i];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int n = sr + 4 * i;
+            sB[((bstep * 4 + n / 16) * 8 + bkw) * 16 + (n % 16)] = wb[i];
+        }
+        xe::syncthreads();
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            jm::joint_matrix_load(sg, Am, lptr((sycl::ext::oneapi::bfloat16*)(sA + wave * 8 * kBfAP + step * 16)), (size_t)kBfAP);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                jm::joint_matrix_load(sg, Bm, lptr((sycl::ext::oneapi::bfloat16*)(sB + (step * 4 + t) * 128)), 32);
+                jm::joint_matrix_mad(sg, Cm[t], Am, Bm, Cm[t]);
+            }
+        }
+    }
+    float* sCw = sC + wave * 128;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        jm::joint_matrix_store(sg, Cm[t], lptr(sCw), 16, jm::layout::row_major);
+        xe::wave_barrier();
+        const int nn = n0 + t * 16 + lane;
+        if (nn < N) {
+            const float bv = BF32 ? ((const float*)bias)[nn] : ld_bf16((const uint16_t*)bias, nn);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int mm = m0 + wave * 8 + e;
+                if (mm >= M) continue;
+                uint16_t v = to_bf16(sCw[e * 16 + lane] + bv);
+                if constexpr (ACT == 1) v = to_bf16(vit_gelu_erf(ld_bf16(&v, 0)));
+                if constexpr (ACT == 2) v = to_bf16(vit_gelu_tanh(ld_bf16(&v, 0)));
+                if constexpr (RES) v = to_bf16(ld_bf16(r, (long)((size_t)mm * r_ld + nn)) + ld_bf16(&v, 0));
+                y[(size_t)mm * y_ld + nn] = v;
+            }
+        }
+        xe::wave_barrier();
+    }
+}
+
 /* ---- run 270 (owner note 209 item 3): the bf16 DPAS form without the shared-memory stages -- the "T form",
  * RADIANCE_XE_GEMM_DPAS_T=1 (opt-in, the same switch as xe_gemv_i8.cpp's), for K % 64 == 0 ----
  *
@@ -497,6 +606,22 @@ int gemv(const RadTensor* A, const RadTensor* B, const RadTensor* Y, long long N
         return RAD_E_DEVICE;
     }
     return RAD_OK;
+}
+
+/* RADIANCE_XE_VIT_DPAS=1 (owner note 268 item 2, run 368; opt-in): the vision tower's gemm_nt_bias on
+ * gemm_bf16_dpas_bias_kernel. Off, or on the CPU device (no matrix unit), the WMMA form keeps serving. */
+bool vit_dpas_on(sycl::queue* q) {
+    static const bool want = [] { const char* v = std::getenv("RADIANCE_XE_VIT_DPAS"); return v && v[0] == '1'; }();
+    if (!want) return false;
+    static const bool gpu = q->get_device().is_gpu();
+    return gpu;
+}
+template <int ACT, bool RES, bool BF32>
+void vit_dpas_launch(sycl::queue* q, const uint16_t* a, long a_ld, const uint16_t* w, long w_ld, const void* bias,
+                     const uint16_t* r, long r_ld, uint16_t* c, long c_ld, int M, int K, int N) {
+    const dim3 grid((unsigned)((N + kBfNT - 1) / kBfNT), (unsigned)((M + kBfRT - 1) / kBfRT)), block(kBfThreads);
+    XE_LAUNCH_SG(kBfSG, q, (gemm_bf16_dpas_bias_kernel<ACT, RES, BF32>), grid, block, 0, a, a_ld, w, w_ld, bias, r, r_ld,
+                 c, c_ld, N, K, M);
 }
 
 bool router_pair_on() {
@@ -780,6 +905,29 @@ extern "C" int xe_rad_logits_gemm_i8(const RadArgs* args, RadStream s) {
 }
 
 /* gemm_nt: a, b, y */
+/* The vision tower's gemm_nt_bias on the matrix unit (owner note 268 item 2): called by ports/r4d_vit_bf16.cpp's
+ * r4d_rad_gemm_nt_bias after its own checks (bf16 A / W / C / R, bias bf16 or f32, 16-byte rows). RAD_E_UNSUPPORTED
+ * when RADIANCE_XE_VIT_DPAS is off or the device has no matrix unit: the caller then keeps its WMMA form. */
+extern "C" int xe_vit_gemm_nt_bias_dpas(const uint16_t* a, long a_ld, const uint16_t* w, long w_ld, const void* bias,
+                                        int bias_f32, const uint16_t* r, long r_ld, uint16_t* c, long c_ld, int M, int K,
+                                        int N, int act, RadStream s) {
+    sycl::queue* q = (sycl::queue*)s;
+    if (!q || !vit_dpas_on(q)) return RAD_E_UNSUPPORTED;
+    if (M <= 0 || N <= 0 || K <= 0 || act < 0 || act > 2) return R4D_NO(RAD_E_SHAPE);
+    try {
+#define VD_L(AC, RS, BF) do { vit_dpas_launch<AC, RS, BF>(q, a, a_ld, w, w_ld, bias, r, r_ld, c, c_ld, M, K, N); return RAD_OK; } while (0)
+#define VD_ACT(RS, BF) do { if (act == 1) VD_L(1, RS, BF); if (act == 2) VD_L(2, RS, BF); VD_L(0, RS, BF); } while (0)
+#define VD_RES(BF) do { if (r) VD_ACT(true, BF); VD_ACT(false, BF); } while (0)
+        if (bias_f32) VD_RES(true);
+        VD_RES(false);
+#undef VD_RES
+#undef VD_ACT
+#undef VD_L
+    } catch (const sycl::exception&) {
+        return RAD_E_DEVICE;
+    }
+}
+
 extern "C" int xe_rad_gemm_nt_bf16(const RadArgs* args, RadStream s) {
     const RadTensor* B = r4d_opt(args, 1);
     if (!B) return R4D_NO(RAD_E_INVAL);
