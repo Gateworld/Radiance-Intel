@@ -20,6 +20,10 @@
 
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace rad {
 namespace server {
 
@@ -179,7 +183,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
-HttpResponse Server::handle_stats(const HttpRequest&) {
+HttpResponse Server::handle_stats(const HttpRequest& req) {
     json o;
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
@@ -409,6 +413,24 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             o["passes"] = std::move(p);
         }
     }
+
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    /* The C heap, on request only (?malloc=1): mallinfo2 takes every arena's lock in turn, which a
+     * page polling each second should not cost the step threads. A drifting RssAnon is either memory
+     * still allocated (`in_use` rises: something keeps a request's data after it ends) or memory
+     * freed that the arenas cannot give back (`free` rises: fragmentation). */
+    if (const auto it = req.query.find("malloc"); it != req.query.end() && it->second == "1") {
+        const struct mallinfo2 mi = ::mallinfo2();
+        o["malloc"] = { { "arena_bytes",  (double)mi.arena },     /* sbrk + arena heaps */
+                        { "mmap_bytes",   (double)mi.hblkhd },    /* direct mmap chunks */
+                        { "mmap_chunks",  (double)mi.hblks },
+                        { "in_use_bytes", (double)mi.uordblks },
+                        { "free_bytes",   (double)mi.fordblks },
+                        { "free_chunks",  (double)mi.ordblks },
+                        { "fast_bytes",   (double)mi.fsmblks },
+                        { "top_bytes",    (double)mi.keepcost } };
+    }
+#endif
 
     /* Not counted in metrics_.observe_http, as for /health: a page polling twice a second would
      * make the request counters describe the dashboard. */
