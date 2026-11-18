@@ -4759,3 +4759,128 @@ Text gates bit-identical as always; nothing goes live without the coordinator.
    Desk prep now; card tests only after HOLD-INTEL-HOST lifts (~11-19). Text gates bit-identical.
 2. **Then** the full 1.17 rebase as its own release (per briefs/2026-11-13-upstream-1.17-inventory.md).
 Nothing changes on intel-host while v1 serves production.
+
+## 271. Coordinator: NEXT-RESTART applied + desk-only runner while the AMD host's GPUs train (owner "yes", 11-13)
+1. Applied NEXT-RESTART.md (Tctl 42.5 C at start, guard --hot 80): run.sh = run.sh.next-restart
+   (RADIANCE_STEP_POISON_EXIT_S=60), unit --cpus 4. Listening after **88 s** (was ~111 s); Tctl 43.9 C after.
+   Record it in STATE / V1.md (startup ~88 s, peak Tctl).
+2. Owner OK: desk-only runner cycles while the other host's GPUs are busy; HOLD-INTEL-HOST stays (no card work on
+   intel-host, no v1 restarts). Priorities: (a) v1.0.4 cherry-picks (note 270): build + CPU tests; say whether 3decb3c
+   explains the ~0.1 GiB/h creep; (b) note 269 items 1, 3, 4 at the desk (failed-step recovery, overload behaviour,
+   drift); (c) note 268 desk analysis (encoder kernels). Card tests and deploys wait for HOLD-INTEL-HOST to lift.
+
+## 272. Owner OK: decode +20 % plan (11-13) -- desk now, cards after HOLD-INTEL-HOST
+Target: ~93 -> ~110+ tok/s single user, EXACT (bit-identical texts; note 149's bar only for lossy forms, which need the owner).
+1. First card job after HOLD-INTEL-HOST lifts: a FRESH decode profile of v1 (the scoreboard's decode table is P87, 11-03,
+   ~57 tok/s; shares have moved) -> refresh briefs/kernel-scoreboard.md; then work rows by note 171's order (biggest gap first).
+2. Desk prep now: (a) expert kernels rows 1 / 3 toward the streaming floor per run 175's ablation: staging + level table
+   once a run, lookups by a select chain (note 167); (b) fewer launches: fuse trunk GEMV pairs, router into the hc read,
+   hc gains into hc down; (c) fuse neighbouring all-reduces. CPU / oracle tests at the desk; card gates later.
+3. Lossy (int8 hc mixes, route lean): NOT without the owner.
+
+## 273. Coordinator: v1 low traffic = quiet period, the forward routes fine (11-14)
+1. amd-host's forward (127.0.0.1:8000 -> <lan-ip>:8030) is active, and that is the address every client uses. A test chat
+   through :8000 returned 200 in 0.45 s (v1). Client logs from the last 10 h: no LLM errors. Overnight traffic is user
+   chats only, and there were few.
+2. Drift scales with work, not time: noted. The MALLOC_ARENA_MAX=2 test measures RssAnon per N requests, not per hour.
+3. 64c652f acceptance: wait for daytime traffic. HOLD-INTEL-HOST stands; no action needed.
+
+## 274. Coordinator: v1 memory creep localised (read-only smaps diffs + 60 test requests, 11-14)
+1. RssAnon 6.26 GiB anon = 25 fixed mmaps >= 64 MiB (3.54 GiB) + 75 glibc arena heaps (2.60 GiB) + [heap] 0.15 + small.
+   The growth is ALL in the glibc arenas; the fixed mmaps (pools, staging, encoder cache, checkpoint store) and UMF/NEO
+   regions did not move. No new regions: the existing arena heaps fill.
+2. Per request (sequential, max_tokens 16): ~3.5 k-token prompt repeated x15 = +1.0 MiB (~70 KB each, prefix cache
+   hitting); distinct ~3.5 k-token prompts x15 = +1.4 MiB (~100 KB each); 10-word prompts x30 = +0.4 MiB (~14 KB each).
+   => ~14 KB a request + ~20-25 B a prompt token, kept after the request ends (or freed into unreusable fragments).
+   Not the prefix cache (the repeat case grows too), not the encoder cache, not the driver.
+3. Next card job, sharpened: (a) MALLOC_ARENA_MAX=2 restart + the same 3 request sets; growth gone = fragmentation;
+   (b) else, mallinfo2() in-use bytes via a debug endpoint across 100 identical requests: in-use rising = a C++ container
+   that keeps the request body / text / token ids after completion (HTTP request -> oai parse -> sched submit -> response).
+
+## 275. Coordinator: creep test order = note 274's (11-14)
+1. Keep note 274's order: config-only restart of image 330 with MALLOC_ARENA_MAX=2, then the three request sets (repeat
+   3.5 k x15, distinct 3.5 k x15, 10-word x30) with smaps arena diffs. Arenas flat = fragmentation, and the fix is the
+   setting itself: keep it in run.sh.
+2. Growth still there = retention: only then is an image carrying 6ac2b7f (/stats?malloc=1) needed for the in_use vs
+   free bisect. Otherwise it rides the next release (v1.0.4 / the 1.17 rebase), staying opt-in as built.
+3. ConnectionPool finding (worker per connection, 5 s idle exit -> frees scattered over many arenas): it explains the
+   75 arenas. If 1. confirms fragmentation, a longer idle time or a fixed worker floor is the code-side follow-up (desk
+   only; not without a card gate).
+
+## 276. Owner (via coordinator, 11-15): idle until HOLD-INTEL-HOST lifts; keep the budget for the card jobs
+1. No new desk work while HOLD-INTEL-HOST stands; idle-skips are fine. Do not start the 1.17 rebase prep now.
+2. Card jobs, in order, when the hold lifts: (1) image encoder DPAS card test (RADIANCE_XE_VIT_DPAS=1 / ebfe90c),
+   (2) fresh decode profile (note 272), (3) memory-creep test per notes 274/275 (MALLOC_ARENA_MAX=2 on image 330 first).
+
+## 277. Owner (via coordinator, 11-16): the v1 memory-creep test runs first of the card jobs
+1. When HOLD-INTEL-HOST is gone: note 275 step 1 FIRST (config-only restart of image 330 with MALLOC_ARENA_MAX=2 in
+   run.sh, the three request sets with smaps arena diffs; ~1-2 h). Flat arenas = fragmentation = the setting stays: done.
+   Growth stays = retention: report, step 2 (6ac2b7f image) only with the coordinator's OK.
+2. v1 back up and healthy, with the result written, within ~12 h: long production stretches on intel-host are coming,
+   and the creep matters most there.
+
+## 278. Owner (via coordinator, 11-16): "not worried about the production now" -- supersedes note 277's timing
+1. The v1 memory-creep test (note 275 step 1) may run NOW, on the live v1 on intel-host: its few minutes of restart
+   downtime are accepted. It is the ONE card job allowed under HOLD-INTEL-HOST. Same outcome rules as 277. Write the
+   result to STATE.md and tell the coordinator.
+
+## 279. Coordinator (11-16): note 278's creep test DONE -- data for STATE.md
+1. Installed on intel-host: m3/service/run.sh = run.sh.arena2 (MALLOC_ARENA_MAX=2; the old one kept as a backup);
+   cool start (41 C); guard --hot 80; /health 200 after 90 s.
+2. Sets (creep_sets.py): 15/15, 15/15, 30/30 ok. RssAnon kB: 6126448 -> 6143008 -> 6148192 -> 6149344.
+3. Arena heaps (64 MiB-class rw-p): 4 heaps, 255.9 MiB in ALL four snapshots = FLAT -> fragmentation; the setting STAYS.
+   base -> short +22 MiB anon: +19 MiB in ONE 80 MiB unnamed rw-p mapping -- first-use warm-up after the restart or engine
+   retention: re-read after a few hundred live requests.
+4. NEW (desk item): rw-s mappings of /dev/dri/renderD128 / renderD129 grow per request: 1057 + 719 at base -> 2600 + 2507
+   after the 60 requests. Small, hardly in RssAnon, but a mapping leak (vm.max_map_count 1048576): check whether L0 / xe
+   buffer mappings are unmapped on free.
+5. Step 2 (6ac2b7f image) not needed for the arenas.
+
+## 280. Coordinator (11-16): answer to +82 MiB RssAnon / h after the creep test
+1. Arenas: note 279's verdict stands. Re-read at ~+4 h and ~+12 h (read-only). The 80 MiB region must stop within its
+   last ~4 MiB. If arena-class growth holds at >= ~15 MiB/h over 12 h, send the numbers + the live request mix: step 2
+   (6ac2b7f image) is decided then; not pre-approved.
+2. Device mappings (renderD128 / 129 rw-s, ~+2,600 per device per hour; ~16 days to vm.max_map_count): read the v1 PID's
+   total map count at every run (read-only). If the total passes 600,000: a plain config-only restart (NEXT-RESTART.md's
+   heat steps, the current run.sh); then tell the coordinator.
+3. The L0 unmap-on-free check: FIRST on the desk list, ahead of the 1.17 rebase prep -- it decides whether v1 needs a
+   scheduled restart during long production stretches.
+
+## 281. Owner (via coordinator, 11-18): "do it now" -- repair the v1 memory creep; option (b) v1.0.4 APPROVED
+1. Desk: (a) the L0 unmap-on-free check (note 279.4 / 280.2-3): why the renderD rw-s mappings grow per request; read the
+   live v1 PID's map count first; re-read the 80 MiB region (note 280.1). (b) Option (b): cherry-pick onto intel-l0 as
+   v1.0.4-intel: 3decb3c (qwen4exp pinned copy leaked per re-declare), 9560780 / 8df9240 (preempted prefill stall +
+   readmission), 64c652f (MTP first draft past its position), 481fcd5 (checkpoint-store floor), plus an unmap-on-free fix
+   if one is found. Each in its own commit. NOT the full 1.17 rebase (option (a) stays its own later milestone).
+2. Gates before any card step: CPU suite; texts = M285.
+3. Card step (the ONE card job under HOLD-INTEL-HOST; restart downtime accepted): swap the live v1 to the v1.0.4 image with
+   the current run.sh (MALLOC_ARENA_MAX=2 stays), heat steps, then the G4b soak and note 274's three request sets with
+   smaps + map-count diffs, in a quiet traffic slot. Any gate fails -> back to v1.0.3 (image 330) at once.
+
+## 282. Owner (via coordinator, 11-18): "go on" -- finish note 281
+1. 64c652f stays DEFAULT ON (RADIANCE_MTP_HIST_CTX unset); the soak decides; =0 in run.sh is the fallback.
+2. Prune only SUPERSEDED image tags before building (never the live image nor the new one). Build the 14300fb image + the
+   texts check, then the coordinator's restart in a quiet slot; G4b soak + note 274's request sets; any failure -> back to
+   image 330 at once.
+(Desk result, run 809: the renderD growth is NEO's command-buffer reuse for recorded command lists, bounded by the 24-tape
+pool and saturating: no fix to carry. 3decb3c was already in (3e26405). 9560780 / 8df9240 patch a preempted-prefill gate the
+port does not have: they belong to the full rebase. Picks: 64c652f -> 0176a22, 481fcd5 -> 14300fb.)
+
+## 283. Coordinator (11-18): v1 swapped to v1.0.4 (image 331); gates run by the coordinator
+1. Swap: Image= pinned by the digest the intel-host store resolves for image 331 (podman save | load re-creates the
+   manifest, so the digest is per store; the image ID 93c7ce59fbae is the same on both hosts). run.sh unchanged
+   (MALLOC_ARENA_MAX=2, RADIANCE_MTP_HIST_CTX unset). Cool start 42 C; guard --hot 80; Tctl 59.8 C at /health;
+   /health 200 after 86 s; keyless 401, keyed 200.
+2. Gate 1: v1_text_check vs M285 tps-1.sse = TEXT IDENTICAL (1097 chars).
+3. Rollback if anything fails: restore the backup unit (Image= 330), daemon-reload, restart.
+
+## 284. Coordinator (11-18): v1.0.4 gates 2 + 3 done
+1. Gate 2, G4b soak (2 users x 60 min): 1150 requests, 1150 x 200, 0 not; greedy 554 (median 3.87 s, max 30.6 s),
+   sampled 550 (3.95 / 32.3 s), long 46 (47.1 / 64.1 s), needles 46 right / 0 wrong; finish reasons length 392 / stop 458 /
+   tool_calls 300. Engine counters: 1195 requests, TPOT mean 25.5 ms (~39 tok/s per user at 2 users, mixed load).
+   Single-user M-pair (greedy, 256 tokens): run 1 77.2, runs 2 / 3 92.9 / 93.1 tok/s = v1.0.3's 93.0.
+2. Gate 3, note 274's sets: repeat 15/15, distinct 15/15, short 30/30.
+3. Runner's reads: device mappings flat at 14,783 before and after the sets (0 new over 60 requests; flat since ~35 min
+   of varied traffic = the NEO pool saturated); RssAnon 6.38 GB after the fresh process's first hour (6.11 GB idle),
+   +4.8 MiB over the sets incl. live traffic; kernel log: 0 GPU lines. The creep question is settled: no fix, no scheduled
+   restart; note 280's 15 MiB/h-over-12 h rule stays the steady-state watch. Tagged v1.0.4-intel at 14300fb.

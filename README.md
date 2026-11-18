@@ -44,8 +44,27 @@ split tensor-parallel across the two cards.
 
 Release tags carry an `-intel` suffix, because upstream radiance already uses `v1.0.0` through `v1.12.0`.
 
-- **`v1.0.3-intel` (13 November 2026): the current release.** It runs as the production service. It adds two things on
-  top of `v1.0.2-intel`, and text output is bit-identical to `v1.0.2-intel`:
+- **`v1.0.4-intel` (18 November 2026): the current release.** It runs as the production service. It brings three
+  upstream fixes and settles the service's slow memory growth; greedy text output is identical to `v1.0.3-intel`:
+  - **MTP's first draft reads its cache only up to its own position** (upstream 64c652f). On a cached prefix the
+    head's first draft could read past where it sits, and position-1 acceptance collapsed on repeated system prompts.
+    The fix is on by default; `RADIANCE_MTP_HIST_CTX=0` turns it off. Drafts are always verified, so texts do not change.
+  - **The checkpoint store gets its floor before the host reserve** (upstream 481fcd5), so prefix hits stop falling
+    back to a full prefill when host memory is tight.
+  - **A model reset no longer leaks its pinned window copy** (upstream 3decb3c).
+  - **Memory growth, explained and settled.** The slow RssAnon growth was glibc arena fragmentation (one arena per
+    connection worker); the service script now sets `MALLOC_ARENA_MAX=2`, and the arenas stay flat. The growing count of
+    `/dev/dri/renderD*` mappings is the Level Zero driver keeping each recorded command list's buffers for reuse; it is
+    bounded by the engine's pool of 24 recorded passes and levels off after about half an hour of varied traffic. No
+    fix and no scheduled restart are needed.
+  - **Opt-in or diagnostic additions:** a prefix-cache snapshot at a head that other prompts share (upstream 74e701e,
+    opt-in); the vision tower's bias GEMM on the matrix unit (opt-in, not yet validated on a card); `/stats?malloc=1`
+    reports glibc `mallinfo2`.
+  - **Validation:** the fixed test prompt gives texts identical to the reference run (92.9 / 93.1 tokens/s single user,
+    as `v1.0.3-intel`); a 60-minute soak with 2 users and long prompts in the mix ran clean (1,150 of 1,150 requests,
+    46 of 46 long-prompt fact checks right); repeated, distinct and short request sets left the device mappings
+    unchanged and the kernel log free of GPU messages.
+- **`v1.0.3-intel`:** it adds two things on top of `v1.0.2-intel`, and text output is bit-identical to `v1.0.2-intel`:
   - **An encoder-output cache for repeated images (opt-in).** On this hybrid model, a prefix-cache hit only reaches the
     last linear-state checkpoint, so a ~1,400-token image prompt has no reusable snapshot, and the same image was encoded
     again on every request (about 22 s per 1024×1024 image). The engine now keeps the vision encoder's output, keyed by
